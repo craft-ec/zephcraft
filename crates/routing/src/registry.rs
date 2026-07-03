@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use zeph_wire::SignedRecord;
 
-use crate::records::{self, KIND_META, KIND_NODE, KIND_PROVIDER, KIND_RELAY, KIND_ROOT, KIND_WANT};
+use crate::records::{
+    self, KIND_MANIFEST, KIND_META, KIND_NODE, KIND_PROVIDER, KIND_RELAY, KIND_ROOT, KIND_WANT,
+};
 
 /// Display snapshot of the registries (for the tracker dashboard / map).
 #[derive(Debug, Clone, Serialize)]
@@ -106,6 +108,9 @@ struct Tables {
     /// (node_id, namespace) -> entry (single-writer DB root pointers, CAS).
     /// NOT TTL-expired: a DB head must not vanish because the owner went quiet.
     roots: HashMap<([u8; 32], String), Entry>,
+    /// (node_id, namespace) -> entry (DB durability manifest pointers). Like
+    /// roots: NOT TTL-expired, single-writer, highest seq wins (monotonic).
+    manifests: HashMap<([u8; 32], String), Entry>,
 }
 
 pub struct Registry {
@@ -186,6 +191,20 @@ impl Registry {
                 }
                 tables.roots.insert(key, Entry::now(record));
             }
+            KIND_MANIFEST => {
+                let Some(m) = records::manifest(&record) else {
+                    return Err("bad-manifest-payload");
+                };
+                let key = (record.node_id, m.namespace.clone());
+                if let Some(cur) = tables.manifests.get(&key) {
+                    if let Some(curm) = records::manifest(&cur.record) {
+                        if m.seq <= curm.seq {
+                            return Err("manifest-stale");
+                        }
+                    }
+                }
+                tables.manifests.insert(key, Entry::now(record));
+            }
             KIND_NODE => {
                 if records::node(&record).is_none() {
                     return Err("bad-node-payload");
@@ -246,6 +265,11 @@ impl Registry {
             KIND_ROOT => {
                 if let Some(r) = records::root(&record) {
                     tables.roots.remove(&(record.node_id, r.namespace));
+                }
+            }
+            KIND_MANIFEST => {
+                if let Some(m) = records::manifest(&record) {
+                    tables.manifests.remove(&(record.node_id, m.namespace));
                 }
             }
             KIND_NODE => {
@@ -319,6 +343,17 @@ impl Registry {
         let tables = self.tables.lock().expect("registry lock");
         tables
             .roots
+            .iter()
+            .filter(|((nid, _), _)| nid == owner)
+            .take(max)
+            .map(|(_, e)| e.record.clone())
+            .collect()
+    }
+
+    pub fn manifests_for(&self, owner: &[u8; 32], max: usize) -> Vec<SignedRecord> {
+        let tables = self.tables.lock().expect("registry lock");
+        tables
+            .manifests
             .iter()
             .filter(|((nid, _), _)| nid == owner)
             .take(max)

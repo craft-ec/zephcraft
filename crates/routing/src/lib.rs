@@ -60,6 +60,16 @@ pub struct RootRecord {
     pub seq: u64,
 }
 
+/// A resolved DB durability-manifest pointer (`KIND_MANIFEST`) — the CID of the
+/// object listing a DB's erasure-coded generations, for network recovery.
+#[derive(Debug, Clone)]
+pub struct ManifestRecord {
+    pub owner: NodeId,
+    pub namespace: String,
+    pub manifest_cid: Cid,
+    pub seq: u64,
+}
+
 /// A resolved provider: who holds `cid`, where to dial them, advisory count.
 #[derive(Debug, Clone)]
 pub struct ProviderRecord {
@@ -136,6 +146,15 @@ pub trait ContentRouting: Send + Sync {
     async fn resolve_root(&self, owner: NodeId, namespace: &str) -> Result<Option<RootRecord>>;
     /// Withdraw this identity's DB root for `namespace`.
     async fn withdraw_root(&self, namespace: &str) -> Result<()>;
+    /// Publish this identity's DB durability-manifest pointer for `namespace`
+    /// (highest `seq` wins). Lets any node later recover the DB from its pieces.
+    async fn publish_manifest(&self, namespace: &str, manifest_cid: Cid, seq: u64) -> Result<()>;
+    /// Resolve `owner`'s current durability-manifest pointer for `namespace`.
+    async fn resolve_manifest(
+        &self,
+        owner: NodeId,
+        namespace: &str,
+    ) -> Result<Option<ManifestRecord>>;
 }
 
 /// Tracker-backed routing client: announces to and resolves from a set of
@@ -530,6 +549,50 @@ impl ContentRouting for TrackerRouting {
                     owner,
                     namespace: p.namespace,
                     root_cid: Cid(p.root_cid),
+                    seq: p.seq,
+                })
+            })
+            .max_by_key(|rr| rr.seq))
+    }
+
+    async fn publish_manifest(&self, namespace: &str, manifest_cid: Cid, seq: u64) -> Result<()> {
+        let payload = records::ManifestPayload {
+            namespace: namespace.to_string(),
+            manifest_cid: manifest_cid.0,
+            seq,
+        };
+        let rec = records::sign(
+            &self.identity,
+            records::KIND_MANIFEST,
+            &payload,
+            self.now_hlc(),
+        );
+        self.announce_cas(rec).await
+    }
+
+    async fn resolve_manifest(
+        &self,
+        owner: NodeId,
+        namespace: &str,
+    ) -> Result<Option<ManifestRecord>> {
+        let recs = self
+            .query(zeph_wire::TrackerResolve {
+                query_kind: 8,
+                cid: owner.0,
+                max: 64,
+            })
+            .await?;
+        Ok(recs
+            .iter()
+            .filter_map(|r| {
+                let p = records::manifest(r)?;
+                if r.node_id != owner.0 || p.namespace != namespace {
+                    return None;
+                }
+                Some(ManifestRecord {
+                    owner,
+                    namespace: p.namespace,
+                    manifest_cid: Cid(p.manifest_cid),
                     seq: p.seq,
                 })
             })

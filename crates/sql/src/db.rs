@@ -44,6 +44,15 @@ pub trait PageSource: Send + Sync {
     async fn fetch(&self, owner: NodeId, cid: Cid) -> Result<Option<Vec<u8>>>;
 }
 
+/// Publishes/resolves a DB's durability-manifest pointer (`KIND_MANIFEST`) — the
+/// CID of the object listing its generations. Lets any node discover, by
+/// `(owner, namespace)` alone, how to reconstruct a DB from its pieces.
+#[async_trait::async_trait]
+pub trait ManifestStore: Send + Sync {
+    async fn publish(&self, namespace: &str, manifest_cid: Cid, seq: u64) -> Result<()>;
+    async fn resolve(&self, owner: NodeId, namespace: &str) -> Result<Option<(Cid, u64)>>;
+}
+
 /// Adapter binding `RootStore` to the real signed `KIND_ROOT` records over
 /// `ContentRouting` (tracker now, DHT later). Publishes sign with this node's
 /// identity (implicit owner = self).
@@ -76,6 +85,36 @@ impl RootStore for RoutingRootStore {
     }
 }
 
+/// Adapter binding `ManifestStore` to `KIND_MANIFEST` over `ContentRouting`.
+pub struct RoutingManifestStore {
+    routing: Arc<dyn zeph_routing::ContentRouting>,
+}
+
+impl RoutingManifestStore {
+    pub fn new(routing: Arc<dyn zeph_routing::ContentRouting>) -> Self {
+        Self { routing }
+    }
+}
+
+#[async_trait::async_trait]
+impl ManifestStore for RoutingManifestStore {
+    async fn publish(&self, namespace: &str, manifest_cid: Cid, seq: u64) -> Result<()> {
+        self.routing
+            .publish_manifest(namespace, manifest_cid, seq)
+            .await
+            .map_err(|e| SqlError::Sqlite(e.to_string()))
+    }
+
+    async fn resolve(&self, owner: NodeId, namespace: &str) -> Result<Option<(Cid, u64)>> {
+        Ok(self
+            .routing
+            .resolve_manifest(owner, namespace)
+            .await
+            .map_err(|e| SqlError::Sqlite(e.to_string()))?
+            .map(|r| (r.manifest_cid, r.seq)))
+    }
+}
+
 static VFS_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A CraftSQL engine bound to a page store, a head store, and this node's
@@ -88,6 +127,7 @@ pub struct CraftSql {
     store_dir: PathBuf,
     source: Option<Arc<dyn PageSource>>,
     durable: Option<Arc<dyn DurableStore>>,
+    manifests: Option<Arc<dyn ManifestStore>>,
 }
 
 impl CraftSql {
@@ -112,6 +152,7 @@ impl CraftSql {
             store_dir,
             source: None,
             durable: None,
+            manifests: None,
         })
     }
 
@@ -126,6 +167,14 @@ impl CraftSql {
     /// (k=8/n=32) + distributed + repaired — the DB survives owner/holder loss.
     pub fn with_durable(mut self, durable: Arc<dyn DurableStore>) -> Self {
         self.durable = Some(durable);
+        self
+    }
+
+    /// Attach a manifest store so each DB's generation list is published network-
+    /// wide (`KIND_MANIFEST`) — any node can then rebuild the DB from `(owner,
+    /// namespace)` alone, even after the owner is gone.
+    pub fn with_manifests(mut self, manifests: Arc<dyn ManifestStore>) -> Self {
+        self.manifests = Some(manifests);
         self
     }
 
@@ -205,6 +254,11 @@ impl CraftSql {
             roots: self.roots.clone(),
             heads: writable.then(|| self.heads.clone()),
             durable: if writable { self.durable.clone() } else { None },
+            manifests: if writable {
+                self.manifests.clone()
+            } else {
+                None
+            },
             store_dir: self.store_dir.clone(),
             key,
             namespace: namespace.to_string(),
@@ -217,17 +271,37 @@ impl CraftSql {
     /// (verifying every object by CID) and re-puts it, then the DB opens
     /// normally at its head. Reads the sidecar manifest for the generation set.
     pub async fn recover(&self, namespace: &str) -> Result<usize> {
+        self.recover_owner(self.owner, namespace).await
+    }
+
+    /// Rebuild `owner`'s DB `namespace` from its durable generations — discovering
+    /// the generation list from the network manifest (`KIND_MANIFEST`) when a
+    /// manifest store is set, else the local sidecar. Works for ANY owner from
+    /// (owner, namespace) alone, so a live node can resurrect a dead owner's DB.
+    pub async fn recover_owner(&self, owner: NodeId, namespace: &str) -> Result<usize> {
         let durable = self
             .durable
             .as_ref()
             .ok_or_else(|| SqlError::Sqlite("no durable store configured".into()))?;
-        let key = format!("{}_{}", &self.owner.to_hex()[..16], namespace);
         let store = ObjectStore::open(&self.store_dir)?;
-        let manifest = load_manifest(&self.store_dir, &key);
+        let key = format!("{}_{}", &owner.to_hex()[..16], namespace);
+        let gens: Vec<[u8; 32]> = match &self.manifests {
+            Some(mstore) => match mstore.resolve(owner, namespace).await? {
+                Some((manifest_cid, _)) => {
+                    let blob = durable.get_generation(manifest_cid).await?.ok_or_else(|| {
+                        SqlError::CorruptIndex("manifest object unrecoverable".into())
+                    })?;
+                    postcard::from_bytes(&blob)
+                        .map_err(|e| SqlError::CorruptIndex(e.to_string()))?
+                }
+                None => load_manifest(&self.store_dir, &key).generations,
+            },
+            None => load_manifest(&self.store_dir, &key).generations,
+        };
         let mut restored = 0;
-        for gcid in &manifest.generations {
-            let blob = durable.get_generation(Cid(*gcid)).await?.ok_or_else(|| {
-                SqlError::CorruptIndex(format!("lost generation {}", Cid(*gcid).to_hex()))
+        for gcid in gens {
+            let blob = durable.get_generation(Cid(gcid)).await?.ok_or_else(|| {
+                SqlError::CorruptIndex(format!("lost generation {}", Cid(gcid).to_hex()))
             })?;
             for (cid, data) in gen::unpack(&blob)? {
                 if !store.has(&cid) {
@@ -250,6 +324,7 @@ pub struct CraftDb {
     roots: Roots,
     heads: Option<Arc<dyn RootStore>>,
     durable: Option<Arc<dyn DurableStore>>,
+    manifests: Option<Arc<dyn ManifestStore>>,
     store_dir: PathBuf,
     key: String,
     namespace: String,
@@ -320,13 +395,31 @@ impl CraftDb {
                 }
             }
         }
+        let mut changed = false;
         if !fresh.is_empty() {
             let blob = gen::pack(&fresh)?;
             let gcid = durable.put_generation(blob).await?;
             manifest.generations.push(gcid.0);
+            changed = true;
         }
         manifest.last_root = Some(root.0);
         save_manifest(&self.store_dir, &self.key, &manifest)?;
+        // Publish the generation list as its own durable object and announce its
+        // CID network-wide, so any node can recover the DB from (owner, ns) alone.
+        if changed {
+            if let Some(mstore) = &self.manifests {
+                let list = postcard::to_allocvec(&manifest.generations)
+                    .map_err(|e| SqlError::Serde(e.to_string()))?;
+                let manifest_cid = durable.put_generation(list).await?;
+                mstore
+                    .publish(
+                        &self.namespace,
+                        manifest_cid,
+                        manifest.generations.len() as u64,
+                    )
+                    .await?;
+            }
+        }
         Ok(())
     }
 
@@ -633,6 +726,78 @@ mod tests {
         assert_eq!(
             v, "via erasure",
             "DB reconstructed from erasure generations"
+        );
+    }
+
+    /// In-memory manifest store (owner implicit, like KIND_MANIFEST's signer).
+    struct MockManifest {
+        owner: NodeId,
+        map: MockMap,
+    }
+    impl MockManifest {
+        fn new(owner: NodeId) -> Arc<Self> {
+            Arc::new(Self {
+                owner,
+                map: Mutex::new(HashMap::new()),
+            })
+        }
+    }
+    #[async_trait::async_trait]
+    impl ManifestStore for MockManifest {
+        async fn publish(&self, ns: &str, cid: Cid, seq: u64) -> Result<()> {
+            self.map
+                .lock()
+                .unwrap()
+                .insert((self.owner, ns.to_string()), (cid.0, seq));
+            Ok(())
+        }
+        async fn resolve(&self, owner: NodeId, ns: &str) -> Result<Option<(Cid, u64)>> {
+            Ok(self
+                .map
+                .lock()
+                .unwrap()
+                .get(&(owner, ns.to_string()))
+                .map(|(c, s)| (Cid(*c), *s)))
+        }
+    }
+
+    #[tokio::test]
+    async fn network_manifest_recovers_db_on_another_node() {
+        let dir1 = tempdir().unwrap(); // owner node
+        let dir2 = tempdir().unwrap(); // a different, live node
+        let owner = NodeId([6u8; 32]);
+        let heads = MockHeads::new(owner);
+        let durable = Arc::new(MockDurable::default()); // the shared "network"
+        let manifests = MockManifest::new(owner);
+
+        // Owner writes on node 1 (generation + manifest published network-wide).
+        let sql1 = CraftSql::register(dir1.path(), heads.clone(), owner)
+            .unwrap()
+            .with_durable(durable.clone())
+            .with_manifests(manifests.clone());
+        let mut db = sql1.open("app").await.unwrap();
+        db.write("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t VALUES (1,'resurrected');")
+            .await
+            .unwrap();
+        drop(db);
+
+        // Node 2 has an EMPTY store and NO local sidecar — it only knows
+        // (owner, namespace). It resolves the manifest, reconstructs, and reads.
+        let sql2 = CraftSql::register(dir2.path(), heads.clone(), owner)
+            .unwrap()
+            .with_durable(durable.clone())
+            .with_manifests(manifests.clone());
+        assert!(sql2.open_reader(owner, "app").await.is_err(), "no data yet");
+        let restored = sql2.recover_owner(owner, "app").await.unwrap();
+        assert!(restored > 0, "reconstructed objects from the network");
+        let db2 = sql2.open_reader(owner, "app").await.unwrap();
+        let v: String = db2
+            .conn()
+            .query_row("SELECT v FROM t WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            v, "resurrected",
+            "a different node rebuilt the DB from the network manifest"
         );
     }
 }

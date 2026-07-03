@@ -92,6 +92,7 @@ fn handle(registry: &Registry, msg: wire::Message) -> wire::Message {
                 5 => registry.all_wants(q.max as usize),
                 6 => registry.all_metas(q.max as usize),
                 7 => registry.roots_for(&q.cid, q.max as usize),
+                8 => registry.manifests_for(&q.cid, q.max as usize),
                 _ => Vec::new(),
             };
             wire::Message::TrackerResolveReply(wire::TrackerResolveReply { records })

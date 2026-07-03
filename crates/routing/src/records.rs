@@ -16,6 +16,7 @@ pub const KIND_RELAY: u8 = 3;
 pub const KIND_WANT: u8 = 4;
 pub const KIND_META: u8 = 5;
 pub const KIND_ROOT: u8 = 6;
+pub const KIND_MANIFEST: u8 = 7;
 
 /// "I hold pieces for `cid`" — advisory piece_count, dialable `addr`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,6 +152,24 @@ pub struct RootPayload {
 
 pub fn root(record: &SignedRecord) -> Option<RootPayload> {
     (record.kind == KIND_ROOT)
+        .then(|| postcard::from_bytes(&record.payload).ok())
+        .flatten()
+}
+
+/// A DB's durability manifest pointer (§33): `(identity, namespace) → the CID of
+/// the object listing the DB's erasure-coded generations`. Lets any node rebuild
+/// a dead owner's DB — resolve the manifest, reconstruct the generations from
+/// their distributed pieces, replay them. Owner is the only writer; highest
+/// `seq` wins (monotonic as generations accrue).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestPayload {
+    pub namespace: String,
+    pub manifest_cid: [u8; 32],
+    pub seq: u64,
+}
+
+pub fn manifest(record: &SignedRecord) -> Option<ManifestPayload> {
+    (record.kind == KIND_MANIFEST)
         .then(|| postcard::from_bytes(&record.payload).ok())
         .flatten()
 }

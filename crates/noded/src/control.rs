@@ -254,6 +254,7 @@ async fn handle_rpc(state: &State, line: &str) -> serde_json::Value {
         Some("delmeta") => rpc_cid_op(state, &request, id, "delmeta").await,
         Some("sql_exec") => rpc_sql_exec(state, &request, id).await,
         Some("sql_query") => rpc_sql_query(state, &request, id).await,
+        Some("sql_recover") => rpc_sql_recover(state, &request, id).await,
         _ => serde_json::json!({"jsonrpc": "2.0", "id": id,
             "error": {"code": -32601, "message": "method not found"}}),
     }
@@ -522,6 +523,32 @@ async fn rpc_sql_query(
     match db.query(sql) {
         Ok(v) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": v}),
         Err(e) => rpc_err(id, format!("query failed: {e}")),
+    }
+}
+
+/// Rebuild a CraftSQL DB (own or another owner's) from its durable generations,
+/// discovered via the network manifest.
+async fn rpc_sql_recover(
+    state: &State,
+    req: &serde_json::Value,
+    id: serde_json::Value,
+) -> serde_json::Value {
+    let Some(ns) = param(req, "ns").and_then(|v| v.as_str()) else {
+        return rpc_err(id, "sql_recover needs 'ns'".into());
+    };
+    let owner = match param(req, "owner").and_then(|v| v.as_str()) {
+        Some(h) => match parse_node_id(h) {
+            Some(n) => n,
+            None => return rpc_err(id, "owner must be 64 hex chars".into()),
+        },
+        None => match parse_node_id(&state.node_id) {
+            Some(n) => n,
+            None => return rpc_err(id, "self node id unparseable".into()),
+        },
+    };
+    match state.craftsql.recover_owner(owner, ns).await {
+        Ok(n) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"restored": n}}),
+        Err(e) => rpc_err(id, format!("recover failed: {e}")),
     }
 }
 

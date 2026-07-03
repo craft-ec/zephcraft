@@ -82,6 +82,14 @@ enum Command {
         #[arg(long)]
         owner: Option<String>,
     },
+    /// Rebuild a CraftSQL database from its durable generations, discovered via
+    /// the network manifest — resurrects a DB from (owner, namespace) alone.
+    SqlRecover {
+        #[arg(long)]
+        ns: String,
+        #[arg(long)]
+        owner: Option<String>,
+    },
 }
 
 #[derive(clap::Args)]
@@ -205,6 +213,9 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::SqlQuery { ns, sql, owner }) => {
             cmd_sql_query(&data_dir, owner.as_deref(), &ns, &sql).await
         }
+        Some(Command::SqlRecover { ns, owner }) => {
+            cmd_sql_recover(&data_dir, owner.as_deref(), &ns).await
+        }
         None => cmd_run(&data_dir, cli.run).await,
     }
 }
@@ -318,6 +329,19 @@ async fn cmd_sql_query(
         "({} row{})",
         rows.len(),
         if rows.len() == 1 { "" } else { "s" }
+    );
+    Ok(())
+}
+
+async fn cmd_sql_recover(data_dir: &Path, owner: Option<&str>, ns: &str) -> anyhow::Result<()> {
+    let mut params = serde_json::json!({ "ns": ns });
+    if let Some(o) = owner {
+        params["owner"] = serde_json::json!(o);
+    }
+    let r = control::query_unix_params(&data_dir.join("zeph.sock"), "sql_recover", params).await?;
+    println!(
+        "recovered {} object(s) from durable generations",
+        r.get("restored").and_then(|v| v.as_u64()).unwrap_or(0)
     );
     Ok(())
 }
@@ -497,10 +521,12 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         transport.clone(),
         routing_dyn,
     ));
+    let sql_manifests = Arc::new(zeph_sql::RoutingManifestStore::new(routing.clone()));
     let craftsql = Arc::new(
         zeph_sql::CraftSql::register(&sql_dir, sql_heads, transport.node_id())?
             .with_source(sql_source)
-            .with_durable(Arc::new(zeph_sql::ObjDurable::new(engine.clone()))),
+            .with_durable(Arc::new(zeph_sql::ObjDurable::new(engine.clone())))
+            .with_manifests(sql_manifests),
     );
 
     tracing::info!(
