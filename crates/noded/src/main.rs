@@ -65,6 +65,23 @@ enum Command {
     Unpin { cid: String },
     /// Delete a CID from this node (tombstone; blocks resurrection).
     Delete { cid: String },
+    /// Execute write SQL against your own CraftSQL database `ns`
+    /// (commits + publishes the KIND_ROOT head).
+    SqlExec {
+        #[arg(long)]
+        ns: String,
+        #[arg(long)]
+        sql: String,
+    },
+    /// Query a CraftSQL database — yours, or another owner's via --owner <hex>.
+    SqlQuery {
+        #[arg(long)]
+        ns: String,
+        #[arg(long)]
+        sql: String,
+        #[arg(long)]
+        owner: Option<String>,
+    },
 }
 
 #[derive(clap::Args)]
@@ -184,6 +201,10 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Pin { cid }) => cmd_cid_op(&data_dir, "pin", &cid).await,
         Some(Command::Unpin { cid }) => cmd_cid_op(&data_dir, "unpin", &cid).await,
         Some(Command::Delete { cid }) => cmd_cid_op(&data_dir, "delete", &cid).await,
+        Some(Command::SqlExec { ns, sql }) => cmd_sql_exec(&data_dir, &ns, &sql).await,
+        Some(Command::SqlQuery { ns, sql, owner }) => {
+            cmd_sql_query(&data_dir, owner.as_deref(), &ns, &sql).await
+        }
         None => cmd_run(&data_dir, cli.run).await,
     }
 }
@@ -249,6 +270,58 @@ async fn cmd_cid_op(data_dir: &Path, op: &str, cid: &str) -> anyhow::Result<()> 
 }
 
 /// `zeph status` — print the daemon's live peer table.
+async fn cmd_sql_exec(data_dir: &Path, ns: &str, sql: &str) -> anyhow::Result<()> {
+    let params = serde_json::json!({"ns": ns, "sql": sql});
+    let r = control::query_unix_params(&data_dir.join("zeph.sock"), "sql_exec", params).await?;
+    println!(
+        "committed — root {}",
+        r.get("root")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(unchanged)")
+    );
+    Ok(())
+}
+
+async fn cmd_sql_query(
+    data_dir: &Path,
+    owner: Option<&str>,
+    ns: &str,
+    sql: &str,
+) -> anyhow::Result<()> {
+    let mut params = serde_json::json!({"ns": ns, "sql": sql});
+    if let Some(o) = owner {
+        params["owner"] = serde_json::json!(o);
+    }
+    let r = control::query_unix_params(&data_dir.join("zeph.sock"), "sql_query", params).await?;
+    let cols = r
+        .get("columns")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let rows = r
+        .get("rows")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let cell = |v: &serde_json::Value| match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => "".into(),
+        other => other.to_string(),
+    };
+    println!("{}", cols.iter().map(cell).collect::<Vec<_>>().join(" | "));
+    for row in &rows {
+        if let Some(a) = row.as_array() {
+            println!("{}", a.iter().map(cell).collect::<Vec<_>>().join(" | "));
+        }
+    }
+    println!(
+        "({} row{})",
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" }
+    );
+    Ok(())
+}
+
 async fn cmd_status(data_dir: &Path) -> anyhow::Result<()> {
     let result = control::query_unix(&data_dir.join("zeph.sock"), "status").await?;
     let status: control::Status = serde_json::from_value(result)?;
@@ -414,6 +487,20 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         },
     );
 
+    // CraftSQL: SQLite over content-addressed pages; single-writer head via
+    // KIND_ROOT, cross-node page fetch over the transport.
+    let sql_dir = data_dir.join("sqlpages");
+    let routing_dyn: Arc<dyn zeph_routing::ContentRouting> = routing.clone();
+    let sql_heads = Arc::new(zeph_sql::RoutingRootStore::new(routing_dyn.clone()));
+    let sql_source = Arc::new(zeph_sql::TransportPageSource::new(
+        transport.clone(),
+        routing_dyn,
+    ));
+    let craftsql = Arc::new(
+        zeph_sql::CraftSql::register(&sql_dir, sql_heads, transport.node_id())?
+            .with_source(sql_source),
+    );
+
     tracing::info!(
         node_id = %identity.node_id().to_hex(),
         data_dir = %data_dir.display(),
@@ -456,6 +543,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         providing: std::sync::atomic::AtomicU64::new(0),
         content: tokio::sync::RwLock::new(Vec::new()),
         health: tokio::sync::RwLock::new((0, 0, 0, 0, 0, 0, 0)),
+        craftsql: craftsql.clone(),
     });
 
     let control_state = state.clone();
@@ -481,6 +569,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let (ping_tx, mut ping_rx) = tokio::sync::mpsc::channel(32);
     let (member_tx, member_rx) = tokio::sync::mpsc::channel(32);
     let (piece_tx, piece_rx) = tokio::sync::mpsc::channel(32);
+    let (sqlpage_tx, sqlpage_rx) = tokio::sync::mpsc::channel(32);
     let server = transport.clone();
     tokio::spawn(async move {
         server
@@ -488,10 +577,12 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                 (alpn::PING.to_vec(), ping_tx),
                 (zeph_membership::ALPN.to_vec(), member_tx),
                 (zeph_obj::ALPN.to_vec(), piece_tx),
+                (zeph_sql::PAGE_ALPN.to_vec(), sqlpage_tx),
             ])
             .await
     });
     tokio::spawn(engine.clone().serve(piece_rx));
+    tokio::spawn(zeph_sql::serve_pages(sql_dir.clone(), sqlpage_rx));
 
     // Announce this node into the tracker's node registry (map/census),
     // immediately and periodically.

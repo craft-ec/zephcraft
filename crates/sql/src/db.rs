@@ -234,6 +234,39 @@ impl CraftDb {
         }
         Ok(())
     }
+
+    /// Run a read query, returning `{ "columns": [...], "rows": [[...], ...] }`.
+    pub fn query(&self, sql: &str) -> Result<serde_json::Value> {
+        let mut stmt = self
+            .conn
+            .prepare(sql)
+            .map_err(|e| SqlError::Sqlite(e.to_string()))?;
+        let cols: Vec<String> = stmt.column_names().into_iter().map(String::from).collect();
+        let ncol = cols.len();
+        let rows = stmt
+            .query_map([], |row| {
+                let mut out = Vec::with_capacity(ncol);
+                for i in 0..ncol {
+                    let v: rusqlite::types::Value = row.get(i)?;
+                    out.push(cell_to_json(v));
+                }
+                Ok(serde_json::Value::Array(out))
+            })
+            .map_err(|e| SqlError::Sqlite(e.to_string()))?;
+        let rows: Vec<serde_json::Value> = rows.filter_map(std::result::Result::ok).collect();
+        Ok(serde_json::json!({ "columns": cols, "rows": rows }))
+    }
+}
+
+fn cell_to_json(v: rusqlite::types::Value) -> serde_json::Value {
+    use rusqlite::types::Value;
+    match v {
+        Value::Null => serde_json::Value::Null,
+        Value::Integer(i) => serde_json::json!(i),
+        Value::Real(f) => serde_json::json!(f),
+        Value::Text(s) => serde_json::json!(s),
+        Value::Blob(b) => serde_json::json!(hex::encode(b)),
+    }
 }
 
 #[cfg(test)]

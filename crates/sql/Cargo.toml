@@ -8,12 +8,16 @@ license.workspace = true
 [dependencies]
 zeph-core.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
 postcard.workspace = true
 thiserror.workspace = true
 sqlite-vfs = "0.2"
 rusqlite = { version = "0.31", features = ["bundled"] }
 async-trait.workspace = true
 zeph-routing.workspace = true
+zeph-transport.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

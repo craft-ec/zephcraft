@@ -19,6 +19,7 @@ zeph-erasure.workspace = true
 zeph-routing.workspace = true
 zeph-store.workspace = true
 zeph-obj.workspace = true
+zeph-sql.workspace = true
 postcard.workspace = true
 tokio.workspace = true
 anyhow.workspace = true

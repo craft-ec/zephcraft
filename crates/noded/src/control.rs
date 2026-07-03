@@ -107,6 +107,7 @@ pub struct State {
     pub providing: std::sync::atomic::AtomicU64,
     pub content: RwLock<Vec<ContentInfo>>,
     pub health: RwLock<(usize, usize, u64, u64, u64, u64, u64)>, // scanned, at_risk, repaired, moved, scaled, degraded, fading
+    pub craftsql: std::sync::Arc<zeph_sql::CraftSql>,
 }
 
 impl State {
@@ -251,6 +252,8 @@ async fn handle_rpc(state: &State, line: &str) -> serde_json::Value {
         Some("unban") => rpc_cid_op(state, &request, id, "unban").await,
         Some("setmeta") => rpc_setmeta(state, &request, id).await,
         Some("delmeta") => rpc_cid_op(state, &request, id, "delmeta").await,
+        Some("sql_exec") => rpc_sql_exec(state, &request, id).await,
+        Some("sql_query") => rpc_sql_query(state, &request, id).await,
         _ => serde_json::json!({"jsonrpc": "2.0", "id": id,
             "error": {"code": -32601, "message": "method not found"}}),
     }
@@ -450,6 +453,75 @@ async fn rpc_get(
             },
             Err(e) => rpc_err(id, format!("get failed: {e}")),
         },
+    }
+}
+
+fn parse_node_id(s: &str) -> Option<zeph_core::NodeId> {
+    let s = s.trim();
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(zeph_core::NodeId(out))
+}
+
+/// Execute write SQL against this node's own CraftSQL database `ns`, committing
+/// and publishing the new KIND_ROOT head.
+async fn rpc_sql_exec(
+    state: &State,
+    req: &serde_json::Value,
+    id: serde_json::Value,
+) -> serde_json::Value {
+    let (Some(ns), Some(sql)) = (
+        param(req, "ns").and_then(|v| v.as_str()),
+        param(req, "sql").and_then(|v| v.as_str()),
+    ) else {
+        return rpc_err(id, "sql_exec needs 'ns' and 'sql'".into());
+    };
+    let mut db = match state.craftsql.open(ns).await {
+        Ok(d) => d,
+        Err(e) => return rpc_err(id, format!("open failed: {e}")),
+    };
+    match db.write(sql).await {
+        Ok(()) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
+            "ok": true, "root": db.root().map(|c| c.to_hex()),
+        }}),
+        Err(e) => rpc_err(id, format!("sql_exec failed: {e}")),
+    }
+}
+
+/// Query a CraftSQL database — this node's own, or another owner's (`owner` hex).
+async fn rpc_sql_query(
+    state: &State,
+    req: &serde_json::Value,
+    id: serde_json::Value,
+) -> serde_json::Value {
+    let (Some(ns), Some(sql)) = (
+        param(req, "ns").and_then(|v| v.as_str()),
+        param(req, "sql").and_then(|v| v.as_str()),
+    ) else {
+        return rpc_err(id, "sql_query needs 'ns' and 'sql'".into());
+    };
+    let owner = match param(req, "owner").and_then(|v| v.as_str()) {
+        Some(h) => match parse_node_id(h) {
+            Some(n) => n,
+            None => return rpc_err(id, "owner must be 64 hex chars".into()),
+        },
+        None => match parse_node_id(&state.node_id) {
+            Some(n) => n,
+            None => return rpc_err(id, "self node id unparseable".into()),
+        },
+    };
+    let db = match state.craftsql.open_reader(owner, ns).await {
+        Ok(d) => d,
+        Err(e) => return rpc_err(id, format!("open_reader failed: {e}")),
+    };
+    match db.query(sql) {
+        Ok(v) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": v}),
+        Err(e) => rpc_err(id, format!("query failed: {e}")),
     }
 }
 
