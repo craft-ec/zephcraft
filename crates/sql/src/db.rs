@@ -110,34 +110,37 @@ impl CraftSql {
         self
     }
 
-    /// Pull the root object + every page it references from the network into the
-    /// local store (each verified by CID), so the sync VFS can then read locally.
+    /// Pull everything reachable from `root` — the root header, every index-tree
+    /// node, and every page object — into the local store (each verified by CID),
+    /// so the sync VFS can then read locally. Walks the tree so only the DB's
+    /// live pages are fetched.
     async fn sync_pages(&self, owner: NodeId, root: Cid) -> Result<()> {
         let Some(source) = &self.source else {
             return Ok(());
         };
         let store = ObjectStore::open(&self.store_dir)?;
-        if !store.has(&root) {
-            let bytes = source
-                .fetch(owner, root)
-                .await?
-                .ok_or_else(|| SqlError::RootNotFound(root.to_hex()))?;
-            if store.put(&bytes)? != root {
-                return Err(SqlError::CorruptIndex("root object hash mismatch".into()));
-            }
+        let src = source.as_ref();
+        let root_bytes = ensure(&store, src, owner, root).await?;
+        let ri = crate::pager::decode_root(&root_bytes)?;
+        if ri.depth == 0 {
+            return Ok(());
         }
-        let root_bytes = store
-            .get(&root)
-            .ok_or_else(|| SqlError::RootNotFound(root.to_hex()))?;
-        for pc in crate::pager::page_cids_from_root_bytes(&root_bytes)? {
-            if !store.has(&pc) {
-                let bytes = source.fetch(owner, pc).await?.ok_or_else(|| {
-                    SqlError::CorruptIndex(format!("missing page {}", pc.to_hex()))
-                })?;
-                if store.put(&bytes)? != pc {
-                    return Err(SqlError::CorruptIndex("page object hash mismatch".into()));
+        // Breadth-first over the index tree: fetch each node, then its children
+        // (child nodes above the leaves, page objects at the leaves).
+        let mut frontier = vec![(ri.depth - 1, Cid(ri.root_cid))];
+        while !frontier.is_empty() {
+            let mut next = Vec::new();
+            for (level, node_cid) in frontier {
+                let node_bytes = ensure(&store, src, owner, node_cid).await?;
+                for child in crate::pager::decode_node(&node_bytes)?.into_values() {
+                    if level == 0 {
+                        ensure(&store, src, owner, Cid(child)).await?;
+                    } else {
+                        next.push((level - 1, Cid(child)));
+                    }
                 }
             }
+            frontier = next;
         }
         Ok(())
     }
@@ -256,6 +259,30 @@ impl CraftDb {
         let rows: Vec<serde_json::Value> = rows.filter_map(std::result::Result::ok).collect();
         Ok(serde_json::json!({ "columns": cols, "rows": rows }))
     }
+}
+
+/// Ensure `cid` is present in `store`, fetching + verifying it from the network
+/// source if missing. Returns its bytes.
+async fn ensure(
+    store: &ObjectStore,
+    source: &dyn PageSource,
+    owner: NodeId,
+    cid: Cid,
+) -> Result<Vec<u8>> {
+    if let Some(b) = store.get(&cid) {
+        return Ok(b);
+    }
+    let bytes = source
+        .fetch(owner, cid)
+        .await?
+        .ok_or_else(|| SqlError::CorruptIndex(format!("missing object {}", cid.to_hex())))?;
+    if store.put(&bytes)? != cid {
+        return Err(SqlError::CorruptIndex(format!(
+            "object hash mismatch {}",
+            cid.to_hex()
+        )));
+    }
+    Ok(bytes)
 }
 
 fn cell_to_json(v: rusqlite::types::Value) -> serde_json::Value {
