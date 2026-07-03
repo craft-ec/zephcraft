@@ -1,0 +1,32 @@
+name: Deploy zeph.craft.ec
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'website/**'
+      - '.github/workflows/deploy-website.yml'
+
+concurrency:
+  group: deploy-zeph-production
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      # Not secret — only VERCEL_TOKEN is. Targets the `zephcraft` Vercel
+      # project (zeph.craft.ec).
+      VERCEL_ORG_ID: team_bMKXXOevLoKXykg70FsxIDoU
+      VERCEL_PROJECT_ID: prj_un8u0iew5Y9LLMbnsJuLDaNGlNPH
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pull Vercel config
+        run: npx vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+        working-directory: website
+      - name: Build
+        run: npx vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
+        working-directory: website
+      - name: Deploy
+        run: npx vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }}
+        working-directory: website
