@@ -460,6 +460,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                 alpn::PING.to_vec(),
                 zeph_membership::ALPN.to_vec(),
                 zeph_obj::ALPN.to_vec(),
+                zeph_sql::PAGE_ALPN.to_vec(),
             ],
             cfg.listen_port,
             relay_urls,
