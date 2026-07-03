@@ -45,6 +45,7 @@ pub mod tag {
     // HealthScan live availability probe (CRAFTOBJ_DESIGN §HealthScan):
     pub const AVAILABILITY_PROBE: u32 = 0x0041;
     pub const AVAILABILITY_ACK: u32 = 0x0042;
+    pub const RELEASE_SYSTEM: u32 = 0x0043;
 }
 
 /// A signed registry record. The typed payload (provider/node/relay) is
@@ -204,6 +205,15 @@ pub struct AvailabilityAck {
     pub pinned: bool,
 }
 
+/// Ask a holder to release a CraftSQL system generation (superseded by
+/// compaction): drop the DB `system` marker so the generation returns to the
+/// normal lifecycle and fades/evicts. Idempotent + re-sendable (churn: a holder
+/// that missed it while offline is released when the owner re-sends).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseSystem {
+    pub cid: [u8; 32],
+}
+
 /// All wire messages. The enum discriminant is NOT serialized — the frame's
 /// `type_tag` selects the payload type explicitly.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,6 +238,7 @@ pub enum Message {
     TrackerWithdraw(SignedRecord),
     AvailabilityProbe(AvailabilityProbe),
     AvailabilityAck(AvailabilityAck),
+    ReleaseSystem(ReleaseSystem),
 }
 
 impl Message {
@@ -253,6 +264,7 @@ impl Message {
             Message::TrackerWithdraw(_) => tag::TRACKER_WITHDRAW,
             Message::AvailabilityProbe(_) => tag::AVAILABILITY_PROBE,
             Message::AvailabilityAck(_) => tag::AVAILABILITY_ACK,
+            Message::ReleaseSystem(_) => tag::RELEASE_SYSTEM,
         }
     }
 }
@@ -304,6 +316,7 @@ pub fn encode(message: &Message, hlc_ts: u64) -> Vec<u8> {
         Message::TrackerWithdraw(p) => postcard::to_allocvec(p),
         Message::AvailabilityProbe(p) => postcard::to_allocvec(p),
         Message::AvailabilityAck(p) => postcard::to_allocvec(p),
+        Message::ReleaseSystem(p) => postcard::to_allocvec(p),
     }
     .expect("postcard serialization of wire messages cannot fail");
     debug_assert!(HEADER_LEN + payload.len() <= MAX_MESSAGE_SIZE);
@@ -391,6 +404,9 @@ pub fn decode(bytes: &[u8]) -> Result<Frame, WireError> {
         }
         tag::AVAILABILITY_ACK => {
             Message::AvailabilityAck(postcard::from_bytes(payload).map_err(malformed)?)
+        }
+        tag::RELEASE_SYSTEM => {
+            Message::ReleaseSystem(postcard::from_bytes(payload).map_err(malformed)?)
         }
         other => return Err(WireError::UnknownType(other)),
     };

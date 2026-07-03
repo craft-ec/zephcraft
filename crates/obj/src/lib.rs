@@ -648,10 +648,25 @@ impl ObjEngine {
     }
 
     /// Release a system object back to the normal lifecycle (compaction dropping
-    /// a superseded generation) — clear the marker so it can fade/evict.
-    pub async fn release_system(&self, cid: Cid) -> anyhow::Result<()> {
+    /// a superseded generation) — clear the marker locally AND tell current
+    /// holders to do the same so the generation fades network-wide. Idempotent
+    /// and re-sendable: re-calling it reaches holders that were offline before
+    /// (churn), so `reannounce` re-runs it until no providers remain. Returns the
+    /// number of holders still providing the (now-releasing) generation.
+    pub async fn release_system(&self, cid: Cid) -> anyhow::Result<usize> {
         self.store.unmark_system(&cid)?;
-        Ok(())
+        let providers = self.routing.resolve(cid).await.unwrap_or_default();
+        let me = self.transport.node_id();
+        let mut remaining = 0;
+        for p in providers {
+            if p.node_id == me {
+                continue;
+            }
+            remaining += 1;
+            let msg = wire::Message::ReleaseSystem(wire::ReleaseSystem { cid: cid.0 });
+            let _ = self.request(&p.addr, &msg).await;
+        }
+        Ok(remaining)
     }
 
     /// WANT a CID: signal keep-alive interest to the network without holding
@@ -1151,6 +1166,15 @@ impl ObjEngine {
     async fn handle(&self, msg: wire::Message) -> wire::Message {
         match msg {
             wire::Message::PiecePush(push) => wire::Message::PiecePushAck(self.ingest(push).await),
+            wire::Message::ReleaseSystem(r) => {
+                // A CraftSQL generation was superseded by compaction: drop the
+                // system marker so it returns to the normal lifecycle and fades.
+                let _ = self.store.unmark_system(&Cid(r.cid));
+                wire::Message::PiecePushAck(wire::PiecePushAck {
+                    ok: true,
+                    reason: String::new(),
+                })
+            }
             wire::Message::PieceRequest(req) => {
                 let cid = Cid(req.cid);
                 let exclude: HashSet<[u8; 32]> = req.exclude.into_iter().collect();

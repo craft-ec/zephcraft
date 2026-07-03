@@ -32,6 +32,10 @@ struct GenManifest {
     /// Monotonic publish counter for the manifest (independent of generation
     /// count, which resets on compaction) — the `KIND_MANIFEST` seq.
     manifest_seq: u64,
+    /// Superseded generations still being released — holders remain that haven't
+    /// dropped the system marker (e.g. offline during the initial release). The
+    /// re-announce loop re-sends the release until this drains (churn safety).
+    releasing: Vec<[u8; 32]>,
 }
 
 /// Compact after this many generations accumulate, to bound storage growth.
@@ -264,7 +268,7 @@ impl CraftSql {
             let Ok(bytes) = std::fs::read(&path) else {
                 continue;
             };
-            let m: GenManifest = match postcard::from_bytes(&bytes) {
+            let mut m: GenManifest = match postcard::from_bytes(&bytes) {
                 Ok(m) => m,
                 Err(_) => continue,
             };
@@ -278,6 +282,22 @@ impl CraftSql {
                 .await;
             if let (Some(mstore), Some(mc)) = (&self.manifests, m.manifest_cid) {
                 let _ = mstore.publish(&m.namespace, Cid(mc), m.manifest_seq).await;
+            }
+            // Re-release superseded generations that still have holders — this is
+            // what reaches a node that churned (was offline) during the initial
+            // release. Drops from the list once no providers remain.
+            if !m.releasing.is_empty() {
+                if let Some(durable) = &self.durable {
+                    let pending = std::mem::take(&mut m.releasing);
+                    for g in pending {
+                        if durable.drop_generation(Cid(g)).await.unwrap_or(0) > 0 {
+                            m.releasing.push(g);
+                        }
+                    }
+                    if let Ok(blob) = postcard::to_allocvec(&m) {
+                        let _ = std::fs::write(&path, blob);
+                    }
+                }
             }
             count += 1;
         }
@@ -663,13 +683,19 @@ async fn run_compaction(
         manifest.manifest_seq += 1;
         let _ = mstore.publish(namespace, mc, manifest.manifest_seq).await;
     }
-    save_manifest(store_dir, key, &manifest)?;
     // Drop superseded generations (base is durable first, so this is safe).
+    // A generation with holders still providing it stays in `releasing` so the
+    // re-announce loop keeps re-sending the release — this is what reaches a
+    // holder that was offline (churned) during the initial release.
     for g in old {
         if g != base.0 {
-            let _ = durable.drop_generation(Cid(g)).await;
+            let remaining = durable.drop_generation(Cid(g)).await.unwrap_or(0);
+            if remaining > 0 {
+                manifest.releasing.push(g);
+            }
         }
     }
+    save_manifest(store_dir, key, &manifest)?;
     // GC page objects no longer reachable from the current root.
     let mut reclaimed = 0;
     if let Ok(all) = store.list() {
@@ -871,9 +897,9 @@ mod tests {
         async fn get_generation(&self, cid: Cid) -> Result<Option<Vec<u8>>> {
             Ok(self.gens.lock().unwrap().get(&cid.0).cloned())
         }
-        async fn drop_generation(&self, cid: Cid) -> Result<()> {
+        async fn drop_generation(&self, cid: Cid) -> Result<usize> {
             self.gens.lock().unwrap().remove(&cid.0);
-            Ok(())
+            Ok(0)
         }
     }
 

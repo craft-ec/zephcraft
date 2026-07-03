@@ -122,7 +122,7 @@ impl DurableStore for ObjDurable {
         Ok(self.engine.get(cid, ConsumeMode::Seed).await.ok())
     }
 
-    async fn drop_generation(&self, cid: Cid) -> Result<()> {
+    async fn drop_generation(&self, cid: Cid) -> Result<usize> {
         self.engine
             .release_system(cid)
             .await

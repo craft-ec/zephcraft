@@ -50,9 +50,11 @@ pub trait DurableStore: Send + Sync {
     async fn put_generation(&self, blob: Vec<u8>) -> Result<Cid>;
     /// Reconstruct a generation blob by CID (None if unrecoverable).
     async fn get_generation(&self, cid: Cid) -> Result<Option<Vec<u8>>>;
-    /// Drop a generation superseded by compaction — unpin it so its erasure
-    /// pieces are no longer repaired and fade from the network.
-    async fn drop_generation(&self, cid: Cid) -> Result<()>;
+    /// Drop a generation superseded by compaction — release its system marker
+    /// locally and on current holders so it returns to the normal lifecycle and
+    /// fades. Idempotent/re-sendable for churn. Returns holders still providing it
+    /// (0 = fully released; compaction re-runs until 0).
+    async fn drop_generation(&self, cid: Cid) -> Result<usize>;
 }
 
 #[cfg(test)]
