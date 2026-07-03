@@ -189,9 +189,6 @@ impl ObjEngine {
     /// both skip it).
     fn is_alive(&self, cid: &Cid, wanted: &HashSet<[u8; 32]>, provider_pinned: bool) -> bool {
         self.store.is_pinned(cid)
-            // CraftSQL generations never fade — they're DB data, kept at the
-            // floor regardless of demand (the system class, not just the pin).
-            || self.store.is_system(cid)
             || self.store.is_wanted(cid)
             || wanted.contains(&cid.0)
             || provider_pinned
@@ -619,20 +616,27 @@ impl ObjEngine {
         Ok(())
     }
 
-    /// Publish a CraftSQL page generation as a SYSTEM object — erasure-coded +
-    /// distributed + repaired like content, but marked DB-managed so it's exempt
-    /// from user pin/unpin/delete/want and from eviction. Returns its CID.
+    /// Publish a CraftSQL page generation as a SYSTEM object. It rides the FULL
+    /// normal lifecycle — erasure-coded, distributed, repaired, scaled, and
+    /// **degraded** (surplus above the floor sheds when demand is cold) — but is
+    /// NOT pinned (no whole-content copy on the owner). Instead a WANT keeps it
+    /// alive network-wide so it never fades; the `system` marker excludes it from
+    /// user commands + local eviction. Returns its CID.
     pub async fn publish_system(&self, data: &[u8]) -> anyhow::Result<Cid> {
-        let report = self.publish(data, true).await?;
+        let report = self.publish(data, false).await?;
         self.store.mark_system(&report.cid)?;
+        self.store.set_want(report.cid)?;
+        let _ = self.routing.announce_want(report.cid).await;
         Ok(report.cid)
     }
 
     /// Release a system object back to the normal lifecycle (compaction dropping
-    /// a superseded generation) — clears the DB exemption + pin so it can fade.
+    /// a superseded generation) — withdraw the keep-alive WANT and the marker so
+    /// the generation fades from the network.
     pub async fn release_system(&self, cid: Cid) -> anyhow::Result<()> {
         self.store.unmark_system(&cid)?;
-        self.store.unpin(&cid)?;
+        self.store.unset_want(&cid)?;
+        let _ = self.routing.withdraw_want(cid).await;
         Ok(())
     }
 
@@ -809,10 +813,7 @@ impl ObjEngine {
                         .filter(|(_, _, c, pinned)| *c > 2 && !*pinned)
                         .map(|(id, _, _, _)| *id)
                         .collect();
-                    if self.store.piece_count(&cid) > 2
-                        && !self.store.is_pinned(&cid)
-                        && !self.store.is_system(&cid)
-                    {
+                    if self.store.piece_count(&cid) > 2 && !self.store.is_pinned(&cid) {
                         shedders.push(me);
                     }
                     let winner = shedders
