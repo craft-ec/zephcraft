@@ -9,10 +9,12 @@
 //!
 //! Unit 2 wires SQLite's VFS (xRead/xWrite/xSync) as a thin adapter over `Pager`.
 
+mod db;
 mod pager;
 mod store;
 mod vfs;
 
+pub use db::{CraftDb, CraftSql, RootStore, RoutingRootStore};
 pub use pager::{Pager, PAGE_SIZE};
 pub use store::ObjectStore;
 pub use vfs::{CraftHandle, CraftVfs, Roots};
@@ -27,6 +29,12 @@ pub enum SqlError {
     RootNotFound(String),
     #[error("corrupt page index: {0}")]
     CorruptIndex(String),
+    #[error("sqlite: {0}")]
+    Sqlite(String),
+    #[error("write conflict — the DB root moved under you (retry)")]
+    Conflict,
+    #[error("database opened read-only")]
+    ReadOnly,
 }
 
 pub type Result<T> = std::result::Result<T, SqlError>;

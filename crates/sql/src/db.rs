@@ -1,0 +1,291 @@
+//! The CraftSQL database handle: a single-writer SQLite DB whose head is a
+//! signed `KIND_ROOT` record.
+//!
+//! The SQLite VFS is synchronous; publishing/resolving the head is async — so
+//! the split is: the VFS commits locally (yielding a root CID in the in-memory
+//! roots map), while this layer RESOLVES the head before opening a connection
+//! and PUBLISHES the new head (compare-and-swap) after each write. The in-memory
+//! roots map is just a per-process cache; the RootStore is the source of truth.
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use zeph_core::{Cid, NodeId};
+
+use crate::{CraftVfs, Result, Roots, SqlError};
+
+/// The DB head: `(owner, namespace) → (root_cid, seq)`. Abstracts `KIND_ROOT`
+/// so CraftSQL can be tested without a live tracker.
+#[async_trait::async_trait]
+pub trait RootStore: Send + Sync {
+    /// Current head for `owner`'s DB (None if never published).
+    async fn resolve(&self, owner: NodeId, namespace: &str) -> Result<Option<(Cid, u64)>>;
+    /// Publish MY new head via compare-and-swap: `prev` must be the current root
+    /// (None = expect none) and `seq` must strictly advance, else `Conflict`.
+    async fn publish(&self, namespace: &str, root: Cid, prev: Option<Cid>, seq: u64) -> Result<()>;
+}
+
+/// Adapter binding `RootStore` to the real signed `KIND_ROOT` records over
+/// `ContentRouting` (tracker now, DHT later). Publishes sign with this node's
+/// identity (implicit owner = self).
+pub struct RoutingRootStore {
+    routing: Arc<dyn zeph_routing::ContentRouting>,
+}
+
+impl RoutingRootStore {
+    pub fn new(routing: Arc<dyn zeph_routing::ContentRouting>) -> Self {
+        Self { routing }
+    }
+}
+
+#[async_trait::async_trait]
+impl RootStore for RoutingRootStore {
+    async fn resolve(&self, owner: NodeId, namespace: &str) -> Result<Option<(Cid, u64)>> {
+        match self.routing.resolve_root(owner, namespace).await {
+            Ok(Some(r)) => Ok(Some((r.root_cid, r.seq))),
+            Ok(None) => Ok(None),
+            Err(e) => Err(SqlError::Sqlite(e.to_string())),
+        }
+    }
+
+    async fn publish(&self, namespace: &str, root: Cid, prev: Option<Cid>, seq: u64) -> Result<()> {
+        match self.routing.publish_root(namespace, root, prev, seq).await {
+            Ok(()) => Ok(()),
+            Err(zeph_routing::RoutingError::Conflict(_)) => Err(SqlError::Conflict),
+            Err(e) => Err(SqlError::Sqlite(e.to_string())),
+        }
+    }
+}
+
+static VFS_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A CraftSQL engine bound to a page store, a head store, and this node's
+/// writer identity. Registers one SQLite VFS.
+pub struct CraftSql {
+    vfs_name: String,
+    roots: Roots,
+    heads: Arc<dyn RootStore>,
+    owner: NodeId,
+}
+
+impl CraftSql {
+    /// Register a VFS over `store_dir`, backed by `heads`, writing as `owner`.
+    pub fn register(
+        store_dir: impl Into<PathBuf>,
+        heads: Arc<dyn RootStore>,
+        owner: NodeId,
+    ) -> Result<Self> {
+        let n = VFS_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let vfs_name = format!("craftsql-{n}");
+        let vfs = CraftVfs::new(store_dir);
+        let roots = vfs.roots();
+        sqlite_vfs::register(&vfs_name, vfs, false)
+            .map_err(|e| SqlError::Sqlite(format!("vfs register: {e:?}")))?;
+        Ok(Self {
+            vfs_name,
+            roots,
+            heads,
+            owner,
+        })
+    }
+
+    /// Open this node's own DB `namespace` for reading and writing.
+    pub async fn open(&self, namespace: &str) -> Result<CraftDb> {
+        self.open_as(self.owner, namespace, true).await
+    }
+
+    /// Open another identity's DB `namespace` read-only (a reader/replica).
+    pub async fn open_reader(&self, owner: NodeId, namespace: &str) -> Result<CraftDb> {
+        self.open_as(owner, namespace, false).await
+    }
+
+    async fn open_as(&self, owner: NodeId, namespace: &str, writable: bool) -> Result<CraftDb> {
+        let key = format!("{}_{}", &owner.to_hex()[..16], namespace);
+        // Resolve the authoritative head and seed the VFS cache for this key.
+        let seq = match self.heads.resolve(owner, namespace).await? {
+            Some((root, seq)) => {
+                self.roots
+                    .lock()
+                    .expect("roots")
+                    .insert(key.clone(), root.0);
+                seq
+            }
+            None => {
+                self.roots.lock().expect("roots").remove(&key);
+                0
+            }
+        };
+        let conn = rusqlite::Connection::open_with_flags_and_vfs(
+            key.as_str(),
+            rusqlite::OpenFlags::default(),
+            &self.vfs_name,
+        )
+        .map_err(|e| SqlError::Sqlite(e.to_string()))?;
+        conn.execute_batch("PRAGMA page_size=16384; PRAGMA synchronous=FULL;")
+            .map_err(|e| SqlError::Sqlite(e.to_string()))?;
+        Ok(CraftDb {
+            conn,
+            roots: self.roots.clone(),
+            heads: writable.then(|| self.heads.clone()),
+            key,
+            namespace: namespace.to_string(),
+            seq,
+        })
+    }
+}
+
+/// An open CraftSQL database.
+pub struct CraftDb {
+    conn: rusqlite::Connection,
+    roots: Roots,
+    heads: Option<Arc<dyn RootStore>>,
+    key: String,
+    namespace: String,
+    seq: u64,
+}
+
+impl CraftDb {
+    /// The underlying connection — for reads (`query_row`, `prepare`, …).
+    pub fn conn(&self) -> &rusqlite::Connection {
+        &self.conn
+    }
+
+    /// Current root CID (the head this handle last committed/opened at).
+    pub fn root(&self) -> Option<Cid> {
+        self.roots
+            .lock()
+            .expect("roots")
+            .get(&self.key)
+            .copied()
+            .map(Cid)
+    }
+
+    /// Run write SQL, then publish the new root as the signed head via CAS.
+    /// Returns `Conflict` if another writer moved the head first (retry).
+    pub async fn write(&mut self, sql: &str) -> Result<()> {
+        let heads = self.heads.clone().ok_or(SqlError::ReadOnly)?;
+        let prev = self.roots.lock().expect("roots").get(&self.key).copied();
+        self.conn
+            .execute_batch(sql)
+            .map_err(|e| SqlError::Sqlite(e.to_string()))?;
+        let new = self.roots.lock().expect("roots").get(&self.key).copied();
+        if let Some(root) = new {
+            if Some(root) != prev {
+                heads
+                    .publish(&self.namespace, Cid(root), prev.map(Cid), self.seq + 1)
+                    .await?;
+                self.seq += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use tempfile::tempdir;
+
+    type MockMap = Mutex<HashMap<(NodeId, String), ([u8; 32], u64)>>;
+
+    /// In-memory head store with the same CAS semantics as KIND_ROOT.
+    struct MockHeads {
+        owner: NodeId,
+        map: MockMap,
+    }
+    impl MockHeads {
+        fn new(owner: NodeId) -> Arc<Self> {
+            Arc::new(Self {
+                owner,
+                map: Mutex::new(HashMap::new()),
+            })
+        }
+    }
+    #[async_trait::async_trait]
+    impl RootStore for MockHeads {
+        async fn resolve(&self, owner: NodeId, ns: &str) -> Result<Option<(Cid, u64)>> {
+            Ok(self
+                .map
+                .lock()
+                .unwrap()
+                .get(&(owner, ns.to_string()))
+                .map(|(r, s)| (Cid(*r), *s)))
+        }
+        async fn publish(&self, ns: &str, root: Cid, prev: Option<Cid>, seq: u64) -> Result<()> {
+            let mut m = self.map.lock().unwrap();
+            let key = (self.owner, ns.to_string());
+            match m.get(&key) {
+                None if prev.is_some() => return Err(SqlError::Conflict),
+                None => {}
+                Some((cur, cur_seq)) => {
+                    if prev.map(|c| c.0) != Some(*cur) || seq <= *cur_seq {
+                        return Err(SqlError::Conflict);
+                    }
+                }
+            }
+            m.insert(key, (root.0, seq));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn head_persists_via_rootstore_and_reopens_elsewhere() {
+        let dir = tempdir().unwrap();
+        let owner = NodeId([7u8; 32]);
+        let heads = MockHeads::new(owner);
+
+        // Writer engine.
+        let w = CraftSql::register(dir.path(), heads.clone(), owner).unwrap();
+        let mut db = w.open("app").await.unwrap();
+        db.write(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t VALUES (1,'hello');",
+        )
+        .await
+        .unwrap();
+        let root_after = db.root().expect("committed a root");
+
+        // The head is now in the store (seq 1).
+        let (head, seq) = heads.resolve(owner, "app").await.unwrap().unwrap();
+        assert_eq!(head, root_after);
+        assert_eq!(seq, 1);
+
+        // A SEPARATE engine (fresh in-memory cache, same page dir + head store)
+        // resolves the head from the store and reads the data.
+        let other = CraftSql::register(dir.path(), heads.clone(), owner).unwrap();
+        let db2 = other.open_reader(owner, "app").await.unwrap();
+        let v: String = db2
+            .conn()
+            .query_row("SELECT v FROM t WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, "hello", "reopened from the KIND_ROOT head via RootStore");
+    }
+
+    #[tokio::test]
+    async fn stale_write_conflicts() {
+        let dir = tempdir().unwrap();
+        let owner = NodeId([9u8; 32]);
+        let heads = MockHeads::new(owner);
+
+        // Two engines, both open the (empty) DB → both think seq 0, prev None.
+        let e1 = CraftSql::register(dir.path(), heads.clone(), owner).unwrap();
+        let e2 = CraftSql::register(dir.path(), heads.clone(), owner).unwrap();
+        let mut w1 = e1.open("db").await.unwrap();
+        let mut w2 = e2.open("db").await.unwrap();
+
+        // w1 commits first → head at seq 1.
+        w1.write("CREATE TABLE a(x); INSERT INTO a VALUES (1);")
+            .await
+            .unwrap();
+        // w2's write publishes prev=None seq 1 → CAS fails (head already moved).
+        let conflict = w2
+            .write("CREATE TABLE b(y); INSERT INTO b VALUES (2);")
+            .await;
+        assert!(
+            matches!(conflict, Err(SqlError::Conflict)),
+            "stale writer is rejected"
+        );
+    }
+}
