@@ -1,0 +1,15 @@
+[package]
+name = "zeph-tests"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+zeph-core.workspace = true
+zeph-routing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+tempfile.workspace = true

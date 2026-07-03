@@ -1,0 +1,27 @@
+[package]
+name = "zeph-tracker"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tracker"
+path = "src/main.rs"
+
+[dependencies]
+zeph-core.workspace = true
+zeph-crypto.workspace = true
+zeph-routing.workspace = true
+zeph-transport.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+dirs.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rand.workspace = true
+hex.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

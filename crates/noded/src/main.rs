@@ -1,0 +1,726 @@
+//! `zeph` — the ZephCraft node daemon (headless; one implementation for all
+//! platforms). M1.3 worker skeleton + MU.1 control API.
+//!
+//! Boot order (foundation §12, skeleton subset): identity → transport →
+//! control servers → serve loop → heartbeat.
+
+mod control;
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Context;
+use clap::{Parser, Subcommand};
+use zeph_crypto::Keystore;
+use zeph_membership::Membership;
+use zeph_obj::{ObjConfig, ObjEngine};
+use zeph_routing::{ContentRouting, TrackerRouting};
+use zeph_store::Store;
+use zeph_transport::{alpn, PeerAddr, Reach, Transport};
+
+#[derive(Parser)]
+#[command(
+    name = "zeph",
+    version,
+    about = "ZephCraft node — decentralized storage network (Craftec)"
+)]
+struct Cli {
+    /// Data directory (keys, config.toml, zeph.sock). Default: ~/.zeph
+    #[arg(long, global = true)]
+    data_dir: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    #[command(flatten)]
+    run: RunArgs,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Query the running daemon's live peer table over the control socket.
+    Status,
+    /// Publish a file: encode, store+pin, spread across the network (via the
+    /// running daemon). Pins by default.
+    Publish {
+        /// File to store.
+        file: PathBuf,
+        /// Do not pin (uploader pins by default).
+        #[arg(long)]
+        no_pin: bool,
+    },
+    /// Fetch content by CID alone — the daemon resolves providers via the
+    /// tracker (no peer address needed).
+    Get {
+        /// Content id (64 hex chars) printed by `zeph publish`.
+        cid: String,
+        /// Output path.
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+    /// Pin a CID (hold whole content, exempt from eviction).
+    Pin { cid: String },
+    /// Unpin a CID (revert to normal, evictable lifecycle).
+    Unpin { cid: String },
+    /// Delete a CID from this node (tombstone; blocks resurrection).
+    Delete { cid: String },
+}
+
+#[derive(clap::Args)]
+struct RunArgs {
+    /// Peer to heartbeat: <node_id_hex>@<ip:port>[,<ip:port>...]
+    /// Repeatable; adds to peers from config.toml.
+    #[arg(long = "peer")]
+    peers: Vec<String>,
+
+    /// Reachability: "local" (direct sockets only) or "relayed" (iroh relays
+    /// + discovery; use for WAN). Overrides config.toml.
+    #[arg(long, global = true)]
+    reach: Option<String>,
+
+    /// Heartbeat interval in seconds. Overrides config.toml.
+    #[arg(long)]
+    heartbeat_secs: Option<u64>,
+
+    /// Fixed UDP listen port (0 = OS-assigned). Overrides config.toml.
+    /// Servers behind a firewall should fix this and allow it (udp).
+    #[arg(long)]
+    listen_port: Option<u16>,
+
+    /// Dashboard port on 127.0.0.1 (0 disables). Overrides config.toml.
+    #[arg(long)]
+    dashboard_port: Option<u16>,
+
+    /// Relay URL (repeatable). REPLACES config.toml relay_urls when given.
+    #[arg(long = "relay-url", global = true)]
+    relay_urls: Vec<String>,
+
+    /// Do not append n0's public relays as fallback (our mesh only).
+    #[arg(long, global = true)]
+    no_fallback_relays: bool,
+
+    /// Tracker to announce to / resolve from: <node_id_hex>@<addr>.
+    /// Repeatable; REPLACES config.toml trackers when given.
+    #[arg(long = "tracker", global = true)]
+    trackers: Vec<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct Config {
+    /// "local" | "relayed"
+    reach: String,
+    heartbeat_secs: u64,
+    /// Fixed UDP listen port; 0 = OS-assigned.
+    listen_port: u16,
+    /// Web dashboard port on 127.0.0.1; 0 disables. Remote access: ssh -L.
+    dashboard_port: u16,
+    /// Relay mesh (foundation §26): our relays first; n0 appended as
+    /// fallback unless fallback_relays = false.
+    relay_urls: Vec<String>,
+    fallback_relays: bool,
+    /// Trackers to announce to / resolve from: <node_id_hex>@<addr>.
+    trackers: Vec<String>,
+    /// Relays this node OPERATES and vouches for — announced into the
+    /// tracker's relay registry (foundation §26). Empty = not a relay op.
+    relay_operator_urls: Vec<String>,
+    /// Storage this node offers to the network, in GiB.
+    storage_quota_gib: f64,
+    /// Bootstrap peers: <node_id_hex>@<ip:port>[,...]
+    peers: Vec<String>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            reach: "local".to_string(),
+            heartbeat_secs: 5,
+            listen_port: 0,
+            dashboard_port: 9945,
+            relay_urls: vec!["https://relay1.zeph.craft.ec".to_string()],
+            fallback_relays: true,
+            trackers: Vec::new(),
+            relay_operator_urls: Vec::new(),
+            storage_quota_gib: 10.0,
+            peers: Vec::new(),
+        }
+    }
+}
+
+/// Load `<data_dir>/config.toml`, writing the defaults on first run.
+fn load_or_init_config(data_dir: &Path) -> anyhow::Result<Config> {
+    std::fs::create_dir_all(data_dir)
+        .with_context(|| format!("creating data dir {}", data_dir.display()))?;
+    let path = data_dir.join("config.toml");
+    if path.exists() {
+        let raw = std::fs::read_to_string(&path)?;
+        toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
+    } else {
+        let cfg = Config::default();
+        std::fs::write(&path, toml::to_string_pretty(&cfg)?)?;
+        Ok(cfg)
+    }
+}
+
+fn resolve_data_dir(cli_dir: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    match cli_dir {
+        Some(dir) => Ok(dir),
+        None => Ok(dirs::home_dir()
+            .context("no home directory; pass --data-dir")?
+            .join(".zeph")),
+    }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    let data_dir = resolve_data_dir(cli.data_dir)?;
+
+    match cli.command {
+        Some(Command::Status) => cmd_status(&data_dir).await,
+        Some(Command::Publish { file, no_pin }) => cmd_publish(&data_dir, &file, !no_pin).await,
+        Some(Command::Get { cid, output }) => cmd_get(&data_dir, &cid, &output).await,
+        Some(Command::Pin { cid }) => cmd_cid_op(&data_dir, "pin", &cid).await,
+        Some(Command::Unpin { cid }) => cmd_cid_op(&data_dir, "unpin", &cid).await,
+        Some(Command::Delete { cid }) => cmd_cid_op(&data_dir, "delete", &cid).await,
+        None => cmd_run(&data_dir, cli.run).await,
+    }
+}
+
+async fn cmd_publish(data_dir: &Path, file: &Path, pin: bool) -> anyhow::Result<()> {
+    let abs =
+        std::fs::canonicalize(file).with_context(|| format!("resolving {}", file.display()))?;
+    let params = serde_json::json!({"path": abs.to_string_lossy(), "pin": pin});
+    let r = control::query_unix_params(&data_dir.join("zeph.sock"), "publish", params).await?;
+    let cid = r.get("cid").and_then(|v| v.as_str()).unwrap_or("?");
+    let name = r.get("name").and_then(|v| v.as_str()).unwrap_or("item");
+    let size = r.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+    if r.get("is_dir").and_then(|v| v.as_bool()).unwrap_or(false) {
+        println!("published folder {name}/ ({size} bytes total)");
+    } else {
+        println!(
+            "published {name} ({size} bytes · {}) — durable={}, pinned={}",
+            r.get("mime")
+                .and_then(|v| v.as_str())
+                .unwrap_or("application/octet-stream"),
+            r.get("durable").and_then(|v| v.as_bool()).unwrap_or(false),
+            r.get("pinned").and_then(|v| v.as_bool()).unwrap_or(false),
+        );
+    }
+    println!("cid {cid}   (share this — `zeph get {cid} -o <path>` restores it by name)");
+    println!("ZEPH_CID {cid}");
+    Ok(())
+}
+
+async fn cmd_get(data_dir: &Path, cid: &str, output: &Path) -> anyhow::Result<()> {
+    let abs = std::path::absolute(output).unwrap_or_else(|_| output.to_path_buf());
+    let params = serde_json::json!({"cid": cid, "output": abs.to_string_lossy()});
+    let r = control::query_unix_params(&data_dir.join("zeph.sock"), "get", params).await?;
+    let path = r
+        .get("path")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| output.display().to_string());
+    if r.get("is_dir").and_then(|v| v.as_bool()).unwrap_or(false) {
+        println!(
+            "restored folder → {path} ({} files, cids verified)",
+            r.get("files").and_then(|v| v.as_u64()).unwrap_or(0),
+        );
+    } else if r.get("files").is_some() {
+        println!(
+            "restored {} → {path} (resolved via tracker, cid verified)",
+            r.get("name").and_then(|v| v.as_str()).unwrap_or("file"),
+        );
+    } else {
+        println!(
+            "fetched {} bytes → {path} (raw content, cid verified)",
+            r.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0),
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_cid_op(data_dir: &Path, op: &str, cid: &str) -> anyhow::Result<()> {
+    let params = serde_json::json!({"cid": cid});
+    control::query_unix_params(&data_dir.join("zeph.sock"), op, params).await?;
+    println!("{op} {cid} ok");
+    Ok(())
+}
+
+/// `zeph status` — print the daemon's live peer table.
+async fn cmd_status(data_dir: &Path) -> anyhow::Result<()> {
+    let result = control::query_unix(&data_dir.join("zeph.sock"), "status").await?;
+    let status: control::Status = serde_json::from_value(result)?;
+    println!("node   {}", status.node_id);
+    let alive = status.peers.iter().filter(|p| p.alive).count();
+    println!(
+        "reach  {}   wire v{}   uptime {}s   peers {}/{} active · {} passive",
+        status.reach,
+        status.wire_version,
+        status.uptime_secs,
+        alive,
+        status.peers.len(),
+        status.passive_peers
+    );
+    println!("erasure {}", status.erasure);
+    println!("hlc    {}.{}", status.hlc_ms, status.hlc_logical);
+    println!("relays {}", status.relays);
+    println!("trackers {}", status.trackers);
+    println!(
+        "store  {} cids · {} pieces · {} pinned · {:.1} MiB · providing {}",
+        status.store_cids,
+        status.store_pieces,
+        status.store_pinned,
+        status.store_bytes as f64 / (1024.0 * 1024.0),
+        status.providing,
+    );
+    println!(
+        "health scanned {} · at-risk {} · repaired {} · distributed {}",
+        status.health_scanned,
+        status.health_at_risk,
+        status.health_repaired,
+        status.health_distributed,
+    );
+    if !status.content.is_empty() {
+        println!("network content ({} cids):", status.content.len());
+        for c in status.content.iter().take(10) {
+            println!(
+                "  {}…  {} providers · {} pinned",
+                &c.cid[..24.min(c.cid.len())],
+                c.providers,
+                c.pinned
+            );
+        }
+    }
+    println!("listen {}", status.listen);
+    if status.peers.is_empty() {
+        println!("peers  (none known yet)");
+        return Ok(());
+    }
+    println!(
+        "\n{:<14} {:<7} {:>9} {:>7}  ADDRS",
+        "PEER", "STATE", "RTT", "SKEW"
+    );
+    for peer in &status.peers {
+        let state = if peer.alive { "alive" } else { "down" };
+        let rtt = peer
+            .rtt_us
+            .map(|us| format!("{:.1}ms", us as f64 / 1000.0))
+            .unwrap_or_else(|| "-".into());
+        let skew = peer
+            .skew_ms
+            .map(|ms| format!("{ms}ms"))
+            .unwrap_or_else(|| "-".into());
+        println!(
+            "{:<14} {:<7} {:>9} {:>7}  {}",
+            &peer.id[..12.min(peer.id.len())],
+            state,
+            rtt,
+            skew,
+            peer.addrs
+        );
+    }
+    Ok(())
+}
+
+/// Run the daemon (default command).
+async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+
+    let mut cfg = load_or_init_config(data_dir)?;
+    if let Some(reach) = args.reach {
+        cfg.reach = reach;
+    }
+    if let Some(hb) = args.heartbeat_secs {
+        cfg.heartbeat_secs = hb;
+    }
+    if let Some(port) = args.listen_port {
+        cfg.listen_port = port;
+    }
+    if let Some(port) = args.dashboard_port {
+        cfg.dashboard_port = port;
+    }
+    if !args.relay_urls.is_empty() {
+        cfg.relay_urls = args.relay_urls;
+    }
+    if args.no_fallback_relays {
+        cfg.fallback_relays = false;
+    }
+    if !args.trackers.is_empty() {
+        cfg.trackers = args.trackers.clone();
+    }
+    cfg.peers.extend(args.peers);
+
+    let reach = match cfg.reach.as_str() {
+        "local" => Reach::LocalOnly,
+        "relayed" => Reach::Relayed,
+        other => anyhow::bail!("invalid reach `{other}`: expected \"local\" or \"relayed\""),
+    };
+
+    // Fail fast on malformed peer addresses.
+    let peers: Vec<PeerAddr> = cfg
+        .peers
+        .iter()
+        .map(|s| s.parse().map_err(anyhow::Error::from))
+        .collect::<anyhow::Result<_>>()?;
+
+    let relay_urls = cfg
+        .relay_urls
+        .iter()
+        .map(|u| {
+            u.parse()
+                .map_err(|e| anyhow::anyhow!("relay url `{u}`: {e}"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let identity = Arc::new(Keystore::new(data_dir.join("keys")).init_or_load()?);
+    let transport = Arc::new(
+        Transport::bind_with_relays(
+            identity.secret_key_bytes(),
+            reach,
+            vec![
+                alpn::PING.to_vec(),
+                zeph_membership::ALPN.to_vec(),
+                zeph_obj::ALPN.to_vec(),
+            ],
+            cfg.listen_port,
+            relay_urls,
+            cfg.fallback_relays,
+        )
+        .await?,
+    );
+
+    // Storage engine: persistent store + tracker routing + obj.
+    let store = Arc::new(Store::open(data_dir.join("store"))?);
+    let tracker_addrs: Vec<PeerAddr> = cfg.trackers.iter().filter_map(|t| t.parse().ok()).collect();
+    let routing = Arc::new(TrackerRouting::new(
+        transport.clone(),
+        identity.clone(),
+        tracker_addrs,
+        env!("CARGO_PKG_VERSION").to_string(),
+    ));
+    let engine = ObjEngine::new(
+        transport.clone(),
+        store.clone(),
+        routing.clone(),
+        ObjConfig {
+            capacity_bytes: (cfg.storage_quota_gib * 1024.0 * 1024.0 * 1024.0) as u64,
+            ..ObjConfig::default()
+        },
+    );
+
+    tracing::info!(
+        node_id = %identity.node_id().to_hex(),
+        data_dir = %data_dir.display(),
+        reach = %cfg.reach,
+        peers = peers.len(),
+        "zeph node started"
+    );
+    // Machine-readable self address — paste into another node's --peer flag.
+    println!("ZEPH_ADDR {}", transport.addr());
+
+    // Control state, shared by the heartbeat loop and the control servers.
+    let state = Arc::new(control::State {
+        clock: transport.clock(),
+        node_id: identity.node_id().to_hex(),
+        reach: cfg.reach.clone(),
+        relays: if matches!(reach, Reach::LocalOnly) {
+            "none (local)".to_string()
+        } else {
+            format!(
+                "{}{}",
+                cfg.relay_urls.join(", "),
+                if cfg.fallback_relays {
+                    " + n0 fallback"
+                } else {
+                    " (exclusive)"
+                }
+            )
+        },
+        trackers: if cfg.trackers.is_empty() {
+            "none configured".to_string()
+        } else {
+            format!("{} configured", cfg.trackers.len())
+        },
+        listen: transport.addr().to_string(),
+        started: std::time::Instant::now(),
+        engine: engine.clone(),
+        peers: tokio::sync::RwLock::new(Vec::new()),
+        passive_peers: std::sync::atomic::AtomicU32::new(0),
+        storage: tokio::sync::RwLock::new((0, 0, 0, 0)),
+        providing: std::sync::atomic::AtomicU64::new(0),
+        content: tokio::sync::RwLock::new(Vec::new()),
+        health: tokio::sync::RwLock::new((0, 0, 0, 0, 0, 0, 0)),
+    });
+
+    let control_state = state.clone();
+    let sock_path = data_dir.join("zeph.sock");
+    tokio::spawn(async move {
+        if let Err(err) = control::serve_unix(control_state, sock_path).await {
+            tracing::error!(%err, "control socket server failed");
+        }
+    });
+
+    if cfg.dashboard_port != 0 {
+        let token = control::load_or_create_token(data_dir)?;
+        let http_state = state.clone();
+        let port = cfg.dashboard_port;
+        tokio::spawn(async move {
+            if let Err(err) = control::serve_http(http_state, token, port).await {
+                tracing::error!(%err, "dashboard server failed");
+            }
+        });
+    }
+
+    // ALPN dispatcher: ping + membership + pieces share the endpoint.
+    let (ping_tx, mut ping_rx) = tokio::sync::mpsc::channel(32);
+    let (member_tx, member_rx) = tokio::sync::mpsc::channel(32);
+    let (piece_tx, piece_rx) = tokio::sync::mpsc::channel(32);
+    let server = transport.clone();
+    tokio::spawn(async move {
+        server
+            .serve(vec![
+                (alpn::PING.to_vec(), ping_tx),
+                (zeph_membership::ALPN.to_vec(), member_tx),
+                (zeph_obj::ALPN.to_vec(), piece_tx),
+            ])
+            .await
+    });
+    tokio::spawn(engine.clone().serve(piece_rx));
+
+    // Announce this node into the tracker's node registry (map/census),
+    // immediately and periodically.
+    // Announce the node into the registry AND re-announce provider records
+    // for everything we hold (pins + pieces), immediately (first tick) and
+    // periodically — so held content stays discoverable across restart,
+    // churn, and tracker restart. Interval well inside the provider TTL and
+    // short enough to recover quickly from a tracker restart.
+    let announce_engine = engine.clone();
+    let announce_relays = cfg.relay_operator_urls.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(120));
+        loop {
+            interval.tick().await;
+            let _ = announce_engine.announce_node().await;
+            for relay in &announce_relays {
+                let _ = announce_engine.announce_relay(relay.clone()).await;
+            }
+            let n = announce_engine.reannounce_providers().await;
+            if n > 0 {
+                tracing::info!(cids = n, "re-announced provider records");
+            }
+        }
+    });
+    let ping_clock = transport.clock();
+    tokio::spawn(async move {
+        while let Some(conn) = ping_rx.recv().await {
+            tokio::spawn(Transport::handle_ping_conn(ping_clock.clone(), conn));
+        }
+    });
+
+    // Membership: bootstrap from configured peers; probes drive the peer table.
+    let membership = Membership::new(
+        transport.clone(),
+        zeph_membership::Config {
+            probe_interval: Duration::from_secs(cfg.heartbeat_secs.max(1)),
+            ..Default::default()
+        },
+    );
+    membership.start(peers, member_rx);
+
+    // Discover peers from the tracker's node registry and seed membership —
+    // a node bootstraps from the network without any hardcoded peer.
+    let seed_membership = membership.clone();
+    let seed_routing = routing.clone();
+    let me_id = transport.node_id();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            if let Ok(nodes) = seed_routing.nodes().await {
+                let candidates: Vec<PeerAddr> = nodes
+                    .into_iter()
+                    .filter(|(id, _)| *id != me_id)
+                    .filter_map(|(_, np)| np.addr.parse().ok())
+                    .collect();
+                if !candidates.is_empty() {
+                    seed_membership.seed(candidates).await;
+                }
+            }
+        }
+    });
+
+    // HealthScan: periodically verify availability of held content and repair
+    // (the self-healing control loop). Runs every epoch (30s).
+    let health_engine = engine.clone();
+    let health_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        interval.tick().await; // skip immediate tick at startup
+        loop {
+            interval.tick().await;
+            let r = health_engine.health_scan().await;
+            let d = health_engine.distribute().await;
+            let sc = health_engine.scale().await;
+            health_engine.enforce_quota().await;
+            health_state
+                .set_health(
+                    r.scanned,
+                    r.at_risk,
+                    r.repaired as u64,
+                    d.moved as u64,
+                    sc.scaled as u64,
+                    r.degraded as u64,
+                    r.fading,
+                )
+                .await;
+            if r.repaired > 0 || d.moved > 0 || sc.scaled > 0 || r.degraded > 0 {
+                tracing::info!(
+                    at_risk = r.at_risk,
+                    repaired = r.repaired,
+                    moved = d.moved,
+                    scaled = sc.scaled,
+                    degraded = r.degraded,
+                    "lifecycle: repair / distribute / scale / degrade"
+                );
+            }
+        }
+    });
+
+    // Poll the tracker for the network's content list + overlay THIS node's
+    // relationship (held pieces / pin / want / floor) for the dashboard.
+    let content_state = state.clone();
+    let content_routing = routing.clone();
+    let content_store = store.clone();
+    tokio::spawn(async move {
+        use std::collections::HashMap;
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            let mut map: HashMap<String, control::ContentInfo> = HashMap::new();
+            if let Ok(list) = content_routing.content().await {
+                for c in list.into_iter().take(200) {
+                    let hex = c.cid.to_hex();
+                    // Default view: earliest publisher (min published_at).
+                    let canonical = c.metas.iter().min_by_key(|m| m.published_at);
+                    let published_at = canonical.map(|m| m.published_at);
+                    let publisher = canonical.map(|m| ::hex::encode(m.publisher.0));
+                    let comment = canonical.and_then(|m| m.comment.clone());
+                    map.insert(
+                        hex.clone(),
+                        control::ContentInfo {
+                            cid: hex,
+                            providers: c.providers,
+                            pinned: c.pinned,
+                            pieces: c.pieces,
+                            wants: c.wants,
+                            k: 0,
+                            floor: 0,
+                            local_pieces: 0,
+                            local_pinned: false,
+                            local_wanted: false,
+                            local_tombstoned: false,
+                            name: None,
+                            size: 0,
+                            is_dir: false,
+                            published_at,
+                            publisher,
+                            comment,
+                        },
+                    );
+                }
+            }
+            // Overlay local relationship (holdings + wants always show).
+            let mut locals: std::collections::HashSet<_> =
+                content_store.cids().into_iter().collect();
+            locals.extend(content_store.wanted_cids());
+            let banned: std::collections::HashSet<_> =
+                content_store.tombstoned_cids().into_iter().collect();
+            locals.extend(banned.iter().copied());
+            for cid in locals {
+                let hex = cid.to_hex();
+                let e = map
+                    .entry(hex.clone())
+                    .or_insert_with(|| control::ContentInfo {
+                        cid: hex,
+                        providers: 0,
+                        pinned: 0,
+                        pieces: 0,
+                        wants: 0,
+                        k: 0,
+                        floor: 0,
+                        local_pieces: 0,
+                        local_pinned: false,
+                        local_wanted: false,
+                        local_tombstoned: false,
+                        name: None,
+                        size: 0,
+                        is_dir: false,
+                        published_at: None,
+                        publisher: None,
+                        comment: None,
+                    });
+                e.local_pieces = content_store.piece_count(&cid);
+                e.local_pinned = content_store.is_pinned(&cid);
+                e.local_wanted = content_store.is_wanted(&cid);
+                e.local_tombstoned = banned.contains(&cid);
+                if let Some(gen) = content_store.generation(&cid) {
+                    e.k = gen.k as usize;
+                    e.floor = zeph_obj::floor_for_k(gen.k as usize);
+                    // Small enough to be a manifest? Decode it locally (cheap)
+                    // so files/folders show by name, not by hash.
+                    if gen.total_len <= 64 * 1024 {
+                        if let Some(m) = content_store
+                            .content(&cid)
+                            .and_then(|b| zeph_obj::Manifest::decode(&b))
+                        {
+                            e.name = Some(m.name().to_string());
+                            e.size = m.size();
+                            e.is_dir = m.is_dir();
+                        }
+                    }
+                }
+            }
+            content_state.set_content(map.into_values().collect()).await;
+        }
+    });
+
+    // Sync membership + storage state into the control API every second.
+    let sync_state = state.clone();
+    let sync_membership = membership.clone();
+    let sync_store = store.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            let stats = sync_store.stats();
+            sync_state.set_providing(stats.cids as u64);
+            sync_state.set_storage(stats).await;
+            let snap = sync_membership.snapshot().await;
+            let mut table: Vec<control::PeerStatus> = Vec::new();
+            for (id, st) in snap.active.iter().chain(snap.dead.iter()) {
+                table.push(control::PeerStatus {
+                    id: id.to_hex(),
+                    addrs: st.addr.to_string(),
+                    alive: st.alive,
+                    rtt_us: st.rtt_us,
+                    skew_ms: st.skew_ms,
+                    last_seen_unix: st.last_seen_unix,
+                    consecutive_failures: st.consecutive_failures,
+                });
+            }
+            table.sort_by(|a, b| (!a.alive).cmp(&!b.alive).then(a.id.cmp(&b.id)));
+            sync_state.set_peers(table, snap.passive_count as u32).await;
+        }
+    });
+
+    tokio::signal::ctrl_c().await?;
+    tracing::info!("shutting down");
+    transport.close().await;
+    Ok(())
+}

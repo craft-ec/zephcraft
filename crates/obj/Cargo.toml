@@ -1,0 +1,26 @@
+[package]
+name = "zeph-obj"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+zeph-core.workspace = true
+zeph-erasure.workspace = true
+zeph-store.workspace = true
+zeph-routing.workspace = true
+zeph-transport.workspace = true
+zeph-wire.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+postcard.workspace = true
+serde.workspace = true
+rand.workspace = true
+futures.workspace = true
+hex.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+zeph-crypto.workspace = true
+tempfile.workspace = true

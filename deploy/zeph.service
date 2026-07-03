@@ -1,0 +1,15 @@
+[Unit]
+Description=ZephCraft node (Craftec decentralized storage)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=zeph
+Group=zeph
+ExecStart=/usr/local/bin/zeph --data-dir /var/lib/zeph --reach relayed --listen-port 9944
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

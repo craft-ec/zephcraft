@@ -1,0 +1,17 @@
+[package]
+name = "zeph-crypto"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+zeph-core.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+zeroize.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

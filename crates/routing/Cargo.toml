@@ -1,0 +1,23 @@
+[package]
+name = "zeph-routing"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+zeph-core.workspace = true
+zeph-crypto.workspace = true
+zeph-wire.workspace = true
+zeph-transport.workspace = true
+async-trait.workspace = true
+hex.workspace = true
+serde.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

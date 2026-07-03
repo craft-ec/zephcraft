@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='85' fill='%2358a6ff' font-family='monospace'%3E%E2%8C%81%3C/text%3E%3C/svg%3E">
+<title>zeph — node dashboard</title>
+<style>
+  :root { --warnc:#d29922; --bg:#0d1117; --panel:#161b22; --line:#21262d; --fg:#e6edf3; --dim:#8b949e;
+          --ok:#3fb950; --bad:#f85149; --accent:#58a6ff; }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--fg); min-height:100vh;
+         font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; padding:2rem 1rem; }
+  main { max-width:880px; margin:0 auto; }
+  h1 { font-size:1.15rem; font-weight:600; letter-spacing:.04em; margin-bottom:1rem; }
+  h1 .z { color:var(--accent); }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:8px;
+          padding:1rem 1.25rem; margin-bottom:1rem; overflow-x:auto; }
+  dl { display:grid; grid-template-columns:auto 1fr; gap:.25rem 1.25rem; }
+  dt { color:var(--dim); }
+  dd { word-break:break-all; }
+  table { width:100%; border-collapse:collapse; }
+  th { text-align:left; color:var(--dim); font-weight:500; padding:.4rem .6rem;
+       border-bottom:1px solid var(--line); }
+  td { padding:.4rem .6rem; border-bottom:1px solid var(--line); word-break:break-all; }
+  tr:last-child td { border-bottom:none; }
+  .cardhead { font-family:var(--mono); font-size:.75rem; letter-spacing:.08em;
+              text-transform:uppercase; color:var(--accent); margin-bottom:.6rem; }
+  .cardhead .muted { text-transform:none; letter-spacing:0; }
+  .dot { display:inline-block; width:.6rem; height:.6rem; border-radius:50%; margin-right:.45rem; }
+  .alive .dot { background:var(--ok); } .alive { color:var(--ok); }
+  .down  .dot { background:var(--bad); } .down { color:var(--bad); }
+  .skewwarn { color:var(--warnc, #d29922); }
+  #banner { display:none; background:#3d1d1f; border:1px solid var(--bad); color:var(--bad);
+            border-radius:8px; padding:.6rem 1rem; margin-bottom:1rem; }
+  .muted { color:var(--dim); }
+  footer { color:var(--dim); font-size:.8rem; margin-top:1rem; }
+  .cidbar { display:flex; gap:.4rem; margin-bottom:.8rem; }
+  .cidin { flex:1; background:var(--bg); color:var(--fg); border:1px solid var(--line);
+           border-radius:5px; padding:.35rem .55rem; font:inherit; font-size:.8rem; }
+  .cidin:focus { outline:none; border-color:var(--accent); }
+  .btn { font:inherit; font-size:.72rem; background:var(--line); color:var(--fg);
+         border:1px solid var(--line); border-radius:5px; padding:.22rem .55rem; cursor:pointer; }
+  .btn:hover { border-color:var(--accent); color:var(--accent); }
+  .btn.on { background:rgba(88,166,255,.14); border-color:var(--accent); color:var(--accent); }
+  .acts { white-space:nowrap; }
+  .acts .btn { margin-right:.2rem; }
+  .badge { font-size:.68rem; padding:.1rem .42rem; border-radius:4px; white-space:nowrap; }
+  .badge.ok { color:var(--ok); background:rgba(63,185,80,.12); }
+  .badge.risk { color:var(--bad); background:rgba(248,81,73,.13); }
+  .badge.scaled { color:var(--accent); background:rgba(88,166,255,.12); }
+  .badge.warn { color:var(--warnc,#d29922); background:rgba(210,153,34,.13); }
+  .badge.net { color:var(--dim); }
+  .cidcell { cursor:pointer; } .cidcell:hover { color:var(--accent); }
+  .fname { font-weight:600; margin-bottom:.15rem; }
+  .meta { font-size:.72rem; margin-top:.15rem; }
+  .grp { font-size:.7rem; text-transform:uppercase; letter-spacing:.06em; color:var(--accent);
+         margin:1rem 0 .35rem; } .grp:first-child { margin-top:0; }
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .citem { display:flex; align-items:flex-start; gap:.7rem; padding:.55rem .1rem;
+           border-bottom:1px solid var(--line); }
+  .citem:last-child { border-bottom:none; }
+  .citem:hover { background:rgba(88,166,255,.04); }
+  .cicon { font-size:1.15rem; line-height:1.3; flex:none; }
+  .cbody { flex:1; min-width:0; }
+  .crow1 { display:flex; align-items:center; gap:.4rem; flex-wrap:wrap; }
+  .ctitle { font-weight:600; word-break:break-all; }
+  .cmeta { font-size:.72rem; margin-top:.2rem; line-height:1.7; }
+  .cmeta .cidcell { color:var(--dim); } .cmeta .cidcell:hover { color:var(--accent); }
+  .tstamp { color:var(--fg); }
+  .cnote { color:var(--warnc,#d29922); }
+  .cacts { display:flex; gap:.2rem; flex-wrap:wrap; justify-content:flex-end;
+           align-self:center; flex:none; max-width:42%; }
+  .chip { font-size:.6rem; text-transform:uppercase; letter-spacing:.05em;
+          padding:.1rem .4rem; border-radius:3px; white-space:nowrap; }
+  .chip.pinned { color:var(--accent); background:rgba(88,166,255,.13); }
+  .chip.providing { color:var(--ok); background:rgba(63,185,80,.13); }
+  .chip.wanted { color:var(--warnc,#d29922); background:rgba(210,153,34,.13); }
+  .chip.banned { color:var(--bad); background:rgba(248,81,73,.14); }
+  .chip.net { color:var(--dim); background:var(--line); }
+</style>
+</head>
+<body>
+<main>
+  <h1><span class="z">⌁ zeph</span> node dashboard</h1>
+  <div id="banner">daemon unreachable — retrying…</div>
+  <div class="card">
+    <dl>
+      <dt>node</dt><dd id="node-id" class="muted">…</dd>
+      <dt>reach</dt><dd id="reach">…</dd>
+      <dt>wire</dt><dd id="wire" class="muted">…</dd>
+      <dt>views</dt><dd id="views" class="muted">…</dd>
+      <dt>erasure</dt><dd id="erasure" class="muted">…</dd>
+      <dt>hlc</dt><dd id="hlc" class="muted">…</dd>
+      <dt>relays</dt><dd id="relays" class="muted">…</dd>
+      <dt>trackers</dt><dd id="trackers" class="muted">…</dd>
+      <dt>store</dt><dd id="store" class="muted">…</dd>
+      <dt>health</dt><dd id="health" class="muted">…</dd>
+      <dt>listen</dt><dd id="listen" class="muted">…</dd>
+      <dt>uptime</dt><dd id="uptime">…</dd>
+    </dl>
+  </div>
+  <div class="card">
+    <div class="cardhead">membership — active view <span class="muted" id="viewnote">(peers discovered via join/shuffle, probed for liveness)</span></div>
+    <table>
+      <thead><tr><th>peer</th><th>state</th><th>rtt</th><th>skew</th><th>last seen</th><th>addrs</th></tr></thead>
+      <tbody id="peers"><tr><td colspan="6" class="muted">no peers in view yet — joining…</td></tr></tbody>
+    </table>
+  </div>
+  <div class="card">
+    <div class="cardhead">content <span class="muted">(this node + network · pin to serve · want to keep alive · fetch to consume)</span></div>
+    <div class="cidbar">
+      <input id="cidin" class="cidin" placeholder="paste a 64-hex cid…" spellcheck="false">
+      <button class="btn" onclick="act('fetch', $('cidin').value)">fetch</button>
+      <button class="btn" onclick="act('pin', $('cidin').value)">pin</button>
+      <button class="btn" onclick="act('want', $('cidin').value)">want</button>
+    </div>
+    <div id="content-groups"><div class="muted">no content yet — publish a file or fetch a cid</div></div>
+  </div>
+
+  <footer>ZephCraft — Craftec decentralized storage · local dashboard (127.0.0.1) · refresh 1s</footer>
+</main>
+<script>
+const TOKEN = "__TOKEN__";
+const $ = (id) => document.getElementById(id);
+function fmtUptime(s){ const h=Math.floor(s/3600), m=Math.floor(s%3600/60), x=s%60;
+  return (h? h+"h ":"") + (m? m+"m ":"") + x + "s"; }
+function fmtAgo(unix){ if(!unix) return "—";
+  const d = Math.max(0, Math.floor(Date.now()/1000) - unix); return d + "s ago"; }
+function render(s){
+  $("node-id").textContent = s.node_id;
+  $("reach").textContent = s.reach;
+  $("wire").textContent = "v" + s.wire_version + " (framed, postcard)";
+  $("views").textContent = "active " + s.peers.filter(p=>p.alive).length + " · passive " + s.passive_peers;
+  $("erasure").textContent = s.erasure;
+  $("hlc").textContent = new Date(s.hlc_ms).toISOString().slice(11,23) + " · logical " + s.hlc_logical;
+  $("relays").textContent = s.relays;
+  $("trackers").textContent = s.trackers;
+  $("store").textContent = s.store_cids + " cids · " + s.store_pieces + " pieces · " + s.store_pinned + " pinned · " + (s.store_bytes/1048576).toFixed(1) + " MiB · providing " + s.providing;
+  const atrisk = s.health_at_risk || 0;
+  $("health").textContent = "scanned " + (s.health_scanned||0) + " · at-risk " + atrisk + " · repaired " + (s.health_repaired||0) + " · distributed " + (s.health_distributed||0) + " · scaled " + (s.health_scaled||0) + " · degraded " + (s.health_degraded||0) + " · fading " + (s.health_fading||0);
+  $("health").style.color = atrisk > 0 ? "var(--warn, #d29922)" : "";
+  $("listen").textContent = s.listen;
+  $("uptime").textContent = fmtUptime(s.uptime_secs);
+  renderContent(s);
+  const body = $("peers");
+  if (!s.peers.length){
+    body.innerHTML = '<tr><td colspan="6" class="muted">no peers in view yet — joining…</td></tr>'; return; }
+  body.innerHTML = s.peers.map(p => {
+    const cls = p.alive ? "alive" : "down";
+    const state = p.alive ? "alive" : "down";
+    const rtt = p.rtt_us != null ? (p.rtt_us/1000).toFixed(1)+" ms" : "—";
+    const skewWarn = p.skew_ms != null && p.skew_ms > 500;
+    const skew = p.skew_ms != null
+      ? `<span class="${skewWarn ? "skewwarn" : ""}">${p.skew_ms} ms${skewWarn ? " ⚠" : ""}</span>` : "—";
+    return `<tr><td>${p.id.slice(0,12)}…</td>`+
+      `<td class="${cls}"><span class="dot"></span>${state}</td>`+
+      `<td>${rtt}</td><td>${skew}</td><td>${fmtAgo(p.last_seen_unix)}</td>`+
+      `<td class="muted">${p.addrs}</td></tr>`;
+  }).join("");
+}
+async function tick(){
+  let data;
+  try {
+    const r = await fetch("/api/status?token=" + TOKEN);
+    if (!r.ok) throw new Error(r.status);
+    data = await r.json();
+    $("banner").style.display = "none";
+  } catch (_) {
+    $("banner").style.display = "block";
+    return;
+  }
+  // Render OUTSIDE the fetch try/catch: a UI bug surfaces in the console,
+  // it must not masquerade as "daemon unreachable".
+  render(data);
+}
+async function act(op, cid){
+  cid = (cid||"").trim();
+  if(cid.length !== 64){ alert("need a 64-hex cid"); return; }
+  try {
+    const r = await fetch("/api/action?token="+TOKEN, {method:"POST",
+      headers:{"content-type":"application/json"}, body: JSON.stringify({op, cid})});
+    if(!r.ok){ alert(op+" failed: "+(await r.text())); }
+    else if(op==="fetch"||op==="pin"||op==="want"){ $("cidin").value=""; }
+  } catch(e){ alert(op+" error: "+e); }
+  tick();
+}
+function badge(c){
+  // A pin anchors durability regardless of coded-piece count — a pinner holds
+  // the whole file and can mint pieces on demand, so it counts as full.
+  if(c.pinned > 0) return `<span class="badge ok">pinned ×${c.pinned}</span>`;
+  const have = Math.max(c.pieces, c.local_pieces);
+  if(c.floor > 0){
+    if(c.k > 0 && have < c.k) return `<span class="badge risk">incomplete ${have}/${c.k}</span>`;
+    if(have < c.floor) return `<span class="badge warn">under-repl ${have}/${c.floor}</span>`;
+    if(have > c.floor) return `<span class="badge scaled">scaled ${have}/${c.floor}</span>`;
+    return `<span class="badge ok">durable ${have}/${c.floor}</span>`;
+  }
+  return `<span class="badge net">${c.providers} prov</span>`;
+}
+function copyCid(cid){ if(navigator.clipboard) navigator.clipboard.writeText(cid); $("cidin").value = cid; }
+function esc(s){ return (s||"").replace(/[&<>"']/g, m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m])); }
+function fmtSize(n){
+  if(!n) return "";
+  if(n < 1024) return n+" B";
+  if(n < 1048576) return (n/1024).toFixed(1)+" KB";
+  if(n < 1073741824) return (n/1048576).toFixed(1)+" MB";
+  return (n/1073741824).toFixed(2)+" GB";
+}
+function fmtAgoMs(ms){
+  if(!ms) return "";
+  const d = Math.max(0, Math.floor((Date.now()-ms)/1000));
+  if(d<60) return d+"s ago";
+  if(d<3600) return Math.floor(d/60)+"m ago";
+  if(d<86400) return Math.floor(d/3600)+"h ago";
+  return Math.floor(d/86400)+"d ago";
+}
+async function setmeta(cid){
+  const t = prompt("comment / label for this content (blank to clear):", "");
+  if(t===null) return;
+  try {
+    await fetch("/api/action?token="+TOKEN, {method:"POST",
+      headers:{"content-type":"application/json"}, body: JSON.stringify({op:"setmeta", cid, comment:t})});
+    tick();
+  } catch(e){ alert("setmeta failed: "+e); }
+}
+// This node's relationship to the content — a colored chip.
+function relChip(c){
+  if(c.local_tombstoned) return `<span class="chip banned">banned</span>`;
+  if(c.local_pinned)     return `<span class="chip pinned">pinned</span>`;
+  if(c.local_pieces>0)   return `<span class="chip providing">providing</span>`;
+  if(c.local_wanted)     return `<span class="chip wanted">wanted</span>`;
+  return `<span class="chip net">network</span>`;
+}
+// One content item as a data-forward card row: icon · name + chips · a dense
+// metadata line (cid · size · age · publisher · providers · comment) · actions.
+function citem(c){
+  const held = c.local_pieces>0 || c.local_pinned;
+  const icon = c.name ? (c.is_dir?"📁":"📄") : "🔗";
+  const title = c.name ? esc(c.name) : `<span class="mono">${c.cid.slice(0,18)}…</span>`;
+
+  const bits = [];
+  bits.push(`<span class="cidcell mono" title="click to copy the full cid" onclick="copyCid('${c.cid}')">${c.cid.slice(0,10)}…</span>`);
+  if(c.size) bits.push(fmtSize(c.size));
+  if(c.published_at) bits.push(`<span class="tstamp">${fmtAgoMs(c.published_at)}</span>`);
+  if(c.publisher) bits.push(`by ${c.publisher.slice(0,8)}`);
+  bits.push(`${c.providers} prov${c.wants?" · "+c.wants+" want":""}`);
+  if(c.local_pieces>0 && !c.local_pinned) bits.push(`${c.local_pieces} pcs here`);
+  if(c.comment) bits.push(`<span class="cnote">💬 ${esc(c.comment)}</span>`);
+
+  let acts;
+  if(c.local_tombstoned){
+    acts = `<button class="btn" onclick="act('unban','${c.cid}')">unban</button>`;
+  } else {
+    const pin = `<button class="btn ${c.local_pinned?'on':''}" onclick="act('${c.local_pinned?'unpin':'pin'}','${c.cid}')">${c.local_pinned?'pinned':'pin'}</button>`;
+    const want = `<button class="btn ${c.local_wanted?'on':''}" onclick="act('${c.local_wanted?'unwant':'want'}','${c.cid}')">${c.local_wanted?'wanted':'want'}</button>`;
+    const fetchb = held ? '' : `<button class="btn" onclick="act('fetch','${c.cid}')">fetch</button>`;
+    const note = held ? `<button class="btn" title="edit metadata envelope" onclick="setmeta('${c.cid}')">note</button>` : '';
+    const del = held ? `<button class="btn" onclick="if(confirm('delete this node\\'s copy?'))act('delete','${c.cid}')">del</button>` : '';
+    acts = `${pin} ${want} ${fetchb} ${note} ${del}`;
+  }
+  return `<div class="citem">
+    <div class="cicon">${icon}</div>
+    <div class="cbody">
+      <div class="crow1"><span class="ctitle">${title}</span> ${relChip(c)} ${badge(c)}</div>
+      <div class="cmeta muted">${bits.join(" · ")}</div>
+    </div>
+    <div class="cacts">${acts}</div>
+  </div>`;
+}
+function renderContent(s){
+  const el = $("content-groups"); const cs = s.content || [];
+  if(!cs.length){ el.innerHTML = '<div class="muted">no content yet — publish a file or fetch a cid</div>'; return; }
+  // Default sort: newest first (by published_at), undated last, then by reach.
+  const sorted = [...cs].sort((a,b) =>
+    (b.published_at||0) - (a.published_at||0) || (b.providers||0) - (a.providers||0));
+  el.innerHTML = sorted.map(citem).join("");
+}
+tick(); setInterval(tick, 1000);
+</script>
+</body>
+</html>

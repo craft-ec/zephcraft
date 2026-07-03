@@ -1,0 +1,68 @@
+# ZephCraft workspace — the Craftec node, greenfield rebuild (2026-07-02 decision record).
+# Specs: docs/craftec_technical_foundation.md v3.7, docs/CRAFTOBJ_DESIGN.md v2.0.
+# The previous workspace referenced archived submodules (craft-ec/*-archive); reset 2026-07-03.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/*",
+    "apps/*",
+    "tests",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Craftec"]
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# ── zephcraft internal crates ──
+zeph-core = { path = "crates/core" }
+zeph-crypto = { path = "crates/crypto" }
+zeph-wire = { path = "crates/wire" }
+zeph-erasure = { path = "crates/erasure" }
+zeph-transport = { path = "crates/transport" }
+zeph-membership = { path = "crates/membership" }
+zeph-routing = { path = "crates/routing" }
+zeph-store = { path = "crates/store" }
+zeph-obj = { path = "crates/obj" }
+
+# ── Async ──
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# ── Serialization (foundation §58: postcard) ──
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1", features = ["alloc", "use-std"] }
+
+# ── Crypto (foundation §7: BLAKE3 + Ed25519 only) ──
+blake3 = "1"
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
+rand = "0.8"
+zeroize = "1"
+
+# ── Error handling ──
+thiserror = "2"
+anyhow = "1"
+
+# ── Logging ──
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ── Utils ──
+hex = "0.4"
+clap = { version = "4", features = ["derive"] }
+tempfile = "3"
+toml = "0.8"
+dirs = "5"
+axum = "0.8"
+
+# ── Transport (pinned at M1.2 integration; iroh 1.0.1 released 2026-06-29) ──
+iroh = "1"
+
+[profile.release]
+overflow-checks = true

@@ -1,0 +1,452 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZephCraft — the internet's shared storage grid</title>
+<meta name="description" content="Every device contributes spare disk into one content-addressed pool that replicates only what matters. A decentralized storage grid — not the cloud, not BitTorrent.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='84' fill='%2358a6ff' font-family='monospace'%3E%E2%8C%81%3C/text%3E%3C/svg%3E">
+<meta property="og:title" content="ZephCraft — the internet's shared storage grid">
+<meta property="og:description" content="Spare disk on every device, pooled into one network that replicates only what matters.">
+<meta property="og:type" content="website">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0b0e14; --bg2:#0e121a; --panel:#12161f; --panel2:#161b26;
+    --line:#1d2430; --line2:#28303d;
+    --fg:#e9eef5; --dim:#8a95a6; --faint:#5c6675;
+    --blue:#58a6ff; --blue-dim:#3d7fd6; --amber:#d29922; --green:#3fb950; --red:#f85149;
+    --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+    --sans:"IBM Plex Sans",-apple-system,BlinkMacSystemFont,sans-serif;
+    --max:1080px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{background:var(--bg);color:var(--fg);font-family:var(--sans);
+    font-size:16px;line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+  a{color:inherit;text-decoration:none}
+  .wrap{max-width:var(--max);margin:0 auto;padding:0 1.5rem}
+  .mono{font-family:var(--mono)}
+  .eyebrow{font-family:var(--mono);font-size:.72rem;letter-spacing:.22em;text-transform:uppercase;
+    color:var(--blue);font-weight:500}
+  .dim{color:var(--dim)}
+
+  /* ---- nav ---- */
+  nav{position:fixed;top:0;left:0;right:0;z-index:50;
+    backdrop-filter:blur(14px);background:rgba(11,14,20,.72);border-bottom:1px solid transparent;
+    transition:border-color .3s,background .3s}
+  nav.scrolled{border-color:var(--line);background:rgba(11,14,20,.9)}
+  nav .wrap{display:flex;align-items:center;justify-content:space-between;height:60px}
+  .brand{font-family:var(--mono);font-weight:600;font-size:1.02rem;letter-spacing:.02em;display:flex;align-items:center;gap:.5rem}
+  .brand .glyph{color:var(--blue)}
+  .navlinks{display:flex;gap:1.9rem;font-family:var(--mono);font-size:.82rem}
+  .navlinks a{color:var(--dim);transition:color .2s}
+  .navlinks a:hover{color:var(--fg)}
+  .navlinks .live{color:var(--green);display:flex;align-items:center;gap:.45rem}
+  .pulse{width:.5rem;height:.5rem;border-radius:50%;background:var(--green);
+    box-shadow:0 0 0 0 rgba(63,185,80,.6);animation:pulse 2.4s infinite}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(63,185,80,.5)}70%{box-shadow:0 0 0 7px rgba(63,185,80,0)}100%{box-shadow:0 0 0 0 rgba(63,185,80,0)}}
+  @media(max-width:640px){.navlinks a:not(.live){display:none}}
+
+  /* ---- hero ---- */
+  header{position:relative;min-height:100svh;display:flex;flex-direction:column;justify-content:center;
+    padding:6rem 0 4rem;overflow:hidden}
+  #lattice{position:absolute;inset:0;width:100%;height:100%;z-index:0;opacity:.55}
+  header::after{content:"";position:absolute;inset:0;z-index:1;pointer-events:none;
+    background:radial-gradient(120% 80% at 50% 40%,transparent 30%,var(--bg) 78%)}
+  .hero{position:relative;z-index:2}
+  .hero .eyebrow{opacity:0;animation:rise .7s .1s forwards}
+  h1{font-family:var(--mono);font-weight:600;letter-spacing:-.015em;line-height:1.04;
+    font-size:clamp(2.5rem,7vw,5.1rem);margin:1.1rem 0 0;max-width:16ch;text-wrap:balance}
+  h1 .l1{display:block;opacity:0;animation:rise .8s .18s forwards}
+  h1 .l2{display:block;opacity:0;animation:rise .8s .30s forwards}
+  h1 .grad{background:linear-gradient(100deg,var(--blue),#8ec3ff 55%,var(--amber));
+    -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+  .lede{font-size:clamp(1.05rem,2.2vw,1.32rem);color:var(--dim);max-width:44ch;margin:1.6rem 0 0;
+    opacity:0;animation:rise .8s .44s forwards}
+  .lede b{color:var(--fg);font-weight:600}
+  .hero-cta{display:flex;flex-wrap:wrap;gap:.9rem;align-items:center;margin-top:2.4rem;
+    opacity:0;animation:rise .8s .58s forwards}
+  .term{font-family:var(--mono);font-size:.86rem;background:var(--panel);border:1px solid var(--line2);
+    border-radius:8px;padding:.72rem 1rem;display:inline-flex;gap:.7rem;align-items:center;color:var(--fg)}
+  .term .p{color:var(--green)}
+  .term .c{color:var(--dim)}
+  .ghost{font-family:var(--mono);font-size:.82rem;color:var(--dim);border:1px solid var(--line2);
+    border-radius:8px;padding:.72rem 1.1rem;transition:border-color .2s,color .2s}
+  .ghost:hover{border-color:var(--blue);color:var(--fg)}
+  .scrollhint{position:absolute;bottom:1.7rem;left:50%;transform:translateX(-50%);z-index:2;
+    font-family:var(--mono);font-size:.68rem;letter-spacing:.2em;color:var(--faint);text-transform:uppercase;
+    display:flex;flex-direction:column;align-items:center;gap:.5rem;opacity:0;animation:rise 1s 1s forwards}
+  .scrollhint span{width:1px;height:34px;background:linear-gradient(var(--faint),transparent);animation:drop 2s infinite}
+  @keyframes drop{0%{transform:scaleY(0);transform-origin:top}45%{transform:scaleY(1);transform-origin:top}55%{transform:scaleY(1);transform-origin:bottom}100%{transform:scaleY(0);transform-origin:bottom}}
+  @keyframes rise{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}
+
+  /* ---- sections ---- */
+  section{position:relative;padding:6.5rem 0;border-top:1px solid var(--line)}
+  .sec-head{max-width:52ch;margin-bottom:3rem}
+  .sec-head h2{font-family:var(--mono);font-weight:600;font-size:clamp(1.6rem,3.6vw,2.4rem);
+    letter-spacing:-.01em;line-height:1.12;margin:.8rem 0 0;text-wrap:balance}
+  .sec-head p{color:var(--dim);margin-top:1rem;font-size:1.05rem}
+
+  /* ---- live network ---- */
+  #network{background:
+    radial-gradient(90% 60% at 85% 0%,rgba(88,166,255,.06),transparent 60%),var(--bg2)}
+  .livecard{border:1px solid var(--line2);border-radius:16px;background:
+    linear-gradient(180deg,var(--panel2),var(--panel));overflow:hidden}
+  .livecard .bar{display:flex;align-items:center;gap:.6rem;padding:.85rem 1.3rem;
+    border-bottom:1px solid var(--line);font-family:var(--mono);font-size:.76rem;color:var(--dim);letter-spacing:.04em}
+  .livecard .bar .status{margin-left:auto;display:flex;align-items:center;gap:.45rem;color:var(--green)}
+  .livecard .bar .status.down{color:var(--amber)}
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
+  .stat{padding:1.9rem 1.5rem;border-right:1px solid var(--line);border-bottom:1px solid var(--line)}
+  .stat b{font-family:var(--mono);font-size:clamp(2rem,5vw,3rem);font-weight:600;display:block;
+    font-variant-numeric:tabular-nums;letter-spacing:-.02em;line-height:1}
+  .stat.accent b{color:var(--blue)}
+  .stats-3{grid-template-columns:repeat(3,1fr);border-top:1px solid var(--line2)}
+  .bytestat b{font-size:clamp(1.5rem,3.2vw,2.05rem);white-space:nowrap}
+  @media(max-width:560px){.stats-3{grid-template-columns:1fr 1fr}}
+  .stat span{font-family:var(--mono);font-size:.72rem;color:var(--dim);letter-spacing:.06em;
+    text-transform:uppercase;display:block;margin-top:.7rem}
+  .honest{margin-top:1.5rem;font-size:.92rem;color:var(--dim);display:flex;gap:.7rem;align-items:flex-start}
+  .honest .k{font-family:var(--mono);color:var(--amber);white-space:nowrap;font-size:.82rem;padding-top:.1rem}
+
+  /* ---- thesis / three knobs ---- */
+  .knobs{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:1.1rem}
+  .knob{border:1px solid var(--line);border-radius:12px;padding:1.5rem;background:var(--panel);
+    transition:border-color .25s,transform .25s}
+  .knob:hover{border-color:var(--line2);transform:translateY(-3px)}
+  .knob .n{font-family:var(--mono);font-size:.72rem;color:var(--blue);letter-spacing:.1em}
+  .knob h3{font-family:var(--mono);font-weight:600;font-size:1.05rem;margin:.7rem 0 .5rem}
+  .knob p{font-size:.92rem;color:var(--dim)}
+  .knob .fade h3{color:var(--faint)}
+  .equation{font-family:var(--mono);font-size:clamp(.82rem,2vw,1.02rem);color:var(--dim);
+    margin-top:2.2rem;padding:1.1rem 1.3rem;border:1px dashed var(--line2);border-radius:10px;
+    text-align:center;overflow-x:auto}
+  .equation b{color:var(--fg)}
+
+  /* ---- contrasts ---- */
+  .tablewrap{overflow-x:auto;border:1px solid var(--line2);border-radius:14px}
+  table{width:100%;border-collapse:collapse;min-width:640px;font-size:.94rem}
+  thead th{font-family:var(--mono);font-size:.72rem;letter-spacing:.06em;text-transform:uppercase;
+    color:var(--dim);text-align:left;padding:1rem 1.3rem;border-bottom:1px solid var(--line2);font-weight:500}
+  tbody td{padding:1.05rem 1.3rem;border-bottom:1px solid var(--line);vertical-align:top}
+  tbody tr:last-child td{border-bottom:none}
+  tbody tr.us{background:linear-gradient(90deg,rgba(88,166,255,.07),transparent)}
+  td.name{font-family:var(--mono);font-weight:600;white-space:nowrap}
+  td.name.us{color:var(--blue)}
+  .redword{color:var(--red)}.dimword{color:var(--dim)}
+
+  /* ---- how ---- */
+  .how{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:1.6rem 2.2rem}
+  .how-item{border-left:2px solid var(--line2);padding:.2rem 0 .2rem 1.3rem}
+  .how-item h3{font-family:var(--mono);font-size:1rem;font-weight:600;margin-bottom:.5rem}
+  .how-item h3 .mono{color:var(--amber)}
+  .how-item p{font-size:.93rem;color:var(--dim)}
+
+  /* ---- run a node / cta ---- */
+  #run{background:
+    radial-gradient(70% 90% at 15% 100%,rgba(210,153,34,.06),transparent 60%),var(--bg2);text-align:center}
+  #run h2{font-family:var(--mono);font-weight:600;font-size:clamp(1.8rem,4.5vw,2.8rem);letter-spacing:-.01em;
+    text-wrap:balance;max-width:20ch;margin:0 auto}
+  #run p{color:var(--dim);max-width:46ch;margin:1.2rem auto 0}
+  .runterm{max-width:520px;margin:2.4rem auto 0;text-align:left;font-family:var(--mono);font-size:.84rem;
+    background:var(--panel);border:1px solid var(--line2);border-radius:12px;overflow:hidden}
+  .runterm .top{display:flex;gap:.5rem;padding:.7rem .9rem;border-bottom:1px solid var(--line)}
+  .runterm .top i{width:.62rem;height:.62rem;border-radius:50%;background:var(--line2)}
+  .runterm .body{padding:1.1rem 1.1rem 1.3rem;line-height:1.9}
+  .runterm .p{color:var(--green)}.runterm .o{color:var(--dim)}.runterm .b{color:var(--blue)}
+
+  footer{border-top:1px solid var(--line);padding:3rem 0;color:var(--faint);font-family:var(--mono);font-size:.8rem}
+  footer .wrap{display:flex;flex-wrap:wrap;gap:1rem 2rem;align-items:center;justify-content:space-between}
+  footer a{color:var(--dim);transition:color .2s}footer a:hover{color:var(--fg)}
+
+  .reveal{opacity:0;transform:translateY(24px);transition:opacity .7s cubic-bezier(.2,.7,.2,1),transform .7s cubic-bezier(.2,.7,.2,1)}
+  .reveal.in{opacity:1;transform:none}
+  @media(prefers-reduced-motion:reduce){
+    *{animation:none!important;transition:none!important}
+    .reveal{opacity:1;transform:none}
+    h1 span,.eyebrow,.lede,.hero-cta,.scrollhint{opacity:1!important}
+  }
+</style>
+</head>
+<body>
+
+<nav id="nav"><div class="wrap">
+  <a class="brand" href="#top"><span class="glyph">⌁</span>zeph<span class="dim">craft</span></a>
+  <div class="navlinks">
+    <a href="#network">network</a>
+    <a href="#thesis">thesis</a>
+    <a href="#how">how</a>
+    <a class="live" href="#network"><span class="pulse"></span><span id="nav-live">live</span></a>
+  </div>
+</div></nav>
+
+<header id="top">
+  <canvas id="lattice"></canvas>
+  <div class="wrap hero">
+    <div class="eyebrow">ZephCraft · decentralized storage</div>
+    <h1><span class="l1">The internet's</span><span class="l2 grad">shared storage grid.</span></h1>
+    <p class="lede">Every device contributes spare disk into one content-addressed pool —
+      that replicates <b>only what matters</b>. Not the cloud. Not BitTorrent. A grid.</p>
+    <div class="hero-cta">
+      <span class="term"><span class="p">$</span> <span>zeph publish</span> <span class="c">./file</span></span>
+      <a class="ghost" href="#network">see it running →</a>
+    </div>
+  </div>
+  <div class="scrollhint">scroll<span></span></div>
+</header>
+
+<!-- LIVE NETWORK -->
+<section id="network"><div class="wrap">
+  <div class="sec-head reveal">
+    <div class="eyebrow">live · right now</div>
+    <h2>This isn't a whitepaper. The network is running.</h2>
+    <p>Real numbers, pulled live from a tracker on the network. It's early — small on purpose,
+      honest by default. No projections, no vanity metrics.</p>
+  </div>
+  <div class="livecard reveal">
+    <div class="bar">
+      <span>GET</span><span class="mono" style="color:var(--blue)">api.zeph.craft.ec/stats</span>
+      <span class="status" id="live-status"><span class="pulse"></span>connecting…</span>
+    </div>
+    <div class="stats">
+      <div class="stat accent"><b id="s-nodes">—</b><span>nodes online</span></div>
+      <div class="stat"><b id="s-cids">—</b><span>content stored</span></div>
+      <div class="stat"><b id="s-pieces">—</b><span>coded pieces</span></div>
+      <div class="stat"><b id="s-providers">—</b><span>provider records</span></div>
+      <div class="stat"><b id="s-relays">—</b><span>relays</span></div>
+    </div>
+    <div class="stats stats-3">
+      <div class="stat bytestat"><b id="s-used">—</b><span>storage used</span></div>
+      <div class="stat bytestat"><b id="s-avail">—</b><span>storage available</span></div>
+      <div class="stat bytestat"><b id="s-vol">—</b><span>total volume contributed</span></div>
+    </div>
+  </div>
+  <div class="honest reveal">
+    <span class="k">// note</span>
+    <span>A handful of nodes today, growing outward. The point of showing you the real count —
+      even when it's small — is that everything here is <b style="color:var(--fg)">built and live</b>,
+      not promised.</span>
+  </div>
+</div></section>
+
+<!-- THESIS -->
+<section id="thesis"><div class="wrap">
+  <div class="sec-head reveal">
+    <div class="eyebrow">the idea</div>
+    <h2>Replicate only what matters.</h2>
+    <p>The internet already has the hardware — billions of devices with idle disk. ZephCraft pools it
+      into one elastic utility. Redundancy is <b class="dim">engineered to need</b>, from three knobs:</p>
+  </div>
+  <div class="knobs">
+    <div class="knob reveal"><div class="n">01 · FLOOR</div><h3>Erasure coding</h3>
+      <p>~3× redundancy survives losing two-thirds of holders. Full-copy replication needs ~20× for the
+        same durability. The floor is cheap.</p></div>
+    <div class="knob reveal"><div class="n">02 · DEMAND</div><h3>Scaling</h3>
+      <p>Popular content gains providers where there's traffic — and sheds them when demand fades.
+        Temporary, bandwidth-driven.</p></div>
+    <div class="knob reveal"><div class="n">03 · INTENT</div><h3>Pinning</h3>
+      <p>Anyone can pin content they care about — a guaranteed anchor. BitTorrent's "seed forever,"
+        done deliberately.</p></div>
+    <div class="knob reveal fade"><div class="n">— · THE FADE</div><h3>Forgotten data dies</h3>
+      <p>Content nobody wants and nobody pins is allowed to disappear. Not a bug — the network never
+        pays to keep garbage alive.</p></div>
+  </div>
+  <div class="equation reveal mono">redundancy&nbsp;≈&nbsp;<b>durability floor</b>&nbsp;+&nbsp;<b>live demand</b>&nbsp;+&nbsp;<b>intentional pins</b></div>
+</div></section>
+
+<!-- CONTRASTS -->
+<section id="contrast"><div class="wrap">
+  <div class="sec-head reveal">
+    <div class="eyebrow">not like the others</div>
+    <h2>Everyone else's redundancy is an accident, or a bill.</h2>
+  </div>
+  <div class="tablewrap reveal"><table>
+    <thead><tr><th>system</th><th>how it replicates</th><th>the catch</th></tr></thead>
+    <tbody>
+      <tr><td class="name">BitTorrent</td>
+        <td>Accidental — a side-effect of who's online. Popular&nbsp;=&nbsp;1000× copies, unpopular&nbsp;=&nbsp;1× then 0.</td>
+        <td><span class="redword">Wasteful and fragile.</span> Whole-file copies, no erasure, no repair — dies when the last seed leaves.</td></tr>
+      <tr><td class="name">The cloud</td>
+        <td>Hidden in a data center you rent, at "11 nines" you can't verify.</td>
+        <td>You don't own it. You pay forever. One company can revoke it.</td></tr>
+      <tr><td class="name">Blockchains</td>
+        <td>Total — every node stores everything.</td>
+        <td><span class="dimword">O(N) waste.</span> More nodes ≠ more capacity.</td></tr>
+      <tr class="us"><td class="name us">ZephCraft</td>
+        <td>Engineered to need — floor + demand + pins. Deduplicated. Self-healing.</td>
+        <td><b style="color:var(--fg)">Leaner and more durable at once.</b> Distribution, not replication. More nodes = more capacity.</td></tr>
+    </tbody>
+  </table></div>
+</div></section>
+
+<!-- HOW -->
+<section id="how"><div class="wrap">
+  <div class="sec-head reveal">
+    <div class="eyebrow">under the hood</div>
+    <h2>A grid, not a backup.</h2>
+    <p>You don't each own a generator sized to your peak — you draw from a grid sized to aggregate
+      demand. Storage should work the same way.</p>
+  </div>
+  <div class="how">
+    <div class="how-item reveal"><h3>Content addressing <span class="mono">· BLAKE3</span></h3>
+      <p>Every file is named by its hash. Dedup and integrity come for free — the name is the checksum.</p></div>
+    <div class="how-item reveal"><h3>Self-healing <span class="mono">· RLNC</span></h3>
+      <p>Any node holding two coded pieces can mint fresh ones — no re-download. Data survives churn no
+        replication scheme can match.</p></div>
+    <div class="how-item reveal"><h3>No consensus</h3>
+      <p>Single-writer-per-identity means no blockchain, no gas, no global agreement. It scales linearly,
+        not O(N).</p></div>
+    <div class="how-item reveal"><h3>Founder-proof</h3>
+      <p>A keypair is the only credential. Anyone can run a node, relay, or tracker. If we vanish, the
+        network keeps healing.</p></div>
+  </div>
+</div></section>
+
+<!-- RUN -->
+<section id="run"><div class="wrap">
+  <div class="reveal">
+    <div class="eyebrow" style="margin-bottom:1rem">join the grid</div>
+    <h2>One binary. Any device. Spare disk becomes the network.</h2>
+    <p>The node runs today on macOS and Linux — connecting across NAT, over its own relays, storing and
+      healing real data. Public builds land with the storage network.</p>
+  </div>
+  <div class="runterm reveal">
+    <div class="top"><i></i><i></i><i></i></div>
+    <div class="body">
+      <div><span class="p">$</span> zeph <span class="o"># start a node — it finds the network</span></div>
+      <div><span class="o">→ joined · storing pieces · providing to peers</span></div>
+      <div style="margin-top:.6rem"><span class="p">$</span> zeph publish <span class="b">./photos.zip</span></div>
+      <div><span class="o">→ pinned · spread across the grid · fetchable by CID, anywhere</span></div>
+    </div>
+  </div>
+</div></section>
+
+<footer><div class="wrap">
+  <span>ZephCraft · a Craftec protocol · <span id="foot-live">building in the open</span></span>
+  <span>store bytes · retrieve bytes · keep them alive</span>
+</div></footer>
+
+<script>
+// ---- live stats ----
+const API = "https://api.zeph.craft.ec/stats";
+function fmtBytes(n){ if(!n) return "0 B"; const u=["B","KiB","MiB","GiB","TiB","PiB"];
+  const i=Math.min(u.length-1,Math.floor(Math.log(n)/Math.log(1024)));
+  return (n/Math.pow(1024,i)).toFixed(i?1:0)+" "+u[i]; }
+function setBytes(id,n){ document.getElementById(id).textContent = fmtBytes(n||0); }
+function animateTo(el, target){
+  const start = performance.now(), dur = 900, from = 0;
+  function step(t){
+    const p = Math.min(1,(t-start)/dur), e = 1-Math.pow(1-p,3);
+    el.textContent = Math.round(from + (target-from)*e).toLocaleString();
+    if(p<1) requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+}
+async function loadStats(){
+  const status = document.getElementById("live-status");
+  try{
+    const r = await fetch(API,{cache:"no-store"});
+    if(!r.ok) throw 0;
+    const d = await r.json();
+    animateTo(document.getElementById("s-nodes"), d.nodes||0);
+    animateTo(document.getElementById("s-cids"), d.content_cids||0);
+    animateTo(document.getElementById("s-pieces"), d.pieces_tracked||0);
+    animateTo(document.getElementById("s-providers"), d.provider_records||0);
+    animateTo(document.getElementById("s-relays"), d.relays||0);
+    setBytes("s-used", d.storage_used_bytes);
+    setBytes("s-avail", d.storage_available_bytes);
+    setBytes("s-vol", d.storage_capacity_bytes);
+    status.innerHTML = '<span class="pulse"></span>live';
+    status.classList.remove("down");
+    const n = d.nodes||0;
+    document.getElementById("nav-live").textContent = n + (n===1?" node":" nodes");
+    document.getElementById("foot-live").textContent = n + " nodes live";
+  }catch(e){
+    status.textContent = "reconnecting…"; status.classList.add("down");
+    ["s-nodes","s-cids","s-pieces","s-providers","s-relays","s-used","s-avail","s-vol"].forEach(id=>{
+      const el=document.getElementById(id); if(el.textContent==="—") el.textContent="·";
+    });
+  }
+}
+loadStats(); setInterval(loadStats, 5000);
+
+// ---- nav scroll ----
+const nav = document.getElementById("nav");
+addEventListener("scroll",()=>nav.classList.toggle("scrolled", scrollY>20));
+
+// ---- reveals ----
+const io = new IntersectionObserver((es)=>es.forEach(e=>{
+  if(e.isIntersecting){e.target.classList.add("in"); io.unobserve(e.target);}
+}),{threshold:.12});
+document.querySelectorAll(".reveal").forEach((el,i)=>{el.style.transitionDelay=(i%4*60)+"ms";io.observe(el);});
+
+// ---- lattice canvas: the living node grid ----
+(function(){
+  if(matchMedia("(prefers-reduced-motion:reduce)").matches) return;
+  const c = document.getElementById("lattice"), x = c.getContext("2d");
+  let W,H,dpr,nodes=[],packets=[];
+  const COUNT = window.innerWidth<640?26:52, LINK=170;
+  function resize(){
+    dpr=Math.min(devicePixelRatio||1,2);
+    W=c.width=innerWidth*dpr; H=c.height=c.offsetHeight*dpr;
+    c.style.width=innerWidth+"px";
+  }
+  function init(){
+    nodes=[];
+    for(let i=0;i<COUNT;i++)nodes.push({
+      x:Math.random()*W,y:Math.random()*H,
+      vx:(Math.random()-.5)*.10*dpr,vy:(Math.random()-.5)*.10*dpr,
+      r:(Math.random()*1.6+1)*dpr, lit:Math.random()<.16, ph:Math.random()*6.28
+    });
+  }
+  function spawn(){
+    // send a "piece" along a random near edge
+    const a=nodes[Math.random()*nodes.length|0];
+    let best=null,bd=LINK*dpr*LINK*dpr;
+    for(const b of nodes){if(b===a)continue;const d=(a.x-b.x)**2+(a.y-b.y)**2;if(d<bd&&d>400){bd=d;best=b;}}
+    if(best)packets.push({a,b:best,t:0,sp:.006+Math.random()*.01});
+  }
+  let last=0;
+  function frame(ts){
+    x.clearRect(0,0,W,H);
+    const L=LINK*dpr;
+    // edges
+    for(let i=0;i<nodes.length;i++)for(let j=i+1;j<nodes.length;j++){
+      const a=nodes[i],b=nodes[j],d=Math.hypot(a.x-b.x,a.y-b.y);
+      if(d<L){const o=(1-d/L)*.5;x.strokeStyle="rgba(88,166,255,"+o*.5+")";
+        x.lineWidth=dpr*.6;x.beginPath();x.moveTo(a.x,a.y);x.lineTo(b.x,b.y);x.stroke();}
+    }
+    // packets
+    for(let i=packets.length-1;i>=0;i--){const p=packets[i];p.t+=p.sp;
+      if(p.t>=1){packets.splice(i,1);continue;}
+      const px=p.a.x+(p.b.x-p.a.x)*p.t, py=p.a.y+(p.b.y-p.a.y)*p.t;
+      x.fillStyle="rgba(210,153,34,"+(Math.sin(p.t*Math.PI))+")";
+      x.beginPath();x.arc(px,py,2*dpr,0,6.28);x.fill();
+    }
+    // nodes
+    for(const n of nodes){
+      n.x+=n.vx;n.y+=n.vy;
+      if(n.x<0||n.x>W)n.vx*=-1; if(n.y<0||n.y>H)n.vy*=-1;
+      n.ph+=.02;
+      if(n.lit){
+        const g=(Math.sin(n.ph)*.5+.5);
+        x.fillStyle="rgba(63,185,80,"+(.5+g*.5)+")";
+        x.shadowColor="rgba(63,185,80,.8)";x.shadowBlur=8*dpr;
+        x.beginPath();x.arc(n.x,n.y,n.r*1.3,0,6.28);x.fill();x.shadowBlur=0;
+      }else{
+        x.fillStyle="rgba(138,149,166,.55)";
+        x.beginPath();x.arc(n.x,n.y,n.r,0,6.28);x.fill();
+      }
+    }
+    if(ts-last>1400){last=ts;spawn();}
+    requestAnimationFrame(frame);
+  }
+  resize();init();requestAnimationFrame(frame);
+  let rt;addEventListener("resize",()=>{clearTimeout(rt);rt=setTimeout(()=>{resize();init();},200);});
+})();
+</script>
+</body>
+</html>
