@@ -90,6 +90,12 @@ enum Command {
         #[arg(long)]
         owner: Option<String>,
     },
+    /// Compact a CraftSQL database you own: fold accumulated generations into one
+    /// base snapshot + reclaim superseded page objects (bounds storage growth).
+    SqlCompact {
+        #[arg(long)]
+        ns: String,
+    },
 }
 
 #[derive(clap::Args)]
@@ -216,6 +222,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::SqlRecover { ns, owner }) => {
             cmd_sql_recover(&data_dir, owner.as_deref(), &ns).await
         }
+        Some(Command::SqlCompact { ns }) => cmd_sql_compact(&data_dir, &ns).await,
         None => cmd_run(&data_dir, cli.run).await,
     }
 }
@@ -329,6 +336,16 @@ async fn cmd_sql_query(
         "({} row{})",
         rows.len(),
         if rows.len() == 1 { "" } else { "s" }
+    );
+    Ok(())
+}
+
+async fn cmd_sql_compact(data_dir: &Path, ns: &str) -> anyhow::Result<()> {
+    let params = serde_json::json!({ "ns": ns });
+    let r = control::query_unix_params(&data_dir.join("zeph.sock"), "sql_compact", params).await?;
+    println!(
+        "compacted — reclaimed {} superseded object(s)",
+        r.get("reclaimed").and_then(|v| v.as_u64()).unwrap_or(0)
     );
     Ok(())
 }

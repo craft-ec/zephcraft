@@ -52,4 +52,43 @@ impl ObjectStore {
     pub fn has(&self, cid: &Cid) -> bool {
         self.path(cid).exists()
     }
+
+    /// Every object CID currently held — for compaction (GC of superseded pages).
+    pub fn list(&self) -> std::io::Result<Vec<Cid>> {
+        let mut out = Vec::new();
+        for shard in fs::read_dir(&self.root)? {
+            let shard = shard?.path();
+            if !shard.is_dir() {
+                continue; // e.g. the `<key>.gens` sidecar files at the root
+            }
+            for entry in fs::read_dir(&shard)? {
+                let name = entry?.file_name();
+                if let Some(cid) = name.to_str().and_then(cid_from_hex) {
+                    out.push(cid);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Remove an object (idempotent — missing is fine). Used by compaction to
+    /// reclaim page versions no longer reachable from the current root.
+    pub fn delete(&self, cid: &Cid) -> std::io::Result<()> {
+        match fs::remove_file(self.path(cid)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+fn cid_from_hex(s: &str) -> Option<Cid> {
+    if s.len() != 64 {
+        return None; // skips `.tmp` files and non-object names
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(Cid(out))
 }

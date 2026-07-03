@@ -123,4 +123,11 @@ impl DurableStore for ObjDurable {
     async fn get_generation(&self, cid: Cid) -> Result<Option<Vec<u8>>> {
         Ok(self.engine.get(cid, ConsumeMode::Seed).await.ok())
     }
+
+    async fn drop_generation(&self, cid: Cid) -> Result<()> {
+        self.engine
+            .unpin(cid)
+            .await
+            .map_err(|e| SqlError::Sqlite(format!("unpin generation: {e}")))
+    }
 }

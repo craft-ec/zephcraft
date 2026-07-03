@@ -255,6 +255,7 @@ async fn handle_rpc(state: &State, line: &str) -> serde_json::Value {
         Some("sql_exec") => rpc_sql_exec(state, &request, id).await,
         Some("sql_query") => rpc_sql_query(state, &request, id).await,
         Some("sql_recover") => rpc_sql_recover(state, &request, id).await,
+        Some("sql_compact") => rpc_sql_compact(state, &request, id).await,
         _ => serde_json::json!({"jsonrpc": "2.0", "id": id,
             "error": {"code": -32601, "message": "method not found"}}),
     }
@@ -527,6 +528,21 @@ async fn rpc_sql_query(
         Ok(Ok(v)) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": v}),
         Ok(Err(e)) => rpc_err(id, format!("query failed: {e}")),
         Err(e) => rpc_err(id, format!("query task: {e}")),
+    }
+}
+
+/// Compact one of this node's own CraftSQL DBs.
+async fn rpc_sql_compact(
+    state: &State,
+    req: &serde_json::Value,
+    id: serde_json::Value,
+) -> serde_json::Value {
+    let Some(ns) = param(req, "ns").and_then(|v| v.as_str()) else {
+        return rpc_err(id, "sql_compact needs 'ns'".into());
+    };
+    match state.craftsql.compact(ns).await {
+        Ok(n) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"reclaimed": n}}),
+        Err(e) => rpc_err(id, format!("compact failed: {e}")),
     }
 }
 

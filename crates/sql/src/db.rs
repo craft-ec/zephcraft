@@ -29,7 +29,13 @@ struct GenManifest {
     generations: Vec<[u8; 32]>,
     /// CID of the published generation-list object (`KIND_MANIFEST` target).
     manifest_cid: Option<[u8; 32]>,
+    /// Monotonic publish counter for the manifest (independent of generation
+    /// count, which resets on compaction) — the `KIND_MANIFEST` seq.
+    manifest_seq: u64,
 }
+
+/// Compact after this many generations accumulate, to bound storage growth.
+const COMPACT_THRESHOLD: usize = 16;
 
 /// The DB head: `(owner, namespace) → (root_cid, seq)`. Abstracts `KIND_ROOT`
 /// so CraftSQL can be tested without a live tracker.
@@ -271,9 +277,7 @@ impl CraftSql {
                 .publish(&m.namespace, Cid(root), None, m.seq)
                 .await;
             if let (Some(mstore), Some(mc)) = (&self.manifests, m.manifest_cid) {
-                let _ = mstore
-                    .publish(&m.namespace, Cid(mc), m.generations.len() as u64)
-                    .await;
+                let _ = mstore.publish(&m.namespace, Cid(mc), m.manifest_seq).await;
             }
             count += 1;
         }
@@ -413,6 +417,33 @@ impl CraftSql {
         }
         Ok(restored)
     }
+
+    /// Compact this owned DB now: re-snapshot the live object set into a single
+    /// base generation, drop the accumulated old generations, and GC superseded
+    /// page objects locally. Returns the count of local objects reclaimed.
+    pub async fn compact(&self, namespace: &str) -> Result<usize> {
+        let durable = self
+            .durable
+            .as_ref()
+            .ok_or_else(|| SqlError::Sqlite("no durable store".into()))?;
+        let key = format!("{}_{}", &self.owner.to_hex()[..16], namespace);
+        let root = match self.heads.resolve(self.owner, namespace).await? {
+            Some((r, _)) => r,
+            None => load_manifest(&self.store_dir, &key)
+                .last_root
+                .map(Cid)
+                .ok_or_else(|| SqlError::Sqlite("no head to compact".into()))?,
+        };
+        run_compaction(
+            &self.store_dir,
+            &key,
+            namespace,
+            root,
+            durable,
+            &self.manifests,
+        )
+        .await
+    }
 }
 
 /// An open CraftSQL database.
@@ -510,16 +541,26 @@ impl CraftDb {
                     .map_err(|e| SqlError::Serde(e.to_string()))?;
                 let manifest_cid = durable.put_generation(list).await?;
                 manifest.manifest_cid = Some(manifest_cid.0);
+                manifest.manifest_seq += 1;
                 mstore
-                    .publish(
-                        &self.namespace,
-                        manifest_cid,
-                        manifest.generations.len() as u64,
-                    )
+                    .publish(&self.namespace, manifest_cid, manifest.manifest_seq)
                     .await?;
             }
         }
         save_manifest(&self.store_dir, &self.key, &manifest)?;
+        // Bound storage: once generations pile up, fold them into one base
+        // snapshot and reclaim superseded objects.
+        if manifest.generations.len() >= COMPACT_THRESHOLD {
+            run_compaction(
+                &self.store_dir,
+                &self.key,
+                &self.namespace,
+                root,
+                durable,
+                &self.manifests,
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -585,6 +626,61 @@ async fn ensure(
         )));
     }
     Ok(bytes)
+}
+
+/// Fold a DB's accumulated generations into one base generation covering only
+/// the objects reachable from `root`, drop the old generations (unpin → fade),
+/// and GC superseded page objects from the local store. Bounds storage to ~the
+/// live DB size instead of growing with write history.
+async fn run_compaction(
+    store_dir: &Path,
+    key: &str,
+    namespace: &str,
+    root: Cid,
+    durable: &Arc<dyn DurableStore>,
+    manifests: &Option<Arc<dyn ManifestStore>>,
+) -> Result<usize> {
+    let store = ObjectStore::open(store_dir)?;
+    let mut manifest = load_manifest(store_dir, key);
+    if manifest.generations.len() <= 1 {
+        return Ok(0);
+    }
+    let live: std::collections::HashSet<Cid> =
+        crate::pager::reachable(&store, root)?.into_iter().collect();
+    // Pack the live object set into one fresh base generation.
+    let live_objs: Vec<(Cid, Vec<u8>)> = live
+        .iter()
+        .filter_map(|c| store.get(c).map(|d| (*c, d)))
+        .collect();
+    let base = durable.put_generation(gen::pack(&live_objs)?).await?;
+    let old = std::mem::replace(&mut manifest.generations, vec![base.0]);
+    // Republish the now single-entry manifest (monotonic seq).
+    if let Some(mstore) = manifests {
+        let list = postcard::to_allocvec(&manifest.generations)
+            .map_err(|e| SqlError::Serde(e.to_string()))?;
+        let mc = durable.put_generation(list).await?;
+        manifest.manifest_cid = Some(mc.0);
+        manifest.manifest_seq += 1;
+        let _ = mstore.publish(namespace, mc, manifest.manifest_seq).await;
+    }
+    save_manifest(store_dir, key, &manifest)?;
+    // Drop superseded generations (base is durable first, so this is safe).
+    for g in old {
+        if g != base.0 {
+            let _ = durable.drop_generation(Cid(g)).await;
+        }
+    }
+    // GC page objects no longer reachable from the current root.
+    let mut reclaimed = 0;
+    if let Ok(all) = store.list() {
+        for cid in all {
+            if !live.contains(&cid) {
+                let _ = store.delete(&cid);
+                reclaimed += 1;
+            }
+        }
+    }
+    Ok(reclaimed)
 }
 
 fn cell_to_json(v: rusqlite::types::Value) -> serde_json::Value {
@@ -775,6 +871,10 @@ mod tests {
         async fn get_generation(&self, cid: Cid) -> Result<Option<Vec<u8>>> {
             Ok(self.gens.lock().unwrap().get(&cid.0).cloned())
         }
+        async fn drop_generation(&self, cid: Cid) -> Result<()> {
+            self.gens.lock().unwrap().remove(&cid.0);
+            Ok(())
+        }
     }
 
     /// Delete every object shard (keep the manifest sidecar) — simulates total
@@ -958,5 +1058,68 @@ mod tests {
             fetched < total,
             "lazy read fetched {fetched} of {total} objects (should be a subset)"
         );
+    }
+
+    #[tokio::test]
+    async fn compaction_bounds_storage_and_preserves_db() {
+        let dir = tempdir().unwrap();
+        let owner = NodeId([11u8; 32]);
+        let heads = MockHeads::new(owner);
+        let durable = Arc::new(MockDurable::default());
+        let manifests = MockManifest::new(owner);
+        let sql = CraftSql::register(dir.path(), heads.clone(), owner)
+            .unwrap()
+            .with_durable(durable.clone())
+            .with_manifests(manifests.clone());
+
+        // Many writes accumulate many generations + superseded page objects.
+        let mut db = sql.open("app").await.unwrap();
+        db.write("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);")
+            .await
+            .unwrap();
+        for i in 0..6 {
+            db.write(&format!("INSERT INTO t VALUES ({i},'row{i}');"))
+                .await
+                .unwrap();
+        }
+        drop(db);
+        let objs_before = crate::ObjectStore::open(dir.path())
+            .unwrap()
+            .list()
+            .unwrap()
+            .len();
+
+        // Compact: fold into one base generation + GC superseded objects.
+        let reclaimed = sql.compact("app").await.unwrap();
+        assert!(reclaimed > 0, "compaction reclaimed superseded objects");
+        let objs_after = crate::ObjectStore::open(dir.path())
+            .unwrap()
+            .list()
+            .unwrap()
+            .len();
+        assert!(
+            objs_after < objs_before,
+            "local store shrank: {objs_after} < {objs_before}"
+        );
+
+        // The DB still reads correctly after compaction.
+        let db2 = sql.open("app").await.unwrap();
+        let v: String = db2
+            .conn()
+            .query_row("SELECT v FROM t WHERE id=3", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, "row3");
+        drop(db2);
+
+        // And it recovers from the single compacted base generation alone.
+        wipe_objects(dir.path());
+        let restored = sql.recover("app").await.unwrap();
+        assert!(restored > 0, "recovered from the compacted base generation");
+        let db3 = sql.open("app").await.unwrap();
+        let v: String = db3
+            .conn()
+            .query_row("SELECT v FROM t WHERE id=5", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, "row5", "compacted DB still fully recoverable");
     }
 }
