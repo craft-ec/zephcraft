@@ -189,6 +189,10 @@ impl ObjEngine {
     /// both skip it).
     fn is_alive(&self, cid: &Cid, wanted: &HashSet<[u8; 32]>, provider_pinned: bool) -> bool {
         self.store.is_pinned(cid)
+            // System pieces (CraftSQL generations) are kept alive locally by every
+            // holder — the marker travels with the piece, so no WANT record floods
+            // the network. Never fades; degrades + repairs like normal content.
+            || self.store.is_system(cid)
             || self.store.is_wanted(cid)
             || wanted.contains(&cid.0)
             || provider_pinned
@@ -239,6 +243,15 @@ impl ObjEngine {
     /// Publish content: encode, store locally (pin by default), spread to
     /// distinct peers, announce providers. `durable` = reached ≥K peers.
     pub async fn publish(&self, data: &[u8], pin: bool) -> anyhow::Result<PublishReport> {
+        self.publish_impl(data, pin, false).await
+    }
+
+    async fn publish_impl(
+        &self,
+        data: &[u8],
+        pin: bool,
+        system: bool,
+    ) -> anyhow::Result<PublishReport> {
         anyhow::ensure!(!data.is_empty(), "refusing to publish empty content");
         let cid = Cid::of(data);
         let k = self.config.k;
@@ -256,6 +269,10 @@ impl ObjEngine {
         };
 
         self.store.put_generation(cid, gen.clone())?;
+        // Mark BEFORE pushing so each push carries the system flag to holders.
+        if system {
+            self.store.mark_system(&cid)?;
+        }
         if pin {
             self.store.pin(cid, data)?;
         }
@@ -438,6 +455,9 @@ impl ObjEngine {
                 coding_vector: piece.coding_vector.clone(),
                 data: piece.data.clone(),
             },
+            // Propagate the system class with every push (publish, repair,
+            // distribute) so each holder treats it as DB data locally.
+            system: self.store.is_system(&cid),
         });
         match self.request(peer, &msg).await? {
             wire::Message::PiecePushAck(ack) if ack.ok => Ok(()),
@@ -623,20 +643,14 @@ impl ObjEngine {
     /// alive network-wide so it never fades; the `system` marker excludes it from
     /// user commands + local eviction. Returns its CID.
     pub async fn publish_system(&self, data: &[u8]) -> anyhow::Result<Cid> {
-        let report = self.publish(data, false).await?;
-        self.store.mark_system(&report.cid)?;
-        self.store.set_want(report.cid)?;
-        let _ = self.routing.announce_want(report.cid).await;
+        let report = self.publish_impl(data, false, true).await?;
         Ok(report.cid)
     }
 
     /// Release a system object back to the normal lifecycle (compaction dropping
-    /// a superseded generation) — withdraw the keep-alive WANT and the marker so
-    /// the generation fades from the network.
+    /// a superseded generation) — clear the marker so it can fade/evict.
     pub async fn release_system(&self, cid: Cid) -> anyhow::Result<()> {
         self.store.unmark_system(&cid)?;
-        self.store.unset_want(&cid)?;
-        let _ = self.routing.withdraw_want(cid).await;
         Ok(())
     }
 
@@ -1232,6 +1246,11 @@ impl ObjEngine {
             || self.store.put_piece(cid, &piece).is_err()
         {
             return reject("store-error");
+        }
+        // A CraftSQL system piece: mark it locally so this holder keeps it alive
+        // (never fades) + exempt from user commands + eviction — no WANT record.
+        if push.system {
+            let _ = self.store.mark_system(&cid);
         }
         // Announce as provider on first piece for this CID.
         if was_empty {

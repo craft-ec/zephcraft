@@ -119,6 +119,10 @@ pub struct PiecePush {
     /// postcard-encoded zeph_erasure::vtags::VTags.
     pub vtags: Vec<u8>,
     pub piece: WirePiece,
+    /// This generation is a CraftSQL system object (DB-managed). The receiver
+    /// marks it locally so it's kept alive (never fades) + excluded from user
+    /// commands + eviction — no per-piece WANT record needed on the network.
+    pub system: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -543,6 +547,7 @@ mod tests {
                 total_len: 500,
                 vtags: vec![1, 2, 3],
                 piece: piece.clone(),
+                system: false,
             }),
             Message::PiecePushAck(PiecePushAck {
                 ok: false,
