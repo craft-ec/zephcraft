@@ -21,8 +21,14 @@ use crate::{CraftVfs, ObjectStore, Result, Roots, SqlError};
 /// a sidecar file so a generation is published only for genuinely new objects.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct GenManifest {
+    /// The DB namespace (so a re-announce knows what to publish).
+    namespace: String,
     last_root: Option<[u8; 32]>,
+    /// Head seq at `last_root` (for re-announce + local-head fallback).
+    seq: u64,
     generations: Vec<[u8; 32]>,
+    /// CID of the published generation-list object (`KIND_MANIFEST` target).
+    manifest_cid: Option<[u8; 32]>,
 }
 
 /// The DB head: `(owner, namespace) → (root_cid, seq)`. Abstracts `KIND_ROOT`
@@ -234,6 +240,46 @@ impl CraftSql {
         crate::fetch::Fetcher::new(tx)
     }
 
+    /// Re-announce every locally-owned DB head + durability manifest to the
+    /// tracker. Heads/manifests are otherwise published only on write, so a
+    /// tracker restart would lose them (leaving even the owner unable to open its
+    /// own DB). Reads the persisted sidecars; restore-tolerant, so it is a no-op
+    /// when the records are already current. Returns the count re-announced.
+    pub async fn reannounce_heads(&self) -> usize {
+        let mut count = 0;
+        let Ok(entries) = std::fs::read_dir(&self.store_dir) else {
+            return 0;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("gens") {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let m: GenManifest = match postcard::from_bytes(&bytes) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let (Some(root), false) = (m.last_root, m.namespace.is_empty()) else {
+                continue;
+            };
+            // prev=None → restore semantics (accepted when the tracker lost it).
+            let _ = self
+                .heads
+                .publish(&m.namespace, Cid(root), None, m.seq)
+                .await;
+            if let (Some(mstore), Some(mc)) = (&self.manifests, m.manifest_cid) {
+                let _ = mstore
+                    .publish(&m.namespace, Cid(mc), m.generations.len() as u64)
+                    .await;
+            }
+            count += 1;
+        }
+        count
+    }
+
     /// Open this node's own DB `namespace` for reading and writing.
     pub async fn open(&self, namespace: &str) -> Result<CraftDb> {
         self.open_as(self.owner, namespace, true).await
@@ -246,8 +292,18 @@ impl CraftSql {
 
     async fn open_as(&self, owner: NodeId, namespace: &str, writable: bool) -> Result<CraftDb> {
         let key = format!("{}_{}", &owner.to_hex()[..16], namespace);
-        // Resolve the authoritative head and seed the VFS cache for this key.
-        let seq = match self.heads.resolve(owner, namespace).await? {
+        // Resolve the authoritative head. If the tracker lost it (restart) and
+        // this is our own DB, recover it from the local sidecar so the owner is
+        // never locked out of its own database by tracker liveness.
+        let head = match self.heads.resolve(owner, namespace).await? {
+            Some(rs) => Some(rs),
+            None if writable => {
+                let m = load_manifest(&self.store_dir, &key);
+                m.last_root.map(|r| (Cid(r), m.seq))
+            }
+            None => None,
+        };
+        let seq = match head {
             Some((root, seq)) => {
                 if !writable && self.source.is_some() {
                     // Lazy reader: sync only the (tiny) index; pull page contents
@@ -443,8 +499,9 @@ impl CraftDb {
             manifest.generations.push(gcid.0);
             changed = true;
         }
+        manifest.namespace = self.namespace.clone();
         manifest.last_root = Some(root.0);
-        save_manifest(&self.store_dir, &self.key, &manifest)?;
+        manifest.seq = self.seq;
         // Publish the generation list as its own durable object and announce its
         // CID network-wide, so any node can recover the DB from (owner, ns) alone.
         if changed {
@@ -452,6 +509,7 @@ impl CraftDb {
                 let list = postcard::to_allocvec(&manifest.generations)
                     .map_err(|e| SqlError::Serde(e.to_string()))?;
                 let manifest_cid = durable.put_generation(list).await?;
+                manifest.manifest_cid = Some(manifest_cid.0);
                 mstore
                     .publish(
                         &self.namespace,
@@ -461,6 +519,7 @@ impl CraftDb {
                     .await?;
             }
         }
+        save_manifest(&self.store_dir, &self.key, &manifest)?;
         Ok(())
     }
 

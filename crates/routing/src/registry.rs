@@ -171,21 +171,26 @@ impl Registry {
                 let key = (record.node_id, r.namespace.clone());
                 match tables.roots.get(&key) {
                     None => {
-                        // First write must expect no prior root.
-                        if r.prev_cid != [0u8; 32] {
-                            return Err("root-conflict");
-                        }
+                        // No current record: first write, OR the owner restoring a
+                        // head the tracker lost on restart (re-announce). Accept —
+                        // the record is signed by the owner. (Rollback-replay after
+                        // loss is a separate hardening item.)
                     }
                     Some(cur) => {
                         let Some(curp) = records::root(&cur.record) else {
                             return Err("root-corrupt");
                         };
-                        // CAS: must expect the current root AND advance the seq.
-                        if r.prev_cid != curp.root_cid {
-                            return Err("root-conflict");
-                        }
-                        if r.seq <= curp.seq {
-                            return Err("root-stale");
+                        // Idempotent re-announce of the current head → refresh, no CAS.
+                        if r.root_cid == curp.root_cid && r.seq == curp.seq {
+                            // accept as-is
+                        } else {
+                            // CAS: must expect the current root AND advance the seq.
+                            if r.prev_cid != curp.root_cid {
+                                return Err("root-conflict");
+                            }
+                            if r.seq <= curp.seq {
+                                return Err("root-stale");
+                            }
                         }
                     }
                 }

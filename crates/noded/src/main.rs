@@ -621,6 +621,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // short enough to recover quickly from a tracker restart.
     let announce_engine = engine.clone();
     let announce_relays = cfg.relay_operator_urls.clone();
+    let announce_sql = craftsql.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(120));
         loop {
@@ -632,6 +633,13 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
             let n = announce_engine.reannounce_providers().await;
             if n > 0 {
                 tracing::info!(cids = n, "re-announced provider records");
+            }
+            // Re-publish owned DB heads + manifests (lost on tracker restart
+            // otherwise). First tick fires immediately, so this also restores
+            // heads right after our own restart.
+            let h = announce_sql.reannounce_heads().await;
+            if h > 0 {
+                tracing::info!(dbs = h, "re-announced CraftSQL heads/manifests");
             }
         }
     });
