@@ -139,6 +139,14 @@ fn pad(data: &[u8]) -> Vec<u8> {
     v
 }
 
+/// Decode a root object's bytes into the CIDs of every page it references — so
+/// a reader can sync a DB by fetching the root, then each page.
+pub(crate) fn page_cids_from_root_bytes(bytes: &[u8]) -> Result<Vec<Cid>> {
+    let idx: RootIndex =
+        postcard::from_bytes(bytes).map_err(|e| SqlError::CorruptIndex(e.to_string()))?;
+    Ok(idx.pages.values().map(|b| Cid(*b)).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

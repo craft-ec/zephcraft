@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use zeph_core::{Cid, NodeId};
 
-use crate::{CraftVfs, Result, Roots, SqlError};
+use crate::{CraftVfs, ObjectStore, Result, Roots, SqlError};
 
 /// The DB head: `(owner, namespace) → (root_cid, seq)`. Abstracts `KIND_ROOT`
 /// so CraftSQL can be tested without a live tracker.
@@ -24,6 +24,14 @@ pub trait RootStore: Send + Sync {
     /// Publish MY new head via compare-and-swap: `prev` must be the current root
     /// (None = expect none) and `seq` must strictly advance, else `Conflict`.
     async fn publish(&self, namespace: &str, root: Cid, prev: Option<Cid>, seq: u64) -> Result<()>;
+}
+
+/// Fetches a DB's page objects by CID from the network (from the owner / a
+/// per-DB provider). A reader syncs a DB by pulling its root then each page.
+/// Objects are self-verifying: `cid == BLAKE3(bytes)` is checked on receipt.
+#[async_trait::async_trait]
+pub trait PageSource: Send + Sync {
+    async fn fetch(&self, owner: NodeId, cid: Cid) -> Result<Option<Vec<u8>>>;
 }
 
 /// Adapter binding `RootStore` to the real signed `KIND_ROOT` records over
@@ -67,6 +75,8 @@ pub struct CraftSql {
     roots: Roots,
     heads: Arc<dyn RootStore>,
     owner: NodeId,
+    store_dir: PathBuf,
+    source: Option<Arc<dyn PageSource>>,
 }
 
 impl CraftSql {
@@ -78,7 +88,8 @@ impl CraftSql {
     ) -> Result<Self> {
         let n = VFS_COUNTER.fetch_add(1, Ordering::Relaxed);
         let vfs_name = format!("craftsql-{n}");
-        let vfs = CraftVfs::new(store_dir);
+        let store_dir = store_dir.into();
+        let vfs = CraftVfs::new(store_dir.clone());
         let roots = vfs.roots();
         sqlite_vfs::register(&vfs_name, vfs, false)
             .map_err(|e| SqlError::Sqlite(format!("vfs register: {e:?}")))?;
@@ -87,7 +98,48 @@ impl CraftSql {
             roots,
             heads,
             owner,
+            store_dir,
+            source: None,
         })
+    }
+
+    /// Attach a network page source so readers can sync DB pages they don't hold
+    /// locally (from the owner). Without one, opens are local-only.
+    pub fn with_source(mut self, source: Arc<dyn PageSource>) -> Self {
+        self.source = Some(source);
+        self
+    }
+
+    /// Pull the root object + every page it references from the network into the
+    /// local store (each verified by CID), so the sync VFS can then read locally.
+    async fn sync_pages(&self, owner: NodeId, root: Cid) -> Result<()> {
+        let Some(source) = &self.source else {
+            return Ok(());
+        };
+        let store = ObjectStore::open(&self.store_dir)?;
+        if !store.has(&root) {
+            let bytes = source
+                .fetch(owner, root)
+                .await?
+                .ok_or_else(|| SqlError::RootNotFound(root.to_hex()))?;
+            if store.put(&bytes)? != root {
+                return Err(SqlError::CorruptIndex("root object hash mismatch".into()));
+            }
+        }
+        let root_bytes = store
+            .get(&root)
+            .ok_or_else(|| SqlError::RootNotFound(root.to_hex()))?;
+        for pc in crate::pager::page_cids_from_root_bytes(&root_bytes)? {
+            if !store.has(&pc) {
+                let bytes = source.fetch(owner, pc).await?.ok_or_else(|| {
+                    SqlError::CorruptIndex(format!("missing page {}", pc.to_hex()))
+                })?;
+                if store.put(&bytes)? != pc {
+                    return Err(SqlError::CorruptIndex("page object hash mismatch".into()));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Open this node's own DB `namespace` for reading and writing.
@@ -105,6 +157,8 @@ impl CraftSql {
         // Resolve the authoritative head and seed the VFS cache for this key.
         let seq = match self.heads.resolve(owner, namespace).await? {
             Some((root, seq)) => {
+                // Pull the pages we don't hold from the network before opening.
+                self.sync_pages(owner, root).await?;
                 self.roots
                     .lock()
                     .expect("roots")
@@ -261,6 +315,60 @@ mod tests {
             .query_row("SELECT v FROM t WHERE id=1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, "hello", "reopened from the KIND_ROOT head via RootStore");
+    }
+
+    /// A network page source that serves objects from the owner's local store —
+    /// stands in for fetching pages from the owner over the wire.
+    struct MockSource {
+        owner_store: crate::ObjectStore,
+    }
+    #[async_trait::async_trait]
+    impl PageSource for MockSource {
+        async fn fetch(&self, _owner: NodeId, cid: Cid) -> Result<Option<Vec<u8>>> {
+            Ok(self.owner_store.get(&cid))
+        }
+    }
+
+    #[tokio::test]
+    async fn reader_syncs_pages_from_owner_over_network() {
+        let owner_dir = tempdir().unwrap();
+        let reader_dir = tempdir().unwrap();
+        let owner_id = NodeId([3u8; 32]);
+        let heads = MockHeads::new(owner_id);
+
+        // Owner writes a DB (pages land in owner_dir).
+        let w = CraftSql::register(owner_dir.path(), heads.clone(), owner_id).unwrap();
+        let mut db = w.open("mail").await.unwrap();
+        db.write("CREATE TABLE msg(id INTEGER PRIMARY KEY, body TEXT); INSERT INTO msg VALUES (1,'hi'),(2,'yo');")
+            .await
+            .unwrap();
+
+        // Reader has an EMPTY store + a page source pointing at the owner's store.
+        let source = Arc::new(MockSource {
+            owner_store: crate::ObjectStore::open(owner_dir.path()).unwrap(),
+        });
+        let r = CraftSql::register(reader_dir.path(), heads.clone(), owner_id)
+            .unwrap()
+            .with_source(source);
+
+        // open_reader resolves the head, SYNCS the pages, then reads locally.
+        let db2 = r.open_reader(owner_id, "mail").await.unwrap();
+        let body: String = db2
+            .conn()
+            .query_row("SELECT body FROM msg WHERE id=2", [], |x| x.get(0))
+            .unwrap();
+        assert_eq!(
+            body, "yo",
+            "reader pulled pages from the owner and read them"
+        );
+
+        // The pages really were absent then fetched: the reader store now holds them.
+        let reader_store = crate::ObjectStore::open(reader_dir.path()).unwrap();
+        let head = db2.root().unwrap();
+        assert!(
+            reader_store.has(&head),
+            "root object synced into the reader's store"
+        );
     }
 
     #[tokio::test]
