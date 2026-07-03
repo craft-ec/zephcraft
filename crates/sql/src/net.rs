@@ -8,10 +8,11 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use zeph_core::{Cid, NodeId};
+use zeph_obj::{ConsumeMode, ObjEngine};
 use zeph_routing::ContentRouting;
 use zeph_transport::{Connection, PeerAddr, Transport};
 
-use crate::{ObjectStore, PageSource, Result, SqlError};
+use crate::{DurableStore, ObjectStore, PageSource, Result, SqlError};
 
 /// ALPN for CraftSQL page-object fetch.
 pub const ALPN: &[u8] = b"/craftec/sqlpage/1";
@@ -92,5 +93,34 @@ impl PageSource for TransportPageSource {
             .map_err(|e| SqlError::Sqlite(e.to_string()))?;
         conn.close(0u32.into(), b"done");
         Ok(if data.is_empty() { None } else { Some(data) })
+    }
+}
+
+/// `DurableStore` over the CraftOBJ engine: a generation is published as content
+/// (erasure-coded k=8/n=32, distributed, HealthScan-repaired) and reconstructed
+/// from any k pieces — DB pages get exactly the durability files have.
+pub struct ObjDurable {
+    engine: std::sync::Arc<ObjEngine>,
+}
+
+impl ObjDurable {
+    pub fn new(engine: std::sync::Arc<ObjEngine>) -> Self {
+        Self { engine }
+    }
+}
+
+#[async_trait::async_trait]
+impl DurableStore for ObjDurable {
+    async fn put_generation(&self, blob: Vec<u8>) -> Result<Cid> {
+        let report = self
+            .engine
+            .publish(&blob, true)
+            .await
+            .map_err(|e| SqlError::Sqlite(format!("publish generation: {e}")))?;
+        Ok(report.cid)
+    }
+
+    async fn get_generation(&self, cid: Cid) -> Result<Option<Vec<u8>>> {
+        Ok(self.engine.get(cid, ConsumeMode::Seed).await.ok())
     }
 }

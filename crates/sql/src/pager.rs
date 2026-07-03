@@ -270,6 +270,39 @@ fn load_subtree(
     Ok(())
 }
 
+/// Every object CID reachable from `root` — the root header, all index-tree
+/// nodes, and all page objects. Used by the durability sweep to know the DB's
+/// full object set (for generation diffing) and by recovery to verify coverage.
+pub(crate) fn reachable(store: &ObjectStore, root: Cid) -> Result<Vec<Cid>> {
+    let mut out = vec![root];
+    let bytes = store
+        .get(&root)
+        .ok_or_else(|| SqlError::RootNotFound(root.to_hex()))?;
+    let ri = decode_root(&bytes)?;
+    if ri.depth == 0 {
+        return Ok(out);
+    }
+    let mut frontier = vec![(ri.depth - 1, Cid(ri.root_cid))];
+    while !frontier.is_empty() {
+        let mut next = Vec::new();
+        for (level, ncid) in frontier {
+            out.push(ncid);
+            let nb = store
+                .get(&ncid)
+                .ok_or_else(|| SqlError::CorruptIndex(format!("missing node {}", ncid.to_hex())))?;
+            for child in decode_node(&nb)?.into_values() {
+                if level == 0 {
+                    out.push(Cid(child));
+                } else {
+                    next.push((level - 1, Cid(child)));
+                }
+            }
+        }
+        frontier = next;
+    }
+    Ok(out)
+}
+
 fn pad(data: &[u8]) -> Vec<u8> {
     let mut v = data.to_vec();
     v.resize(PAGE_SIZE, 0);

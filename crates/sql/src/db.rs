@@ -7,13 +7,23 @@
 //! and PUBLISHES the new head (compare-and-swap) after each write. The in-memory
 //! roots map is just a per-process cache; the RootStore is the source of truth.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use zeph_core::{Cid, NodeId};
 
+use crate::gen::{self, DurableStore};
 use crate::{CraftVfs, ObjectStore, Result, Roots, SqlError};
+
+/// Per-DB durability manifest: the generation CIDs published so far, and the
+/// root they were last swept at (to diff for the next generation). Persisted as
+/// a sidecar file so a generation is published only for genuinely new objects.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct GenManifest {
+    last_root: Option<[u8; 32]>,
+    generations: Vec<[u8; 32]>,
+}
 
 /// The DB head: `(owner, namespace) → (root_cid, seq)`. Abstracts `KIND_ROOT`
 /// so CraftSQL can be tested without a live tracker.
@@ -77,6 +87,7 @@ pub struct CraftSql {
     owner: NodeId,
     store_dir: PathBuf,
     source: Option<Arc<dyn PageSource>>,
+    durable: Option<Arc<dyn DurableStore>>,
 }
 
 impl CraftSql {
@@ -100,6 +111,7 @@ impl CraftSql {
             owner,
             store_dir,
             source: None,
+            durable: None,
         })
     }
 
@@ -107,6 +119,13 @@ impl CraftSql {
     /// locally (from the owner). Without one, opens are local-only.
     pub fn with_source(mut self, source: Arc<dyn PageSource>) -> Self {
         self.source = Some(source);
+        self
+    }
+
+    /// Attach a durable store so each commit's new objects are erasure-coded
+    /// (k=8/n=32) + distributed + repaired — the DB survives owner/holder loss.
+    pub fn with_durable(mut self, durable: Arc<dyn DurableStore>) -> Self {
+        self.durable = Some(durable);
         self
     }
 
@@ -185,10 +204,43 @@ impl CraftSql {
             conn,
             roots: self.roots.clone(),
             heads: writable.then(|| self.heads.clone()),
+            durable: if writable { self.durable.clone() } else { None },
+            store_dir: self.store_dir.clone(),
             key,
             namespace: namespace.to_string(),
             seq,
         })
+    }
+
+    /// Rebuild a DB's local object store from its durable generations — for
+    /// recovery after page-store loss/corruption. Decodes each generation
+    /// (verifying every object by CID) and re-puts it, then the DB opens
+    /// normally at its head. Reads the sidecar manifest for the generation set.
+    pub async fn recover(&self, namespace: &str) -> Result<usize> {
+        let durable = self
+            .durable
+            .as_ref()
+            .ok_or_else(|| SqlError::Sqlite("no durable store configured".into()))?;
+        let key = format!("{}_{}", &self.owner.to_hex()[..16], namespace);
+        let store = ObjectStore::open(&self.store_dir)?;
+        let manifest = load_manifest(&self.store_dir, &key);
+        let mut restored = 0;
+        for gcid in &manifest.generations {
+            let blob = durable.get_generation(Cid(*gcid)).await?.ok_or_else(|| {
+                SqlError::CorruptIndex(format!("lost generation {}", Cid(*gcid).to_hex()))
+            })?;
+            for (cid, data) in gen::unpack(&blob)? {
+                if !store.has(&cid) {
+                    if store.put(&data)? != cid {
+                        return Err(SqlError::CorruptIndex(
+                            "recovered object hash mismatch".into(),
+                        ));
+                    }
+                    restored += 1;
+                }
+            }
+        }
+        Ok(restored)
     }
 }
 
@@ -197,6 +249,8 @@ pub struct CraftDb {
     conn: rusqlite::Connection,
     roots: Roots,
     heads: Option<Arc<dyn RootStore>>,
+    durable: Option<Arc<dyn DurableStore>>,
+    store_dir: PathBuf,
     key: String,
     namespace: String,
     seq: u64,
@@ -233,8 +287,46 @@ impl CraftDb {
                     .publish(&self.namespace, Cid(root), prev.map(Cid), self.seq + 1)
                     .await?;
                 self.seq += 1;
+                self.sweep_durability(Cid(root)).await?;
             }
         }
+        Ok(())
+    }
+
+    /// Publish this commit's NEW objects (changed pages + the rewritten index
+    /// path) as one durable generation. Diffs the objects reachable from the new
+    /// root against the last swept root, so only genuinely new objects are coded
+    /// — the generation stays O(changed), like the commit that produced it.
+    async fn sweep_durability(&mut self, root: Cid) -> Result<()> {
+        let Some(durable) = &self.durable else {
+            return Ok(());
+        };
+        let store = ObjectStore::open(&self.store_dir)?;
+        let mut manifest = load_manifest(&self.store_dir, &self.key);
+        if manifest.last_root == Some(root.0) {
+            return Ok(());
+        }
+        let prev: std::collections::HashSet<Cid> = match manifest.last_root {
+            Some(r) => crate::pager::reachable(&store, Cid(r))?
+                .into_iter()
+                .collect(),
+            None => std::collections::HashSet::new(),
+        };
+        let mut fresh = Vec::new();
+        for cid in crate::pager::reachable(&store, root)? {
+            if !prev.contains(&cid) {
+                if let Some(bytes) = store.get(&cid) {
+                    fresh.push((cid, bytes));
+                }
+            }
+        }
+        if !fresh.is_empty() {
+            let blob = gen::pack(&fresh)?;
+            let gcid = durable.put_generation(blob).await?;
+            manifest.generations.push(gcid.0);
+        }
+        manifest.last_root = Some(root.0);
+        save_manifest(&self.store_dir, &self.key, &manifest)?;
         Ok(())
     }
 
@@ -259,6 +351,23 @@ impl CraftDb {
         let rows: Vec<serde_json::Value> = rows.filter_map(std::result::Result::ok).collect();
         Ok(serde_json::json!({ "columns": cols, "rows": rows }))
     }
+}
+
+fn manifest_path(store_dir: &Path, key: &str) -> PathBuf {
+    store_dir.join(format!("{key}.gens"))
+}
+
+fn load_manifest(store_dir: &Path, key: &str) -> GenManifest {
+    std::fs::read(manifest_path(store_dir, key))
+        .ok()
+        .and_then(|b| postcard::from_bytes(&b).ok())
+        .unwrap_or_default()
+}
+
+fn save_manifest(store_dir: &Path, key: &str, m: &GenManifest) -> Result<()> {
+    let blob = postcard::to_allocvec(m).map_err(|e| SqlError::Serde(e.to_string()))?;
+    std::fs::write(manifest_path(store_dir, key), blob)?;
+    Ok(())
 }
 
 /// Ensure `cid` is present in `store`, fetching + verifying it from the network
@@ -454,6 +563,76 @@ mod tests {
         assert!(
             matches!(conflict, Err(SqlError::Conflict)),
             "stale writer is rejected"
+        );
+    }
+
+    /// In-memory durable store: a generation goes in, comes back by CID —
+    /// stands in for erasure-coded + distributed + repaired storage.
+    #[derive(Default)]
+    struct MockDurable {
+        gens: Mutex<HashMap<[u8; 32], Vec<u8>>>,
+    }
+    #[async_trait::async_trait]
+    impl DurableStore for MockDurable {
+        async fn put_generation(&self, blob: Vec<u8>) -> Result<Cid> {
+            let cid = Cid::of(&blob);
+            self.gens.lock().unwrap().insert(cid.0, blob);
+            Ok(cid)
+        }
+        async fn get_generation(&self, cid: Cid) -> Result<Option<Vec<u8>>> {
+            Ok(self.gens.lock().unwrap().get(&cid.0).cloned())
+        }
+    }
+
+    /// Delete every object shard (keep the manifest sidecar) — simulates total
+    /// local page-store loss/corruption on the owner.
+    fn wipe_objects(dir: &std::path::Path) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                std::fs::remove_dir_all(&p).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn generations_recover_db_after_object_store_loss() {
+        let dir = tempdir().unwrap();
+        let owner = NodeId([5u8; 32]);
+        let heads = MockHeads::new(owner);
+        let durable = Arc::new(MockDurable::default());
+        let sql = CraftSql::register(dir.path(), heads.clone(), owner)
+            .unwrap()
+            .with_durable(durable.clone());
+
+        let mut db = sql.open("app").await.unwrap();
+        db.write("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t VALUES (1,'durable'),(2,'via erasure');")
+            .await
+            .unwrap();
+        drop(db);
+        assert!(
+            !durable.gens.lock().unwrap().is_empty(),
+            "a generation was published"
+        );
+
+        // Catastrophe: the owner's entire local object store is lost.
+        wipe_objects(dir.path());
+        assert!(
+            sql.open_reader(owner, "app").await.is_err(),
+            "DB is unreadable with objects gone"
+        );
+
+        // Reconstruct from the durable generations, then reopen + query.
+        let restored = sql.recover("app").await.unwrap();
+        assert!(restored > 0, "objects restored from generations");
+        let db2 = sql.open_reader(owner, "app").await.unwrap();
+        let v: String = db2
+            .conn()
+            .query_row("SELECT v FROM t WHERE id=2", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            v, "via erasure",
+            "DB reconstructed from erasure generations"
         );
     }
 }

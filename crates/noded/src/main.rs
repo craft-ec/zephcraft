@@ -499,7 +499,8 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     ));
     let craftsql = Arc::new(
         zeph_sql::CraftSql::register(&sql_dir, sql_heads, transport.node_id())?
-            .with_source(sql_source),
+            .with_source(sql_source)
+            .with_durable(Arc::new(zeph_sql::ObjDurable::new(engine.clone()))),
     );
 
     tracing::info!(

@@ -17,6 +17,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 async-trait.workspace = true
 zeph-routing.workspace = true
 zeph-transport.workspace = true
+zeph-obj.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

@@ -10,13 +10,15 @@
 //! Unit 2 wires SQLite's VFS (xRead/xWrite/xSync) as a thin adapter over `Pager`.
 
 mod db;
+mod gen;
 mod net;
 mod pager;
 mod store;
 mod vfs;
 
 pub use db::{CraftDb, CraftSql, PageSource, RootStore, RoutingRootStore};
-pub use net::{serve_pages, TransportPageSource, ALPN as PAGE_ALPN};
+pub use gen::DurableStore;
+pub use net::{serve_pages, ObjDurable, TransportPageSource, ALPN as PAGE_ALPN};
 pub use pager::{Pager, PAGE_SIZE};
 pub use store::ObjectStore;
 pub use vfs::{CraftHandle, CraftVfs, Roots};
