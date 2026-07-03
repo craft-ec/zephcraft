@@ -11,9 +11,11 @@
 
 mod pager;
 mod store;
+mod vfs;
 
 pub use pager::{Pager, PAGE_SIZE};
 pub use store::ObjectStore;
+pub use vfs::{CraftHandle, CraftVfs, Roots};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SqlError {

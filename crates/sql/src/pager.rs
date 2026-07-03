@@ -86,6 +86,37 @@ impl Pager {
         self.dirty.retain(|&n, _| n < pages);
     }
 
+    /// Byte-addressable read (spans/sub-divides pages) — for the VFS's
+    /// `read_exact_at`. Fills `buf` from the pages covering `[offset, +len)`.
+    pub fn read_at(&self, buf: &mut [u8], offset: u64) {
+        let mut done = 0;
+        while done < buf.len() {
+            let pos = offset as usize + done;
+            let page = (pos / PAGE_SIZE) as u32;
+            let within = pos % PAGE_SIZE;
+            let pdata = self.read_page(page);
+            let n = (PAGE_SIZE - within).min(buf.len() - done);
+            buf[done..done + n].copy_from_slice(&pdata[within..within + n]);
+            done += n;
+        }
+    }
+
+    /// Byte-addressable write (read-modify-write of covering pages) — for the
+    /// VFS's `write_all_at`. Buffered until commit.
+    pub fn write_at(&mut self, buf: &[u8], offset: u64) {
+        let mut done = 0;
+        while done < buf.len() {
+            let pos = offset as usize + done;
+            let page = (pos / PAGE_SIZE) as u32;
+            let within = pos % PAGE_SIZE;
+            let mut pdata = self.read_page(page);
+            let n = (PAGE_SIZE - within).min(buf.len() - done);
+            pdata[within..within + n].copy_from_slice(&buf[done..done + n]);
+            self.write_page(page, pdata);
+            done += n;
+        }
+    }
+
     /// Flush buffered pages to objects, build a new root index, return its CID —
     /// SQLite's xSync commit trigger.
     pub fn commit(&mut self) -> Result<Cid> {

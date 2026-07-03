@@ -10,6 +10,8 @@ zeph-core.workspace = true
 serde.workspace = true
 postcard.workspace = true
 thiserror.workspace = true
+sqlite-vfs = "0.2"
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile.workspace = true
