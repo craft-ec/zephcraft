@@ -189,6 +189,9 @@ impl ObjEngine {
     /// both skip it).
     fn is_alive(&self, cid: &Cid, wanted: &HashSet<[u8; 32]>, provider_pinned: bool) -> bool {
         self.store.is_pinned(cid)
+            // CraftSQL generations never fade — they're DB data, kept at the
+            // floor regardless of demand (the system class, not just the pin).
+            || self.store.is_system(cid)
             || self.store.is_wanted(cid)
             || wanted.contains(&cid.0)
             || provider_pinned
@@ -806,7 +809,10 @@ impl ObjEngine {
                         .filter(|(_, _, c, pinned)| *c > 2 && !*pinned)
                         .map(|(id, _, _, _)| *id)
                         .collect();
-                    if self.store.piece_count(&cid) > 2 && !self.store.is_pinned(&cid) {
+                    if self.store.piece_count(&cid) > 2
+                        && !self.store.is_pinned(&cid)
+                        && !self.store.is_system(&cid)
+                    {
                         shedders.push(me);
                     }
                     let winner = shedders
