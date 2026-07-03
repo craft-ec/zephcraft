@@ -66,6 +66,9 @@ pub struct Pager {
     node_cids: HashMap<(u8, u32), [u8; 32]>,
     page_count: u32,
     depth: u8,
+    /// For lazy readers: fetch a missing page's bytes from the network on demand
+    /// (the index is already local; only page contents are pulled per-read).
+    remote: Option<crate::fetch::Fetcher>,
 }
 
 impl Pager {
@@ -78,6 +81,7 @@ impl Pager {
             node_cids: HashMap::new(),
             page_count: 0,
             depth: 0,
+            remote: None,
         }
     }
 
@@ -107,7 +111,26 @@ impl Pager {
             node_cids,
             page_count: ri.page_count,
             depth: ri.depth,
+            remote: None,
         })
+    }
+
+    /// Attach a network fetcher — page contents missing locally are pulled on
+    /// demand (lazy reads). The index (nodes) must already be local.
+    pub fn set_remote(&mut self, fetcher: crate::fetch::Fetcher) {
+        self.remote = Some(fetcher);
+    }
+
+    /// A page/object's bytes: local store first, else fetch from the network and
+    /// cache. Verifies nothing here (the VFS layer put verified objects locally;
+    /// the fetcher's source verifies on receipt).
+    fn object(&self, cid: [u8; 32]) -> Option<Vec<u8>> {
+        if let Some(d) = self.store.get(&Cid(cid)) {
+            return Some(d);
+        }
+        let bytes = self.remote.as_ref()?.fetch(Cid(cid))?;
+        let _ = self.store.put(&bytes);
+        Some(bytes)
     }
 
     pub fn page_count(&self) -> u32 {
@@ -119,7 +142,7 @@ impl Pager {
             return pad(d);
         }
         if let Some(cid) = self.pages.get(&n) {
-            if let Some(data) = self.store.get(&Cid(*cid)) {
+            if let Some(data) = self.object(*cid) {
                 return pad(&data);
             }
         }

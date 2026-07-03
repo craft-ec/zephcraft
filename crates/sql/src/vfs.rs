@@ -20,11 +20,15 @@ use crate::{ObjectStore, Pager, PAGE_SIZE};
 /// db name → current root CID (in-memory here; the real head is a signed
 /// `KIND_ROOT` record published via routing).
 pub type Roots = Arc<Mutex<HashMap<String, [u8; 32]>>>;
+/// Per-db lazy-read fetchers: a reader registers one so the sync VFS can pull
+/// page contents on demand instead of syncing the whole DB up front.
+pub type Fetchers = Arc<Mutex<HashMap<String, crate::fetch::Fetcher>>>;
 
 /// A SQLite VFS whose database files are CraftOBJ page objects.
 pub struct CraftVfs {
     dir: PathBuf,
     roots: Roots,
+    fetchers: Fetchers,
 }
 
 impl CraftVfs {
@@ -32,6 +36,7 @@ impl CraftVfs {
         Self {
             dir: dir.into(),
             roots: Arc::new(Mutex::new(HashMap::new())),
+            fetchers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -39,6 +44,11 @@ impl CraftVfs {
     /// for a db (and, later, publish it as `KIND_ROOT`).
     pub fn roots(&self) -> Roots {
         self.roots.clone()
+    }
+
+    /// Handle to the per-db lazy-read fetcher map.
+    pub fn fetchers(&self) -> Fetchers {
+        self.fetchers.clone()
     }
 
     /// Current committed root CID for `name`, if any.
@@ -70,10 +80,14 @@ impl Vfs for CraftVfs {
         if opts.kind == OpenKind::MainDb {
             let store = ObjectStore::open(&self.dir)?;
             let roots = self.roots.clone();
-            let pager = match roots.lock().expect("roots").get(db).copied() {
+            let mut pager = match roots.lock().expect("roots").get(db).copied() {
                 Some(root) => Pager::open(store, Cid(root)).map_err(to_io)?,
                 None => Pager::create(store),
             };
+            // Lazy reader: pull page contents on demand via the registered fetcher.
+            if let Some(f) = self.fetchers.lock().expect("fetchers").get(db) {
+                pager.set_remote(f.clone());
+            }
             Ok(CraftHandle {
                 inner: Inner::Db {
                     pager,

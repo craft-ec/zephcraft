@@ -10,6 +10,7 @@
 //! Unit 2 wires SQLite's VFS (xRead/xWrite/xSync) as a thin adapter over `Pager`.
 
 mod db;
+mod fetch;
 mod gen;
 mod net;
 mod pager;

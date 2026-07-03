@@ -128,6 +128,7 @@ pub struct CraftSql {
     source: Option<Arc<dyn PageSource>>,
     durable: Option<Arc<dyn DurableStore>>,
     manifests: Option<Arc<dyn ManifestStore>>,
+    fetchers: crate::vfs::Fetchers,
 }
 
 impl CraftSql {
@@ -142,6 +143,7 @@ impl CraftSql {
         let store_dir = store_dir.into();
         let vfs = CraftVfs::new(store_dir.clone());
         let roots = vfs.roots();
+        let fetchers = vfs.fetchers();
         sqlite_vfs::register(&vfs_name, vfs, false)
             .map_err(|e| SqlError::Sqlite(format!("vfs register: {e:?}")))?;
         Ok(Self {
@@ -153,6 +155,7 @@ impl CraftSql {
             source: None,
             durable: None,
             manifests: None,
+            fetchers,
         })
     }
 
@@ -182,7 +185,7 @@ impl CraftSql {
     /// node, and every page object — into the local store (each verified by CID),
     /// so the sync VFS can then read locally. Walks the tree so only the DB's
     /// live pages are fetched.
-    async fn sync_pages(&self, owner: NodeId, root: Cid) -> Result<()> {
+    async fn sync_reachable(&self, owner: NodeId, root: Cid, fetch_pages: bool) -> Result<()> {
         let Some(source) = &self.source else {
             return Ok(());
         };
@@ -202,7 +205,11 @@ impl CraftSql {
                 let node_bytes = ensure(&store, src, owner, node_cid).await?;
                 for child in crate::pager::decode_node(&node_bytes)?.into_values() {
                     if level == 0 {
-                        ensure(&store, src, owner, Cid(child)).await?;
+                        // Leaf children are page objects — fetch them only in
+                        // eager mode; a lazy reader pulls them per-read.
+                        if fetch_pages {
+                            ensure(&store, src, owner, Cid(child)).await?;
+                        }
                     } else {
                         next.push((level - 1, Cid(child)));
                     }
@@ -211,6 +218,20 @@ impl CraftSql {
             frontier = next;
         }
         Ok(())
+    }
+
+    /// Spawn a background task that services lazy page fetches from the network
+    /// source, returning a sync handle the VFS blocks on.
+    fn spawn_fetcher(&self, owner: NodeId) -> crate::fetch::Fetcher {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::fetch::FetchRequest>();
+        let source = self.source.clone().expect("lazy reader needs a source");
+        tokio::spawn(async move {
+            while let Some((cid, resp)) = rx.recv().await {
+                let bytes = source.fetch(owner, cid).await.ok().flatten();
+                let _ = resp.send(bytes);
+            }
+        });
+        crate::fetch::Fetcher::new(tx)
     }
 
     /// Open this node's own DB `namespace` for reading and writing.
@@ -228,8 +249,19 @@ impl CraftSql {
         // Resolve the authoritative head and seed the VFS cache for this key.
         let seq = match self.heads.resolve(owner, namespace).await? {
             Some((root, seq)) => {
-                // Pull the pages we don't hold from the network before opening.
-                self.sync_pages(owner, root).await?;
+                if !writable && self.source.is_some() {
+                    // Lazy reader: sync only the (tiny) index; pull page contents
+                    // on demand as the query touches them.
+                    self.sync_reachable(owner, root, false).await?;
+                    let fetcher = self.spawn_fetcher(owner);
+                    self.fetchers
+                        .lock()
+                        .expect("fetchers")
+                        .insert(key.clone(), fetcher);
+                } else {
+                    // Writer (all local) or source-less: ensure everything present.
+                    self.sync_reachable(owner, root, true).await?;
+                }
                 self.roots
                     .lock()
                     .expect("roots")
@@ -591,7 +623,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reader_syncs_pages_from_owner_over_network() {
         let owner_dir = tempdir().unwrap();
         let reader_dir = tempdir().unwrap();
@@ -798,6 +830,65 @@ mod tests {
         assert_eq!(
             v, "resurrected",
             "a different node rebuilt the DB from the network manifest"
+        );
+    }
+
+    /// A page source that counts fetches and serves from the owner's store.
+    struct CountingSource {
+        owner_store: crate::ObjectStore,
+        count: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl PageSource for CountingSource {
+        async fn fetch(&self, _owner: NodeId, cid: Cid) -> Result<Option<Vec<u8>>> {
+            self.count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(self.owner_store.get(&cid))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lazy_reader_fetches_only_touched_pages() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let owner_dir = tempdir().unwrap();
+        let reader_dir = tempdir().unwrap();
+        let owner_id = NodeId([8u8; 32]);
+        let heads = MockHeads::new(owner_id);
+
+        // Owner writes a multi-page DB (100 fat rows → many pages).
+        let w = CraftSql::register(owner_dir.path(), heads.clone(), owner_id).unwrap();
+        let mut db = w.open("big").await.unwrap();
+        let mut sql = String::from("CREATE TABLE t(id INTEGER PRIMARY KEY, blob TEXT);");
+        for i in 0..100 {
+            sql += &format!("INSERT INTO t VALUES ({i}, '{}');", "x".repeat(3000));
+        }
+        db.write(&sql).await.unwrap();
+        drop(db);
+
+        // Total objects reachable from the DB root.
+        let (root, _) = heads.resolve(owner_id, "big").await.unwrap().unwrap();
+        let owner_store = crate::ObjectStore::open(owner_dir.path()).unwrap();
+        let total = crate::pager::reachable(&owner_store, root).unwrap().len();
+        assert!(total > 10, "DB should span many objects, got {total}");
+
+        // Lazy reader: a point query should fetch far fewer than every object.
+        let src = Arc::new(CountingSource {
+            owner_store: crate::ObjectStore::open(owner_dir.path()).unwrap(),
+            count: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let r = CraftSql::register(reader_dir.path(), heads.clone(), owner_id)
+            .unwrap()
+            .with_source(src.clone());
+        let db2 = r.open_reader(owner_id, "big").await.unwrap();
+        let blob: String = db2
+            .conn()
+            .query_row("SELECT blob FROM t WHERE id=5", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(blob.len(), 3000, "correct row read");
+        let fetched = src.count.load(Relaxed);
+        assert!(
+            fetched < total,
+            "lazy read fetched {fetched} of {total} objects (should be a subset)"
         );
     }
 }
