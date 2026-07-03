@@ -273,14 +273,23 @@ impl CraftSql {
                 0
             }
         };
-        let conn = rusqlite::Connection::open_with_flags_and_vfs(
-            key.as_str(),
-            rusqlite::OpenFlags::default(),
-            &self.vfs_name,
-        )
+        // Opening (and its PRAGMA read) can trigger lazy page fetches that block
+        // on the sync→async bridge, so run the blocking SQLite work on a blocking
+        // thread — never a runtime worker (else the fetcher task can't progress).
+        let vfs_name = self.vfs_name.clone();
+        let key_c = key.clone();
+        let conn = tokio::task::spawn_blocking(move || {
+            let conn = rusqlite::Connection::open_with_flags_and_vfs(
+                key_c.as_str(),
+                rusqlite::OpenFlags::default(),
+                &vfs_name,
+            )?;
+            conn.execute_batch("PRAGMA page_size=16384; PRAGMA synchronous=FULL;")?;
+            Ok::<_, rusqlite::Error>(conn)
+        })
+        .await
+        .map_err(|e| SqlError::Sqlite(format!("open task: {e}")))?
         .map_err(|e| SqlError::Sqlite(e.to_string()))?;
-        conn.execute_batch("PRAGMA page_size=16384; PRAGMA synchronous=FULL;")
-            .map_err(|e| SqlError::Sqlite(e.to_string()))?;
         Ok(CraftDb {
             conn,
             roots: self.roots.clone(),

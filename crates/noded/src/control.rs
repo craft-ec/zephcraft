@@ -520,9 +520,13 @@ async fn rpc_sql_query(
         Ok(d) => d,
         Err(e) => return rpc_err(id, format!("open_reader failed: {e}")),
     };
-    match db.query(sql) {
-        Ok(v) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": v}),
-        Err(e) => rpc_err(id, format!("query failed: {e}")),
+    // Run the query off the async workers — a lazy read blocks on the sync→async
+    // fetch bridge, which must not hold a runtime worker.
+    let sql = sql.to_string();
+    match tokio::task::spawn_blocking(move || db.query(&sql)).await {
+        Ok(Ok(v)) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": v}),
+        Ok(Err(e)) => rpc_err(id, format!("query failed: {e}")),
+        Err(e) => rpc_err(id, format!("query task: {e}")),
     }
 }
 
