@@ -68,6 +68,9 @@ struct CidState {
     gen: Generation,
     piece_ids: HashSet<[u8; 32]>,
     pinned: bool,
+    /// System object (a CraftSQL page generation): managed by the DB layer, not
+    /// the user — excluded from user pin/unpin/delete/want and from eviction.
+    system: bool,
     has_content: bool,
     last_access: u64,
 }
@@ -186,12 +189,14 @@ impl Store {
                 }
                 let has_content = dir.join("content").exists();
                 let pinned = dir.join("pinned").exists();
+                let system = dir.join("system").exists();
                 index.insert(
                     cid,
                     CidState {
                         gen,
                         piece_ids,
                         pinned,
+                        system,
                         has_content,
                         last_access: now(),
                     },
@@ -221,6 +226,7 @@ impl Store {
             gen,
             piece_ids: HashSet::new(),
             pinned: false,
+            system: false,
             has_content: false,
             last_access: now(),
         });
@@ -308,6 +314,34 @@ impl Store {
             .expect("index")
             .get(cid)
             .is_some_and(|s| s.pinned)
+    }
+
+    /// Mark a CID as a system object (a CraftSQL generation) — DB-managed,
+    /// exempt from user lifecycle commands and from eviction.
+    pub fn mark_system(&self, cid: &Cid) -> Result<()> {
+        write_atomic(&self.cid_dir(cid).join("system"), b"")?;
+        if let Some(state) = self.index.lock().expect("index").get_mut(cid) {
+            state.system = true;
+        }
+        Ok(())
+    }
+
+    /// Release a system object back to the normal lifecycle (compaction dropping
+    /// a superseded generation). Removes the exemption so it can fade/evict.
+    pub fn unmark_system(&self, cid: &Cid) -> Result<()> {
+        let _ = fs::remove_file(self.cid_dir(cid).join("system"));
+        if let Some(state) = self.index.lock().expect("index").get_mut(cid) {
+            state.system = false;
+        }
+        Ok(())
+    }
+
+    pub fn is_system(&self, cid: &Cid) -> bool {
+        self.index
+            .lock()
+            .expect("index")
+            .get(cid)
+            .is_some_and(|s| s.system)
     }
 
     /// Whether we hold the whole content for a CID (pin or seed cache) —
@@ -522,7 +556,7 @@ impl Store {
             }
             let mut candidates: Vec<(u64, u64, Cid)> = index
                 .iter()
-                .filter(|(_, s)| !s.pinned)
+                .filter(|(_, s)| !s.pinned && !s.system)
                 .map(|(cid, s)| (s.last_access, s.bytes(), *cid))
                 .collect();
             candidates.sort_by_key(|(access, _, _)| *access); // oldest first

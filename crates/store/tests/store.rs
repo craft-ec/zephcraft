@@ -125,6 +125,53 @@ fn eviction_skips_pins() {
 }
 
 #[test]
+fn system_objects_survive_eviction_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rng = StdRng::seed_from_u64(7);
+
+    let mut sys_cid = None;
+    {
+        let store = Store::open(dir.path()).unwrap();
+        for i in 0..4 {
+            let content: Vec<u8> = (0..K * PIECE_LEN).map(|_| rng.gen()).collect();
+            let cid = Cid::of(&content);
+            let (gen, sources) = generation(&content, &mut rng);
+            store.put_generation(cid, gen).unwrap();
+            for piece in encode_n(&sources, 4, &mut rng).unwrap() {
+                store.put_piece(cid, &piece).unwrap();
+            }
+            if i == 1 {
+                // A CraftSQL generation: pinned + marked system.
+                store.pin(cid, &content).unwrap();
+                store.mark_system(&cid).unwrap();
+                sys_cid = Some(cid);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let sys = sys_cid.unwrap();
+        assert!(store.is_system(&sys));
+
+        // Eviction never touches a system object.
+        store.evict_to(0).unwrap();
+        assert!(store.is_system(&sys), "system object survives eviction");
+    }
+
+    let sys = sys_cid.unwrap();
+    // The system marker persists across reopen.
+    let store = Store::open(dir.path()).unwrap();
+    assert!(store.is_system(&sys), "system marker survives reopen");
+
+    // Releasing it (compaction) returns it to the normal lifecycle → evictable.
+    store.unmark_system(&sys).unwrap();
+    store.unpin(&sys).unwrap();
+    store.evict_to(0).unwrap();
+    assert!(
+        !store.cids().contains(&sys),
+        "released system object is now evictable"
+    );
+}
+
+#[test]
 fn tombstone_blocks_resurrection() {
     let dir = tempfile::tempdir().unwrap();
     let mut rng = StdRng::seed_from_u64(4);

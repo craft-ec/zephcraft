@@ -786,6 +786,9 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
             let banned: std::collections::HashSet<_> =
                 content_store.tombstoned_cids().into_iter().collect();
             locals.extend(banned.iter().copied());
+            // CraftSQL page generations are DB-internal, not user content — keep
+            // them out of the content list (they're managed by the DB layer).
+            locals.retain(|cid| !content_store.is_system(cid));
             for cid in locals {
                 let hex = cid.to_hex();
                 let e = map

@@ -112,12 +112,10 @@ impl ObjDurable {
 #[async_trait::async_trait]
 impl DurableStore for ObjDurable {
     async fn put_generation(&self, blob: Vec<u8>) -> Result<Cid> {
-        let report = self
-            .engine
-            .publish(&blob, true)
+        self.engine
+            .publish_system(&blob)
             .await
-            .map_err(|e| SqlError::Sqlite(format!("publish generation: {e}")))?;
-        Ok(report.cid)
+            .map_err(|e| SqlError::Sqlite(format!("publish generation: {e}")))
     }
 
     async fn get_generation(&self, cid: Cid) -> Result<Option<Vec<u8>>> {
@@ -126,8 +124,8 @@ impl DurableStore for ObjDurable {
 
     async fn drop_generation(&self, cid: Cid) -> Result<()> {
         self.engine
-            .unpin(cid)
+            .release_system(cid)
             .await
-            .map_err(|e| SqlError::Sqlite(format!("unpin generation: {e}")))
+            .map_err(|e| SqlError::Sqlite(format!("release generation: {e}")))
     }
 }

@@ -598,6 +598,7 @@ impl ObjEngine {
     /// Pin a CID: ensure we hold the whole content (fetch if needed), store
     /// it eviction-exempt, and announce as a pinned provider.
     pub async fn pin(&self, cid: Cid) -> anyhow::Result<()> {
+        guard_not_system(&self.store, &cid)?;
         let content = match self.store.content(&cid) {
             Some(c) if cid.verifies(&c) => c,
             _ => self.get(cid, ConsumeMode::Drop).await?,
@@ -610,6 +611,24 @@ impl ObjEngine {
 
     /// Unpin a CID: revert to the normal (evictable) lifecycle.
     pub async fn unpin(&self, cid: Cid) -> anyhow::Result<()> {
+        guard_not_system(&self.store, &cid)?;
+        self.store.unpin(&cid)?;
+        Ok(())
+    }
+
+    /// Publish a CraftSQL page generation as a SYSTEM object — erasure-coded +
+    /// distributed + repaired like content, but marked DB-managed so it's exempt
+    /// from user pin/unpin/delete/want and from eviction. Returns its CID.
+    pub async fn publish_system(&self, data: &[u8]) -> anyhow::Result<Cid> {
+        let report = self.publish(data, true).await?;
+        self.store.mark_system(&report.cid)?;
+        Ok(report.cid)
+    }
+
+    /// Release a system object back to the normal lifecycle (compaction dropping
+    /// a superseded generation) — clears the DB exemption + pin so it can fade.
+    pub async fn release_system(&self, cid: Cid) -> anyhow::Result<()> {
+        self.store.unmark_system(&cid)?;
         self.store.unpin(&cid)?;
         Ok(())
     }
@@ -618,6 +637,7 @@ impl ObjEngine {
     /// it (the demand-independent survival signal; gates Fade). Local intent is
     /// persisted so it survives restart and is re-announced.
     pub async fn want(&self, cid: Cid) -> anyhow::Result<()> {
+        guard_not_system(&self.store, &cid)?;
         self.store.set_want(cid)?;
         self.store.clear_cooldown(&cid); // manual want overrides eviction cooldown
         let _ = self.routing.announce_want(cid).await;
@@ -643,6 +663,7 @@ impl ObjEngine {
     /// withdraw the provider record. (Signed network-wide DELETE propagation
     /// is a later obj sub-item.)
     pub async fn delete_local(&self, cid: Cid) -> anyhow::Result<()> {
+        guard_not_system(&self.store, &cid)?;
         self.store.tombstone(cid)?;
         let _ = self.routing.withdraw(cid).await;
         Ok(())
@@ -1215,6 +1236,16 @@ impl ObjEngine {
             reason: String::new(),
         }
     }
+}
+
+/// Refuse a user lifecycle operation on a CraftSQL system object (DB generation).
+fn guard_not_system(store: &Store, cid: &Cid) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !store.is_system(cid),
+        "cid {} is a CraftSQL system object (DB-managed; not user-controllable)",
+        cid.to_hex()
+    );
+    Ok(())
 }
 
 fn decoder_k(tags: &vtags::VTags) -> u32 {
