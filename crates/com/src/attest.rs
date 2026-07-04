@@ -201,6 +201,82 @@ pub fn verify_quorum(
         .map(|(out, _)| out)
 }
 
+// ---- phase 2: program-derived accounts + attested head authority ----
+
+/// Domain tag for deriving a program-derived account identity.
+const PDA_DOMAIN: &[u8] = b"craftec/pda/v1";
+
+/// Derive a **program-derived account (PDA)** identity from a program (+ seed). No
+/// private key exists for it; its state is authorized ONLY by an attestation quorum
+/// over `program_cid` (ATTESTATION_DESIGN §3). Deterministic + collision-resistant, so
+/// anyone can compute the account for a program and no one can sign for it directly.
+pub fn pda(program_cid: &[u8; 32], seed: &[u8]) -> NodeId {
+    let mut b = Vec::with_capacity(PDA_DOMAIN.len() + 32 + seed.len());
+    b.extend_from_slice(PDA_DOMAIN);
+    b.extend_from_slice(program_cid);
+    b.extend_from_slice(seed);
+    NodeId(Cid::of(&b).0)
+}
+
+/// An authorized advance of a PDA account's head: the account's program, run on
+/// `(prev_root, request)`, deterministically produced `new_root`, attested by a
+/// quorum. This is the *attested authority type* for a `KIND_ROOT`/`KIND_APP` head
+/// (foundation §62 A2) — it replaces the single owner signature for a PDA account.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AttestedCommit {
+    pub program_cid: [u8; 32],
+    pub seed: Vec<u8>,
+    pub prev_root: [u8; 32],
+    pub request: Vec<u8>,
+    pub new_root: [u8; 32],
+    pub attestations: Vec<Attestation>,
+}
+
+impl AttestedCommit {
+    /// The account this commit advances (unverified \u2014 call [`verify_commit`]).
+    pub fn account(&self) -> NodeId {
+        pda(&self.program_cid, &self.seed)
+    }
+}
+
+/// A verified head advance: which account moves, and from/to which root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PdaAdvance {
+    pub account: NodeId,
+    pub prev_root: [u8; 32],
+    pub new_root: [u8; 32],
+}
+
+/// Verify that an [`AttestedCommit`] legitimately advances its PDA account's head.
+/// Returns the account + transition IFF a k-of-n quorum of `agent_set` attested that
+/// the account's program, run on `(prev_root, request)`, produced EXACTLY `new_root`.
+/// Rejects a sub-quorum, forged/out-of-set attestations, or a `new_root` the quorum
+/// never attested (so a coordinator can't staple a false result onto real signatures).
+pub fn verify_commit(
+    commit: &AttestedCommit,
+    agent_set: &[[u8; 32]],
+    k: usize,
+) -> Option<PdaAdvance> {
+    let request_hash = Cid::of(&commit.request).0;
+    let agreed = verify_quorum(
+        &commit.attestations,
+        &commit.program_cid,
+        &commit.prev_root,
+        &request_hash,
+        agent_set,
+        k,
+    )?;
+    // The quorum must have attested EXACTLY the claimed new head.
+    if agreed != commit.new_root {
+        return None;
+    }
+    Some(PdaAdvance {
+        account: pda(&commit.program_cid, &commit.seed),
+        prev_root: commit.prev_root,
+        new_root: commit.new_root,
+    })
+}
+
 /// The agent's exported linear memory, if present.
 fn det_memory(caller: &mut Caller<'_, AttestCtx>) -> Option<Memory> {
     match caller.get_export("memory") {
@@ -474,5 +550,105 @@ mod tests {
         let mut bad = a_in;
         bad.signature[0] ^= 0xFF;
         assert!(!verify(&bad));
+    }
+
+    // ---- phase 2: PDA accounts + attested head authority ----
+
+    fn commit_for(
+        rt: &AttestedRuntime,
+        program_cid: [u8; 32],
+        seed: &[u8],
+        prev: [u8; 32],
+        request: &[u8],
+        signers: &[NodeIdentity],
+    ) -> AttestedCommit {
+        let attestations: Vec<Attestation> = signers
+            .iter()
+            .map(|id| {
+                attest_run(
+                    id,
+                    rt,
+                    DOUBLE_WAT,
+                    "run",
+                    program_cid,
+                    prev,
+                    request,
+                    DEFAULT_FUEL,
+                )
+                .unwrap()
+                .0
+            })
+            .collect();
+        let new_root = attestations[0].output_root;
+        AttestedCommit {
+            program_cid,
+            seed: seed.to_vec(),
+            prev_root: prev,
+            request: request.to_vec(),
+            new_root,
+            attestations,
+        }
+    }
+
+    #[test]
+    fn pda_is_deterministic_program_and_seed_bound() {
+        let p1 = Cid::of(b"prog-a").0;
+        let p2 = Cid::of(b"prog-b").0;
+        assert_eq!(pda(&p1, b"s"), pda(&p1, b"s"), "stable");
+        assert_ne!(pda(&p1, b"s"), pda(&p2, b"s"), "program-bound");
+        assert_ne!(pda(&p1, b"s"), pda(&p1, b"t"), "seed-bound");
+    }
+
+    #[test]
+    fn attested_commit_advances_the_pda_account() {
+        let rt = AttestedRuntime::new().unwrap();
+        let program_cid = Cid::of(DOUBLE_WAT).0;
+        let ids = agents(3);
+        let n = set(&ids);
+        let commit = commit_for(&rt, program_cid, b"registry", [0u8; 32], &[10u8], &ids);
+        let adv = verify_commit(&commit, &n, 2).expect("a k=2 quorum advances the account");
+        assert_eq!(adv.account, pda(&program_cid, b"registry"));
+        assert_eq!(adv.prev_root, [0u8; 32]);
+        assert_eq!(adv.new_root, Cid::of(&[10u8, 20]).0);
+        assert_eq!(adv.account, commit.account());
+    }
+
+    #[test]
+    fn sub_quorum_commit_does_not_advance() {
+        let rt = AttestedRuntime::new().unwrap();
+        let program_cid = Cid::of(DOUBLE_WAT).0;
+        let ids = agents(3);
+        let n = set(&ids);
+        let commit = commit_for(&rt, program_cid, b"registry", [0u8; 32], &[10u8], &ids);
+        assert!(
+            verify_commit(&commit, &n, 4).is_none(),
+            "3 attestations cannot meet k=4"
+        );
+    }
+
+    #[test]
+    fn stapled_false_new_root_is_rejected() {
+        // A coordinator keeps real signatures but claims a new_root the quorum never
+        // attested — must be rejected (the quorum agreed on a different output).
+        let rt = AttestedRuntime::new().unwrap();
+        let program_cid = Cid::of(DOUBLE_WAT).0;
+        let ids = agents(3);
+        let n = set(&ids);
+        let mut commit = commit_for(&rt, program_cid, b"registry", [0u8; 32], &[10u8], &ids);
+        commit.new_root = Cid::of(b"a-lie").0;
+        assert!(verify_commit(&commit, &n, 2).is_none());
+    }
+
+    #[test]
+    fn out_of_set_agents_cannot_advance() {
+        let rt = AttestedRuntime::new().unwrap();
+        let program_cid = Cid::of(DOUBLE_WAT).0;
+        let signers = agents(3);
+        let commit = commit_for(&rt, program_cid, b"registry", [0u8; 32], &[10u8], &signers);
+        let strangers = set(&agents(3)); // a totally different set
+        assert!(
+            verify_commit(&commit, &strangers, 2).is_none(),
+            "attestations from outside the agent set do not count"
+        );
     }
 }
