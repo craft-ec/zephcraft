@@ -972,88 +972,48 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // Poll the tracker for the network's content list + overlay THIS node's
     // relationship (held pieces / pin / want / floor) for the dashboard.
     let content_state = state.clone();
-    let content_routing = routing.clone();
     let content_store = store.clone();
     tokio::spawn(async move {
-        use std::collections::HashMap;
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         loop {
             interval.tick().await;
-            let mut map: HashMap<String, control::ContentInfo> = HashMap::new();
-            if let Ok(list) = content_routing.content().await {
-                for c in list.into_iter().take(200) {
-                    let hex = c.cid.to_hex();
-                    // Default view: earliest publisher (min published_at).
-                    let canonical = c.metas.iter().min_by_key(|m| m.published_at);
-                    let published_at = canonical.map(|m| m.published_at);
-                    let publisher = canonical.map(|m| ::hex::encode(m.publisher.0));
-                    let comment = canonical.and_then(|m| m.comment.clone());
-                    map.insert(
-                        hex.clone(),
-                        control::ContentInfo {
-                            cid: hex,
-                            providers: c.providers,
-                            pinned: c.pinned,
-                            pieces: c.pieces,
-                            wants: c.wants,
-                            k: 0,
-                            floor: 0,
-                            local_pieces: 0,
-                            local_pinned: false,
-                            local_wanted: false,
-                            local_tombstoned: false,
-                            name: None,
-                            size: 0,
-                            is_dir: false,
-                            published_at,
-                            publisher,
-                            comment,
-                        },
-                    );
-                }
-            }
-            // Overlay local relationship (holdings + wants always show).
+            // A DHT has no global enumeration: the content list is LOCAL knowledge
+            // only — cids we hold, want, or have banned. New cids enter it by
+            // fetch/pin/want (discover-by-cid), never by listing the network.
+            let banned: std::collections::HashSet<_> =
+                content_store.tombstoned_cids().into_iter().collect();
             let mut locals: std::collections::HashSet<_> =
                 content_store.cids().into_iter().collect();
             locals.extend(content_store.wanted_cids());
-            let banned: std::collections::HashSet<_> =
-                content_store.tombstoned_cids().into_iter().collect();
             locals.extend(banned.iter().copied());
-            // CraftSQL page generations are DB-internal, not user content — keep
-            // them out of the content list (they're managed by the DB layer).
+            // CraftSQL page generations are DB-internal, not user content.
             locals.retain(|cid| !content_store.is_system(cid));
+            let mut out = Vec::new();
             for cid in locals {
-                let hex = cid.to_hex();
-                let e = map
-                    .entry(hex.clone())
-                    .or_insert_with(|| control::ContentInfo {
-                        cid: hex,
-                        providers: 0,
-                        pinned: 0,
-                        pieces: 0,
-                        wants: 0,
-                        k: 0,
-                        floor: 0,
-                        local_pieces: 0,
-                        local_pinned: false,
-                        local_wanted: false,
-                        local_tombstoned: false,
-                        name: None,
-                        size: 0,
-                        is_dir: false,
-                        published_at: None,
-                        publisher: None,
-                        comment: None,
-                    });
-                e.local_pieces = content_store.piece_count(&cid);
-                e.local_pinned = content_store.is_pinned(&cid);
-                e.local_wanted = content_store.is_wanted(&cid);
-                e.local_tombstoned = banned.contains(&cid);
+                let mut e = control::ContentInfo {
+                    cid: cid.to_hex(),
+                    providers: 0,
+                    pinned: 0,
+                    pieces: 0,
+                    wants: 0,
+                    k: 0,
+                    floor: 0,
+                    local_pieces: content_store.piece_count(&cid),
+                    local_pinned: content_store.is_pinned(&cid),
+                    local_wanted: content_store.is_wanted(&cid),
+                    local_tombstoned: banned.contains(&cid),
+                    name: None,
+                    size: 0,
+                    is_dir: false,
+                    published_at: None,
+                    publisher: None,
+                    comment: None,
+                };
                 if let Some(gen) = content_store.generation(&cid) {
                     e.k = gen.k as usize;
                     e.floor = zeph_obj::floor_for_k(gen.k as usize);
-                    // Small enough to be a manifest? Decode it locally (cheap)
-                    // so files/folders show by name, not by hash.
+                    // Small enough to be a manifest? Decode it locally so
+                    // files/folders show by name, not by hash.
                     if gen.total_len <= 64 * 1024 {
                         if let Some(m) = content_store
                             .content(&cid)
@@ -1065,8 +1025,9 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                         }
                     }
                 }
+                out.push(e);
             }
-            content_state.set_content(map.into_values().collect()).await;
+            content_state.set_content(out).await;
         }
     });
 

@@ -124,7 +124,7 @@
     <div id="drive"><div class="muted">loading…</div></div>
   </div>
   <div class="card">
-    <div class="cardhead">content <span class="muted">(this node + network · pin to serve · want to keep alive · fetch to consume)</span></div>
+    <div class="cardhead">content you know <span class="muted">(cids you hold, want, or fetched — not a network listing · pin to serve · want to keep alive)</span></div>
     <div class="cidbar">
       <input id="cidin" class="cidin" placeholder="paste a 64-hex cid…" spellcheck="false">
       <button class="btn" onclick="act('fetch', $('cidin').value)">fetch</button>
@@ -287,6 +287,7 @@ async function tick(){
 function renderDrive(v){
   const el = $("drive");
   const rows = (v && v.rows) || [];
+  window.driveCids = new Set(rows.map(r => r[0]));
   if(!rows.length){
     el.innerHTML = '<div class="muted">no files yet — publish with <span class="mono">zeph publish &lt;path&gt;</span></div>';
     return;
@@ -371,16 +372,11 @@ function relChip(c){
 function citem(c){
   const held = c.local_pieces>0 || c.local_pinned;
   const icon = c.name ? (c.is_dir?"📁":"📄") : "🔗";
-  const title = c.name ? esc(c.name) : `<span class="mono">${c.cid.slice(0,18)}…</span>`;
+  const title = c.name ? esc(c.name) : `<span class="mono">${c.cid.slice(0,20)}…</span>`;
 
-  const bits = [];
-  bits.push(`<span class="cidcell mono" title="click to copy the full cid" onclick="copyCid('${c.cid}')">${c.cid.slice(0,10)}…</span>`);
+  const bits = [`<span class="cidcell mono" title="click to copy the full cid" onclick="copyCid('${c.cid}')">${c.cid.slice(0,12)}…</span>`];
   if(c.size) bits.push(fmtSize(c.size));
-  if(c.published_at) bits.push(`<span class="tstamp">${fmtAgoMs(c.published_at)}</span>`);
-  if(c.publisher) bits.push(`by ${c.publisher.slice(0,8)}`);
-  bits.push(`${c.providers} prov${c.wants?" · "+c.wants+" want":""}`);
-  if(c.local_pieces>0 && !c.local_pinned) bits.push(`${c.local_pieces} pcs here`);
-  if(c.comment) bits.push(`<span class="cnote">💬 ${esc(c.comment)}</span>`);
+  if(c.local_pieces>0 && !c.local_pinned) bits.push(`${c.local_pieces} pcs held`);
 
   let acts;
   if(c.local_tombstoned){
@@ -388,26 +384,27 @@ function citem(c){
   } else {
     const pin = `<button class="btn ${c.local_pinned?'on':''}" onclick="act('${c.local_pinned?'unpin':'pin'}','${c.cid}')">${c.local_pinned?'pinned':'pin'}</button>`;
     const want = `<button class="btn ${c.local_wanted?'on':''}" onclick="act('${c.local_wanted?'unwant':'want'}','${c.cid}')">${c.local_wanted?'wanted':'want'}</button>`;
-    const fetchb = held ? '' : `<button class="btn" onclick="act('fetch','${c.cid}')">fetch</button>`;
-    const note = held ? `<button class="btn" title="edit metadata envelope" onclick="setmeta('${c.cid}')">note</button>` : '';
-    const ban = held ? `<button class="btn" title="tombstone: refuse to host + block resurrection (moderation)" onclick="if(confirm('ban this cid on this node? refuses to host + blocks resurrection.'))act('ban','${c.cid}')">ban</button>` : '';
-    acts = `${pin} ${want} ${fetchb} ${note} ${ban}`;
+    const note = held ? `<button class="btn" title="edit note (metadata)" onclick="setmeta('${c.cid}')">note</button>` : '';
+    const ban = held ? `<button class="btn" title="tombstone: refuse to host + block resurrection" onclick="if(confirm('ban this cid on this node? refuses to host + blocks resurrection.'))act('ban','${c.cid}')">ban</button>` : '';
+    acts = `${pin} ${want} ${note} ${ban}`;
   }
   return `<div class="citem">
     <div class="cicon">${icon}</div>
     <div class="cbody">
-      <div class="crow1"><span class="ctitle">${title}</span> ${relChip(c)} ${badge(c)}</div>
+      <div class="crow1"><span class="ctitle">${title}</span> ${relChip(c)}</div>
       <div class="cmeta muted">${bits.join(" · ")}</div>
     </div>
     <div class="cacts">${acts}</div>
   </div>`;
 }
 function renderContent(s){
-  const el = $("content-groups"); const cs = s.content || [];
-  if(!cs.length){ el.innerHTML = '<div class="muted">no content yet — publish a file or fetch a cid</div>'; return; }
-  // Default sort: newest first (by published_at), undated last, then by reach.
-  const sorted = [...cs].sort((a,b) =>
-    (b.published_at||0) - (a.published_at||0) || (b.providers||0) - (a.providers||0));
+  const el = $("content-groups");
+  // Exclude your own files (they're in My Drive) — this list is OTHER content you
+  // know: cids you hold, want, or fetched.
+  const drive = window.driveCids || new Set();
+  const cs = (s.content || []).filter(c => !drive.has(c.cid));
+  if(!cs.length){ el.innerHTML = '<div class="muted">nothing tracked — fetch or want a cid to add it (your own files are in My Drive)</div>'; return; }
+  const sorted = [...cs].sort((a,b) => (b.local_pieces||0) - (a.local_pieces||0));
   el.innerHTML = sorted.map(citem).join("");
 }
 function showTab(name){
