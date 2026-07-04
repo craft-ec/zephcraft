@@ -120,6 +120,7 @@ async fn agent_writes_persist_to_craftsql_and_reload() {
         caller: [0u8; 32],
         app_ns: "feed".into(),
         backend: backend.clone(),
+        input: Vec::new(),
     };
     let out = rt.invoke(wasm, "run", ctx, DEFAULT_FUEL).await.unwrap();
     assert!(

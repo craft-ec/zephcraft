@@ -88,6 +88,9 @@ enum Command {
         wasm: String,
         #[arg(long, default_value = "run")]
         func: String,
+        /// Optional input passed to the agent (UTF-8 bytes, via the `input` host fn).
+        #[arg(long)]
+        input: Option<String>,
     },
     /// Execute write SQL against your own CraftSQL database `ns`
     /// (commits + publishes the KIND_ROOT head).
@@ -279,9 +282,12 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Unwant { cid }) => cmd_cid_op(&data_dir, "unwant", &cid).await,
         Some(Command::Delete { cid }) => cmd_cid_op(&data_dir, "delete", &cid).await,
         Some(Command::Ban { cid }) => cmd_cid_op(&data_dir, "ban", &cid).await,
-        Some(Command::Invoke { app, wasm, func }) => {
-            cmd_invoke(&data_dir, &app, &wasm, &func).await
-        }
+        Some(Command::Invoke {
+            app,
+            wasm,
+            func,
+            input,
+        }) => cmd_invoke(&data_dir, &app, &wasm, &func, input.as_deref()).await,
         Some(Command::SqlExec { ns, sql }) => cmd_sql_exec(&data_dir, &ns, &sql).await,
         Some(Command::SqlQuery { ns, sql, owner }) => {
             cmd_sql_query(&data_dir, owner.as_deref(), &ns, &sql).await
@@ -367,8 +373,14 @@ async fn cmd_cid_op(data_dir: &Path, op: &str, cid: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
-async fn cmd_invoke(data_dir: &Path, app: &str, wasm: &str, func: &str) -> anyhow::Result<()> {
-    let params = serde_json::json!({"app_ns": app, "wasm_cid": wasm, "func": func});
+async fn cmd_invoke(
+    data_dir: &Path,
+    app: &str,
+    wasm: &str,
+    func: &str,
+    input: Option<&str>,
+) -> anyhow::Result<()> {
+    let params = serde_json::json!({"app_ns": app, "wasm_cid": wasm, "func": func, "input": input});
     let res = control::query_unix_params(&data_dir.join("zeph.sock"), "invoke", params).await?;
     let value = res.get("value").and_then(|v| v.as_i64()).unwrap_or(-1);
     let fuel = res.get("fuel_used").and_then(|v| v.as_u64()).unwrap_or(0);

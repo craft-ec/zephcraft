@@ -157,6 +157,7 @@ async fn node_b_invokes_an_app_on_node_a_as_a_distinct_identity() {
         app_ns: "guestbook".into(),
         wasm_cid,
         func: "run".into(),
+        input: Vec::new(),
     };
     let host_addr: PeerAddr = host.transport.addr();
     let result = invoke_remote(&caller.transport, &host_addr, &req)

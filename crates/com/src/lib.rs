@@ -66,7 +66,8 @@ pub trait AppBackend: Send + Sync {
 }
 
 /// Per-invocation host context in the Wasmtime `Store`: who invoked the agent, the
-/// app namespace it is confined to, and the substrate it acts on.
+/// app namespace it is confined to, the substrate it acts on, and the invocation's
+/// input bytes.
 pub struct HostCtx {
     /// The verified NodeId that invoked this agent (exposed via `caller`).
     pub caller: [u8; 32],
@@ -74,6 +75,9 @@ pub struct HostCtx {
     pub app_ns: String,
     /// The identity-bound substrate the host functions call.
     pub backend: Arc<dyn AppBackend>,
+    /// Opaque input bytes for this invocation (exposed via `input`) — e.g. a post
+    /// body, or the participant list for an aggregation.
+    pub input: Vec<u8>,
 }
 
 impl HostCtx {
@@ -84,6 +88,7 @@ impl HostCtx {
             caller: [0u8; 32],
             app_ns: String::new(),
             backend: Arc::new(Noop),
+            input: Vec::new(),
         }
     }
 }
@@ -167,6 +172,20 @@ fn bind_host_functions(linker: &mut Linker<HostCtx>) -> anyhow::Result<()> {
                     return -1i32;
                 };
                 write_out(&mut caller, &mem, out, cap, &id)
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        HOST_MODULE,
+        "input",
+        |mut caller: Caller<'_, HostCtx>, (out, cap): (i32, i32)| {
+            Box::new(async move {
+                let input = caller.data().input.clone();
+                let Some(mem) = memory(&mut caller) else {
+                    return -1i32;
+                };
+                write_out(&mut caller, &mem, out, cap, &input)
             })
         },
     )?;
@@ -415,6 +434,7 @@ mod tests {
             caller,
             app_ns: app_ns.into(),
             backend,
+            input: Vec::new(),
         }
     }
 

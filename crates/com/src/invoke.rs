@@ -22,11 +22,14 @@ use crate::{AppBackend, HostCtx, Outcome, Runtime, DEFAULT_FUEL};
 pub const INVOKE_ALPN: &[u8] = b"/craftec/invoke/1";
 
 /// An invocation request: which app namespace, which WASM (by CID), which export.
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 pub struct InvokeRequest {
     pub app_ns: String,
     pub wasm_cid: [u8; 32],
     pub func: String,
+    /// Opaque input bytes passed to the agent (via the `input` host fn).
+    #[serde(default)]
+    pub input: Vec<u8>,
 }
 
 /// Runs app invocations on THIS node: loads the WASM by CID from CraftOBJ and runs
@@ -62,6 +65,7 @@ impl InvokeService {
             caller,
             app_ns: req.app_ns.clone(),
             backend: self.backend.clone(),
+            input: req.input.clone(),
         };
         self.runtime
             .invoke(&wasm, &req.func, ctx, DEFAULT_FUEL)

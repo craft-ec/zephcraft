@@ -939,10 +939,16 @@ async fn rpc_invoke(
         Some(n) => n.0,
         None => return rpc_err(id, "self node id unparseable".into()),
     };
+    let input = p
+        .get("input")
+        .and_then(|v| v.as_str())
+        .map(|s| s.as_bytes().to_vec())
+        .unwrap_or_default();
     let ireq = zeph_com::InvokeRequest {
         app_ns: app_ns.to_string(),
         wasm_cid: cid.0,
         func: func.to_string(),
+        input,
     };
     match state.com.invoke(&ireq, caller).await {
         Ok(out) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
