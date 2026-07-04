@@ -65,9 +65,24 @@ async fn main() -> anyhow::Result<()> {
         .await?,
     );
 
-    let registry = Arc::new(Registry::new(RegistryConfig::default()));
+    // Persistent registry: durable heads (roots/manifests/app names) survive
+    // restart via a snapshot file; ephemeral records re-announce.
+    let registry = Arc::new(Registry::persistent(
+        RegistryConfig::default(),
+        data_dir.join("registry.snapshot"),
+    ));
     tracing::info!(node_id = %identity.node_id().to_hex(), "tracker started");
     println!("TRACKER_ADDR {}", transport.addr());
+
+    // Periodically flush changed durable heads to disk (bounds write frequency).
+    let flush_reg = registry.clone();
+    tokio::spawn(async move {
+        let mut iv = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            iv.tick().await;
+            flush_reg.flush();
+        }
+    });
 
     if cli.dashboard_port != 0 {
         let token = dashboard::load_or_create_token(&data_dir)?;
@@ -96,6 +111,31 @@ async fn main() -> anyhow::Result<()> {
             .serve(vec![(zeph_routing::ALPN.to_vec(), tx)])
             .await
     });
-    serve(registry, transport.clone(), rx).await;
+    let serve_reg = registry.clone();
+    let serve_tp = transport.clone();
+    tokio::spawn(async move { serve(serve_reg, serve_tp, rx).await });
+
+    // Flush the durable heads on shutdown (SIGINT/SIGTERM) so a graceful restart
+    // loses nothing.
+    shutdown_signal().await;
+    tracing::info!("shutting down — flushing registry");
+    registry.flush();
     Ok(())
+}
+
+/// Resolve when the process receives SIGINT (Ctrl-C) or SIGTERM (systemctl stop).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }

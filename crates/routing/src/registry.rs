@@ -119,6 +119,11 @@ struct Tables {
 pub struct Registry {
     cfg: RegistryConfig,
     tables: Mutex<Tables>,
+    /// Snapshot file for the durable single-writer heads (roots/manifests/apps),
+    /// so they survive a tracker restart. None = in-memory only.
+    persist_path: Option<std::path::PathBuf>,
+    /// A durable head changed since the last flush.
+    dirty: std::sync::atomic::AtomicBool,
 }
 
 impl Registry {
@@ -126,6 +131,63 @@ impl Registry {
         Self {
             cfg,
             tables: Mutex::new(Tables::default()),
+            persist_path: None,
+            dirty: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// A registry backed by a snapshot file: the durable single-writer heads
+    /// (roots, manifests, app names) are reloaded on start and flushed on change,
+    /// so they don't vanish when the tracker restarts. Ephemeral records
+    /// (providers/nodes/relays/wants/metas) are re-announced by their owners.
+    pub fn persistent(cfg: RegistryConfig, path: std::path::PathBuf) -> Self {
+        let reg = Self {
+            cfg,
+            tables: Mutex::new(Tables::default()),
+            persist_path: Some(path.clone()),
+            dirty: std::sync::atomic::AtomicBool::new(false),
+        };
+        if let Ok(bytes) = std::fs::read(&path) {
+            if let Ok(recs) = postcard::from_bytes::<Vec<SignedRecord>>(&bytes) {
+                let n = recs.len();
+                for r in recs {
+                    let _ = reg.announce(r);
+                }
+                tracing::info!(records = n, "tracker registry restored from snapshot");
+            }
+        }
+        reg.dirty
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        reg
+    }
+
+    /// The durable single-writer heads (roots, manifests, app names).
+    fn durable_records(&self) -> Vec<SignedRecord> {
+        let t = self.tables.lock().expect("registry lock");
+        t.roots
+            .values()
+            .chain(t.manifests.values())
+            .chain(t.apps.values())
+            .map(|e| e.record.clone())
+            .collect()
+    }
+
+    /// Flush the durable heads to the snapshot file if any changed (atomic write).
+    pub fn flush(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.dirty.load(Relaxed) {
+            return;
+        }
+        let Some(path) = &self.persist_path else {
+            self.dirty.store(false, Relaxed);
+            return;
+        };
+        let recs = self.durable_records();
+        if let Ok(bytes) = postcard::to_allocvec(&recs) {
+            let tmp = path.with_extension("tmp");
+            if std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, path).is_ok() {
+                self.dirty.store(false, Relaxed);
+            }
         }
     }
 
@@ -135,6 +197,7 @@ impl Registry {
         if !records::verify(&record) {
             return Err("bad-signature");
         }
+        let kind = record.kind;
         let mut tables = self.tables.lock().expect("registry lock");
         match record.kind {
             KIND_PROVIDER => {
@@ -254,6 +317,11 @@ impl Registry {
             }
             _ => return Err("unknown-kind"),
         }
+        drop(tables);
+        if matches!(kind, KIND_ROOT | KIND_MANIFEST | KIND_APP) {
+            self.dirty
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -263,6 +331,7 @@ impl Registry {
         if !records::verify(&record) {
             return Err("bad-signature");
         }
+        let kind = record.kind;
         let mut tables = self.tables.lock().expect("registry lock");
         match record.kind {
             KIND_PROVIDER => {
@@ -303,6 +372,11 @@ impl Registry {
                 tables.relays.remove(&record.node_id);
             }
             _ => return Err("unknown-kind"),
+        }
+        drop(tables);
+        if matches!(kind, KIND_ROOT | KIND_MANIFEST | KIND_APP) {
+            self.dirty
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(())
     }
