@@ -101,6 +101,10 @@
     </dl>
   </div>
   <div class="card">
+    <div class="cardhead">my drive <span class="muted">(everything you've published — your files, durable on the shared grid)</span></div>
+    <div id="drive"><div class="muted">loading…</div></div>
+  </div>
+  <div class="card">
     <div class="cardhead">membership — active view <span class="muted" id="viewnote">(peers discovered via join/shuffle, probed for liveness)</span></div>
     <table>
       <thead><tr><th>peer</th><th>state</th><th>rtt</th><th>skew</th><th>last seen</th><th>addrs</th></tr></thead>
@@ -173,6 +177,35 @@ async function tick(){
   // Render OUTSIDE the fetch try/catch: a UI bug surfaces in the console,
   // it must not masquerade as "daemon unreachable".
   render(data);
+  // Drive is a separate fetch — a drive error must never blank the dashboard.
+  try {
+    const rf = await fetch("/api/files?token=" + TOKEN);
+    if (rf.ok) renderDrive(await rf.json());
+  } catch (_) {}
+}
+// My Drive: this identity's CraftSQL file index (name · size · type · age · cid).
+function renderDrive(v){
+  const el = $("drive");
+  const rows = (v && v.rows) || [];
+  if(!rows.length){
+    el.innerHTML = '<div class="muted">no files yet — publish with <span class="mono">zeph publish &lt;path&gt;</span></div>';
+    return;
+  }
+  // columns: cid, name, size, mime, is_dir, published_at
+  el.innerHTML = rows.map(r => {
+    const cid=r[0], name=r[1], size=r[2], mime=r[3], is_dir=r[4], pub=r[5];
+    const icon = is_dir ? "📁" : "📄";
+    const kind = is_dir ? "folder" : (mime || "file");
+    const meta = [fmtSize(size), esc(kind), fmtAgoMs(pub)].filter(Boolean).join(" · ");
+    return `<div class="citem">
+      <div class="cicon">${icon}</div>
+      <div class="cbody">
+        <div class="crow1"><span class="ctitle">${esc(name)}</span></div>
+        <div class="cmeta muted"><span class="cidcell mono" title="click to copy the cid" onclick="copyCid('${cid}')">${cid.slice(0,12)}…</span> · ${meta}</div>
+      </div>
+      <div class="cacts"><button class="btn" title="copy cid — share it or fetch elsewhere" onclick="copyCid('${cid}')">copy cid</button></div>
+    </div>`;
+  }).join("");
 }
 async function act(op, cid){
   cid = (cid||"").trim();

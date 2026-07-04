@@ -242,6 +242,7 @@ async fn handle_rpc(state: &State, line: &str) -> serde_json::Value {
         Some("identity") => serde_json::json!({"jsonrpc": "2.0", "id": id,
             "result": {"node_id": state.node_id, "listen": state.listen}}),
         Some("publish") => rpc_publish(state, &request, id).await,
+        Some("files") => rpc_files(state, &request, id).await,
         Some("get") => rpc_get(state, &request, id).await,
         Some("pin") => rpc_cid_op(state, &request, id, "pin").await,
         Some("unpin") => rpc_cid_op(state, &request, id, "unpin").await,
@@ -353,6 +354,65 @@ fn reconstruct(
     })
 }
 
+/// Escape a value for a single-quoted SQL string literal.
+fn sql_esc(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+/// Record a published item in this identity's DRIVE — a per-identity CraftSQL DB
+/// indexing everything you've published (your files on the grid). Best-effort:
+/// a drive hiccup never fails the publish itself.
+async fn drive_add(state: &State, cid: &str, name: &str, size: u64, mime: &str, is_dir: bool) {
+    let now = state.clock.now().millis();
+    let sql = format!(
+        "CREATE TABLE IF NOT EXISTS files(cid TEXT PRIMARY KEY, name TEXT, size INTEGER, \
+         mime TEXT, is_dir INTEGER, published_at INTEGER);\n\
+         INSERT OR REPLACE INTO files(cid,name,size,mime,is_dir,published_at) \
+         VALUES ('{}','{}',{},'{}',{},{});",
+        sql_esc(cid),
+        sql_esc(name),
+        size,
+        sql_esc(mime),
+        i32::from(is_dir),
+        now,
+    );
+    if let Ok(mut db) = state.craftsql.open("drive").await {
+        if let Err(e) = db.write(&sql).await {
+            tracing::warn!(%e, "drive index write failed");
+        }
+    }
+}
+
+/// List this identity's DRIVE (or another owner's via `owner`) — the files
+/// indexed in the CraftSQL `drive` DB, newest first. Empty if never published.
+async fn rpc_files(
+    state: &State,
+    req: &serde_json::Value,
+    id: serde_json::Value,
+) -> serde_json::Value {
+    let empty =
+        || serde_json::json!({"jsonrpc":"2.0","id":id.clone(),"result":{"columns":[],"rows":[]}});
+    let owner = match param(req, "owner").and_then(|v| v.as_str()) {
+        Some(h) => match parse_node_id(h) {
+            Some(n) => n,
+            None => return rpc_err(id, "owner must be 64 hex chars".into()),
+        },
+        None => match parse_node_id(&state.node_id) {
+            Some(n) => n,
+            None => return empty(),
+        },
+    };
+    let db = match state.craftsql.open_reader(owner, "drive").await {
+        Ok(d) => d,
+        Err(_) => return empty(),
+    };
+    let q = "SELECT cid,name,size,mime,is_dir,published_at FROM files ORDER BY published_at DESC";
+    match tokio::task::spawn_blocking(move || db.query(q)).await {
+        Ok(Ok(v)) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":v}),
+        _ => empty(),
+    }
+}
+
 async fn rpc_publish(
     state: &State,
     req: &serde_json::Value,
@@ -369,9 +429,12 @@ async fn rpc_publish(
     // Directory → recursive folder manifest.
     if std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false) {
         return match publish_path(state.engine.clone(), PathBuf::from(path), pin).await {
-            Ok((cid, size, _)) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
-                "cid": cid.to_hex(), "name": name, "size": size, "is_dir": true, "pinned": pin,
-            }}),
+            Ok((cid, size, _)) => {
+                drive_add(state, &cid.to_hex(), &name, size, "inode/directory", true).await;
+                serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
+                    "cid": cid.to_hex(), "name": name, "size": size, "is_dir": true, "pinned": pin,
+                }})
+            }
             Err(e) => rpc_err(id, format!("publish folder failed: {e}")),
         };
     }
@@ -381,11 +444,22 @@ async fn rpc_publish(
     };
     let mime = guess_mime(&name);
     match state.engine.publish_file(&name, &mime, &data, pin).await {
-        Ok(fp) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
-            "cid": fp.manifest_cid.to_hex(), "content_cid": fp.content_cid.to_hex(),
-            "name": name, "mime": mime, "size": fp.size,
-            "durable": fp.durable, "pinned": fp.pinned, "bytes": data.len(),
-        }}),
+        Ok(fp) => {
+            drive_add(
+                state,
+                &fp.manifest_cid.to_hex(),
+                &name,
+                fp.size,
+                &mime,
+                false,
+            )
+            .await;
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
+                "cid": fp.manifest_cid.to_hex(), "content_cid": fp.content_cid.to_hex(),
+                "name": name, "mime": mime, "size": fp.size,
+                "durable": fp.durable, "pinned": fp.pinned, "bytes": data.len(),
+            }})
+        }
         Err(e) => rpc_err(id, format!("publish failed: {e}")),
     }
 }
@@ -765,6 +839,31 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         }
     }
 
+    async fn api_files(
+        AxumState(ctx): AxumState<HttpCtx>,
+        Query(params): Query<TokenParam>,
+    ) -> axum::response::Response {
+        if params.token != *ctx.token {
+            return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
+        }
+        let empty = serde_json::json!({"columns": [], "rows": []});
+        let Some(owner) = parse_node_id(&ctx.state.node_id) else {
+            return axum::Json(empty).into_response();
+        };
+        let db = match ctx.state.craftsql.open_reader(owner, "drive").await {
+            Ok(d) => d,
+            Err(_) => return axum::Json(empty).into_response(),
+        };
+        let q =
+            "SELECT cid,name,size,mime,is_dir,published_at FROM files ORDER BY published_at DESC";
+        let v = tokio::task::spawn_blocking(move || db.query(q))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or(empty);
+        axum::Json(v).into_response()
+    }
+
     let ctx = HttpCtx {
         state,
         token: Arc::new(token),
@@ -772,6 +871,7 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
     let app = axum::Router::new()
         .route("/", get(index))
         .route("/api/status", get(api_status))
+        .route("/api/files", get(api_files))
         .route("/api/action", axum::routing::post(api_action))
         .with_state(ctx);
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));

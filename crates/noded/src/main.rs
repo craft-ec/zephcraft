@@ -96,6 +96,12 @@ enum Command {
         #[arg(long)]
         ns: String,
     },
+    /// List your drive — everything you've published (or another owner's via
+    /// --owner <hex>), from the per-identity CraftSQL index.
+    Files {
+        #[arg(long)]
+        owner: Option<String>,
+    },
 }
 
 #[derive(clap::Args)]
@@ -223,6 +229,7 @@ async fn main() -> anyhow::Result<()> {
             cmd_sql_recover(&data_dir, owner.as_deref(), &ns).await
         }
         Some(Command::SqlCompact { ns }) => cmd_sql_compact(&data_dir, &ns).await,
+        Some(Command::Files { owner }) => cmd_files(&data_dir, owner.as_deref()).await,
         None => cmd_run(&data_dir, cli.run).await,
     }
 }
@@ -334,6 +341,66 @@ async fn cmd_sql_query(
     }
     println!(
         "({} row{})",
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" }
+    );
+    Ok(())
+}
+
+fn trunc(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+fn human_size(n: u64) -> String {
+    const U: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < U.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", U[i])
+    }
+}
+
+async fn cmd_files(data_dir: &Path, owner: Option<&str>) -> anyhow::Result<()> {
+    let mut params = serde_json::json!({});
+    if let Some(o) = owner {
+        params["owner"] = serde_json::json!(o);
+    }
+    let r = control::query_unix_params(&data_dir.join("zeph.sock"), "files", params).await?;
+    let rows = r
+        .get("rows")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if rows.is_empty() {
+        println!("(no files — publish something with `zeph publish <path>`)");
+        return Ok(());
+    }
+    // columns: cid, name, size, mime, is_dir, published_at
+    println!("{:<28} {:>9}  {:<22} CID", "NAME", "SIZE", "TYPE");
+    for row in &rows {
+        let Some(a) = row.as_array() else { continue };
+        let cid = a.first().and_then(|v| v.as_str()).unwrap_or("");
+        let name = a.get(1).and_then(|v| v.as_str()).unwrap_or("");
+        let size = a.get(2).and_then(|v| v.as_u64()).unwrap_or(0);
+        let is_dir = a.get(4).and_then(|v| v.as_i64()).unwrap_or(0) != 0;
+        let mime = a.get(3).and_then(|v| v.as_str()).unwrap_or("");
+        let kind = if is_dir { "folder" } else { mime };
+        println!(
+            "{:<28} {:>9}  {:<22} {}",
+            trunc(name, 28),
+            human_size(size),
+            trunc(kind, 22),
+            &cid[..16.min(cid.len())]
+        );
+    }
+    println!(
+        "({} file{})",
         rows.len(),
         if rows.len() == 1 { "" } else { "s" }
     );
