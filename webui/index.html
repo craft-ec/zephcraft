@@ -322,8 +322,9 @@ function renderApps(v){
   const rows = (v && v.rows) || [];
   if(!rows.length){ el.innerHTML = 'no apps deployed — <span class="mono">zeph deploy &lt;app.wasm&gt; --name &lt;name&gt;</span>'; return; }
   el.innerHTML = '<b>deployed apps</b> (system objects, durable, not drive files)<br>' + rows.map(r => {
-    const name=r[0], cid=r[1];
+    const name=r[0], cid=r[1], ver=r[2]!=null?r[2]:1;
     return `<span style="display:inline-flex;gap:.4rem;align-items:center;margin:.2rem .6rem .2rem 0">\u2699 <b>${esc(name)}</b>
+      <span class="chip providing" title="published version — resolves by name network-wide">v${ver}</span>
       <span class="cidcell mono" onclick="copyCid('${cid}')" title="copy cid">${cid.slice(0,10)}\u2026</span>
       <button class="btn" onclick="useApp('${cid}','${esc(name)}.wasm')">invoke</button></span>`;
   }).join("");

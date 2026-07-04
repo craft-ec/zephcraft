@@ -60,6 +60,16 @@ pub struct RootRecord {
     pub seq: u64,
 }
 
+/// A resolved CraftCOM app head (`KIND_APP`) — `(publisher, name) → wasm_cid` at a
+/// version. Makes an app resolvable + invocable BY NAME network-wide.
+#[derive(Debug, Clone)]
+pub struct AppRecord {
+    pub publisher: NodeId,
+    pub name: String,
+    pub wasm_cid: Cid,
+    pub version: u64,
+}
+
 /// A resolved DB durability-manifest pointer (`KIND_MANIFEST`) — the CID of the
 /// object listing a DB's erasure-coded generations, for network recovery.
 #[derive(Debug, Clone)]
@@ -144,6 +154,16 @@ pub trait ContentRouting: Send + Sync {
     ) -> Result<()>;
     /// Resolve `owner`'s current DB root for `namespace` (None if none/withdrawn).
     async fn resolve_root(&self, owner: NodeId, namespace: &str) -> Result<Option<RootRecord>>;
+
+    /// Publish this node's app head `(self, name) → (wasm_cid, version)`, signed.
+    /// Default: unsupported (only tracker/DHT routing implements it).
+    async fn announce_app(&self, _name: &str, _wasm_cid: Cid, _version: u64) -> Result<()> {
+        Err(RoutingError::NoTracker)
+    }
+    /// Resolve `publisher`'s app `name` to its current head. Default: none.
+    async fn resolve_app(&self, _publisher: NodeId, _name: &str) -> Result<Option<AppRecord>> {
+        Ok(None)
+    }
     /// Withdraw this identity's DB root for `namespace`.
     async fn withdraw_root(&self, namespace: &str) -> Result<()>;
     /// Publish this identity's DB durability-manifest pointer for `namespace`
@@ -553,6 +573,41 @@ impl ContentRouting for TrackerRouting {
                 })
             })
             .max_by_key(|rr| rr.seq))
+    }
+
+    async fn announce_app(&self, name: &str, wasm_cid: Cid, version: u64) -> Result<()> {
+        let payload = records::AppPayload {
+            name: name.to_string(),
+            wasm_cid: wasm_cid.0,
+            version,
+        };
+        let rec = records::sign(&self.identity, records::KIND_APP, &payload, self.now_hlc());
+        self.announce_cas(rec).await
+    }
+
+    async fn resolve_app(&self, publisher: NodeId, name: &str) -> Result<Option<AppRecord>> {
+        let recs = self
+            .query(zeph_wire::TrackerResolve {
+                query_kind: 9,
+                cid: publisher.0,
+                max: 64,
+            })
+            .await?;
+        Ok(recs
+            .iter()
+            .filter_map(|r| {
+                let p = records::app(r)?;
+                if r.node_id != publisher.0 || p.name != name {
+                    return None;
+                }
+                Some(AppRecord {
+                    publisher,
+                    name: p.name,
+                    wasm_cid: Cid(p.wasm_cid),
+                    version: p.version,
+                })
+            })
+            .max_by_key(|a| a.version))
     }
 
     async fn publish_manifest(&self, namespace: &str, manifest_cid: Cid, seq: u64) -> Result<()> {

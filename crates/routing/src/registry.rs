@@ -14,7 +14,8 @@ use serde::Serialize;
 use zeph_wire::SignedRecord;
 
 use crate::records::{
-    self, KIND_MANIFEST, KIND_META, KIND_NODE, KIND_PROVIDER, KIND_RELAY, KIND_ROOT, KIND_WANT,
+    self, KIND_APP, KIND_MANIFEST, KIND_META, KIND_NODE, KIND_PROVIDER, KIND_RELAY, KIND_ROOT,
+    KIND_WANT,
 };
 
 /// Display snapshot of the registries (for the tracker dashboard / map).
@@ -111,6 +112,8 @@ struct Tables {
     /// (node_id, namespace) -> entry (DB durability manifest pointers). Like
     /// roots: NOT TTL-expired, single-writer, highest seq wins (monotonic).
     manifests: HashMap<([u8; 32], String), Entry>,
+    /// (node_id, app_name) -> entry (CraftCOM app heads; highest version wins).
+    apps: HashMap<([u8; 32], String), Entry>,
 }
 
 pub struct Registry {
@@ -195,6 +198,22 @@ impl Registry {
                     }
                 }
                 tables.roots.insert(key, Entry::now(record));
+            }
+            KIND_APP => {
+                let Some(a) = records::app(&record) else {
+                    return Err("bad-app-payload");
+                };
+                let key = (record.node_id, a.name.clone());
+                if let Some(cur) = tables.apps.get(&key) {
+                    if let Some(curp) = records::app(&cur.record) {
+                        // Monotonic: only a strictly newer version replaces the head
+                        // (idempotent re-announce of the current version is fine).
+                        if a.version < curp.version {
+                            return Err("app-stale");
+                        }
+                    }
+                }
+                tables.apps.insert(key, Entry::now(record));
             }
             KIND_MANIFEST => {
                 let Some(m) = records::manifest(&record) else {
@@ -348,6 +367,17 @@ impl Registry {
         let tables = self.tables.lock().expect("registry lock");
         tables
             .roots
+            .iter()
+            .filter(|((nid, _), _)| nid == owner)
+            .take(max)
+            .map(|(_, e)| e.record.clone())
+            .collect()
+    }
+
+    pub fn apps_for(&self, owner: &[u8; 32], max: usize) -> Vec<SignedRecord> {
+        let tables = self.tables.lock().expect("registry lock");
+        tables
+            .apps
             .iter()
             .filter(|((nid, _), _)| nid == owner)
             .take(max)

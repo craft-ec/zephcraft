@@ -22,6 +22,7 @@ pub const KIND_MANIFEST: u8 = 7;
 /// app doing proxy re-encryption) needs no routing rework. NOT yet enforced or
 /// wired into the registry — enforcement is a CraftCOM concern, not the tracker's.
 pub const KIND_GRANT: u8 = 8;
+pub const KIND_APP: u8 = 9;
 
 /// Payload of a KIND_GRANT record (RESERVED — see `KIND_GRANT`). Not yet enforced.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -170,6 +171,22 @@ pub struct RootPayload {
 
 pub fn root(record: &SignedRecord) -> Option<RootPayload> {
     (record.kind == KIND_ROOT)
+        .then(|| postcard::from_bytes(&record.payload).ok())
+        .flatten()
+}
+
+/// A CraftCOM app head: `(publisher, name) → (wasm_cid, version)`. Signed by the
+/// publisher; highest `version` wins. This is what makes an app NAME resolvable
+/// network-wide (and versioned), vs sharing a bare cid (CRAFTCOM_DESIGN §13).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppPayload {
+    pub name: String,
+    pub wasm_cid: [u8; 32],
+    pub version: u64,
+}
+
+pub fn app(record: &SignedRecord) -> Option<AppPayload> {
+    (record.kind == KIND_APP)
         .then(|| postcard::from_bytes(&record.payload).ok())
         .flatten()
 }

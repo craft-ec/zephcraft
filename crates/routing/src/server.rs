@@ -93,6 +93,7 @@ fn handle(registry: &Registry, msg: wire::Message) -> wire::Message {
                 6 => registry.all_metas(q.max as usize),
                 7 => registry.roots_for(&q.cid, q.max as usize),
                 8 => registry.manifests_for(&q.cid, q.max as usize),
+                9 => registry.apps_for(&q.cid, q.max as usize),
                 _ => Vec::new(),
             };
             wire::Message::TrackerResolveReply(wire::TrackerResolveReply { records })

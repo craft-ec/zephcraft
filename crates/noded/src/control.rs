@@ -179,6 +179,8 @@ pub struct State {
     pub settings: NodeSettings,
     /// CraftCOM invocation service — run user-level app WASM (local invoke).
     pub com: std::sync::Arc<zeph_com::InvokeService>,
+    /// Content routing — for resolving/announcing signed app-name heads (KIND_APP).
+    pub routing: std::sync::Arc<dyn zeph_routing::ContentRouting>,
 }
 
 impl State {
@@ -520,14 +522,22 @@ async fn owned_add(state: &State, cid: &str) {
 /// Register a deployed CraftCOM app in the private "apps" index (name → the app's
 /// SYSTEM-object cid). Upserts by name — re-deploying updates the cid (a light
 /// name→current-CID versioning, cf. CRAFTCOM_DESIGN §13).
-async fn apps_add(state: &State, name: &str, cid: &str) {
+async fn apps_add(state: &State, name: &str, cid: &str, version: u64) {
     let now = state.clock.now().millis();
+    // Best-effort migration: add the `version` column to a pre-existing table (a
+    // no-op / ignored error if the table is absent or already migrated).
+    if let Ok(mut db) = state.craftsql.open_private("apps").await {
+        let _ = db
+            .write("ALTER TABLE apps ADD COLUMN version INTEGER DEFAULT 1")
+            .await;
+    }
     let sql = format!(
-        "CREATE TABLE IF NOT EXISTS apps(name TEXT PRIMARY KEY, cid TEXT, deployed_at INTEGER);\n\
-         INSERT INTO apps(name, cid, deployed_at) VALUES ('{}', '{}', {})\n\
-         ON CONFLICT(name) DO UPDATE SET cid = excluded.cid, deployed_at = excluded.deployed_at;",
+        "CREATE TABLE IF NOT EXISTS apps(name TEXT PRIMARY KEY, cid TEXT, version INTEGER, deployed_at INTEGER);\n\
+         INSERT INTO apps(name, cid, version, deployed_at) VALUES ('{}', '{}', {}, {})\n\
+         ON CONFLICT(name) DO UPDATE SET cid = excluded.cid, version = excluded.version, deployed_at = excluded.deployed_at;",
         sql_esc(name),
         sql_esc(cid),
+        version,
         now,
     );
     if let Ok(mut db) = state.craftsql.open_private("apps").await {
@@ -539,10 +549,11 @@ async fn apps_add(state: &State, name: &str, cid: &str) {
 
 /// The deployed-apps registry: `{columns, rows}` of (name, cid, deployed_at).
 async fn apps_list(state: &State) -> serde_json::Value {
-    let empty = serde_json::json!({"columns": ["name", "cid", "deployed_at"], "rows": []});
+    let empty =
+        serde_json::json!({"columns": ["name", "cid", "version", "deployed_at"], "rows": []});
     match state.craftsql.open_private("apps").await {
         Ok(db) => db
-            .query("SELECT name, cid, deployed_at FROM apps ORDER BY deployed_at DESC")
+            .query("SELECT name, cid, version, deployed_at FROM apps ORDER BY deployed_at DESC")
             .unwrap_or(empty),
         Err(_) => empty,
     }
@@ -981,9 +992,20 @@ async fn rpc_deploy(
     };
     match state.engine.publish_system(&bytes).await {
         Ok(cid) => {
-            apps_add(state, &name, &cid.to_hex()).await;
+            // Next version = current published head + 1 (or 1 on first deploy).
+            let version = match parse_node_id(&state.node_id) {
+                Some(own) => match state.routing.resolve_app(own, &name).await {
+                    Ok(Some(rec)) => rec.version + 1,
+                    _ => 1,
+                },
+                None => 1,
+            };
+            // Publish the SIGNED name→cid head so the app resolves by name
+            // network-wide (KIND_APP), then record it locally.
+            let _ = state.routing.announce_app(&name, cid, version).await;
+            apps_add(state, &name, &cid.to_hex(), version).await;
             serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
-                "name": name, "cid": cid.to_hex(), "size": bytes.len()
+                "name": name, "cid": cid.to_hex(), "size": bytes.len(), "version": version
             }})
         }
         Err(e) => rpc_err(id, format!("deploy failed: {e}")),
@@ -999,12 +1021,38 @@ async fn rpc_invoke(
     id: serde_json::Value,
 ) -> serde_json::Value {
     let p = &req["params"];
-    let app_ns = p.get("app_ns").and_then(|v| v.as_str()).unwrap_or("");
     let func = p.get("func").and_then(|v| v.as_str()).unwrap_or("run");
-    let wasm_hex = p.get("wasm_cid").and_then(|v| v.as_str()).unwrap_or("");
-    let Some(cid) = parse_cid(wasm_hex) else {
-        return rpc_err(id, "wasm_cid: expected 64 hex chars".into());
+    // Resolve the app's WASM cid — by NAME (`<pubhex>/<name>` or `<name>` = own,
+    // via the signed KIND_APP head) or by a raw `wasm_cid`.
+    let (wasm_cid, default_ns) = if let Some(nm) = p
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        let (publisher, app_name) = match nm.split_once('/') {
+            Some((ph, n)) => (parse_node_id(ph), n),
+            None => (parse_node_id(&state.node_id), nm),
+        };
+        let Some(publisher) = publisher else {
+            return rpc_err(id, "name: bad publisher (expected <hex>/<app>)".into());
+        };
+        match state.routing.resolve_app(publisher, app_name).await {
+            Ok(Some(rec)) => (rec.wasm_cid.0, app_name.to_string()),
+            _ => return rpc_err(id, format!("app '{nm}' not found (deploy it first?)")),
+        }
+    } else {
+        let wasm_hex = p.get("wasm_cid").and_then(|v| v.as_str()).unwrap_or("");
+        match parse_cid(wasm_hex) {
+            Some(cid) => (cid.0, String::new()),
+            None => return rpc_err(id, "provide 'name' or a 64-hex 'wasm_cid'".into()),
+        }
     };
+    let app_ns = p
+        .get("app_ns")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or(default_ns);
     let caller = match parse_node_id(&state.node_id) {
         Some(n) => n.0,
         None => return rpc_err(id, "self node id unparseable".into()),
@@ -1015,8 +1063,8 @@ async fn rpc_invoke(
         .map(|s| s.as_bytes().to_vec())
         .unwrap_or_default();
     let ireq = zeph_com::InvokeRequest {
-        app_ns: app_ns.to_string(),
-        wasm_cid: cid.0,
+        app_ns,
+        wasm_cid,
         func: func.to_string(),
         input,
     };
