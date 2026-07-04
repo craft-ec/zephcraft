@@ -166,6 +166,24 @@ struct Config {
     storage_quota_gib: f64,
     /// Bootstrap peers: <node_id_hex>@<ip:port>[,...]
     peers: Vec<String>,
+    /// Erasure generation size k (decode threshold). Default 8.
+    erasure_k: usize,
+    /// Distinct-peer threshold for `durable`. Default 8.
+    durability_threshold: usize,
+    /// HealthScan availability-probe timeout (seconds). Default 2.
+    probe_timeout_secs: u64,
+    /// Scaling: pulls/cycle above which a hot CID recruits a provider. Default 20.
+    scale_threshold: u32,
+    /// Degradation: pulls/cycle below which a surplus CID sheds to floor. Default 5.
+    degrade_threshold: u32,
+    /// Fade grace: content fetched within this stays demand-alive (seconds). Default 1 day.
+    fade_grace_secs: u64,
+    /// Eviction cooldown: an evicted CID is not refilled for this (seconds). Default 30 days.
+    eviction_cooldown_secs: u64,
+    /// Health-scan / lifecycle loop interval (seconds). Default 30.
+    health_scan_secs: u64,
+    /// Provider + CraftSQL-head re-announce interval (seconds). Default 120.
+    reannounce_secs: u64,
 }
 
 impl Default for Config {
@@ -181,6 +199,15 @@ impl Default for Config {
             relay_operator_urls: Vec::new(),
             storage_quota_gib: 10.0,
             peers: Vec::new(),
+            erasure_k: 8,
+            durability_threshold: 8,
+            probe_timeout_secs: 2,
+            scale_threshold: 20,
+            degrade_threshold: 5,
+            fade_grace_secs: 24 * 60 * 60,
+            eviction_cooldown_secs: 30 * 24 * 60 * 60,
+            health_scan_secs: 30,
+            reannounce_secs: 120,
         }
     }
 }
@@ -591,8 +618,14 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         store.clone(),
         routing.clone(),
         ObjConfig {
+            k: cfg.erasure_k,
+            durability_threshold: cfg.durability_threshold,
             capacity_bytes: (cfg.storage_quota_gib * 1024.0 * 1024.0 * 1024.0) as u64,
-            ..ObjConfig::default()
+            probe_timeout: Duration::from_secs(cfg.probe_timeout_secs),
+            scale_threshold: cfg.scale_threshold,
+            degrade_threshold: cfg.degrade_threshold,
+            fade_grace: Duration::from_secs(cfg.fade_grace_secs),
+            eviction_cooldown: Duration::from_secs(cfg.eviction_cooldown_secs),
         },
     );
 
@@ -690,8 +723,8 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                 degrade_threshold: oc.degrade_threshold,
                 fade_grace_secs: oc.fade_grace.as_secs(),
                 eviction_cooldown_secs: oc.eviction_cooldown.as_secs(),
-                health_scan_secs: 30,
-                reannounce_secs: 120,
+                health_scan_secs: cfg.health_scan_secs,
+                reannounce_secs: cfg.reannounce_secs,
                 data_dir: data_dir.display().to_string(),
             }
         },
@@ -761,8 +794,9 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let announce_relays = cfg.relay_operator_urls.clone();
     let announce_sql = craftsql.clone();
     let announce_jobs = jobs.clone();
+    let reannounce_secs = cfg.reannounce_secs.max(1);
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(120));
+        let mut interval = tokio::time::interval(Duration::from_secs(reannounce_secs));
         loop {
             interval.tick().await;
             let e = announce_engine.clone();
@@ -844,8 +878,9 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let health_engine = engine.clone();
     let health_state = state.clone();
     let health_jobs = jobs.clone();
+    let health_scan_secs = cfg.health_scan_secs.max(1);
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        let mut interval = tokio::time::interval(Duration::from_secs(health_scan_secs));
         interval.tick().await; // skip immediate tick at startup
         loop {
             interval.tick().await;
