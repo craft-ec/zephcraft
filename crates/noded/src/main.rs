@@ -744,6 +744,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                 zeph_obj::ALPN.to_vec(),
                 zeph_sql::PAGE_ALPN.to_vec(),
                 zeph_com::INVOKE_ALPN.to_vec(),
+                zeph_com::ATTEST_ALPN.to_vec(),
             ],
             cfg.listen_port,
             relay_urls,
@@ -815,6 +816,15 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         engine.clone(),
         com_backend,
     ));
+    // Attestation service: serve the RegistryProgram to the committee (phase 4d).
+    let attest_service = Arc::new(
+        zeph_com::AttestService::new(
+            zeph_com::AttestedRuntime::new()?,
+            engine.clone(),
+            identity.clone(),
+        )
+        .with_native(Arc::new(zeph_com::RegistryProgram)),
+    );
 
     tracing::info!(
         node_id = %identity.node_id().to_hex(),
@@ -950,6 +960,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let (piece_tx, piece_rx) = tokio::sync::mpsc::channel(32);
     let (sqlpage_tx, sqlpage_rx) = tokio::sync::mpsc::channel(32);
     let (invoke_tx, invoke_rx) = tokio::sync::mpsc::channel(32);
+    let (attest_tx, attest_rx) = tokio::sync::mpsc::channel(32);
     let server = transport.clone();
     tokio::spawn(async move {
         server
@@ -959,12 +970,17 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                 (zeph_obj::ALPN.to_vec(), piece_tx),
                 (zeph_sql::PAGE_ALPN.to_vec(), sqlpage_tx),
                 (zeph_com::INVOKE_ALPN.to_vec(), invoke_tx),
+                (zeph_com::ATTEST_ALPN.to_vec(), attest_tx),
             ])
             .await
     });
     tokio::spawn(engine.clone().serve(piece_rx));
     tokio::spawn(zeph_sql::serve_pages(sql_dir.clone(), sqlpage_rx));
     tokio::spawn(zeph_com::serve_invocations(invoke_rx, com_service.clone()));
+    tokio::spawn(zeph_com::serve_attestations(
+        attest_rx,
+        attest_service.clone(),
+    ));
 
     // Announce this node into the tracker's node registry (map/census),
     // immediately and periodically.
@@ -1033,6 +1049,10 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         },
     );
     membership.start(peers, member_rx);
+    // Wire the registry's live committee coordinator now that membership is up.
+    appreg_store
+        .set_coordinator(transport.clone(), membership.clone())
+        .await;
 
     // Discover peers from the tracker's node registry and seed membership —
     // a node bootstraps from the network without any hardcoded peer.

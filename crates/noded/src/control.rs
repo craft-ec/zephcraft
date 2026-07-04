@@ -1020,7 +1020,11 @@ async fn deploy_bytes(
     };
     let _ = state.routing.announce_app(name, cid, version).await;
     // Phase 4c: also register into the durable program-owned registry (self-attested).
-    if let Err(e) = state.appreg.register(name, cid.0, version).await {
+    if let Err(e) = state
+        .appreg
+        .register(name, cid.0, version, state.clock.now().millis())
+        .await
+    {
         tracing::warn!(%e, "registry register failed (KIND_APP path still applied)");
     }
     apps_add(state, name, &cid.to_hex(), version).await;
