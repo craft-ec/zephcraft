@@ -69,6 +69,10 @@ pub struct Pager {
     /// For lazy readers: fetch a missing page's bytes from the network on demand
     /// (the index is already local; only page contents are pulled per-read).
     remote: Option<crate::fetch::Fetcher>,
+    /// If set, PAGE contents are encrypted (deterministic) before storage and
+    /// decrypted on read — a private DB. Index nodes + root stay plaintext (they
+    /// carry only ciphertext-page CIDs, revealing structure not content).
+    cipher: Option<zeph_cipher::Dek>,
 }
 
 impl Pager {
@@ -82,6 +86,7 @@ impl Pager {
             page_count: 0,
             depth: 0,
             remote: None,
+            cipher: None,
         }
     }
 
@@ -112,6 +117,7 @@ impl Pager {
             page_count: ri.page_count,
             depth: ri.depth,
             remote: None,
+            cipher: None,
         })
     }
 
@@ -119,6 +125,12 @@ impl Pager {
     /// demand (lazy reads). The index (nodes) must already be local.
     pub fn set_remote(&mut self, fetcher: crate::fetch::Fetcher) {
         self.remote = Some(fetcher);
+    }
+
+    /// Attach the DB's data-encryption key — pages are stored encrypted and
+    /// decrypted on read (a private DB). Must be set before page reads/commits.
+    pub fn set_cipher(&mut self, dek: zeph_cipher::Dek) {
+        self.cipher = Some(dek);
     }
 
     /// A page/object's bytes: local store first, else fetch from the network and
@@ -143,7 +155,13 @@ impl Pager {
         }
         if let Some(cid) = self.pages.get(&n) {
             if let Some(data) = self.object(*cid) {
-                return pad(&data);
+                let plain = match &self.cipher {
+                    // On wrong-key decrypt failure, return the ciphertext — SQLite
+                    // sees a malformed page and errors (a foreign reader can't read).
+                    Some(dek) => zeph_cipher::open(dek, &data).unwrap_or(data),
+                    None => data,
+                };
+                return pad(&plain);
             }
         }
         vec![0u8; PAGE_SIZE]
@@ -199,7 +217,11 @@ impl Pager {
     /// to a changed page are re-stored.
     pub fn commit(&mut self) -> Result<Cid> {
         for (n, data) in std::mem::take(&mut self.dirty) {
-            let cid = self.store.put(&data)?;
+            let stored = match &self.cipher {
+                Some(dek) => zeph_cipher::seal_deterministic(dek, &data),
+                None => data,
+            };
+            let cid = self.store.put(&stored)?;
             self.pages.insert(n, cid.0);
         }
         let new_depth = depth_for(self.page_count);
@@ -342,6 +364,44 @@ mod tests {
     }
     fn store_at(dir: &std::path::Path) -> ObjectStore {
         ObjectStore::open(dir).unwrap()
+    }
+
+    #[test]
+    fn encrypted_pages_are_ciphertext_and_only_the_key_reads() {
+        let dir = tempdir().unwrap();
+        let dek = zeph_cipher::Dek::generate();
+        let mut p = Pager::create(store_at(dir.path()));
+        p.set_cipher(dek.clone());
+        let mut secret = page(0);
+        secret[..6].copy_from_slice(b"SECRET");
+        p.write_page(0, secret.clone());
+        p.write_page(1, page(7));
+        let root = p.commit().unwrap();
+
+        // Owner reads it back.
+        assert_eq!(p.read_page(0), secret);
+
+        // The STORE holds ciphertext — not the plaintext page.
+        let cid0 = *p.pages.get(&0).unwrap();
+        let stored = p.store.get(&Cid(cid0)).unwrap();
+        assert_ne!(stored, secret, "stored bytes are ciphertext");
+        assert!(
+            !stored.windows(6).any(|w| w == b"SECRET"),
+            "plaintext marker absent from the ciphertext page"
+        );
+
+        // Reopen WITH the key → reads back.
+        let mut owner = Pager::open(store_at(dir.path()), root).unwrap();
+        owner.set_cipher(dek);
+        assert_eq!(owner.read_page(0), secret);
+
+        // Reopen WITHOUT the key → cannot recover the plaintext.
+        let foreign = Pager::open(store_at(dir.path()), root).unwrap();
+        assert_ne!(
+            foreign.read_page(0),
+            secret,
+            "no key → cannot read plaintext"
+        );
     }
 
     #[test]

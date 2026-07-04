@@ -72,6 +72,28 @@ pub fn seal(dek: &Dek, plaintext: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Seal `plaintext` under `dek` with a DETERMINISTIC nonce (a keyed BLAKE3 of the
+/// plaintext). Same `(dek, plaintext)` → same ciphertext → same CID, so
+/// content-addressed dedup / structural sharing is preserved (needed for CraftSQL
+/// pages). Leaks equality of identical plaintexts under the same key — acceptable
+/// for a sole-owner DB. Output format matches `seal` (`nonce || ct`), so `open`
+/// decrypts either.
+pub fn seal_deterministic(dek: &Dek, plaintext: &[u8]) -> Vec<u8> {
+    let mut h = blake3::Hasher::new_keyed(&dek.0);
+    h.update(b"craftec/det-nonce/v1");
+    h.update(plaintext);
+    let mut nonce = [0u8; XNONCE_LEN];
+    h.finalize_xof().fill(&mut nonce);
+    let cipher = XChaCha20Poly1305::new((&dek.0).into());
+    let ct = cipher
+        .encrypt(XNonce::from_slice(&nonce), plaintext)
+        .expect("xchacha20poly1305 encrypt infallible for valid key");
+    let mut out = Vec::with_capacity(XNONCE_LEN + ct.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct);
+    out
+}
+
 /// Open a `seal`ed blob under `dek`.
 pub fn open(dek: &Dek, sealed: &[u8]) -> Result<Vec<u8>> {
     if sealed.len() < XNONCE_LEN {
@@ -205,6 +227,21 @@ mod tests {
             open(&Dek::generate(), &sealed),
             Err(CipherError::Decrypt)
         ));
+    }
+
+    #[test]
+    fn deterministic_seal_is_stable_and_decrypts() {
+        let dek = Dek::generate();
+        let page = b"a craftsql page of rows";
+        let a = seal_deterministic(&dek, page);
+        let b = seal_deterministic(&dek, page);
+        assert_eq!(
+            a, b,
+            "same (key,plaintext) → same ciphertext (structural sharing)"
+        );
+        assert_eq!(open(&dek, &a).unwrap(), page);
+        // Different plaintext → different ciphertext (no nonce reuse).
+        assert_ne!(seal_deterministic(&dek, b"other page"), a);
     }
 
     #[test]
