@@ -956,6 +956,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
 
     tokio::signal::ctrl_c().await?;
     tracing::info!("shutting down");
+    events.publish(zeph_events::Event::Shutdown);
     transport.close().await;
     Ok(())
 }
