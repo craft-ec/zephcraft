@@ -13,3 +13,9 @@ zeph-routing.workspace = true
 [dev-dependencies]
 tokio.workspace = true
 tempfile.workspace = true
+rand.workspace = true
+zeph-crypto.workspace = true
+zeph-store.workspace = true
+zeph-transport.workspace = true
+zeph-obj.workspace = true
+zeph-sql.workspace = true
