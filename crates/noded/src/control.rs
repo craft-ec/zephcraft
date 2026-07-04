@@ -514,16 +514,9 @@ async fn owned_remove(state: &State, cid: &str) {
 /// as the local capsule is dropped + fades this is the best-effort crypto-shred
 /// (Tier 2, docs/CRYPTO_SHRED_DESIGN.md): your copies go, network copies fade.
 async fn soft_delete(state: &State, cid: zeph_core::Cid) -> anyhow::Result<()> {
-    // For a private file, forget the ciphertext it points at too.
-    if let Ok(bytes) = state.engine.get(cid, zeph_obj::ConsumeMode::Drop).await {
-        if let Some(env) = zeph_obj::EncryptedEnvelope::decode(&bytes) {
-            let _ = state
-                .engine
-                .forget_local(zeph_core::Cid(env.ciphertext_cid))
-                .await;
-        }
-    }
-    let _ = state.engine.forget_local(cid).await;
+    // Forget the whole file/folder chain (manifest/envelope + content/ciphertext +
+    // any folder children) so nothing is orphaned.
+    let _ = state.engine.forget_chain(cid).await;
     owned_remove(state, &cid.to_hex()).await;
     Ok(())
 }
@@ -927,8 +920,8 @@ async fn rpc_cid_op(
         return rpc_err(id, format!("{op} needs a valid 'cid'"));
     };
     let result = match op {
-        "pin" => state.engine.pin(cid).await,
-        "unpin" => state.engine.unpin(cid).await,
+        "pin" => state.engine.pin_chain(cid).await.map(|_| ()),
+        "unpin" => state.engine.unpin_chain(cid).await.map(|_| ()),
         "want" => state.engine.want(cid).await,
         "unwant" => state.engine.unwant(cid).await,
         "fetch" => state
@@ -1088,8 +1081,8 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
             return (StatusCode::BAD_REQUEST, "bad cid").into_response();
         };
         let r = match action.op.as_str() {
-            "pin" => ctx.state.engine.pin(cid).await,
-            "unpin" => ctx.state.engine.unpin(cid).await,
+            "pin" => ctx.state.engine.pin_chain(cid).await.map(|_| ()),
+            "unpin" => ctx.state.engine.unpin_chain(cid).await.map(|_| ()),
             "want" => ctx.state.engine.want(cid).await,
             "unwant" => ctx.state.engine.unwant(cid).await,
             "fetch" => ctx

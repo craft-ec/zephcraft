@@ -988,6 +988,16 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
             locals.extend(banned.iter().copied());
             // CraftSQL page generations are DB-internal, not user content.
             locals.retain(|cid| !content_store.is_system(cid));
+            // A content/ciphertext object backing a manifest/envelope we hold is
+            // PART of that file, not standalone content — hide it so the file shows
+            // as ONE named entry. Banned cids always stay (ban must be reversible).
+            let mut referenced = std::collections::HashSet::new();
+            for cid in &locals {
+                for child in content_state.engine.referenced_objects(cid) {
+                    referenced.insert(child.0);
+                }
+            }
+            locals.retain(|cid| banned.contains(cid) || !referenced.contains(&cid.0));
             let mut out = Vec::new();
             for cid in locals {
                 let mut e = control::ContentInfo {

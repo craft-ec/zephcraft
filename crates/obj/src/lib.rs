@@ -747,6 +747,81 @@ impl ObjEngine {
         Ok(())
     }
 
+    /// Objects this manifest/envelope directly references — the content (File),
+    /// the ciphertext (private envelope), or the child entries (Dir) — if we hold
+    /// it whole. Empty for raw content or objects we don't have. Lets callers
+    /// treat a file/folder as its whole reachable chain, not just the top object.
+    pub fn referenced_objects(&self, cid: &Cid) -> Vec<Cid> {
+        match self.store.content(cid) {
+            Some(bytes) => chain_children(&bytes),
+            None => Vec::new(),
+        }
+    }
+
+    /// Pin a whole file/folder: pin the manifest/envelope AND cascade to every
+    /// object it references (content, ciphertext, folder children, recursively),
+    /// so a pin keeps the ENTIRE thing alive — not just the top object, which
+    /// would leave the content evictable and the file broken. Returns the count.
+    pub async fn pin_chain(&self, cid: Cid) -> anyhow::Result<usize> {
+        let mut n = 0;
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![cid];
+        while let Some(c) = stack.pop() {
+            if !seen.insert(c.0) {
+                continue;
+            }
+            // pin() fetches + stores the content, so after it the object is local
+            // and we can decode it to discover the next links in the chain.
+            if self.pin(c).await.is_ok() {
+                n += 1;
+            }
+            if let Some(bytes) = self.store.content(&c) {
+                stack.extend(chain_children(&bytes));
+            }
+        }
+        Ok(n)
+    }
+
+    /// Unpin a whole file/folder — the cascade counterpart to `pin_chain`.
+    pub async fn unpin_chain(&self, cid: Cid) -> anyhow::Result<usize> {
+        let mut n = 0;
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![cid];
+        while let Some(c) = stack.pop() {
+            if !seen.insert(c.0) {
+                continue;
+            }
+            // Decode the chain BEFORE unpinning (unpin keeps the object, but read
+            // links while the object is still definitely held).
+            if let Some(bytes) = self.store.content(&c) {
+                stack.extend(chain_children(&bytes));
+            }
+            let _ = self.unpin(c).await;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// Forget a whole file/folder locally — cascade `forget_local` over the chain
+    /// so deleting a file drops its content/ciphertext too (no orphaned objects).
+    pub async fn forget_chain(&self, cid: Cid) -> anyhow::Result<usize> {
+        let mut n = 0;
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![cid];
+        while let Some(c) = stack.pop() {
+            if !seen.insert(c.0) {
+                continue;
+            }
+            // Read the chain BEFORE forgetting — forget removes the bytes.
+            if let Some(bytes) = self.store.content(&c) {
+                stack.extend(chain_children(&bytes));
+            }
+            let _ = self.forget_local(c).await;
+            n += 1;
+        }
+        Ok(n)
+    }
+
     /// Publish a CraftSQL page generation as a SYSTEM object. It rides the FULL
     /// normal lifecycle — erasure-coded, distributed, repaired, scaled, and
     /// **degraded** (surplus above the floor sheds when demand is cold) — but is
@@ -1420,6 +1495,20 @@ fn guard_not_system(store: &Store, cid: &Cid) -> anyhow::Result<()> {
         cid.to_hex()
     );
     Ok(())
+}
+
+/// Objects a manifest/envelope directly links to: content (File), ciphertext
+/// (envelope), or child entries (Dir). Empty if `bytes` is raw content. The basis
+/// for cascading pin/unpin/forget over a whole file/folder chain.
+fn chain_children(bytes: &[u8]) -> Vec<Cid> {
+    if let Some(env) = EncryptedEnvelope::decode(bytes) {
+        return vec![Cid(env.ciphertext_cid)];
+    }
+    match Manifest::decode(bytes) {
+        Some(Manifest::File { content, .. }) => vec![Cid(content)],
+        Some(Manifest::Dir { entries, .. }) => entries.iter().map(|e| Cid(e.cid)).collect(),
+        None => Vec::new(),
+    }
 }
 
 fn decoder_k(tags: &vtags::VTags) -> u32 {

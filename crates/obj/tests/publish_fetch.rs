@@ -187,3 +187,55 @@ async fn reannounce_restores_piece_provider_after_restart() {
     let got = fetcher.get(cid, ConsumeMode::Drop).await.unwrap();
     assert_eq!(got, payload, "content fetchable again after re-announce");
 }
+
+/// Pin/unpin/forget operate on the whole FILE via its manifest, cascading to the
+/// content object — because pinning a manifest without its content is a broken
+/// pin (the content evicts, the file breaks). Manifest and content are distinct
+/// objects; the manifest links forward to the content, and the cascade follows it.
+#[tokio::test]
+async fn pin_unpin_forget_cascade_the_whole_file_chain() {
+    let tracker = start_tracker().await;
+    let dirs: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    // Two storage nodes so publish spreads normally.
+    for dir in dirs.iter().take(2) {
+        let (_e, routing) = node(&tracker, dir.path()).await;
+        routing.announce_node(0, 0).await.unwrap();
+    }
+    let (owner, _r) = node(&tracker, dirs[2].path()).await;
+
+    let fp = owner
+        .publish_file("photo.jpg", "image/jpeg", b"the real photo bytes", true)
+        .await
+        .unwrap();
+    let (m, c) = (fp.manifest_cid, fp.content_cid);
+    let store = owner.store().clone();
+    assert_ne!(m.0, c.0, "manifest and content are DIFFERENT objects");
+    assert!(
+        store.is_pinned(&m) && store.is_pinned(&c),
+        "publish(pin=true) pins both objects"
+    );
+
+    // Unpin the FILE via its manifest — cascades to the content object.
+    let n = owner.unpin_chain(m).await.unwrap();
+    assert_eq!(n, 2, "unpin cascaded over manifest + content");
+    assert!(
+        !store.is_pinned(&m) && !store.is_pinned(&c),
+        "the content object unpinned via the manifest — not left stranded"
+    );
+
+    // Pin the FILE again — cascades, keeping the whole file alive.
+    let n = owner.pin_chain(m).await.unwrap();
+    assert_eq!(n, 2, "pin cascaded over manifest + content");
+    assert!(
+        store.is_pinned(&m) && store.is_pinned(&c),
+        "pinning the manifest kept the content alive too"
+    );
+
+    // Forget the FILE — both objects dropped locally (no orphaned content).
+    owner.forget_chain(m).await.unwrap();
+    assert!(store.content(&m).is_none(), "manifest forgotten");
+    assert!(
+        store.content(&c).is_none(),
+        "content object forgotten too — no orphan left behind"
+    );
+}
