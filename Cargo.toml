@@ -20,6 +20,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 # ── zephcraft internal crates ──
 zeph-core = { path = "crates/core" }
+zeph-cipher = { path = "crates/cipher" }
 zeph-events = { path = "crates/events" }
 zeph-sched = { path = "crates/sched" }
 zeph-crypto = { path = "crates/crypto" }
