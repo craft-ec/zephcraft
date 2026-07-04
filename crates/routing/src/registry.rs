@@ -156,8 +156,7 @@ impl Registry {
                 tracing::info!(records = n, "tracker registry restored from snapshot");
             }
         }
-        reg.dirty
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        reg.dirty.store(false, std::sync::atomic::Ordering::Relaxed);
         reg
     }
 
@@ -319,8 +318,7 @@ impl Registry {
         }
         drop(tables);
         if matches!(kind, KIND_ROOT | KIND_MANIFEST | KIND_APP) {
-            self.dirty
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(())
     }
@@ -375,8 +373,7 @@ impl Registry {
         }
         drop(tables);
         if matches!(kind, KIND_ROOT | KIND_MANIFEST | KIND_APP) {
-            self.dirty
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(())
     }
