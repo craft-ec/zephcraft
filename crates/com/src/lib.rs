@@ -33,8 +33,8 @@ mod attest;
 mod craft;
 mod invoke;
 pub use attest::{
-    attest_run, pda, verify, verify_commit, verify_quorum, Attestation, AttestedCommit,
-    AttestedRuntime, PdaAdvance,
+    attest_run, pda, select_committee, verify, verify_commit, verify_quorum, Attestation,
+    AttestedCommit, AttestedRuntime, Committee, PdaAdvance,
 };
 pub use craft::CraftBackend;
 pub use invoke::{invoke_remote, serve_invocations, InvokeRequest, InvokeService, INVOKE_ALPN};

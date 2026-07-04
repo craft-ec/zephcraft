@@ -277,6 +277,56 @@ pub fn verify_commit(
     })
 }
 
+// ---- phase 3a: deterministic epoch-rotating committee ----
+
+/// The attesting committee for an epoch: the deterministic sortition of the eligible
+/// pool. Everyone derives the identical committee from `(eligible, epoch)`, so it is
+/// verifiable without a stored whitelist (ATTESTATION_DESIGN §5).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Committee {
+    pub epoch: u64,
+    /// Members in canonical (sorted) order.
+    pub members: Vec<[u8; 32]>,
+    /// Quorum threshold (clamped to the committee size).
+    pub k: usize,
+}
+
+/// Deterministically select the epoch's committee: from the `eligible` pool (already
+/// quality-gated upstream by reputation/uptime), take the `n` nodes with the smallest
+/// `BLAKE3(epoch ‖ node)` — a per-epoch sortition. Deterministic (all nodes compute
+/// the same set) and rotating (a different draw each epoch). `k` is clamped to size.
+pub fn select_committee(eligible: &[[u8; 32]], epoch: u64, n: usize, k: usize) -> Committee {
+    let mut scored: Vec<([u8; 32], [u8; 32])> = eligible
+        .iter()
+        .map(|node| {
+            let mut buf = [0u8; 40];
+            buf[..8].copy_from_slice(&epoch.to_be_bytes());
+            buf[8..].copy_from_slice(node);
+            (Cid::of(&buf).0, *node)
+        })
+        .collect();
+    // Total order by (score, node) so the draw is unambiguous; take the n smallest.
+    scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut members: Vec<[u8; 32]> = scored.into_iter().take(n).map(|(_, node)| node).collect();
+    members.sort(); // canonical form for membership checks
+    let k = k.min(members.len());
+    Committee { epoch, members, k }
+}
+
+impl Committee {
+    /// Is `node` on this committee?
+    pub fn is_member(&self, node: &[u8; 32]) -> bool {
+        self.members.binary_search(node).is_ok()
+    }
+
+    /// Verify an attested commit against THIS committee — its members are the agent
+    /// set and `k` is the quorum. Returns the authorized advance iff a committee
+    /// quorum agrees.
+    pub fn verify_commit(&self, commit: &AttestedCommit) -> Option<PdaAdvance> {
+        verify_commit(commit, &self.members, self.k)
+    }
+}
+
 /// The agent's exported linear memory, if present.
 fn det_memory(caller: &mut Caller<'_, AttestCtx>) -> Option<Memory> {
     match caller.get_export("memory") {
@@ -649,6 +699,127 @@ mod tests {
         assert!(
             verify_commit(&commit, &strangers, 2).is_none(),
             "attestations from outside the agent set do not count"
+        );
+    }
+
+    // ---- phase 3a: deterministic rotating committee ----
+
+    #[test]
+    fn committee_is_deterministic_and_order_independent() {
+        let pool: Vec<[u8; 32]> = (0u8..12).map(|i| [i; 32]).collect();
+        let c1 = select_committee(&pool, 7, 5, 3);
+        // a shuffled pool must yield the identical committee
+        let mut shuffled = pool.clone();
+        shuffled.reverse();
+        let c2 = select_committee(&shuffled, 7, 5, 3);
+        assert_eq!(
+            c1, c2,
+            "committee is a deterministic function of (pool, epoch)"
+        );
+        assert_eq!(c1.members.len(), 5);
+        assert_eq!(c1.k, 3);
+    }
+
+    #[test]
+    fn committee_rotates_across_epochs() {
+        let pool: Vec<[u8; 32]> = (0u8..40).map(|i| [i; 32]).collect();
+        let a = select_committee(&pool, 1, 7, 4);
+        let b = select_committee(&pool, 2, 7, 4);
+        assert_ne!(a.members, b.members, "a new epoch redraws the committee");
+    }
+
+    #[test]
+    fn k_and_n_clamp_to_a_small_pool() {
+        let pool: Vec<[u8; 32]> = (0u8..3).map(|i| [i; 32]).collect();
+        let c = select_committee(&pool, 1, 10, 8);
+        assert_eq!(c.members.len(), 3, "n clamps to the pool size");
+        assert_eq!(c.k, 3, "k clamps to the committee size");
+    }
+
+    #[test]
+    fn commit_verifies_against_its_epoch_committee() {
+        let rt = AttestedRuntime::new().unwrap();
+        let program_cid = Cid::of(DOUBLE_WAT).0;
+        let pool = agents(9);
+        let eligible: Vec<[u8; 32]> = pool.iter().map(|a| a.node_id().0).collect();
+        let committee = select_committee(&eligible, 42, 5, 3);
+        // exactly the selected members attest.
+        let signers: Vec<&NodeIdentity> = pool
+            .iter()
+            .filter(|id| committee.is_member(&id.node_id().0))
+            .collect();
+        assert_eq!(signers.len(), 5);
+        let attestations: Vec<Attestation> = signers
+            .iter()
+            .map(|id| {
+                attest_run(
+                    id,
+                    &rt,
+                    DOUBLE_WAT,
+                    "run",
+                    program_cid,
+                    [0u8; 32],
+                    &[10u8],
+                    DEFAULT_FUEL,
+                )
+                .unwrap()
+                .0
+            })
+            .collect();
+        let commit = AttestedCommit {
+            program_cid,
+            seed: b"registry".to_vec(),
+            prev_root: [0u8; 32],
+            request: vec![10u8],
+            new_root: attestations[0].output_root,
+            attestations,
+        };
+        let adv = committee
+            .verify_commit(&commit)
+            .expect("a committee quorum advances the account");
+        assert_eq!(adv.new_root, Cid::of(&[10u8, 20]).0);
+    }
+
+    #[test]
+    fn attestations_from_non_members_do_not_advance() {
+        let rt = AttestedRuntime::new().unwrap();
+        let program_cid = Cid::of(DOUBLE_WAT).0;
+        let pool = agents(9);
+        let eligible: Vec<[u8; 32]> = pool.iter().map(|a| a.node_id().0).collect();
+        let committee = select_committee(&eligible, 42, 5, 3);
+        // the NON-members attest instead — they are outside the committee.
+        let outsiders: Vec<&NodeIdentity> = pool
+            .iter()
+            .filter(|id| !committee.is_member(&id.node_id().0))
+            .collect();
+        let attestations: Vec<Attestation> = outsiders
+            .iter()
+            .map(|id| {
+                attest_run(
+                    id,
+                    &rt,
+                    DOUBLE_WAT,
+                    "run",
+                    program_cid,
+                    [0u8; 32],
+                    &[10u8],
+                    DEFAULT_FUEL,
+                )
+                .unwrap()
+                .0
+            })
+            .collect();
+        let commit = AttestedCommit {
+            program_cid,
+            seed: b"registry".to_vec(),
+            prev_root: [0u8; 32],
+            request: vec![10u8],
+            new_root: attestations[0].output_root,
+            attestations,
+        };
+        assert!(
+            committee.verify_commit(&commit).is_none(),
+            "non-committee attestations carry no authority"
         );
     }
 }
