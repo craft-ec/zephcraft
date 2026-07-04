@@ -137,10 +137,11 @@
     </div>
     <div class="subdesc muted" id="sub-desc"></div>
     <div class="cidbar" id="cidbar">
-      <input id="cidin" class="cidin" placeholder="paste a 64-hex cid to fetch / pin / want…" spellcheck="false">
+      <input id="cidin" class="cidin" placeholder="paste a 64-hex cid to fetch / pin / want / ban…" spellcheck="false">
       <button class="btn" onclick="act('fetch', $('cidin').value)">fetch</button>
       <button class="btn" onclick="act('pin', $('cidin').value)">pin</button>
       <button class="btn" onclick="act('want', $('cidin').value)">want</button>
+      <button class="btn" title="tombstone: refuse to host + block resurrection" onclick="if(confirm('ban this cid? refuses to host + blocks resurrection.'))act('ban', $('cidin').value)">ban</button>
     </div>
     <div id="storage-body"><div class="muted">loading…</div></div>
     <div class="muted hostline" id="hosting-note"></div>
