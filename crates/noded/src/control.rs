@@ -60,6 +60,30 @@ pub struct ContentInfo {
     pub comment: Option<String>,
 }
 
+/// Node configuration for the Settings view (read-only; edit config.toml +
+/// restart to change).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct NodeSettings {
+    pub reach: String,
+    pub listen_port: u16,
+    pub dashboard_port: u16,
+    pub relay_urls: Vec<String>,
+    pub fallback_relays: bool,
+    pub trackers: Vec<String>,
+    pub storage_quota_gib: f64,
+    pub peers: Vec<String>,
+    pub data_dir: String,
+}
+
+/// Event-bus activity: totals + per-type breakdown + live subscriber count.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct EventStats {
+    pub total: u64,
+    pub by_tag: std::collections::BTreeMap<String, u64>,
+    pub subscribers: usize,
+    pub capacity: usize,
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Status {
     pub node_id: String,
@@ -94,6 +118,12 @@ pub struct Status {
     pub recent_events: Vec<String>,
     /// Background job coordinator activity (foundation §51).
     pub jobs: zeph_sched::JobStats,
+    /// Event-bus activity (foundation §52) — totals + per-type + subscribers.
+    pub event_stats: EventStats,
+    /// Most recent finished jobs (newest first).
+    pub recent_jobs: Vec<zeph_sched::JobRecord>,
+    /// Node configuration (read-only Settings view).
+    pub settings: NodeSettings,
 }
 
 pub struct State {
@@ -119,6 +149,10 @@ pub struct State {
     /// Background job coordinator (foundation §51) — prioritized, deduped,
     /// bounded-concurrency scheduler the lifecycle + reannounce run through.
     pub jobs: zeph_sched::JobCoordinator,
+    /// Per-type event counts for the event-bus status view (tag → count).
+    pub event_counts: RwLock<std::collections::BTreeMap<String, u64>>,
+    /// Node configuration snapshot (Settings view).
+    pub settings: NodeSettings,
 }
 
 impl State {
@@ -165,6 +199,14 @@ impl State {
                 .cloned()
                 .collect(),
             jobs: self.jobs.stats(),
+            event_stats: EventStats {
+                by_tag: self.event_counts.read().await.clone(),
+                total: self.event_counts.read().await.values().sum(),
+                subscribers: self.events.subscribers(),
+                capacity: 256,
+            },
+            recent_jobs: self.jobs.recent_jobs(),
+            settings: self.settings.clone(),
         }
     }
 
@@ -175,6 +217,17 @@ impl State {
         while q.len() > 40 {
             q.pop_front();
         }
+    }
+
+    /// Record an event: append to the feed AND increment its per-type counter.
+    pub async fn record_event(&self, ev: &zeph_events::Event) {
+        self.push_event(ev.describe()).await;
+        *self
+            .event_counts
+            .write()
+            .await
+            .entry(ev.tag().to_string())
+            .or_insert(0) += 1;
     }
 
     pub async fn set_storage(&self, stats: zeph_store::StoreStats) {

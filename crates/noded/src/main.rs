@@ -669,6 +669,18 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         events: events.clone(),
         recent_events: tokio::sync::RwLock::new(std::collections::VecDeque::new()),
         jobs: jobs.clone(),
+        event_counts: tokio::sync::RwLock::new(std::collections::BTreeMap::new()),
+        settings: control::NodeSettings {
+            reach: cfg.reach.clone(),
+            listen_port: cfg.listen_port,
+            dashboard_port: cfg.dashboard_port,
+            relay_urls: cfg.relay_urls.clone(),
+            fallback_relays: cfg.fallback_relays,
+            trackers: cfg.trackers.clone(),
+            storage_quota_gib: cfg.storage_quota_gib,
+            peers: cfg.peers.clone(),
+            data_dir: data_dir.display().to_string(),
+        },
     });
 
     // Activity feed: drain the event bus into the bounded recent-events buffer
@@ -679,7 +691,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     tokio::spawn(async move {
         loop {
             match feed_rx.recv().await {
-                Ok(ev) => feed_state.push_event(ev.describe()).await,
+                Ok(ev) => feed_state.record_event(&ev).await,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }

@@ -80,12 +80,28 @@
   .chip.wanted { color:var(--warnc,#d29922); background:rgba(210,153,34,.13); }
   .chip.banned { color:var(--bad); background:rgba(248,81,73,.14); }
   .chip.net { color:var(--dim); background:var(--line); }
+  .tabnav { display:flex; gap:.2rem; margin-bottom:1rem; border-bottom:1px solid var(--line); }
+  .tab-btn { font:inherit; font-size:.8rem; background:none; color:var(--dim); border:none;
+             border-bottom:2px solid transparent; padding:.45rem .9rem; cursor:pointer; margin-bottom:-1px; }
+  .tab-btn:hover { color:var(--fg); }
+  .tab-btn.on { color:var(--accent); border-bottom-color:var(--accent); }
+  .kv { font-size:.78rem; padding:.14rem 0; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; gap:1rem; }
+  .kv:last-child { border-bottom:none; }
+  .kv b { font-weight:600; }
 </style>
 </head>
 <body>
 <main>
   <h1><span class="z">⌁ zeph</span> node dashboard</h1>
   <div id="banner">daemon unreachable — retrying…</div>
+
+  <nav class="tabnav">
+    <button class="tab-btn on" data-tab="overview" onclick="showTab('overview')">overview</button>
+    <button class="tab-btn" data-tab="status" onclick="showTab('status')">status</button>
+    <button class="tab-btn" data-tab="settings" onclick="showTab('settings')">settings</button>
+  </nav>
+
+  <section id="tab-overview" class="tab">
   <div class="card">
     <dl>
       <dt>node</dt><dd id="node-id" class="muted">…</dd>
@@ -108,13 +124,6 @@
     <div id="drive"><div class="muted">loading…</div></div>
   </div>
   <div class="card">
-    <div class="cardhead">membership — active view <span class="muted" id="viewnote">(peers discovered via join/shuffle, probed for liveness)</span></div>
-    <table>
-      <thead><tr><th>peer</th><th>state</th><th>rtt</th><th>skew</th><th>last seen</th><th>addrs</th></tr></thead>
-      <tbody id="peers"><tr><td colspan="6" class="muted">no peers in view yet — joining…</td></tr></tbody>
-    </table>
-  </div>
-  <div class="card">
     <div class="cardhead">content <span class="muted">(this node + network · pin to serve · want to keep alive · fetch to consume)</span></div>
     <div class="cidbar">
       <input id="cidin" class="cidin" placeholder="paste a 64-hex cid…" spellcheck="false">
@@ -129,6 +138,57 @@
     <div class="cardhead">activity <span class="muted">(node event bus §52 — the reactive stream apps subscribe to)</span></div>
     <div id="activity"><div class="muted">no events yet</div></div>
   </div>
+  </section>
+
+  <section id="tab-status" class="tab" hidden>
+    <div class="card">
+      <div class="cardhead">event bus <span class="muted">(foundation §52 — the reactive nervous system)</span></div>
+      <div class="kv"><span>total events</span><b id="eb-total">…</b></div>
+      <div class="kv"><span>live subscribers</span><b id="eb-subs">…</b></div>
+      <div class="kv"><span>channel capacity</span><b id="eb-cap">…</b></div>
+      <div class="grp">by type</div>
+      <div id="eb-bytag"><div class="muted">no events yet</div></div>
+    </div>
+    <div class="card">
+      <div class="cardhead">job coordinator <span class="muted">(foundation §51 — prioritized background scheduler)</span></div>
+      <div class="kv"><span>concurrency</span><b id="jc-conc">…</b></div>
+      <div class="kv"><span>queue depth</span><b id="jc-queue">…</b></div>
+      <div class="kv"><span>in-flight</span><b id="jc-inflight">…</b></div>
+      <div class="kv"><span>submitted</span><b id="jc-sub">…</b></div>
+      <div class="kv"><span>completed</span><b id="jc-comp">…</b></div>
+      <div class="kv"><span>deduped (singleflight)</span><b id="jc-dedup">…</b></div>
+      <div class="kv"><span>retried</span><b id="jc-retry">…</b></div>
+      <div class="kv"><span>failed</span><b id="jc-fail">…</b></div>
+      <div class="grp">recent jobs</div>
+      <table><thead><tr><th>job</th><th>result</th><th>duration</th></tr></thead>
+        <tbody id="jc-recent"><tr><td colspan="3" class="muted">no jobs run yet</td></tr></tbody></table>
+    </div>
+    <div class="card">
+      <div class="cardhead">membership — active view <span class="muted">(peers discovered via join/shuffle, probed for liveness)</span></div>
+      <table>
+        <thead><tr><th>peer</th><th>state</th><th>rtt</th><th>skew</th><th>last seen</th><th>addrs</th></tr></thead>
+        <tbody id="peers"><tr><td colspan="6" class="muted">no peers in view yet — joining…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="tab-settings" class="tab" hidden>
+    <div class="card">
+      <div class="cardhead">node settings <span class="muted">(read-only — edit config.toml + restart to change)</span></div>
+      <div class="kv"><span>data dir</span><b id="set-datadir">…</b></div>
+      <div class="kv"><span>reachability</span><b id="set-reach">…</b></div>
+      <div class="kv"><span>listen port (udp)</span><b id="set-listen">…</b></div>
+      <div class="kv"><span>dashboard port</span><b id="set-dash">…</b></div>
+      <div class="kv"><span>storage quota</span><b id="set-quota">…</b></div>
+      <div class="kv"><span>fallback relays</span><b id="set-fallback">…</b></div>
+      <div class="grp">relays</div>
+      <div id="set-relays"><div class="muted">none</div></div>
+      <div class="grp">trackers</div>
+      <div id="set-trackers"><div class="muted">none</div></div>
+      <div class="grp">bootstrap peers</div>
+      <div id="set-peers"><div class="muted">none</div></div>
+    </div>
+  </section>
 
   <footer>ZephCraft — Craftec decentralized storage · local dashboard (127.0.0.1) · refresh 1s</footer>
 </main>
@@ -158,6 +218,8 @@ function render(s){
   $("listen").textContent = s.listen;
   $("uptime").textContent = fmtUptime(s.uptime_secs);
   renderContent(s);
+  renderStatus(s);
+  renderSettings(s);
   const act = $("activity");
   const ev = s.recent_events || [];
   act.innerHTML = ev.length
@@ -324,6 +386,47 @@ function renderContent(s){
   const sorted = [...cs].sort((a,b) =>
     (b.published_at||0) - (a.published_at||0) || (b.providers||0) - (a.providers||0));
   el.innerHTML = sorted.map(citem).join("");
+}
+function showTab(name){
+  document.querySelectorAll('.tab').forEach(t => { t.hidden = (t.id !== 'tab-'+name); });
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('on', b.dataset.tab === name));
+}
+function renderStatus(s){
+  const eb = s.event_stats || {};
+  $("eb-total").textContent = eb.total || 0;
+  $("eb-subs").textContent = (eb.subscribers || 0) + " (feed + open SSE streams)";
+  $("eb-cap").textContent = (eb.capacity || 0) + " (bounded broadcast)";
+  const bt = eb.by_tag || {};
+  const keys = Object.keys(bt).sort((a,b) => bt[b] - bt[a]);
+  $("eb-bytag").innerHTML = keys.length
+    ? keys.map(k => `<div class="kv"><span class="mono">${esc(k)}</span><b>${bt[k]}</b></div>`).join("")
+    : '<div class="muted">no events yet</div>';
+  const j = s.jobs || {};
+  $("jc-conc").textContent = j.concurrency || 0;
+  $("jc-queue").textContent = j.queue_depth || 0;
+  $("jc-inflight").textContent = j.in_flight || 0;
+  $("jc-sub").textContent = j.submitted || 0;
+  $("jc-comp").textContent = j.completed || 0;
+  $("jc-dedup").textContent = j.deduped || 0;
+  $("jc-retry").textContent = j.retried || 0;
+  $("jc-fail").textContent = j.failed || 0;
+  const rj = s.recent_jobs || [];
+  $("jc-recent").innerHTML = rj.length
+    ? rj.map(r => `<tr><td class="mono">${esc(r.key)}</td><td class="${r.ok?'alive':'down'}">${r.ok?'ok':'failed'}</td><td>${r.ms} ms</td></tr>`).join("")
+    : '<tr><td colspan="3" class="muted">no jobs run yet</td></tr>';
+}
+function renderSettings(s){
+  const st = s.settings || {};
+  $("set-datadir").textContent = st.data_dir || "—";
+  $("set-reach").textContent = st.reach || "—";
+  $("set-listen").textContent = (st.listen_port === 0) ? "OS-assigned (0)" : (st.listen_port || "—");
+  $("set-dash").textContent = st.dashboard_port || "—";
+  $("set-quota").textContent = (st.storage_quota_gib || 0) + " GiB";
+  $("set-fallback").textContent = st.fallback_relays ? "yes — n0 public relays appended" : "no — our mesh only";
+  const list = (a) => (a && a.length) ? a.map(x => `<div class="evline mono">${esc(x)}</div>`).join("") : '<div class="muted">none</div>';
+  $("set-relays").innerHTML = list(st.relay_urls);
+  $("set-trackers").innerHTML = list(st.trackers);
+  $("set-peers").innerHTML = list(st.peers);
 }
 tick(); setInterval(tick, 1000);
 </script>

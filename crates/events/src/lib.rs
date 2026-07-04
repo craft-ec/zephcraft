@@ -114,6 +114,11 @@ impl EventBus {
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.tx.subscribe()
     }
+
+    /// Number of live subscribers (the activity feed + any open SSE streams).
+    pub fn subscribers(&self) -> usize {
+        self.tx.receiver_count()
+    }
 }
 
 #[cfg(test)]

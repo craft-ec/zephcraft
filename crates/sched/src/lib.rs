@@ -13,12 +13,12 @@
 //! (that's CraftCOM). `concurrency = 1` makes it a serial priority queue.
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BinaryHeap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrd};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
@@ -83,6 +83,18 @@ pub struct JobStats {
     pub retried: u64,
     pub deduped: u64,
     pub in_flight: u64,
+    /// Jobs waiting in the priority queue right now.
+    pub queue_depth: u64,
+    /// Configured max concurrent jobs.
+    pub concurrency: u64,
+}
+
+/// One finished job, for the recent-jobs view.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct JobRecord {
+    pub key: String,
+    pub ok: bool,
+    pub ms: u64,
 }
 
 struct Inner {
@@ -92,6 +104,8 @@ struct Inner {
     sem: Arc<Semaphore>,
     seq: AtomicU64,
     counters: Counters,
+    concurrency: usize,
+    recent: Mutex<VecDeque<JobRecord>>,
 }
 
 /// A cheaply-cloneable handle to the coordinator.
@@ -111,6 +125,8 @@ impl JobCoordinator {
             sem: Arc::new(Semaphore::new(concurrency.max(1))),
             seq: AtomicU64::new(0),
             counters: Counters::default(),
+            concurrency: concurrency.max(1),
+            recent: Mutex::new(VecDeque::new()),
         });
         let dispatch = inner.clone();
         tokio::spawn(dispatcher(dispatch));
@@ -164,7 +180,21 @@ impl JobCoordinator {
             retried: c.retried.load(AtomicOrd::Relaxed),
             deduped: c.deduped.load(AtomicOrd::Relaxed),
             in_flight: c.in_flight.load(AtomicOrd::Relaxed),
+            queue_depth: self.inner.queue.lock().unwrap().len() as u64,
+            concurrency: self.inner.concurrency as u64,
         }
+    }
+
+    /// The most recent finished jobs, newest first (bounded history).
+    pub fn recent_jobs(&self) -> Vec<JobRecord> {
+        self.inner
+            .recent
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .cloned()
+            .collect()
     }
 }
 
@@ -186,18 +216,19 @@ async fn dispatcher(inner: Arc<Inner>) {
 
 async fn run_job(inner: Arc<Inner>, job: QueuedJob, _permit: OwnedSemaphorePermit) {
     inner.counters.in_flight.fetch_add(1, AtomicOrd::Relaxed);
+    let started = Instant::now();
     let mut attempt = 0u32;
-    loop {
+    let ok = loop {
         attempt += 1;
         match (job.factory)().await {
             Ok(()) => {
                 inner.counters.completed.fetch_add(1, AtomicOrd::Relaxed);
-                break;
+                break true;
             }
             Err(e) if attempt >= job.max_attempts => {
                 inner.counters.failed.fetch_add(1, AtomicOrd::Relaxed);
                 tracing::warn!(key = %job.key, attempts = attempt, error = %e, "job failed");
-                break;
+                break false;
             }
             Err(e) => {
                 inner.counters.retried.fetch_add(1, AtomicOrd::Relaxed);
@@ -207,9 +238,20 @@ async fn run_job(inner: Arc<Inner>, job: QueuedJob, _permit: OwnedSemaphorePermi
                 tokio::time::sleep(Duration::from_millis(100u64 << shift)).await;
             }
         }
-    }
+    };
     inner.counters.in_flight.fetch_sub(1, AtomicOrd::Relaxed);
     inner.inflight.lock().unwrap().remove(&job.key);
+    {
+        let mut recent = inner.recent.lock().unwrap();
+        recent.push_back(JobRecord {
+            key: job.key,
+            ok,
+            ms: started.elapsed().as_millis() as u64,
+        });
+        while recent.len() > 20 {
+            recent.pop_front();
+        }
+    }
     // Permit drops here → a concurrency slot frees.
 }
 
