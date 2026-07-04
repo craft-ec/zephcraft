@@ -12,13 +12,15 @@ wasmtime = { version = "27", features = ["async"] }
 zeph-core.workspace = true
 zeph-sql.workspace = true
 zeph-obj.workspace = true
+zeph-transport.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+postcard.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
 tempfile.workspace = true
 zeph-crypto.workspace = true
 zeph-cipher.workspace = true
 zeph-routing.workspace = true
-zeph-transport.workspace = true
 zeph-store.workspace = true
