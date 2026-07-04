@@ -743,6 +743,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         recent_events: tokio::sync::RwLock::new(std::collections::VecDeque::new()),
         jobs: jobs.clone(),
         event_counts: tokio::sync::RwLock::new(std::collections::BTreeMap::new()),
+        hosting_cids: std::sync::atomic::AtomicU64::new(0),
         settings: {
             let oc = engine.config();
             control::NodeSettings {
@@ -980,26 +981,43 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
             // A DHT has no global enumeration: the content list is LOCAL knowledge
             // only — cids we hold, want, or have banned. New cids enter it by
             // fetch/pin/want (discover-by-cid), never by listing the network.
+            // The content list is the user's CURATED set: cids they explicitly
+            // PINNED, WANTED, or BANNED. Pieces the node merely HOSTS for the
+            // network (parked by Distribution, not user-chosen) are COUNTED
+            // separately (`hosting_cids`) — never itemized here.
             let banned: std::collections::HashSet<_> =
                 content_store.tombstoned_cids().into_iter().collect();
-            let mut locals: std::collections::HashSet<_> =
-                content_store.cids().into_iter().collect();
-            locals.extend(content_store.wanted_cids());
-            locals.extend(banned.iter().copied());
-            // CraftSQL page generations are DB-internal, not user content.
-            locals.retain(|cid| !content_store.is_system(cid));
-            // A content/ciphertext object backing a manifest/envelope we hold is
-            // PART of that file, not standalone content — hide it so the file shows
-            // as ONE named entry. Banned cids always stay (ban must be reversible).
+            let wanted: std::collections::HashSet<_> =
+                content_store.wanted_cids().into_iter().collect();
+            let mut curated: std::collections::HashSet<_> = wanted.iter().copied().collect();
+            curated.extend(banned.iter().copied());
+            let mut hosting = 0u64;
+            for cid in content_store.cids() {
+                if content_store.is_system(&cid) {
+                    continue;
+                }
+                if content_store.is_pinned(&cid) {
+                    curated.insert(cid);
+                } else if !wanted.contains(&cid) && !banned.contains(&cid) {
+                    hosting += 1; // held for the network, not user-curated
+                }
+            }
+            content_state
+                .hosting_cids
+                .store(hosting, std::sync::atomic::Ordering::Relaxed);
+            curated.retain(|cid| !content_store.is_system(cid));
+            // A content/ciphertext object backing a curated manifest/envelope is
+            // PART of that file — hide it so the file shows as ONE named entry.
+            // Banned cids always stay (ban must be reversible).
             let mut referenced = std::collections::HashSet::new();
-            for cid in &locals {
+            for cid in &curated {
                 for child in content_state.engine.referenced_objects(cid) {
                     referenced.insert(child.0);
                 }
             }
-            locals.retain(|cid| banned.contains(cid) || !referenced.contains(&cid.0));
+            curated.retain(|cid| banned.contains(cid) || !referenced.contains(&cid.0));
             let mut out = Vec::new();
-            for cid in locals {
+            for cid in curated {
                 let mut e = control::ContentInfo {
                     cid: cid.to_hex(),
                     providers: 0,

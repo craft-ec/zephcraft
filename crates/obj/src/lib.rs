@@ -822,6 +822,85 @@ impl ObjEngine {
         Ok(n)
     }
 
+    /// WANT a whole file/folder — cascade `want` over the chain so the keep-alive
+    /// intent covers the content, not just the manifest (else the content could
+    /// fade while the manifest stays). Cascades over the part of the chain we hold.
+    pub async fn want_chain(&self, cid: Cid) -> anyhow::Result<usize> {
+        let mut n = 0;
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![cid];
+        while let Some(c) = stack.pop() {
+            if !seen.insert(c.0) {
+                continue;
+            }
+            if let Some(bytes) = self.store.content(&c) {
+                stack.extend(chain_children(&bytes));
+            }
+            let _ = self.want(c).await;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// UNWANT a whole file/folder — the cascade counterpart to `want_chain`.
+    pub async fn unwant_chain(&self, cid: Cid) -> anyhow::Result<usize> {
+        let mut n = 0;
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![cid];
+        while let Some(c) = stack.pop() {
+            if !seen.insert(c.0) {
+                continue;
+            }
+            if let Some(bytes) = self.store.content(&c) {
+                stack.extend(chain_children(&bytes));
+            }
+            let _ = self.unwant(c).await;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// BAN a whole file/folder — cascade the tombstone over the chain so a banned
+    /// file refuses to host BOTH the manifest and its content (else the content
+    /// stays hostable). Decodes the chain BEFORE tombstoning removes the bytes.
+    pub async fn ban_chain(&self, cid: Cid) -> anyhow::Result<usize> {
+        let mut n = 0;
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![cid];
+        while let Some(c) = stack.pop() {
+            if !seen.insert(c.0) {
+                continue;
+            }
+            if let Some(bytes) = self.store.content(&c) {
+                stack.extend(chain_children(&bytes));
+            }
+            let _ = self.delete_local(c).await; // tombstone
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// UNBAN a whole file/folder. The ban removed the local bytes, so we can't
+    /// decode the chain locally — re-fetch each object (the ban was LOCAL, so the
+    /// network still serves it) to rediscover and un-tombstone the whole chain.
+    pub async fn unban_chain(&self, cid: Cid) -> anyhow::Result<usize> {
+        let mut n = 0;
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![cid];
+        while let Some(c) = stack.pop() {
+            if !seen.insert(c.0) {
+                continue;
+            }
+            let _ = self.undelete(c).await; // lift the tombstone first…
+            n += 1;
+            // …then re-fetch (now permitted) to rediscover the chain's next links.
+            if let Ok(bytes) = self.get(c, ConsumeMode::Drop).await {
+                stack.extend(chain_children(&bytes));
+            }
+        }
+        Ok(n)
+    }
+
     /// Publish a CraftSQL page generation as a SYSTEM object. It rides the FULL
     /// normal lifecycle — erasure-coded, distributed, repaired, scaled, and
     /// **degraded** (surplus above the floor sheds when demand is cold) — but is

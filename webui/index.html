@@ -85,6 +85,15 @@
              border-bottom:2px solid transparent; padding:.45rem .9rem; cursor:pointer; margin-bottom:-1px; }
   .tab-btn:hover { color:var(--fg); }
   .tab-btn.on { color:var(--accent); border-bottom-color:var(--accent); }
+  .subtabnav { display:flex; gap:.3rem; margin-bottom:.7rem; flex-wrap:wrap; }
+  .subtab { font:inherit; font-size:.76rem; background:var(--bg); color:var(--dim); border:1px solid var(--line);
+            border-radius:6px; padding:.3rem .7rem; cursor:pointer; display:flex; align-items:center; gap:.35rem; }
+  .subtab:hover { color:var(--fg); border-color:var(--accent); }
+  .subtab.on { color:var(--accent); border-color:var(--accent); background:rgba(88,166,255,.1); }
+  .scount { font-size:.66rem; background:var(--line); color:var(--dim); border-radius:8px; padding:.02rem .4rem; }
+  .subtab.on .scount { background:rgba(88,166,255,.18); color:var(--accent); }
+  .subdesc { font-size:.74rem; margin-bottom:.6rem; }
+  .hostline { font-size:.72rem; margin-top:.7rem; padding-top:.5rem; border-top:1px solid var(--line); }
   .kv { font-size:.78rem; padding:.14rem 0; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; gap:1rem; }
   .kv:last-child { border-bottom:none; }
   .kv b { font-weight:600; }
@@ -120,18 +129,21 @@
     </dl>
   </div>
   <div class="card">
-    <div class="cardhead">my drive <span class="muted">(everything you've published — your files, durable on the shared grid)</span></div>
-    <div id="drive"><div class="muted">loading…</div></div>
-  </div>
-  <div class="card">
-    <div class="cardhead">content you know <span class="muted">(cids you hold, want, or fetched — not a network listing · pin to serve · want to keep alive)</span></div>
-    <div class="cidbar">
-      <input id="cidin" class="cidin" placeholder="paste a 64-hex cid…" spellcheck="false">
+    <div class="subtabnav">
+      <button class="subtab on" data-sub="drive" onclick="showSub('drive')">drive <span class="scount" id="sc-drive">0</span></button>
+      <button class="subtab" data-sub="pin" onclick="showSub('pin')">pinned <span class="scount" id="sc-pin">0</span></button>
+      <button class="subtab" data-sub="want" onclick="showSub('want')">wanted <span class="scount" id="sc-want">0</span></button>
+      <button class="subtab" data-sub="ban" onclick="showSub('ban')">banned <span class="scount" id="sc-ban">0</span></button>
+    </div>
+    <div class="subdesc muted" id="sub-desc"></div>
+    <div class="cidbar" id="cidbar">
+      <input id="cidin" class="cidin" placeholder="paste a 64-hex cid to fetch / pin / want…" spellcheck="false">
       <button class="btn" onclick="act('fetch', $('cidin').value)">fetch</button>
       <button class="btn" onclick="act('pin', $('cidin').value)">pin</button>
       <button class="btn" onclick="act('want', $('cidin').value)">want</button>
     </div>
-    <div id="content-groups"><div class="muted">no content yet — publish a file or fetch a cid</div></div>
+    <div id="storage-body"><div class="muted">loading…</div></div>
+    <div class="muted hostline" id="hosting-note"></div>
   </div>
 
   <div class="card">
@@ -285,9 +297,11 @@ async function tick(){
 }
 // My Drive: this identity's CraftSQL file index (name · size · type · age · cid).
 function renderDrive(v){
-  const el = $("drive");
-  const rows = (v && v.rows) || [];
-  window.driveCids = new Set(rows.map(r => r[0]));
+  window.lastDrive = (v && v.rows) || [];
+  window.driveCids = new Set(window.lastDrive.map(r => r[0]));
+  renderStorage();
+}
+function renderDriveInto(el, rows){
   if(!rows.length){
     el.innerHTML = '<div class="muted">no files yet — publish with <span class="mono">zeph publish &lt;path&gt;</span></div>';
     return;
@@ -398,15 +412,50 @@ function citem(c){
   </div>`;
 }
 function renderContent(s){
-  const el = $("content-groups");
-  // Exclude your own files (they're in My Drive) — this list is OTHER content you
-  // know: cids you hold, want, or fetched.
-  // BANNED items always show (even if once your own file) so you can unban them.
+  window.lastStatus = s;
+  renderStorage();
+}
+// One tabbed storage view: Drive (your files) | Pinned | Wanted | Banned — the
+// user's curated set. Pieces the node hosts for the network are counted, not listed.
+function renderStorage(){
+  const s = window.lastStatus || {};
+  const driveRows = window.lastDrive || [];
   const drive = window.driveCids || new Set();
-  const cs = (s.content || []).filter(c => c.local_tombstoned || !drive.has(c.cid));
-  if(!cs.length){ el.innerHTML = '<div class="muted">nothing tracked — fetch or want a cid to add it (your own files are in My Drive)</div>'; return; }
-  const sorted = [...cs].sort((a,b) => (b.local_pieces||0) - (a.local_pieces||0));
+  const content = s.content || [];
+  const pins  = content.filter(c => c.local_pinned && !drive.has(c.cid));
+  const wants = content.filter(c => c.local_wanted && !drive.has(c.cid));
+  const bans  = content.filter(c => c.local_tombstoned);
+  const set = (id,n) => { const e=$(id); if(e) e.textContent=n; };
+  set('sc-drive', driveRows.length); set('sc-pin', pins.length);
+  set('sc-want', wants.length); set('sc-ban', bans.length);
+  const h = s.hosting_cids||0;
+  const hn=$('hosting-note');
+  if(hn) hn.textContent = h ? `⛁ also hosting ${h} cid${h==1?"":"s"} for the network — managed automatically (they fade / evict on their own)` : "";
+  const sub = window.curSub || 'drive';
+  const body=$('storage-body'), desc=$('sub-desc');
+  const DESC = {
+    drive:"everything you've published — your files, durable on the shared grid",
+    pin:"cids you pin so this node keeps serving the whole file (cascaded)",
+    want:"cids you want kept alive on the network — the whole file (cascaded)",
+    ban:"cids this node refuses to host + blocks resurrection (moderation, cascaded)"
+  };
+  if(desc) desc.textContent = DESC[sub]||"";
+  if(!body) return;
+  if(sub==='drive') renderDriveInto(body, driveRows);
+  else if(sub==='pin') renderList(body, pins, "nothing pinned — paste a cid above and pin it");
+  else if(sub==='want') renderList(body, wants, "nothing wanted — paste a cid above and want it");
+  else if(sub==='ban') renderList(body, bans, "nothing banned");
+}
+function renderList(el, items, empty){
+  if(!items.length){ el.innerHTML = `<div class="muted">${empty}</div>`; return; }
+  const sorted=[...items].sort((a,b)=>(b.local_pieces||0)-(a.local_pieces||0));
   el.innerHTML = sorted.map(citem).join("");
+}
+function showSub(name){
+  window.curSub = name;
+  document.querySelectorAll('.subtab').forEach(b=>b.classList.toggle('on', b.dataset.sub===name));
+  try{ localStorage.setItem('zeph-sub', name); }catch(e){}
+  renderStorage();
 }
 function showTab(name){
   document.querySelectorAll('.tab').forEach(t => { t.hidden = (t.id !== 'tab-'+name); });
@@ -476,6 +525,8 @@ function renderSettings(s){
 }
 // Restore the last-selected tab (persists across reloads).
 showTab((() => { try { return localStorage.getItem('zeph-tab'); } catch(e){ return null; } })() || 'overview');
+window.curSub = (() => { try { return localStorage.getItem('zeph-sub'); } catch(e){ return null; } })() || 'drive';
+document.querySelectorAll('.subtab').forEach(b=>b.classList.toggle('on', b.dataset.sub===window.curSub));
 tick(); setInterval(tick, 1000);
 </script>
 </body>

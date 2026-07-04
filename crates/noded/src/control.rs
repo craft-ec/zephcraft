@@ -119,6 +119,8 @@ pub struct Status {
     pub store_pinned: u64,
     pub store_bytes: u64,
     pub providing: u64,
+    /// CIDs hosted for the network (provided; not user-curated).
+    pub hosting_cids: u64,
     pub trackers: String,
     pub content: Vec<ContentInfo>,
     /// HealthScan: last-pass scanned + at-risk CIDs, cumulative pieces repaired.
@@ -167,6 +169,10 @@ pub struct State {
     pub jobs: zeph_sched::JobCoordinator,
     /// Per-type event counts for the event-bus status view (tag → count).
     pub event_counts: RwLock<std::collections::BTreeMap<String, u64>>,
+    /// Count of CIDs this node HOSTS for the network (holds pieces of, but the
+    /// user did not pin/want/ban) — the "provided" set, managed separately from
+    /// the curated content list.
+    pub hosting_cids: std::sync::atomic::AtomicU64,
     /// Node configuration snapshot (Settings view).
     pub settings: NodeSettings,
 }
@@ -196,6 +202,7 @@ impl State {
             store_pinned: self.storage.read().await.2,
             store_bytes: self.storage.read().await.3,
             providing: self.providing.load(std::sync::atomic::Ordering::Relaxed),
+            hosting_cids: self.hosting_cids.load(std::sync::atomic::Ordering::Relaxed),
             trackers: self.trackers.clone(),
             content: self.content.read().await.clone(),
             health_scanned: self.health.read().await.0,
@@ -922,16 +929,16 @@ async fn rpc_cid_op(
     let result = match op {
         "pin" => state.engine.pin_chain(cid).await.map(|_| ()),
         "unpin" => state.engine.unpin_chain(cid).await.map(|_| ()),
-        "want" => state.engine.want(cid).await,
-        "unwant" => state.engine.unwant(cid).await,
+        "want" => state.engine.want_chain(cid).await.map(|_| ()),
+        "unwant" => state.engine.unwant_chain(cid).await.map(|_| ()),
         "fetch" => state
             .engine
             .get(cid, zeph_obj::ConsumeMode::Seed)
             .await
             .map(|_| ()),
         "delete" => soft_delete(state, cid).await,
-        "ban" => state.engine.delete_local(cid).await,
-        "unban" => state.engine.undelete(cid).await,
+        "ban" => state.engine.ban_chain(cid).await.map(|_| ()),
+        "unban" => state.engine.unban_chain(cid).await.map(|_| ()),
         "delmeta" => state.engine.del_meta(cid).await,
         _ => unreachable!(),
     };
@@ -1083,8 +1090,8 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         let r = match action.op.as_str() {
             "pin" => ctx.state.engine.pin_chain(cid).await.map(|_| ()),
             "unpin" => ctx.state.engine.unpin_chain(cid).await.map(|_| ()),
-            "want" => ctx.state.engine.want(cid).await,
-            "unwant" => ctx.state.engine.unwant(cid).await,
+            "want" => ctx.state.engine.want_chain(cid).await.map(|_| ()),
+            "unwant" => ctx.state.engine.unwant_chain(cid).await.map(|_| ()),
             "fetch" => ctx
                 .state
                 .engine
@@ -1092,8 +1099,8 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
                 .await
                 .map(|_| ()),
             "delete" => soft_delete(&ctx.state, cid).await,
-            "ban" => ctx.state.engine.delete_local(cid).await,
-            "unban" => ctx.state.engine.undelete(cid).await,
+            "ban" => ctx.state.engine.ban_chain(cid).await.map(|_| ()),
+            "unban" => ctx.state.engine.unban_chain(cid).await.map(|_| ()),
             other => Err(anyhow::anyhow!("unknown op {other}")),
         };
         match r {
