@@ -382,6 +382,10 @@ async fn handle_rpc(state: &State, line: &str) -> serde_json::Value {
         Some("ban") => rpc_cid_op(state, &request, id, "ban").await,
         Some("unban") => rpc_cid_op(state, &request, id, "unban").await,
         Some("invoke") => rpc_invoke(state, &request, id).await,
+        Some("deploy") => rpc_deploy(state, &request, id).await,
+        Some("apps") => {
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "result": apps_list(state).await})
+        }
         Some("setmeta") => rpc_setmeta(state, &request, id).await,
         Some("delmeta") => rpc_cid_op(state, &request, id, "delmeta").await,
         Some("sql_exec") => rpc_sql_exec(state, &request, id).await,
@@ -510,6 +514,37 @@ async fn owned_add(state: &State, cid: &str) {
         if let Err(e) = db.write(&sql).await {
             tracing::warn!(%e, "owned index write failed");
         }
+    }
+}
+
+/// Register a deployed CraftCOM app in the private "apps" index (name → the app's
+/// SYSTEM-object cid). Upserts by name — re-deploying updates the cid (a light
+/// name→current-CID versioning, cf. CRAFTCOM_DESIGN §13).
+async fn apps_add(state: &State, name: &str, cid: &str) {
+    let now = state.clock.now().millis();
+    let sql = format!(
+        "CREATE TABLE IF NOT EXISTS apps(name TEXT PRIMARY KEY, cid TEXT, deployed_at INTEGER);\n\
+         INSERT INTO apps(name, cid, deployed_at) VALUES ('{}', '{}', {})\n\
+         ON CONFLICT(name) DO UPDATE SET cid = excluded.cid, deployed_at = excluded.deployed_at;",
+        sql_esc(name),
+        sql_esc(cid),
+        now,
+    );
+    if let Ok(mut db) = state.craftsql.open_private("apps").await {
+        if let Err(e) = db.write(&sql).await {
+            tracing::warn!(%e, "apps index write failed");
+        }
+    }
+}
+
+/// The deployed-apps registry: `{columns, rows}` of (name, cid, deployed_at).
+async fn apps_list(state: &State) -> serde_json::Value {
+    let empty = serde_json::json!({"columns": ["name", "cid", "deployed_at"], "rows": []});
+    match state.craftsql.open_private("apps").await {
+        Ok(db) => db
+            .query("SELECT name, cid, deployed_at FROM apps ORDER BY deployed_at DESC")
+            .unwrap_or(empty),
+        Err(_) => empty,
     }
 }
 
@@ -920,6 +955,41 @@ async fn rpc_sql_recover(
     }
 }
 
+/// Deploy a CraftCOM app: publish the WASM as a SYSTEM object (durable + managed
+/// like a database, hidden from the drive) and register it by name in the apps
+/// index. Returns {name, cid, size}.
+async fn rpc_deploy(
+    state: &State,
+    req: &serde_json::Value,
+    id: serde_json::Value,
+) -> serde_json::Value {
+    let Some(path) = param(req, "path").and_then(|v| v.as_str()) else {
+        return rpc_err(id, "deploy needs a 'path'".into());
+    };
+    let name = param(req, "name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            std::path::Path::new(path)
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+        })
+        .unwrap_or_else(|| "app".into());
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => return rpc_err(id, format!("read {path}: {e}")),
+    };
+    match state.engine.publish_system(&bytes).await {
+        Ok(cid) => {
+            apps_add(state, &name, &cid.to_hex()).await;
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
+                "name": name, "cid": cid.to_hex(), "size": bytes.len()
+            }})
+        }
+        Err(e) => rpc_err(id, format!("deploy failed: {e}")),
+    }
+}
+
 /// Invoke a CraftCOM app LOCALLY: run `func` from the WASM at `wasm_cid` against
 /// this node's `app.<app_ns>` namespace. Caller = this node's own identity (a local
 /// invocation); remote callers come in over INVOKE_ALPN with their own identity.
@@ -1264,6 +1334,16 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         }
     }
 
+    async fn api_apps(
+        AxumState(ctx): AxumState<HttpCtx>,
+        Query(params): Query<TokenParam>,
+    ) -> axum::response::Response {
+        if params.token != *ctx.token {
+            return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
+        }
+        axum::Json(apps_list(&ctx.state).await).into_response()
+    }
+
     let ctx = HttpCtx {
         state,
         token: Arc::new(token),
@@ -1276,6 +1356,7 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         .route("/api/action", axum::routing::post(api_action))
         .route("/api/invoke", axum::routing::post(api_invoke))
         .route("/api/app_query", get(api_app_query))
+        .route("/api/apps", get(api_apps))
         .with_state(ctx);
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;

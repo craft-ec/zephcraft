@@ -92,6 +92,17 @@ enum Command {
         #[arg(long)]
         input: Option<String>,
     },
+    /// Deploy a CraftCOM app: publish the WASM as a SYSTEM object (durable, managed
+    /// like a database — NOT a drive file) and register it by name.
+    Deploy {
+        /// The .wasm (or .wat) app file.
+        file: PathBuf,
+        /// App name (defaults to the file stem). Re-deploying updates it.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List your deployed CraftCOM apps.
+    Apps,
     /// Execute write SQL against your own CraftSQL database `ns`
     /// (commits + publishes the KIND_ROOT head).
     SqlExec {
@@ -288,6 +299,8 @@ async fn main() -> anyhow::Result<()> {
             func,
             input,
         }) => cmd_invoke(&data_dir, &app, &wasm, &func, input.as_deref()).await,
+        Some(Command::Deploy { file, name }) => cmd_deploy(&data_dir, &file, name.as_deref()).await,
+        Some(Command::Apps) => cmd_apps(&data_dir).await,
         Some(Command::SqlExec { ns, sql }) => cmd_sql_exec(&data_dir, &ns, &sql).await,
         Some(Command::SqlQuery { ns, sql, owner }) => {
             cmd_sql_query(&data_dir, owner.as_deref(), &ns, &sql).await
@@ -385,6 +398,41 @@ async fn cmd_invoke(
     let value = res.get("value").and_then(|v| v.as_i64()).unwrap_or(-1);
     let fuel = res.get("fuel_used").and_then(|v| v.as_u64()).unwrap_or(0);
     println!("app '{app}' returned {value}  (fuel {fuel})");
+    Ok(())
+}
+
+async fn cmd_deploy(data_dir: &Path, file: &Path, name: Option<&str>) -> anyhow::Result<()> {
+    let abs =
+        std::fs::canonicalize(file).with_context(|| format!("resolving {}", file.display()))?;
+    let params = serde_json::json!({"path": abs.to_string_lossy(), "name": name});
+    let r = control::query_unix_params(&data_dir.join("zeph.sock"), "deploy", params).await?;
+    let n = r.get("name").and_then(|v| v.as_str()).unwrap_or("app");
+    let cid = r.get("cid").and_then(|v| v.as_str()).unwrap_or("?");
+    let size = r.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+    println!("deployed app '{n}' ({size} bytes, system object) - cid {cid}");
+    println!("invoke: zeph invoke --app {n} --wasm {cid}");
+    Ok(())
+}
+
+async fn cmd_apps(data_dir: &Path) -> anyhow::Result<()> {
+    let r =
+        control::query_unix_params(&data_dir.join("zeph.sock"), "apps", serde_json::json!({})).await?;
+    let rows = r
+        .get("rows")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if rows.is_empty() {
+        println!("no apps deployed - zeph deploy <app.wasm> --name <name>");
+        return Ok(());
+    }
+    println!("{:<16} CID", "NAME");
+    for row in rows {
+        let a = row.as_array().cloned().unwrap_or_default();
+        let name = a.first().and_then(|v| v.as_str()).unwrap_or("");
+        let cid = a.get(1).and_then(|v| v.as_str()).unwrap_or("");
+        println!("{:<16} {}", name, &cid[..cid.len().min(16)]);
+    }
     Ok(())
 }
 

@@ -149,6 +149,7 @@
 
   <div class="card">
     <div class="cardhead">craftcom <span class="muted">(sovereign apps — sandboxed WASM against your <span class="mono">app.&lt;ns&gt;</span> namespace)</span></div>
+    <div id="apps-list" class="muted" style="font-size:.78rem;margin-bottom:.7rem">no apps deployed — <span class="mono">zeph deploy &lt;app.wasm&gt; --name &lt;name&gt;</span></div>
     <div class="cidbar">
       <input id="inv-app" class="cidin" style="flex:0 0 9rem" placeholder="app (e.g. feed)" spellcheck="false">
       <input id="inv-wasm" class="cidin" placeholder="app wasm cid (64 hex)" spellcheck="false">
@@ -310,8 +311,23 @@ async function tick(){
     const rf = await fetch("/api/files?token=" + TOKEN);
     if (rf.ok) renderDrive(await rf.json());
   } catch (_) {}
+  try {
+    const ra = await fetch("/api/apps?token=" + TOKEN);
+    if (ra.ok) renderApps(await ra.json());
+  } catch (_) {}
 }
 // My Drive: this identity's CraftSQL file index (name · size · type · age · cid).
+function renderApps(v){
+  const el = $("apps-list"); if(!el) return;
+  const rows = (v && v.rows) || [];
+  if(!rows.length){ el.innerHTML = 'no apps deployed — <span class="mono">zeph deploy &lt;app.wasm&gt; --name &lt;name&gt;</span>'; return; }
+  el.innerHTML = '<b>deployed apps</b> (system objects, durable, not drive files)<br>' + rows.map(r => {
+    const name=r[0], cid=r[1];
+    return `<span style="display:inline-flex;gap:.4rem;align-items:center;margin:.2rem .6rem .2rem 0">\u2699 <b>${esc(name)}</b>
+      <span class="cidcell mono" onclick="copyCid('${cid}')" title="copy cid">${cid.slice(0,10)}\u2026</span>
+      <button class="btn" onclick="useApp('${cid}','${esc(name)}.wasm')">invoke</button></span>`;
+  }).join("");
+}
 function renderDrive(v){
   window.lastDrive = (v && v.rows) || [];
   window.driveCids = new Set(window.lastDrive.map(r => r[0]));
