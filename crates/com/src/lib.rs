@@ -3,12 +3,14 @@
 //! runs untrusted WASM agents with metered, capability-gated access to CraftSQL +
 //! CraftOBJ. Aggregation and consensus are the app's job, never the runtime's.
 //!
-//! Phase 1: the fuel-metered runtime core.
-//! Phase 2 (this file): host functions + the **capability gate**. The gate is
-//! STRUCTURAL — the host functions expose no namespace parameter, so an agent can
-//! only ever write its OWN app namespace and read across other participants' SAME
-//! app namespace. It can't name a personal DB or a neighbor app, so there's nothing
-//! to "escape" — confinement is by construction, not a runtime check.
+//! Phase 1: fuel-metered runtime core. Phase 2: host functions + the STRUCTURAL
+//! capability gate. Phase 3: async execution + [`CraftBackend`] wiring the host
+//! functions to real CraftSQL/CraftOBJ (see [`craft`]).
+//!
+//! The gate is STRUCTURAL — the host functions expose no namespace parameter, so an
+//! agent can only ever write its OWN app namespace and read across other
+//! participants' SAME app namespace. It can't name a personal DB or a neighbor app,
+//! so there's nothing to "escape" — confinement is by construction.
 //!
 //! ## Guest ABI (import module `craftcom`)
 //! The guest exports its linear memory as `memory`. Strings/bytes are passed as
@@ -16,16 +18,19 @@
 //! the actual length is returned (`-1` on error / insufficient capacity).
 //! - `clock() -> i64` — HLC millis.
 //! - `caller(out, cap) -> i32` — writes the 32-byte invoking NodeId.
-//! - `sql_execute(sql_ptr, sql_len) -> i64` — write SQL to the app's OWN namespace;
-//!   rows affected, or `-1`. (No namespace arg — the gate.)
+//! - `sql_execute(sql_ptr, sql_len) -> i64` — write SQL to the app's OWN namespace.
 //! - `sql_query(owner_ptr, owner_len, sql_ptr, sql_len, out, cap) -> i32` — read the
-//!   app namespace of `owner` (own if `owner_len==0`); result JSON length written.
+//!   app namespace of `owner` (own if `owner_len==0`); result-JSON length written.
 //! - `obj_put(ptr, len, out, cap) -> i32` — store bytes; writes the 32-byte CID.
 //! - `obj_get(cid_ptr, out, cap) -> i32` — fetch by CID; content length written.
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use wasmtime::{Caller, Config, Engine, Extern, Linker, Memory, Module, Store};
+
+mod craft;
+pub use craft::CraftBackend;
 
 /// Default fuel budget per invocation — roughly proportional to executed WASM
 /// instructions (foundation §38). A runaway loop exhausts this and traps.
@@ -38,19 +43,23 @@ const HOST_MODULE: &str = "craftcom";
 /// implementation is constructed for ONE user (the node's own identity), so
 /// `sql_execute` always writes THAT user's `(own, app_ns)` — the agent never picks
 /// the writer. `sql_query` may name another participant (`owner`) but only within
-/// the same `app_ns`. This is where the capability gate is enforced concretely;
-/// phase 3 backs it with CraftSQL.
+/// the same `app_ns`. This is where the capability gate is enforced concretely.
+#[async_trait]
 pub trait AppBackend: Send + Sync {
     /// Write SQL against the OWN app namespace `(own_identity, app_ns)`.
-    fn sql_execute(&self, app_ns: &str, sql: &str) -> anyhow::Result<u64>;
+    async fn sql_execute(&self, app_ns: &str, sql: &str) -> anyhow::Result<u64>;
     /// Read the app namespace of `owner` (own if `None`) — SAME `app_ns` only.
-    fn sql_query(&self, owner: Option<[u8; 32]>, app_ns: &str, sql: &str)
-        -> anyhow::Result<String>;
+    async fn sql_query(
+        &self,
+        owner: Option<[u8; 32]>,
+        app_ns: &str,
+        sql: &str,
+    ) -> anyhow::Result<String>;
     /// Store bytes as an app object; returns its CID.
-    fn obj_put(&self, data: &[u8]) -> anyhow::Result<[u8; 32]>;
+    async fn obj_put(&self, data: &[u8]) -> anyhow::Result<[u8; 32]>;
     /// Fetch an app object by CID.
-    fn obj_get(&self, cid: [u8; 32]) -> anyhow::Result<Vec<u8>>;
-    /// Current HLC time in millis.
+    async fn obj_get(&self, cid: [u8; 32]) -> anyhow::Result<Vec<u8>>;
+    /// Current HLC time in millis (sync — no IO).
     fn now_millis(&self) -> u64;
 }
 
@@ -67,7 +76,7 @@ pub struct HostCtx {
 
 impl HostCtx {
     /// An inert context (no capabilities) — for running modules that import no host
-    /// functions (the phase-1 runtime-core path).
+    /// functions (the runtime-core path).
     pub fn inert() -> Self {
         Self {
             caller: [0u8; 32],
@@ -92,10 +101,12 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    /// Build a runtime with fuel metering enabled.
+    /// Build a runtime with fuel metering + async execution enabled (host functions
+    /// await CraftSQL/CraftOBJ).
     pub fn new() -> anyhow::Result<Self> {
         let mut cfg = Config::new();
         cfg.consume_fuel(true);
+        cfg.async_support(true);
         cfg.wasm_backtrace(true);
         Ok(Self {
             engine: Engine::new(&cfg)?,
@@ -103,9 +114,8 @@ impl Runtime {
     }
 
     /// Invoke `func` (no args → `i64`) with capability-gated host functions, under a
-    /// fresh `fuel` budget. `ctx` supplies the caller, the app namespace, and the
-    /// substrate. A runaway agent exhausts fuel and traps (returned as `Err`).
-    pub fn invoke(
+    /// fresh `fuel` budget. A runaway agent exhausts fuel and traps (`Err`).
+    pub async fn invoke(
         &self,
         wasm: &[u8],
         func: &str,
@@ -117,9 +127,9 @@ impl Runtime {
         store.set_fuel(fuel)?;
         let mut linker = Linker::new(&self.engine);
         bind_host_functions(&mut linker)?;
-        let instance = linker.instantiate(&mut store, &module)?;
+        let instance = linker.instantiate_async(&mut store, &module).await?;
         let f = instance.get_typed_func::<(), i64>(&mut store, func)?;
-        let value = f.call(&mut store, ())?;
+        let value = f.call_async(&mut store, ()).await?;
         let remaining = store.get_fuel().unwrap_or(0);
         Ok(Outcome {
             value,
@@ -127,125 +137,135 @@ impl Runtime {
         })
     }
 
-    /// Run a module with NO host capabilities (runtime-core path, phase 1).
-    pub fn run_i64(&self, wasm: &[u8], func: &str, fuel: u64) -> anyhow::Result<Outcome> {
-        self.invoke(wasm, func, HostCtx::inert(), fuel)
+    /// Run a module with NO host capabilities (runtime-core path).
+    pub async fn run_i64(&self, wasm: &[u8], func: &str, fuel: u64) -> anyhow::Result<Outcome> {
+        self.invoke(wasm, func, HostCtx::inert(), fuel).await
     }
 }
 
 /// Bind the `craftcom` host functions onto the linker. Every function reads the app
-/// namespace from the store context — NEVER from an agent argument — which is what
+/// namespace from the store CONTEXT — never from an agent argument — which is what
 /// makes the namespace gate structural.
 fn bind_host_functions(linker: &mut Linker<HostCtx>) -> anyhow::Result<()> {
-    linker.func_wrap(HOST_MODULE, "clock", |caller: Caller<'_, HostCtx>| -> i64 {
-        caller.data().backend.now_millis() as i64
-    })?;
+    linker.func_wrap_async(
+        HOST_MODULE,
+        "clock",
+        |caller: Caller<'_, HostCtx>, (): ()| {
+            Box::new(async move { caller.data().backend.now_millis() as i64 })
+        },
+    )?;
 
-    linker.func_wrap(
+    linker.func_wrap_async(
         HOST_MODULE,
         "caller",
-        |mut caller: Caller<'_, HostCtx>, out: i32, cap: i32| -> i32 {
-            let id = caller.data().caller;
-            let Some(mem) = memory(&mut caller) else {
-                return -1;
-            };
-            write_out(&mut caller, &mem, out, cap, &id)
+        |mut caller: Caller<'_, HostCtx>, (out, cap): (i32, i32)| {
+            Box::new(async move {
+                let id = caller.data().caller;
+                let Some(mem) = memory(&mut caller) else {
+                    return -1i32;
+                };
+                write_out(&mut caller, &mem, out, cap, &id)
+            })
         },
     )?;
 
-    linker.func_wrap(
+    linker.func_wrap_async(
         HOST_MODULE,
         "sql_execute",
-        |mut caller: Caller<'_, HostCtx>, ptr: i32, len: i32| -> i64 {
-            let Some(mem) = memory(&mut caller) else {
-                return -1;
-            };
-            let Some(sql) = read_str(&caller, &mem, ptr, len) else {
-                return -1;
-            };
-            // app_ns comes from the CONTEXT, not the agent — the gate.
-            let ns = caller.data().app_ns.clone();
-            match caller.data().backend.sql_execute(&ns, &sql) {
-                Ok(n) => n as i64,
-                Err(_) => -1,
-            }
+        |mut caller: Caller<'_, HostCtx>, (ptr, len): (i32, i32)| {
+            Box::new(async move {
+                let Some(mem) = memory(&mut caller) else {
+                    return -1i64;
+                };
+                let Some(sql) = read_str(&caller, &mem, ptr, len) else {
+                    return -1;
+                };
+                let ns = caller.data().app_ns.clone(); // gate: ctx namespace, not agent
+                let backend = caller.data().backend.clone();
+                match backend.sql_execute(&ns, &sql).await {
+                    Ok(n) => n as i64,
+                    Err(_) => -1,
+                }
+            })
         },
     )?;
 
-    linker.func_wrap(
+    linker.func_wrap_async(
         HOST_MODULE,
         "sql_query",
         |mut caller: Caller<'_, HostCtx>,
-         owner_ptr: i32,
-         owner_len: i32,
-         sql_ptr: i32,
-         sql_len: i32,
-         out: i32,
-         cap: i32|
-         -> i32 {
-            let Some(mem) = memory(&mut caller) else {
-                return -1;
-            };
-            // owner: absent (own space) or exactly 32 bytes.
-            let owner = if owner_len == 0 {
-                None
-            } else {
-                match read_bytes(&caller, &mem, owner_ptr, owner_len) {
+         (owner_ptr, owner_len, sql_ptr, sql_len, out, cap): (i32, i32, i32, i32, i32, i32)| {
+            Box::new(async move {
+                let Some(mem) = memory(&mut caller) else {
+                    return -1i32;
+                };
+                let owner = if owner_len == 0 {
+                    None
+                } else {
+                    match read_bytes(&caller, &mem, owner_ptr, owner_len) {
+                        Some(b) if b.len() == 32 => {
+                            let mut a = [0u8; 32];
+                            a.copy_from_slice(&b);
+                            Some(a)
+                        }
+                        _ => return -1,
+                    }
+                };
+                let Some(sql) = read_str(&caller, &mem, sql_ptr, sql_len) else {
+                    return -1;
+                };
+                let ns = caller.data().app_ns.clone(); // gate: same app_ns only
+                let backend = caller.data().backend.clone();
+                match backend.sql_query(owner, &ns, &sql).await {
+                    Ok(res) => write_out(&mut caller, &mem, out, cap, res.as_bytes()),
+                    Err(_) => -1,
+                }
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        HOST_MODULE,
+        "obj_put",
+        |mut caller: Caller<'_, HostCtx>, (ptr, len, out, cap): (i32, i32, i32, i32)| {
+            Box::new(async move {
+                let Some(mem) = memory(&mut caller) else {
+                    return -1i32;
+                };
+                let Some(data) = read_bytes(&caller, &mem, ptr, len) else {
+                    return -1;
+                };
+                let backend = caller.data().backend.clone();
+                match backend.obj_put(&data).await {
+                    Ok(cid) => write_out(&mut caller, &mem, out, cap, &cid),
+                    Err(_) => -1,
+                }
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        HOST_MODULE,
+        "obj_get",
+        |mut caller: Caller<'_, HostCtx>, (cid_ptr, out, cap): (i32, i32, i32)| {
+            Box::new(async move {
+                let Some(mem) = memory(&mut caller) else {
+                    return -1i32;
+                };
+                let cid = match read_bytes(&caller, &mem, cid_ptr, 32) {
                     Some(b) if b.len() == 32 => {
                         let mut a = [0u8; 32];
                         a.copy_from_slice(&b);
-                        Some(a)
+                        a
                     }
                     _ => return -1,
+                };
+                let backend = caller.data().backend.clone();
+                match backend.obj_get(cid).await {
+                    Ok(data) => write_out(&mut caller, &mem, out, cap, &data),
+                    Err(_) => -1,
                 }
-            };
-            let Some(sql) = read_str(&caller, &mem, sql_ptr, sql_len) else {
-                return -1;
-            };
-            let ns = caller.data().app_ns.clone(); // gate: same app_ns only
-            match caller.data().backend.sql_query(owner, &ns, &sql) {
-                Ok(res) => write_out(&mut caller, &mem, out, cap, res.as_bytes()),
-                Err(_) => -1,
-            }
-        },
-    )?;
-
-    linker.func_wrap(
-        HOST_MODULE,
-        "obj_put",
-        |mut caller: Caller<'_, HostCtx>, ptr: i32, len: i32, out: i32, cap: i32| -> i32 {
-            let Some(mem) = memory(&mut caller) else {
-                return -1;
-            };
-            let Some(data) = read_bytes(&caller, &mem, ptr, len) else {
-                return -1;
-            };
-            match caller.data().backend.obj_put(&data) {
-                Ok(cid) => write_out(&mut caller, &mem, out, cap, &cid),
-                Err(_) => -1,
-            }
-        },
-    )?;
-
-    linker.func_wrap(
-        HOST_MODULE,
-        "obj_get",
-        |mut caller: Caller<'_, HostCtx>, cid_ptr: i32, out: i32, cap: i32| -> i32 {
-            let Some(mem) = memory(&mut caller) else {
-                return -1;
-            };
-            let cid = match read_bytes(&caller, &mem, cid_ptr, 32) {
-                Some(b) if b.len() == 32 => {
-                    let mut a = [0u8; 32];
-                    a.copy_from_slice(&b);
-                    a
-                }
-                _ => return -1,
-            };
-            match caller.data().backend.obj_get(cid) {
-                Ok(data) => write_out(&mut caller, &mem, out, cap, &data),
-                Err(_) => -1,
-            }
+            })
         },
     )?;
 
@@ -300,17 +320,23 @@ fn write_out(
 
 /// A no-capability backend (for `HostCtx::inert`).
 struct Noop;
+#[async_trait]
 impl AppBackend for Noop {
-    fn sql_execute(&self, _ns: &str, _sql: &str) -> anyhow::Result<u64> {
+    async fn sql_execute(&self, _ns: &str, _sql: &str) -> anyhow::Result<u64> {
         Ok(0)
     }
-    fn sql_query(&self, _o: Option<[u8; 32]>, _ns: &str, _sql: &str) -> anyhow::Result<String> {
+    async fn sql_query(
+        &self,
+        _o: Option<[u8; 32]>,
+        _ns: &str,
+        _sql: &str,
+    ) -> anyhow::Result<String> {
         Ok(String::new())
     }
-    fn obj_put(&self, _d: &[u8]) -> anyhow::Result<[u8; 32]> {
+    async fn obj_put(&self, _d: &[u8]) -> anyhow::Result<[u8; 32]> {
         Ok([0u8; 32])
     }
-    fn obj_get(&self, _c: [u8; 32]) -> anyhow::Result<Vec<u8>> {
+    async fn obj_get(&self, _c: [u8; 32]) -> anyhow::Result<Vec<u8>> {
         Ok(Vec::new())
     }
     fn now_millis(&self) -> u64 {
@@ -325,20 +351,20 @@ mod tests {
 
     // ---- phase 1: runtime core ----
 
-    #[test]
-    fn runs_a_module_and_returns_a_value() {
+    #[tokio::test]
+    async fn runs_a_module_and_returns_a_value() {
         let rt = Runtime::new().unwrap();
         let wasm = br#"(module (func (export "answer") (result i64) i64.const 42))"#;
-        let out = rt.run_i64(wasm, "answer", DEFAULT_FUEL).unwrap();
+        let out = rt.run_i64(wasm, "answer", DEFAULT_FUEL).await.unwrap();
         assert_eq!(out.value, 42);
         assert!(out.fuel_used > 0);
     }
 
-    #[test]
-    fn runaway_loop_traps_on_fuel_exhaustion() {
+    #[tokio::test]
+    async fn runaway_loop_traps_on_fuel_exhaustion() {
         let rt = Runtime::new().unwrap();
         let wasm = br#"(module (func (export "spin") (result i64) (loop (br 0)) i64.const 0))"#;
-        let err = rt.run_i64(wasm, "spin", 100_000).unwrap_err();
+        let err = rt.run_i64(wasm, "spin", 100_000).await.unwrap_err();
         let msg = format!("{err:#}").to_lowercase();
         assert!(msg.contains("fuel") || msg.contains("trap") || msg.contains("interrupt"));
     }
@@ -353,22 +379,28 @@ mod tests {
         queries: Mutex<QueryLog>,
         clock: u64,
     }
+    #[async_trait]
     impl AppBackend for MockBackend {
-        fn sql_execute(&self, ns: &str, sql: &str) -> anyhow::Result<u64> {
+        async fn sql_execute(&self, ns: &str, sql: &str) -> anyhow::Result<u64> {
             self.executes.lock().unwrap().push((ns.into(), sql.into()));
             Ok(3)
         }
-        fn sql_query(&self, o: Option<[u8; 32]>, ns: &str, sql: &str) -> anyhow::Result<String> {
+        async fn sql_query(
+            &self,
+            o: Option<[u8; 32]>,
+            ns: &str,
+            sql: &str,
+        ) -> anyhow::Result<String> {
             self.queries
                 .lock()
                 .unwrap()
                 .push((o, ns.into(), sql.into()));
             Ok("[]".into())
         }
-        fn obj_put(&self, _d: &[u8]) -> anyhow::Result<[u8; 32]> {
+        async fn obj_put(&self, _d: &[u8]) -> anyhow::Result<[u8; 32]> {
             Ok([9u8; 32])
         }
-        fn obj_get(&self, _c: [u8; 32]) -> anyhow::Result<Vec<u8>> {
+        async fn obj_get(&self, _c: [u8; 32]) -> anyhow::Result<Vec<u8>> {
             Ok(vec![1, 2, 3])
         }
         fn now_millis(&self) -> u64 {
@@ -384,8 +416,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn clock_host_function_returns_backend_time() {
+    #[tokio::test]
+    async fn clock_host_function_returns_backend_time() {
         let rt = Runtime::new().unwrap();
         let backend = Arc::new(MockBackend {
             clock: 999,
@@ -396,15 +428,15 @@ mod tests {
             (func (export "run") (result i64) (call $clock)))"#;
         let out = rt
             .invoke(wasm, "run", ctx(backend, [0; 32], "feed"), DEFAULT_FUEL)
+            .await
             .unwrap();
         assert_eq!(out.value, 999);
     }
 
-    #[test]
-    fn caller_host_function_exposes_the_invoking_identity() {
+    #[tokio::test]
+    async fn caller_host_function_exposes_the_invoking_identity() {
         let rt = Runtime::new().unwrap();
         let backend = Arc::new(MockBackend::default());
-        // write the caller to offset 0, then return its first byte.
         let wasm = br#"(module
             (import "craftcom" "caller" (func $caller (param i32 i32) (result i32)))
             (memory (export "memory") 1)
@@ -413,15 +445,15 @@ mod tests {
                 (i64.load8_u (i32.const 0))))"#;
         let out = rt
             .invoke(wasm, "run", ctx(backend, [0xAB; 32], "feed"), DEFAULT_FUEL)
+            .await
             .unwrap();
         assert_eq!(out.value, 0xAB);
     }
 
-    #[test]
-    fn sql_execute_is_confined_to_the_context_app_namespace() {
+    #[tokio::test]
+    async fn sql_execute_is_confined_to_the_context_app_namespace() {
         let rt = Runtime::new().unwrap();
         let backend = Arc::new(MockBackend::default());
-        // agent writes SQL "hello" — it has NO way to name a namespace.
         let wasm = br#"(module
             (import "craftcom" "sql_execute" (func $exec (param i32 i32) (result i64)))
             (memory (export "memory") 1)
@@ -434,8 +466,9 @@ mod tests {
                 ctx(backend.clone(), [0; 32], "feed"),
                 DEFAULT_FUEL,
             )
+            .await
             .unwrap();
-        assert_eq!(out.value, 3, "rows affected from the backend");
+        assert_eq!(out.value, 3);
         let recorded = backend.executes.lock().unwrap();
         assert_eq!(
             recorded.as_slice(),
@@ -444,11 +477,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sql_query_reads_another_participant_but_same_app_namespace() {
+    #[tokio::test]
+    async fn sql_query_reads_another_participant_but_same_app_namespace() {
         let rt = Runtime::new().unwrap();
         let backend = Arc::new(MockBackend::default());
-        // owner = 32 * 0x02 at offset 0; sql "SELECT" at offset 32; out buffer at 64.
         let wasm = br#"(module
             (import "craftcom" "sql_query"
                 (func $q (param i32 i32 i32 i32 i32 i32) (result i32)))
@@ -466,17 +498,14 @@ mod tests {
                 ctx(backend.clone(), [0; 32], "feed"),
                 DEFAULT_FUEL,
             )
+            .await
             .unwrap();
-        assert_eq!(out.value, 2, "wrote the 2-byte result \"[]\"");
+        assert_eq!(out.value, 2);
         let recorded = backend.queries.lock().unwrap();
         assert_eq!(recorded.len(), 1);
         let (owner, ns, sql) = &recorded[0];
-        assert_eq!(
-            *owner,
-            Some([0x02; 32]),
-            "cross-user read names a participant"
-        );
-        assert_eq!(ns, "feed", "confined to the SAME app namespace");
+        assert_eq!(*owner, Some([0x02; 32]));
+        assert_eq!(ns, "feed");
         assert_eq!(sql, "SELECT");
     }
 }

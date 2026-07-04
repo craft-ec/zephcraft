@@ -7,6 +7,18 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-wasmtime = "27"
+async-trait.workspace = true
+wasmtime = { version = "27", features = ["async"] }
+zeph-core.workspace = true
+zeph-sql.workspace = true
+zeph-obj.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
+tokio.workspace = true
+tempfile.workspace = true
+zeph-crypto.workspace = true
+zeph-cipher.workspace = true
+zeph-routing.workspace = true
+zeph-transport.workspace = true
+zeph-store.workspace = true

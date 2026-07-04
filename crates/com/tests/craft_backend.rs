@@ -1,0 +1,141 @@
+//! CraftCOM phase 3 GATE — an agent's SQL writes route through the real
+//! [`CraftBackend`], persist to CraftSQL, and reload from the committed head.
+//!
+//! Builds a single real node (transport + obj engine + CraftSQL), wires a
+//! `CraftBackend`, runs a WASM agent that CREATEs a table and INSERTs a row via the
+//! `sql_execute` host function, then a FRESH query (a new `open`, which re-resolves
+//! the committed root) reads the row back — proving persistence, not just in-memory
+//! mutation.
+
+use std::path::Path;
+use std::sync::Arc;
+
+use zeph_com::{AppBackend, CraftBackend, HostCtx, Runtime, DEFAULT_FUEL};
+use zeph_core::hlc::Clock;
+use zeph_crypto::NodeIdentity;
+use zeph_obj::{ObjConfig, ObjEngine};
+use zeph_routing::{ContentRouting, Registry, RegistryConfig, TrackerRouting};
+use zeph_sql::{CraftSql, ObjDurable, RoutingManifestStore, RoutingRootStore, TransportPageSource};
+use zeph_store::Store;
+use zeph_transport::{Reach, Transport};
+
+async fn start_tracker() -> Arc<Transport> {
+    let id = NodeIdentity::generate();
+    let t = Arc::new(
+        Transport::bind(
+            id.secret_key_bytes(),
+            Reach::LocalOnly,
+            vec![zeph_routing::ALPN.to_vec()],
+            0,
+        )
+        .await
+        .unwrap(),
+    );
+    let registry = Arc::new(Registry::new(RegistryConfig::default()));
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let st = t.clone();
+    tokio::spawn(async move { st.serve(vec![(zeph_routing::ALPN.to_vec(), tx)]).await });
+    let rt = t.clone();
+    tokio::spawn(async move { zeph_routing::serve(registry, rt, rx).await });
+    t
+}
+
+/// A real node: obj engine + CraftSQL serving the piece + page ALPNs. Returns the
+/// CraftSQL + engine so a CraftBackend can be built over them.
+async fn node(tracker: &Transport, dir: &Path) -> (Arc<CraftSql>, Arc<ObjEngine>) {
+    let id = Arc::new(NodeIdentity::generate());
+    let node_id = id.node_id();
+    let t = Arc::new(
+        Transport::bind(
+            id.secret_key_bytes(),
+            Reach::LocalOnly,
+            vec![zeph_obj::ALPN.to_vec(), zeph_sql::PAGE_ALPN.to_vec()],
+            0,
+        )
+        .await
+        .unwrap(),
+    );
+    let store = Arc::new(Store::open(dir.join("obj")).unwrap());
+    let routing = Arc::new(TrackerRouting::new(
+        t.clone(),
+        id.clone(),
+        vec![tracker.addr()],
+        "test".into(),
+    ));
+    let engine = ObjEngine::new(t.clone(), store, routing.clone(), ObjConfig::default());
+    let sql_dir = dir.join("sqlpages");
+    let routing_dyn: Arc<dyn ContentRouting> = routing.clone();
+    let craftsql = Arc::new(
+        CraftSql::register(
+            &sql_dir,
+            Arc::new(RoutingRootStore::new(routing_dyn.clone())),
+            node_id,
+        )
+        .unwrap()
+        .with_source(Arc::new(TransportPageSource::new(
+            t.clone(),
+            routing_dyn.clone(),
+        )))
+        .with_durable(Arc::new(ObjDurable::new(engine.clone())))
+        .with_manifests(Arc::new(RoutingManifestStore::new(routing_dyn.clone()))),
+    );
+    let (obj_tx, obj_rx) = tokio::sync::mpsc::channel(64);
+    let (sql_tx, sql_rx) = tokio::sync::mpsc::channel(64);
+    let st = t.clone();
+    tokio::spawn(async move {
+        st.serve(vec![
+            (zeph_obj::ALPN.to_vec(), obj_tx),
+            (zeph_sql::PAGE_ALPN.to_vec(), sql_tx),
+        ])
+        .await
+    });
+    let se = engine.clone();
+    tokio::spawn(async move { se.serve(obj_rx).await });
+    let sdir = sql_dir.clone();
+    tokio::spawn(async move { zeph_sql::serve_pages(sdir, sql_rx).await });
+    routing.announce_node(0, 0).await.unwrap();
+    (craftsql, engine)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_writes_persist_to_craftsql_and_reload() {
+    let tracker = start_tracker().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (craftsql, engine) = node(&tracker, dir.path()).await;
+    let backend: Arc<dyn AppBackend> =
+        Arc::new(CraftBackend::new(craftsql, engine, Arc::new(Clock::new())));
+
+    // Agent: CREATE a table, then INSERT a row — both via `sql_execute`, both
+    // confined (structurally) to (own, "app/feed").
+    let rt = Runtime::new().unwrap();
+    let wasm = br#"(module
+        (import "craftcom" "sql_execute" (func $exec (param i32 i32) (result i64)))
+        (memory (export "memory") 1)
+        (data (i32.const 0)  "CREATE TABLE posts(body TEXT)")
+        (data (i32.const 64) "INSERT INTO posts VALUES('x')")
+        (func (export "run") (result i64)
+            (drop (call $exec (i32.const 0)  (i32.const 29)))
+            (call $exec (i32.const 64) (i32.const 29))))"#;
+    let ctx = HostCtx {
+        caller: [0u8; 32],
+        app_ns: "feed".into(),
+        backend: backend.clone(),
+    };
+    let out = rt.invoke(wasm, "run", ctx, DEFAULT_FUEL).await.unwrap();
+    assert!(
+        out.value >= 0,
+        "sql_execute host function did not error (got {})",
+        out.value
+    );
+
+    // A FRESH query (new open → re-resolves the committed root) reads the row back.
+    // This is the real gate: the write PERSISTED, not just mutated memory.
+    let got = backend
+        .sql_query(None, "feed", "SELECT body FROM posts")
+        .await
+        .unwrap();
+    assert!(
+        got.contains('x'),
+        "the agent's write persisted + reloaded from the CraftSQL head; got: {got}"
+    );
+}
