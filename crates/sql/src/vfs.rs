@@ -62,6 +62,9 @@ pub struct CraftHandle {
     lock: LockKind,
 }
 
+// The `Db` variant is the common, long-lived case (the open database); boxing it
+// would add indirection to page-heavy operations for no real memory win.
+#[allow(clippy::large_enum_variant)]
 enum Inner {
     /// The main database — persisted as CraftOBJ pages under a root CID.
     Db {
