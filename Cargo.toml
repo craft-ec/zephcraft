@@ -32,6 +32,7 @@ zeph-routing = { path = "crates/routing" }
 zeph-store = { path = "crates/store" }
 zeph-obj = { path = "crates/obj" }
 zeph-sql = { path = "crates/sql" }
+zeph-com = { path = "crates/com" }
 
 # ── Async ──
 tokio = { version = "1", features = ["full"] }

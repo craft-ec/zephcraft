@@ -1,0 +1,12 @@
+[package]
+name = "zeph-com"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+wasmtime = "27"
+
+[dev-dependencies]
