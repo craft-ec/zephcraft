@@ -25,11 +25,7 @@ pub enum Event {
         pinned: bool,
     },
     /// A CraftSQL commit produced a new root (`PAGE_COMMITTED`).
-    PageCommitted {
-        namespace: String,
-        root: Cid,
-        seq: u64,
-    },
+    PageCommitted { namespace: String, root: Cid },
     /// A peer entered the active view (`PEER_CONNECTED`).
     PeerConnected(NodeId),
     /// A peer left the active view (`PEER_DISCONNECTED`).
@@ -55,6 +51,17 @@ impl Event {
         }
     }
 
+    /// The CID this event concerns, hex-encoded — for structured consumers
+    /// (e.g. the SSE stream). `None` for events without a CID (peer, disk, …).
+    pub fn cid_hex(&self) -> Option<String> {
+        match self {
+            Event::CidWritten { cid, .. }
+            | Event::PageCommitted { root: cid, .. }
+            | Event::RepairNeeded(cid) => Some(cid.to_hex()),
+            _ => None,
+        }
+    }
+
     /// A one-line human-readable description — for logs and the activity feed.
     pub fn describe(&self) -> String {
         let short = |c: &Cid| c.to_hex()[..12].to_string();
@@ -66,8 +73,8 @@ impl Event {
                     short(cid)
                 )
             }
-            Event::PageCommitted { namespace, seq, .. } => {
-                format!("db commit · {namespace} · seq {seq}")
+            Event::PageCommitted { namespace, root } => {
+                format!("db commit · {namespace} · {}", &root.to_hex()[..12])
             }
             Event::PeerConnected(n) => format!("peer connected · {}", &n.to_hex()[..12]),
             Event::PeerDisconnected(n) => format!("peer disconnected · {}", &n.to_hex()[..12]),

@@ -625,6 +625,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
 
     // The node event bus (foundation §52): subsystems publish, apps subscribe.
     let events = zeph_events::EventBus::default();
+    engine.set_events(events.clone());
 
     // Control state, shared by the heartbeat loop and the control servers.
     let state = Arc::new(control::State {

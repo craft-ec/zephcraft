@@ -160,6 +160,10 @@ pub struct ObjEngine {
     /// bumped by lifecycle writes, unlike the store's LRU last_access). Fade's
     /// demand-recency signal.
     last_served: Mutex<HashMap<[u8; 32], Instant>>,
+    /// The node event bus (foundation §52), set post-construction. Producers:
+    /// health_scan → RepairNeeded, enforce_quota → DiskWatermarkHit. Optional so
+    /// tests construct an engine without one.
+    events: std::sync::OnceLock<zeph_events::EventBus>,
 }
 
 impl ObjEngine {
@@ -176,7 +180,20 @@ impl ObjEngine {
             config,
             demand: Mutex::new(HashMap::new()),
             last_served: Mutex::new(HashMap::new()),
+            events: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Attach the node event bus so lifecycle producers can publish (§52).
+    pub fn set_events(&self, bus: zeph_events::EventBus) {
+        let _ = self.events.set(bus);
+    }
+
+    /// Publish an event if a bus is attached (no-op otherwise).
+    fn emit(&self, event: zeph_events::Event) {
+        if let Some(bus) = self.events.get() {
+            bus.publish(event);
+        }
     }
 
     pub fn store(&self) -> &Arc<Store> {
@@ -738,7 +755,9 @@ impl ObjEngine {
     /// isn't immediately refilled), then purge expired cooldown records.
     pub async fn enforce_quota(&self) {
         let cap = self.config.capacity_bytes;
-        if cap > 0 && self.store.stats().bytes > cap {
+        let used = self.store.stats().bytes;
+        if cap > 0 && used > cap {
+            self.emit(zeph_events::Event::DiskWatermarkHit { used, cap });
             let freed = self.store.evict_to(cap * 9 / 10).unwrap_or(0);
             if freed > 0 {
                 tracing::info!(freed, "evicted under disk pressure");
@@ -884,6 +903,7 @@ impl ObjEngine {
             // Repair: mint one fresh piece and push it to the live holder that
             // most needs it (fewest pieces). Falls back to a non-holder peer if
             // no other live holder exists (sole survivor recruiting a new one).
+            self.emit(zeph_events::Event::RepairNeeded(cid));
             if self.repair_one(&cid, &gen, &live).await {
                 report.repaired += 1;
             }

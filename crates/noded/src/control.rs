@@ -653,9 +653,17 @@ async fn rpc_sql_exec(
         Err(e) => return rpc_err(id, format!("open failed: {e}")),
     };
     match db.write(sql).await {
-        Ok(()) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
-            "ok": true, "root": db.root().map(|c| c.to_hex()),
-        }}),
+        Ok(()) => {
+            if let Some(root) = db.root() {
+                state.events.publish(zeph_events::Event::PageCommitted {
+                    namespace: ns.to_string(),
+                    root,
+                });
+            }
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
+                "ok": true, "root": db.root().map(|c| c.to_hex()),
+            }})
+        }
         Err(e) => rpc_err(id, format!("sql_exec failed: {e}")),
     }
 }
@@ -943,6 +951,38 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         axum::Json(drive_list(&ctx.state, owner).await).into_response()
     }
 
+    // SSE: stream the event bus (foundation §52) to external subscribers. This is
+    // the exposure step — the internal bus made reactive over the control API, so
+    // apps react to node events without being wired into the kernel.
+    async fn api_events(
+        AxumState(ctx): AxumState<HttpCtx>,
+        Query(params): Query<TokenParam>,
+    ) -> axum::response::Response {
+        use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
+        use futures::StreamExt;
+        if params.token != *ctx.token {
+            return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
+        }
+        let rx = ctx.state.events.subscribe();
+        let stream = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|r| {
+            std::future::ready(match r {
+                Ok(ev) => {
+                    let data = serde_json::json!({
+                        "tag": ev.tag(), "desc": ev.describe(), "cid": ev.cid_hex(),
+                    })
+                    .to_string();
+                    Some(Ok::<_, std::convert::Infallible>(
+                        SseEvent::default().event(ev.tag()).data(data),
+                    ))
+                }
+                Err(_) => None, // lagged subscriber: skip, resume at newest
+            })
+        });
+        Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response()
+    }
+
     let ctx = HttpCtx {
         state,
         token: Arc::new(token),
@@ -951,6 +991,7 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         .route("/", get(index))
         .route("/api/status", get(api_status))
         .route("/api/files", get(api_files))
+        .route("/api/events", get(api_events))
         .route("/api/action", axum::routing::post(api_action))
         .with_state(ctx);
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
