@@ -41,11 +41,13 @@ pub use attest::{
 };
 pub use coordinate::{
     collect_commit, request_attestation, serve_attestations, AttestRequest, AttestService,
-    ATTEST_ALPN,
+    NativeProgram, ATTEST_ALPN,
 };
 pub use craft::CraftBackend;
 pub use invoke::{invoke_remote, serve_invocations, InvokeRequest, InvokeService, INVOKE_ALPN};
-pub use registry::{HeadEntry, HeadSubmission, RegistryState};
+pub use registry::{
+    registry_program_cid, HeadEntry, HeadSubmission, RegistryProgram, RegistryState, REGISTRY_SEED,
+};
 
 /// Default fuel budget per invocation — roughly proportional to executed WASM
 /// instructions (foundation §38). A runaway loop exhausts this and traps.

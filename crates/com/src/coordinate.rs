@@ -18,8 +18,8 @@ use zeph_obj::{ConsumeMode, ObjEngine};
 use zeph_transport::{Connection, PeerAddr, Transport};
 
 use crate::{
-    attest_run, verify_quorum, Attestation, AttestedCommit, AttestedRuntime, Committee,
-    DEFAULT_FUEL,
+    attest_run, attest_transition, verify_quorum, Attestation, AttestedCommit, AttestedRuntime,
+    Committee, DEFAULT_FUEL,
 };
 
 /// ALPN for attestation requests.
@@ -34,6 +34,19 @@ pub struct AttestRequest {
     pub func: String,
     #[serde(default)]
     pub request: Vec<u8>,
+    /// For NATIVE programs: the prior state the transition runs on. Its hash must equal
+    /// `prev_root` (checked by the agent). WASM programs ignore this — their prior state
+    /// is bound only through `prev_root`.
+    #[serde(default)]
+    pub prev_state: Vec<u8>,
+}
+
+/// A NATIVE network-owned program the attestation service runs deterministically:
+/// `(prev_state, request) → new_state`. Its code is the node's own (identical on every
+/// agent), so it needn't run through the WASM sandbox (foundation mechanism/policy split).
+pub trait NativeProgram: Send + Sync {
+    fn program_cid(&self) -> [u8; 32];
+    fn run(&self, prev_state: &[u8], request: &[u8]) -> anyhow::Result<Vec<u8>>;
 }
 
 /// Attests deterministic program runs on THIS node: loads the program by CID, runs it
@@ -44,6 +57,7 @@ pub struct AttestService {
     runtime: AttestedRuntime,
     obj: Arc<ObjEngine>,
     identity: Arc<NodeIdentity>,
+    native: Vec<Arc<dyn NativeProgram>>,
 }
 
 impl AttestService {
@@ -52,12 +66,39 @@ impl AttestService {
             runtime,
             obj,
             identity,
+            native: Vec::new(),
         }
+    }
+
+    /// Register a native network-owned program (e.g. the registry) this node will attest.
+    pub fn with_native(mut self, program: Arc<dyn NativeProgram>) -> Self {
+        self.native.push(program);
+        self
     }
 
     /// Load the program by CID (following a File manifest to its content, like invoke)
     /// and produce this node's attestation of the deterministic run.
     pub async fn attest(&self, req: &AttestRequest) -> anyhow::Result<Attestation> {
+        // Native network-owned program (e.g. the registry): run the transition on the
+        // supplied prior state (whose hash must match prev_root) — no WASM sandbox.
+        if let Some(program) = self
+            .native
+            .iter()
+            .find(|p| p.program_cid() == req.program_cid)
+        {
+            anyhow::ensure!(
+                Cid::of(&req.prev_state).0 == req.prev_root,
+                "prev_state does not hash to prev_root"
+            );
+            let new_state = program.run(&req.prev_state, &req.request)?;
+            return Ok(attest_transition(
+                &self.identity,
+                req.program_cid,
+                req.prev_root,
+                &req.request,
+                &new_state,
+            ));
+        }
         let raw = self
             .obj
             .get(Cid(req.program_cid), ConsumeMode::Drop)
@@ -139,12 +180,14 @@ pub async fn collect_commit(
     prev_root: [u8; 32],
     func: &str,
     request: Vec<u8>,
+    prev_state: Vec<u8>,
 ) -> Option<AttestedCommit> {
     let req = AttestRequest {
         program_cid,
         prev_root,
         func: func.to_string(),
         request: request.clone(),
+        prev_state,
     };
     let mut set = tokio::task::JoinSet::new();
     for addr in members {

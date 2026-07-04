@@ -59,6 +59,16 @@ impl HeadSubmission {
         }
     }
 
+    /// Canonical wire encoding of this submission (the registry request bytes).
+    pub fn encode(&self) -> Vec<u8> {
+        postcard::to_allocvec(self).unwrap_or_default()
+    }
+
+    /// Decode a submission from its wire bytes.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        postcard::from_bytes(bytes).ok()
+    }
+
     /// Verify the owner's signature over this submission.
     pub fn verify(&self) -> bool {
         let Ok(sig) = <[u8; 64]>::try_from(self.signature.as_slice()) else {
@@ -149,6 +159,35 @@ impl RegistryState {
             Err(i) => next.entries.insert(i, entry),
         }
         Ok(next)
+    }
+}
+
+/// The well-known program CID of the app-name registry — a NATIVE network-owned
+/// program (its logic is [`RegistryState::apply`]).
+pub fn registry_program_cid() -> [u8; 32] {
+    Cid::of(b"craftec/program/registry/1").0
+}
+
+/// The seed for the registry PDA account (so `pda(registry_program_cid(), REGISTRY_SEED)`
+/// is the account whose head advances as the registry).
+pub const REGISTRY_SEED: &[u8] = b"apps";
+
+/// The registry as a [`crate::NativeProgram`] the attestation committee runs: decode the
+/// prior state, apply the signed submission, re-encode. Deterministic, so every agent
+/// computes the identical new state.
+pub struct RegistryProgram;
+
+impl crate::NativeProgram for RegistryProgram {
+    fn program_cid(&self) -> [u8; 32] {
+        registry_program_cid()
+    }
+    fn run(&self, prev_state: &[u8], request: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let state = RegistryState::decode(prev_state)
+            .ok_or_else(|| anyhow::anyhow!("undecodable registry state"))?;
+        let sub =
+            HeadSubmission::decode(request).ok_or_else(|| anyhow::anyhow!("bad submission"))?;
+        let next = state.apply(&sub).map_err(|e| anyhow::anyhow!(e))?;
+        Ok(next.encode())
     }
 }
 

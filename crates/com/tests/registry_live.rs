@@ -1,34 +1,22 @@
-//! Phase 3b GATE — attestation coordination over the wire. Three committee members
-//! each run the SAME deterministic program and return their own signed attestation; a
-//! coordinator collects a k-of-n quorum into an `AttestedCommit` that verifies against
-//! the epoch committee. No trusted coordinator, no shared secret — the coordinator
-//! only gathers independently-signed attestations.
+//! Phase 4b GATE — the app-name registry, LIVE over the committee. Three committee
+//! members each run the native `RegistryProgram`; a coordinator submits a signed head,
+//! the committee attests the registry transition over the wire, and the advanced state
+//! resolves the registered name. Program-owned (PDA), no keyholder, quorum-attested.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use zeph_com::{
-    collect_commit, pda, select_committee, serve_attestations, AttestService, AttestedRuntime,
-    ATTEST_ALPN,
+    collect_commit, pda, registry_program_cid, select_committee, serve_attestations, AttestService,
+    AttestedRuntime, HeadSubmission, RegistryProgram, RegistryState, ATTEST_ALPN, REGISTRY_SEED,
 };
-use zeph_core::{Cid, NodeId};
+use zeph_core::NodeId;
 use zeph_crypto::NodeIdentity;
 use zeph_obj::{ObjConfig, ObjEngine};
 use zeph_routing::{Registry, RegistryConfig, TrackerRouting};
 use zeph_store::Store;
 use zeph_transport::{Connection, PeerAddr, Reach, Transport};
-
-// Deterministic program: read the first input byte `b`, commit `[b, b*2]`.
-const DOUBLE_WAT: &[u8] = br#"(module
-  (import "craftcom" "input"  (func $input  (param i32 i32) (result i32)))
-  (import "craftcom" "commit" (func $commit (param i32 i32) (result i32)))
-  (memory (export "memory") 1)
-  (func (export "run")
-    (drop (call $input (i32.const 0) (i32.const 64)))
-    (i32.store8 (i32.const 100) (i32.load8_u (i32.const 0)))
-    (i32.store8 (i32.const 101) (i32.mul (i32.load8_u (i32.const 0)) (i32.const 2)))
-    (drop (call $commit (i32.const 100) (i32.const 2)))))"#;
 
 async fn start_tracker() -> Arc<Transport> {
     let id = NodeIdentity::generate();
@@ -55,7 +43,6 @@ struct Member {
     node_id: NodeId,
     addr: PeerAddr,
     transport: Arc<Transport>,
-    engine: Arc<ObjEngine>,
 }
 
 async fn member(tracker: &Transport, dir: &Path) -> Member {
@@ -92,61 +79,70 @@ async fn member(tracker: &Transport, dir: &Path) -> Member {
     let se = engine.clone();
     tokio::spawn(async move { se.serve(obj_rx).await });
     routing.announce_node(0, 0).await.unwrap();
-    let service = Arc::new(AttestService::new(
-        AttestedRuntime::new().unwrap(),
-        engine.clone(),
-        id.clone(),
-    ));
+    // Each member registers the native registry program it will attest.
+    let service = Arc::new(
+        AttestService::new(AttestedRuntime::new().unwrap(), engine.clone(), id.clone())
+            .with_native(Arc::new(RegistryProgram)),
+    );
     tokio::spawn(serve_attestations(att_rx, service));
     Member {
         node_id,
         addr: t.addr(),
         transport: t,
-        engine,
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn committee_attests_a_commit_over_the_wire() {
+async fn registry_advances_live_over_the_committee() {
     let tracker = start_tracker().await;
     let dirs: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
     let mut members = Vec::new();
     for d in &dirs {
         members.push(member(&tracker, d.path()).await);
     }
-
-    // Each member holds the program locally (same content-addressed CID).
-    let mut wasm_cid = [0u8; 32];
-    for m in &members {
-        wasm_cid = m.engine.publish(DOUBLE_WAT, true).await.unwrap().cid.0;
-    }
-
-    // The committee = all three members (n=3, k=2).
     let eligible: Vec<[u8; 32]> = members.iter().map(|m| m.node_id.0).collect();
     let committee = select_committee(&eligible, 1, 3, 2);
     let addrs: Vec<PeerAddr> = members.iter().map(|m| m.addr.clone()).collect();
 
-    // A coordinator (member 0) fans the run out to the committee and collects a quorum.
+    // Genesis registry state.
+    let state = RegistryState::default();
+    let prev_root = state.root();
+
+    // A publisher submits a signed head.
+    let publisher = NodeIdentity::generate();
+    let sub = HeadSubmission::sign(&publisher, "feed", [1u8; 32], 1);
+
+    // The committee runs the native registry transition and attests it over the wire.
     let commit = collect_commit(
         &members[0].transport,
         &addrs,
         &committee,
-        wasm_cid,
-        b"registry".to_vec(),
-        [0u8; 32],
-        "run",
-        vec![10u8],
-        Vec::new(), // WASM program: prev_state unused
+        registry_program_cid(),
+        REGISTRY_SEED.to_vec(),
+        prev_root,
+        "", // native program: func unused
+        sub.encode(),
+        state.encode(), // the prior state the agents run the transition on
     )
     .await
-    .expect("the committee reached a k-of-n quorum over the wire");
+    .expect("the committee attested the registry advance over the wire");
 
-    // ≥k members independently attested the SAME deterministic output, and the
-    // collected commit is a valid advance of the program's PDA account.
-    assert!(commit.attestations.len() >= 2);
+    // The advance is a valid move of the registry PDA account...
     let adv = committee
         .verify_commit(&commit)
-        .expect("the collected commit is a valid PDA advance");
-    assert_eq!(adv.new_root, Cid::of(&[10u8, 20]).0);
-    assert_eq!(adv.account, pda(&wasm_cid, b"registry"));
+        .expect("the collected commit advances the registry PDA");
+    assert_eq!(adv.account, pda(&registry_program_cid(), REGISTRY_SEED));
+    assert_eq!(adv.prev_root, prev_root);
+
+    // ...to exactly the state that resolves the registered name.
+    let new_state = state.apply(&sub).unwrap();
+    assert_eq!(adv.new_root, new_state.root());
+    assert_eq!(
+        new_state
+            .resolve(&publisher.node_id().0, "feed")
+            .unwrap()
+            .cid,
+        [1u8; 32],
+        "the name resolves to the published cid after the live committee advance"
+    );
 }
