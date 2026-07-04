@@ -982,6 +982,10 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let content_store = store.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
+        // Resolved names for curated cids we can't decode locally (too few pieces)
+        // — fetched once from the network, then cached so the tab stays named.
+        let mut name_cache: std::collections::HashMap<[u8; 32], (String, u64, bool)> =
+            std::collections::HashMap::new();
         loop {
             interval.tick().await;
             // A DHT has no global enumeration: the content list is LOCAL knowledge
@@ -1023,6 +1027,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
             }
             curated.retain(|cid| banned.contains(cid) || !referenced.contains(&cid.0));
             let mut out = Vec::new();
+            let mut fetches = 0u32; // cap network name-resolves per pass
             for cid in curated {
                 let mut e = control::ContentInfo {
                     cid: cid.to_hex(),
@@ -1049,13 +1054,32 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                     // Small enough to be a manifest? Decode it locally so
                     // files/folders show by name, not by hash.
                     if gen.total_len <= 64 * 1024 {
-                        if let Some(m) = content_store
-                            .content(&cid)
+                        // Name it, best-first: (1) decode from local pieces; else
+                        // (2) a cached name; else (3) fetch the manifest from the
+                        // network ONCE (capped per pass) and cache it. Skip fetching
+                        // for banned cids — we refuse that content, don't pull it.
+                        if let Some(m) = content_state
+                            .engine
+                            .decode_local(&cid)
                             .and_then(|b| zeph_obj::Manifest::decode(&b))
                         {
                             e.name = Some(m.name().to_string());
                             e.size = m.size();
                             e.is_dir = m.is_dir();
+                            name_cache.insert(cid.0, (m.name().to_string(), m.size(), m.is_dir()));
+                        } else if let Some((n, s, dir)) = name_cache.get(&cid.0) {
+                            e.name = Some(n.clone());
+                            e.size = *s;
+                            e.is_dir = *dir;
+                        } else if fetches < 4 && !banned.contains(&cid) {
+                            fetches += 1;
+                            if let Ok(m) = content_state.engine.fetch_manifest(cid).await {
+                                e.name = Some(m.name().to_string());
+                                e.size = m.size();
+                                e.is_dir = m.is_dir();
+                                name_cache
+                                    .insert(cid.0, (m.name().to_string(), m.size(), m.is_dir()));
+                            }
                         }
                     }
                 }

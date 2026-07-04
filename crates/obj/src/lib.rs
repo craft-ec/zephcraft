@@ -747,12 +747,46 @@ impl ObjEngine {
         Ok(())
     }
 
+    /// Reconstruct an object from LOCAL pieces only (no network) — returns the
+    /// whole content if we hold it whole OR hold ≥k of its coded pieces. Lets us
+    /// name a curated cid we host only as pieces (e.g. a wanted manifest) without
+    /// a network round-trip.
+    pub fn decode_local(&self, cid: &Cid) -> Option<Vec<u8>> {
+        if let Some(c) = self.store.content(cid) {
+            if cid.verifies(&c) {
+                return Some(c);
+            }
+        }
+        let gen = self.store.generation(cid)?;
+        let t = postcard::from_bytes::<vtags::VTags>(&gen.vtags).ok()?;
+        let local = self
+            .store
+            .serve_pieces(cid, &HashSet::new(), gen.k as usize * 3)
+            .unwrap_or_default();
+        if local.is_empty() {
+            return None;
+        }
+        let mut d = Decoder::new(gen.k as usize, gen.piece_len as usize);
+        let mut seen = HashSet::new();
+        for p in &local {
+            if vtags::verify(&t, p) && seen.insert(p.piece_id()) {
+                let _ = d.add_piece(p);
+            }
+        }
+        if !d.is_complete() {
+            return None;
+        }
+        let mut bytes: Vec<u8> = d.decode().ok()?.into_iter().flatten().collect();
+        bytes.truncate(gen.total_len as usize);
+        cid.verifies(&bytes).then_some(bytes)
+    }
+
     /// Objects this manifest/envelope directly references — the content (File),
-    /// the ciphertext (private envelope), or the child entries (Dir) — if we hold
-    /// it whole. Empty for raw content or objects we don't have. Lets callers
-    /// treat a file/folder as its whole reachable chain, not just the top object.
+    /// the ciphertext (private envelope), or the child entries (Dir) — reconstructed
+    /// from local pieces if needed. Empty for raw content or objects we don't have.
+    /// Lets callers treat a file/folder as its whole reachable chain.
     pub fn referenced_objects(&self, cid: &Cid) -> Vec<Cid> {
-        match self.store.content(cid) {
+        match self.decode_local(cid) {
             Some(bytes) => chain_children(&bytes),
             None => Vec::new(),
         }
