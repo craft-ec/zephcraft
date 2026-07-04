@@ -1,0 +1,179 @@
+//! Phase 3b — attestation coordination over the wire (`ATTEST_ALPN`). This is the
+//! foundation §41 flow made live (the deferred `ATTEST_BROADCAST`, §1042): a
+//! coordinator asks each committee member to attest a deterministic program run, the
+//! members return their own signed [`Attestation`], and the coordinator collects a
+//! k-of-n quorum into an [`AttestedCommit`].
+//!
+//! The coordinator is **untrusted** — it only gathers independently-signed
+//! attestations; it cannot forge one, and it cannot advance state without a real
+//! quorum of committee members agreeing on the same deterministic output.
+
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+use zeph_core::Cid;
+use zeph_crypto::NodeIdentity;
+use zeph_obj::{ConsumeMode, ObjEngine};
+use zeph_transport::{Connection, PeerAddr, Transport};
+
+use crate::{
+    attest_run, verify_quorum, Attestation, AttestedCommit, AttestedRuntime, Committee,
+    DEFAULT_FUEL,
+};
+
+/// ALPN for attestation requests.
+pub const ATTEST_ALPN: &[u8] = b"/craftec/attest/1";
+
+/// A request to attest a deterministic program run: which program (by CID), which
+/// export, the prior state root it builds on, and the request bytes.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct AttestRequest {
+    pub program_cid: [u8; 32],
+    pub prev_root: [u8; 32],
+    pub func: String,
+    #[serde(default)]
+    pub request: Vec<u8>,
+}
+
+/// Attests deterministic program runs on THIS node: loads the program by CID, runs it
+/// under the restricted deterministic ABI, and returns this node's signed
+/// [`Attestation`]. The attestor is this node's own identity (it signs) — so, unlike
+/// invocation, there is no caller identity.
+pub struct AttestService {
+    runtime: AttestedRuntime,
+    obj: Arc<ObjEngine>,
+    identity: Arc<NodeIdentity>,
+}
+
+impl AttestService {
+    pub fn new(runtime: AttestedRuntime, obj: Arc<ObjEngine>, identity: Arc<NodeIdentity>) -> Self {
+        Self {
+            runtime,
+            obj,
+            identity,
+        }
+    }
+
+    /// Load the program by CID (following a File manifest to its content, like invoke)
+    /// and produce this node's attestation of the deterministic run.
+    pub async fn attest(&self, req: &AttestRequest) -> anyhow::Result<Attestation> {
+        let raw = self
+            .obj
+            .get(Cid(req.program_cid), ConsumeMode::Drop)
+            .await?;
+        let wasm = match zeph_obj::Manifest::decode(&raw) {
+            Some(zeph_obj::Manifest::File { content, .. }) => {
+                self.obj.get(Cid(content), ConsumeMode::Drop).await?
+            }
+            _ => raw,
+        };
+        let (att, _output) = attest_run(
+            &self.identity,
+            &self.runtime,
+            &wasm,
+            &req.func,
+            req.program_cid,
+            req.prev_root,
+            &req.request,
+            DEFAULT_FUEL,
+        )?;
+        Ok(att)
+    }
+}
+
+/// Serve attestation requests. Each reply is this node's signed attestation (or `None`
+/// if it declines / errors), postcard-encoded.
+pub async fn serve_attestations(
+    mut conns: mpsc::Receiver<Connection>,
+    service: Arc<AttestService>,
+) {
+    while let Some(conn) = conns.recv().await {
+        let service = service.clone();
+        tokio::spawn(async move {
+            while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                let Ok(bytes) = recv.read_to_end(64 * 1024).await else {
+                    break;
+                };
+                let reply: Option<Attestation> = match postcard::from_bytes::<AttestRequest>(&bytes)
+                {
+                    Ok(req) => service.attest(&req).await.ok(),
+                    Err(_) => None,
+                };
+                let out = postcard::to_allocvec(&reply).unwrap_or_default();
+                let _ = send.write_all(&out).await;
+                let _ = send.finish();
+            }
+        });
+    }
+}
+
+/// Ask ONE committee member to attest the run.
+pub async fn request_attestation(
+    transport: &Transport,
+    addr: &PeerAddr,
+    req: &AttestRequest,
+) -> anyhow::Result<Attestation> {
+    let conn = transport.connect(addr, ATTEST_ALPN).await?;
+    let (mut send, mut recv) = conn.open_bi().await?;
+    send.write_all(&postcard::to_allocvec(req)?).await?;
+    send.finish()?;
+    let resp = recv.read_to_end(64 * 1024).await?;
+    conn.close(0u32.into(), b"done");
+    let reply: Option<Attestation> = postcard::from_bytes(&resp)?;
+    reply.ok_or_else(|| anyhow::anyhow!("member declined to attest"))
+}
+
+/// Coordinate a commit: fan out the run to the committee's members (concurrently),
+/// collect their attestations, and bundle a k-of-n quorum into an [`AttestedCommit`].
+/// Returns `None` if the quorum is not reached. `members[i]` is the address of a
+/// committee member; verification is against `committee` (its member set + `k`), so an
+/// address that isn't a committee member simply doesn't count toward the quorum.
+#[allow(clippy::too_many_arguments)]
+pub async fn collect_commit(
+    transport: &Arc<Transport>,
+    members: &[PeerAddr],
+    committee: &Committee,
+    program_cid: [u8; 32],
+    seed: Vec<u8>,
+    prev_root: [u8; 32],
+    func: &str,
+    request: Vec<u8>,
+) -> Option<AttestedCommit> {
+    let req = AttestRequest {
+        program_cid,
+        prev_root,
+        func: func.to_string(),
+        request: request.clone(),
+    };
+    let mut set = tokio::task::JoinSet::new();
+    for addr in members {
+        let t = transport.clone();
+        let a = addr.clone();
+        let r = req.clone();
+        set.spawn(async move { request_attestation(&t, &a, &r).await.ok() });
+    }
+    let mut attestations = Vec::new();
+    while let Some(res) = set.join_next().await {
+        if let Ok(Some(att)) = res {
+            attestations.push(att);
+        }
+    }
+    let request_hash = Cid::of(&request).0;
+    let new_root = verify_quorum(
+        &attestations,
+        &program_cid,
+        &prev_root,
+        &request_hash,
+        &committee.members,
+        committee.k,
+    )?;
+    Some(AttestedCommit {
+        program_cid,
+        seed,
+        prev_root,
+        request,
+        new_root,
+        attestations,
+    })
+}

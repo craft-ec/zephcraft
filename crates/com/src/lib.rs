@@ -30,11 +30,16 @@ use async_trait::async_trait;
 use wasmtime::{Caller, Config, Engine, Extern, Linker, Memory, Module, Store};
 
 mod attest;
+mod coordinate;
 mod craft;
 mod invoke;
 pub use attest::{
     attest_run, pda, select_committee, verify, verify_commit, verify_quorum, Attestation,
     AttestedCommit, AttestedRuntime, Committee, PdaAdvance,
+};
+pub use coordinate::{
+    collect_commit, request_attestation, serve_attestations, AttestRequest, AttestService,
+    ATTEST_ALPN,
 };
 pub use craft::CraftBackend;
 pub use invoke::{invoke_remote, serve_invocations, InvokeRequest, InvokeService, INVOKE_ALPN};
