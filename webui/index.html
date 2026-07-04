@@ -304,7 +304,7 @@ function renderDrive(v){
         <div class="crow1"><span class="ctitle">${esc(name)}</span>${chip}</div>
         <div class="cmeta muted"><span class="cidcell mono" title="click to copy the cid" onclick="copyCid('${cid}')">${cid.slice(0,12)}…</span> · ${meta}</div>
       </div>
-      <div class="cacts"><button class="btn" title="copy cid" onclick="copyCid('${cid}')">copy cid</button></div>
+      <div class="cacts"><button class="btn" title="copy cid" onclick="copyCid('${cid}')">copy cid</button><button class="btn" title="remove from your drive + unpin so it fades" onclick="if(confirm('delete '+${JSON.stringify(name)}+' from your drive?'))act('delete','${cid}')">delete</button></div>
     </div>`;
   }).join("");
 }
@@ -390,8 +390,8 @@ function citem(c){
     const want = `<button class="btn ${c.local_wanted?'on':''}" onclick="act('${c.local_wanted?'unwant':'want'}','${c.cid}')">${c.local_wanted?'wanted':'want'}</button>`;
     const fetchb = held ? '' : `<button class="btn" onclick="act('fetch','${c.cid}')">fetch</button>`;
     const note = held ? `<button class="btn" title="edit metadata envelope" onclick="setmeta('${c.cid}')">note</button>` : '';
-    const del = held ? `<button class="btn" onclick="if(confirm('delete this node\\'s copy?'))act('delete','${c.cid}')">del</button>` : '';
-    acts = `${pin} ${want} ${fetchb} ${note} ${del}`;
+    const ban = held ? `<button class="btn" title="tombstone: refuse to host + block resurrection (moderation)" onclick="if(confirm('ban this cid on this node? refuses to host + blocks resurrection.'))act('ban','${c.cid}')">ban</button>` : '';
+    acts = `${pin} ${want} ${fetchb} ${note} ${ban}`;
   }
   return `<div class="citem">
     <div class="cicon">${icon}</div>

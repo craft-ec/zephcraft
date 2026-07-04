@@ -500,6 +500,33 @@ async fn owned_add(state: &State, cid: &str) {
     }
 }
 
+/// Remove a CID from the drive index (on delete).
+async fn owned_remove(state: &State, cid: &str) {
+    let sql = format!("DELETE FROM owned WHERE cid = '{}';", sql_esc(cid));
+    if let Ok(mut db) = state.craftsql.open_private("owned").await {
+        let _ = db.write(&sql).await;
+    }
+}
+
+/// Soft-delete YOUR OWN content: remove it from your drive, then unpin + unwant so
+/// it's evictable and fades from the network (nothing wants it). Re-publishable —
+/// NO tombstone (that's `ban`). For a private file, also unpins the ciphertext, so
+/// as the local capsule is dropped + fades this is the best-effort crypto-shred
+/// (Tier 2, docs/CRYPTO_SHRED_DESIGN.md): your copies go, network copies fade.
+async fn soft_delete(state: &State, cid: zeph_core::Cid) -> anyhow::Result<()> {
+    if let Ok(bytes) = state.engine.get(cid, zeph_obj::ConsumeMode::Drop).await {
+        if let Some(env) = zeph_obj::EncryptedEnvelope::decode(&bytes) {
+            let ct = zeph_core::Cid(env.ciphertext_cid);
+            let _ = state.engine.unpin(ct).await;
+            let _ = state.engine.unwant(ct).await;
+        }
+    }
+    let _ = state.engine.unpin(cid).await;
+    let _ = state.engine.unwant(cid).await;
+    owned_remove(state, &cid.to_hex()).await;
+    Ok(())
+}
+
 /// The DRIVE (bundled reference app): read `owner`'s owned index and enrich each
 /// entry from its manifest (name/size/mime/is_dir). No denormalized copy — the
 /// manifest is the source of truth; the drive is a view. `{columns, rows}`.
@@ -908,7 +935,8 @@ async fn rpc_cid_op(
             .get(cid, zeph_obj::ConsumeMode::Seed)
             .await
             .map(|_| ()),
-        "delete" => state.engine.delete_local(cid).await,
+        "delete" => soft_delete(state, cid).await,
+        "ban" => state.engine.delete_local(cid).await,
         "unban" => state.engine.undelete(cid).await,
         "delmeta" => state.engine.del_meta(cid).await,
         _ => unreachable!(),
@@ -1069,7 +1097,8 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
                 .get(cid, zeph_obj::ConsumeMode::Seed)
                 .await
                 .map(|_| ()),
-            "delete" => ctx.state.engine.delete_local(cid).await,
+            "delete" => soft_delete(&ctx.state, cid).await,
+            "ban" => ctx.state.engine.delete_local(cid).await,
             "unban" => ctx.state.engine.undelete(cid).await,
             other => Err(anyhow::anyhow!("unknown op {other}")),
         };

@@ -66,8 +66,14 @@ enum Command {
     Pin { cid: String },
     /// Unpin a CID (revert to normal, evictable lifecycle).
     Unpin { cid: String },
-    /// Delete a CID from this node (tombstone; blocks resurrection).
+    /// Remove a file from your drive: unlist it + unpin so it fades from the
+    /// network (nothing wants it). Re-publishable. For a private file, also unpins
+    /// the ciphertext (best-effort crypto-shred). Your copies go; network copies
+    /// fade — not a guarantee for published objects.
     Delete { cid: String },
+    /// Ban a CID on THIS node: tombstone it — refuse to host + block resurrection.
+    /// For moderating content off your node; sticky until unbanned.
+    Ban { cid: String },
     /// Execute write SQL against your own CraftSQL database `ns`
     /// (commits + publishes the KIND_ROOT head).
     SqlExec {
@@ -255,6 +261,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Pin { cid }) => cmd_cid_op(&data_dir, "pin", &cid).await,
         Some(Command::Unpin { cid }) => cmd_cid_op(&data_dir, "unpin", &cid).await,
         Some(Command::Delete { cid }) => cmd_cid_op(&data_dir, "delete", &cid).await,
+        Some(Command::Ban { cid }) => cmd_cid_op(&data_dir, "ban", &cid).await,
         Some(Command::SqlExec { ns, sql }) => cmd_sql_exec(&data_dir, &ns, &sql).await,
         Some(Command::SqlQuery { ns, sql, owner }) => {
             cmd_sql_query(&data_dir, owner.as_deref(), &ns, &sql).await
