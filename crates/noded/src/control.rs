@@ -514,15 +514,16 @@ async fn owned_remove(state: &State, cid: &str) {
 /// as the local capsule is dropped + fades this is the best-effort crypto-shred
 /// (Tier 2, docs/CRYPTO_SHRED_DESIGN.md): your copies go, network copies fade.
 async fn soft_delete(state: &State, cid: zeph_core::Cid) -> anyhow::Result<()> {
+    // For a private file, forget the ciphertext it points at too.
     if let Ok(bytes) = state.engine.get(cid, zeph_obj::ConsumeMode::Drop).await {
         if let Some(env) = zeph_obj::EncryptedEnvelope::decode(&bytes) {
-            let ct = zeph_core::Cid(env.ciphertext_cid);
-            let _ = state.engine.unpin(ct).await;
-            let _ = state.engine.unwant(ct).await;
+            let _ = state
+                .engine
+                .forget_local(zeph_core::Cid(env.ciphertext_cid))
+                .await;
         }
     }
-    let _ = state.engine.unpin(cid).await;
-    let _ = state.engine.unwant(cid).await;
+    let _ = state.engine.forget_local(cid).await;
     owned_remove(state, &cid.to_hex()).await;
     Ok(())
 }

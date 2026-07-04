@@ -816,6 +816,16 @@ impl ObjEngine {
         Ok(())
     }
 
+    /// Soft-forget this node's local copy: drop content + pieces (no tombstone, so
+    /// it's re-fetchable/re-publishable) + stop advertising it. Used by the
+    /// file-manager `delete` (vs `delete_local`/tombstone = ban).
+    pub async fn forget_local(&self, cid: Cid) -> anyhow::Result<()> {
+        guard_not_system(&self.store, &cid)?;
+        self.store.forget(&cid)?;
+        let _ = self.routing.withdraw(cid).await;
+        Ok(())
+    }
+
     /// Re-announce provider records for ALL content this node holds — pins,
     /// seed-cached content, AND plain coded pieces. Called on startup and
     /// periodically so held content stays discoverable across restart,

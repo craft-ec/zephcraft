@@ -477,6 +477,17 @@ impl Store {
         Ok(())
     }
 
+    /// Drop this node's local copy (content + pieces + generation + pin/want)
+    /// WITHOUT tombstoning — the CID can be re-fetched or re-published later. This
+    /// is soft delete ("remove my file"); `tombstone` is the ban ("never host").
+    pub fn forget(&self, cid: &Cid) -> Result<()> {
+        self.index.lock().expect("index").remove(cid);
+        self.wanted.lock().expect("wanted").remove(cid);
+        let _ = fs::remove_file(self.root.join("wanted").join(cid.to_hex()));
+        let _ = fs::remove_dir_all(self.cid_dir(cid));
+        Ok(())
+    }
+
     /// Mark a CID as WANTed (keep-alive intent; independent of holding it).
     pub fn set_want(&self, cid: Cid) -> Result<()> {
         write_atomic(&self.root.join("wanted").join(cid.to_hex()), b"")?;
