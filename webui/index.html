@@ -98,6 +98,7 @@
       <dt>trackers</dt><dd id="trackers" class="muted">…</dd>
       <dt>store</dt><dd id="store" class="muted">…</dd>
       <dt>health</dt><dd id="health" class="muted">…</dd>
+      <dt>jobs</dt><dd id="jobs" class="muted">…</dd>
       <dt>listen</dt><dd id="listen" class="muted">…</dd>
       <dt>uptime</dt><dd id="uptime">…</dd>
     </dl>
@@ -151,6 +152,9 @@ function render(s){
   const atrisk = s.health_at_risk || 0;
   $("health").textContent = "scanned " + (s.health_scanned||0) + " · at-risk " + atrisk + " · repaired " + (s.health_repaired||0) + " · distributed " + (s.health_distributed||0) + " · scaled " + (s.health_scaled||0) + " · degraded " + (s.health_degraded||0) + " · fading " + (s.health_fading||0);
   $("health").style.color = atrisk > 0 ? "var(--warn, #d29922)" : "";
+  const j = s.jobs || {};
+  $("jobs").textContent = "coordinator (§51) — submitted " + (j.submitted||0) + " · completed " + (j.completed||0) +
+    " · in-flight " + (j.in_flight||0) + " · deduped " + (j.deduped||0) + " · retried " + (j.retried||0) + " · failed " + (j.failed||0);
   $("listen").textContent = s.listen;
   $("uptime").textContent = fmtUptime(s.uptime_secs);
   renderContent(s);

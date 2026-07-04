@@ -1,0 +1,12 @@
+[package]
+name = "zeph-sched"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+tracing.workspace = true

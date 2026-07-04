@@ -21,6 +21,7 @@ rust-version = "1.85"
 # ── zephcraft internal crates ──
 zeph-core = { path = "crates/core" }
 zeph-events = { path = "crates/events" }
+zeph-sched = { path = "crates/sched" }
 zeph-crypto = { path = "crates/crypto" }
 zeph-wire = { path = "crates/wire" }
 zeph-erasure = { path = "crates/erasure" }

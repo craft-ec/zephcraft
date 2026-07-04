@@ -92,6 +92,8 @@ pub struct Status {
     pub peers: Vec<PeerStatus>,
     /// Recent node events (activity feed), newest first.
     pub recent_events: Vec<String>,
+    /// Background job coordinator activity (foundation §51).
+    pub jobs: zeph_sched::JobStats,
 }
 
 pub struct State {
@@ -114,6 +116,9 @@ pub struct State {
     pub events: zeph_events::EventBus,
     /// Recent event descriptions for the dashboard activity feed (newest last).
     pub recent_events: RwLock<std::collections::VecDeque<String>>,
+    /// Background job coordinator (foundation §51) — prioritized, deduped,
+    /// bounded-concurrency scheduler the lifecycle + reannounce run through.
+    pub jobs: zeph_sched::JobCoordinator,
 }
 
 impl State {
@@ -159,6 +164,7 @@ impl State {
                 .rev()
                 .cloned()
                 .collect(),
+            jobs: self.jobs.stats(),
         }
     }
 

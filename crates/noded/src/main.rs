@@ -627,6 +627,12 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let events = zeph_events::EventBus::default();
     engine.set_events(events.clone());
 
+    // Background job coordinator (foundation §51): the periodic lifecycle +
+    // re-announce run THROUGH it — prioritized, deduped (a slow pass can't
+    // stack), retried, and metered. Serial for now (concurrency 1); the
+    // primitive supports more for future per-item reactive jobs.
+    let jobs = zeph_sched::JobCoordinator::new(1);
+
     // Control state, shared by the heartbeat loop and the control servers.
     let state = Arc::new(control::State {
         clock: transport.clock(),
@@ -662,6 +668,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         craftsql: craftsql.clone(),
         events: events.clone(),
         recent_events: tokio::sync::RwLock::new(std::collections::VecDeque::new()),
+        jobs: jobs.clone(),
     });
 
     // Activity feed: drain the event bus into the bounded recent-events buffer
@@ -727,25 +734,44 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let announce_engine = engine.clone();
     let announce_relays = cfg.relay_operator_urls.clone();
     let announce_sql = craftsql.clone();
+    let announce_jobs = jobs.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(120));
         loop {
             interval.tick().await;
-            let _ = announce_engine.announce_node().await;
-            for relay in &announce_relays {
-                let _ = announce_engine.announce_relay(relay.clone()).await;
-            }
-            let n = announce_engine.reannounce_providers().await;
-            if n > 0 {
-                tracing::info!(cids = n, "re-announced provider records");
-            }
-            // Re-publish owned DB heads + manifests (lost on tracker restart
-            // otherwise). First tick fires immediately, so this also restores
-            // heads right after our own restart.
-            let h = announce_sql.reannounce_heads().await;
-            if h > 0 {
-                tracing::info!(dbs = h, "re-announced CraftSQL heads/manifests");
-            }
+            let e = announce_engine.clone();
+            let relays = announce_relays.clone();
+            let sql = announce_sql.clone();
+            // Distribution priority: getting records to peers matters, but yields
+            // to Repair. Deduped so a slow re-announce can't stack.
+            announce_jobs.submit(
+                "reannounce",
+                zeph_sched::Priority::Distribution,
+                1,
+                move || {
+                    let e = e.clone();
+                    let relays = relays.clone();
+                    let sql = sql.clone();
+                    async move {
+                        let _ = e.announce_node().await;
+                        for relay in &relays {
+                            let _ = e.announce_relay(relay.clone()).await;
+                        }
+                        let n = e.reannounce_providers().await;
+                        if n > 0 {
+                            tracing::info!(cids = n, "re-announced provider records");
+                        }
+                        // Re-publish owned DB heads + manifests (lost on tracker
+                        // restart otherwise). First tick fires immediately, so this
+                        // also restores heads right after our own restart.
+                        let h = sql.reannounce_heads().await;
+                        if h > 0 {
+                            tracing::info!(dbs = h, "re-announced CraftSQL heads/manifests");
+                        }
+                        Ok(())
+                    }
+                },
+            );
         }
     });
     let ping_clock = transport.clock();
@@ -791,36 +817,54 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // (the self-healing control loop). Runs every epoch (30s).
     let health_engine = engine.clone();
     let health_state = state.clone();
+    let health_jobs = jobs.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         interval.tick().await; // skip immediate tick at startup
         loop {
             interval.tick().await;
-            let r = health_engine.health_scan().await;
-            let d = health_engine.distribute().await;
-            let sc = health_engine.scale().await;
-            health_engine.enforce_quota().await;
-            health_state
-                .set_health(
-                    r.scanned,
-                    r.at_risk,
-                    r.repaired as u64,
-                    d.moved as u64,
-                    sc.scaled as u64,
-                    r.degraded as u64,
-                    r.fading,
-                )
-                .await;
-            if r.repaired > 0 || d.moved > 0 || sc.scaled > 0 || r.degraded > 0 {
-                tracing::info!(
-                    at_risk = r.at_risk,
-                    repaired = r.repaired,
-                    moved = d.moved,
-                    scaled = sc.scaled,
-                    degraded = r.degraded,
-                    "lifecycle: repair / distribute / scale / degrade"
-                );
-            }
+            let e = health_engine.clone();
+            let st = health_state.clone();
+            // The self-healing pass runs THROUGH the coordinator: HealthScan
+            // priority, deduped so a pass that runs long can't stack on the next
+            // tick. (Runs as one unit to preserve the proven scan→distribute→
+            // scale→evict order; split into per-priority jobs when scale needs it.)
+            health_jobs.submit(
+                "lifecycle",
+                zeph_sched::Priority::HealthScan,
+                1,
+                move || {
+                    let e = e.clone();
+                    let st = st.clone();
+                    async move {
+                        let r = e.health_scan().await;
+                        let d = e.distribute().await;
+                        let sc = e.scale().await;
+                        e.enforce_quota().await;
+                        st.set_health(
+                            r.scanned,
+                            r.at_risk,
+                            r.repaired as u64,
+                            d.moved as u64,
+                            sc.scaled as u64,
+                            r.degraded as u64,
+                            r.fading,
+                        )
+                        .await;
+                        if r.repaired > 0 || d.moved > 0 || sc.scaled > 0 || r.degraded > 0 {
+                            tracing::info!(
+                                at_risk = r.at_risk,
+                                repaired = r.repaired,
+                                moved = d.moved,
+                                scaled = sc.scaled,
+                                degraded = r.degraded,
+                                "lifecycle: repair / distribute / scale / degrade"
+                            );
+                        }
+                        Ok(())
+                    }
+                },
+            );
         }
     });
 
