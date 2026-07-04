@@ -106,6 +106,8 @@
 
   <nav class="tabnav">
     <button class="tab-btn on" data-tab="overview" onclick="showTab('overview')">overview</button>
+    <button class="tab-btn" data-tab="data" onclick="showTab('data')">data</button>
+    <button class="tab-btn" data-tab="attest" onclick="showTab('attest')">attest</button>
     <button class="tab-btn" data-tab="status" onclick="showTab('status')">status</button>
     <button class="tab-btn" data-tab="settings" onclick="showTab('settings')">settings</button>
   </nav>
@@ -151,6 +153,12 @@
     <div class="cardhead">craftcom <span class="muted">(sovereign apps — sandboxed WASM against your <span class="mono">app.&lt;ns&gt;</span> namespace)</span></div>
     <div id="apps-list" class="muted" style="font-size:.78rem;margin-bottom:.7rem">no apps deployed — <span class="mono">zeph deploy &lt;app.wasm&gt; --name &lt;name&gt;</span></div>
     <div class="cidbar">
+      <input id="dep-name" class="cidin" style="flex:0 0 9rem" placeholder="new app name" spellcheck="false">
+      <input id="dep-file" type="file" accept=".wasm,.wat" class="cidin" style="padding:.25rem">
+      <button class="btn" title="publish a .wasm as a durable system app + signed name" onclick="doDeploy()">deploy</button>
+    </div>
+    <div id="dep-result" class="muted" style="font-size:.76rem;margin-bottom:.4rem"></div>
+    <div class="cidbar">
       <input id="inv-app" class="cidin" style="flex:0 0 9rem" placeholder="app (e.g. feed)" spellcheck="false">
       <input id="inv-wasm" class="cidin" placeholder="app wasm cid (64 hex)" spellcheck="false">
       <input id="inv-func" class="cidin" style="flex:0 0 6rem" placeholder="func" value="run" spellcheck="false">
@@ -167,6 +175,28 @@
     <div class="cardhead">activity <span class="muted">(node event bus §52 — the reactive stream apps subscribe to)</span></div>
     <div id="activity"><div class="muted">no events yet</div></div>
   </div>
+  </section>
+
+  <section id="tab-data" class="tab" hidden>
+    <div class="card">
+      <div class="cardhead">databases <span class="muted">(your sovereign CraftSQL data — read a namespace; blank owner = you, or paste an owner to read across)</span></div>
+      <div class="cidbar">
+        <input id="sql-ns" class="cidin" style="flex:0 0 11rem" placeholder="db namespace (e.g. notes)" spellcheck="false">
+        <input id="sql-owner" class="cidin" placeholder="owner hex — blank = you (cross-owner read)" spellcheck="false">
+      </div>
+      <div class="cidbar">
+        <input id="sql-q" class="cidin" placeholder="SELECT … (read-only)" value="SELECT name FROM sqlite_master WHERE type='table'" spellcheck="false">
+        <button class="btn" onclick="runSql()">query</button>
+      </div>
+      <div id="sql-result" style="font-size:.8rem;margin-top:.6rem;overflow-x:auto"><div class="muted">enter a namespace + query</div></div>
+    </div>
+  </section>
+
+  <section id="tab-attest" class="tab" hidden>
+    <div class="card">
+      <div class="cardhead">attestation &amp; registry <span class="muted">(program-owned durable heads — foundation §41/§56)</span></div>
+      <div id="attest-body"><div class="muted">loading…</div></div>
+    </div>
   </section>
 
   <section id="tab-status" class="tab" hidden>
@@ -503,6 +533,54 @@ function showTab(name){
   document.querySelectorAll('.tab').forEach(t => { t.hidden = (t.id !== 'tab-'+name); });
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('on', b.dataset.tab === name));
   try { localStorage.setItem('zeph-tab', name); } catch(e){}
+  if(name==="attest") loadAttestation();
+}
+async function doDeploy(){
+  const name=$("dep-name").value.trim(); const f=$("dep-file").files[0]; const out=$("dep-result");
+  if(!name){ out.textContent="enter an app name"; return; }
+  if(!f){ out.textContent="choose a .wasm / .wat file"; return; }
+  out.textContent="deploying…";
+  try{
+    const buf=new Uint8Array(await f.arrayBuffer());
+    let hex=""; for(const b of buf) hex+=b.toString(16).padStart(2,"0");
+    const r=await fetch("/api/deploy?token="+TOKEN,{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({name,wasm:hex})});
+    if(r.ok){ const j=await r.json(); out.innerHTML=`deployed <b>${esc(j.name)}</b> v${j.version} · ${fmtSize(j.size)} · <span class="mono">${j.cid.slice(0,12)}…</span>`; $("dep-file").value=""; tick(); }
+    else out.textContent="error: "+(await r.text());
+  }catch(e){ out.textContent="error: "+e; }
+}
+async function runSql(){
+  const ns=$("sql-ns").value.trim(), owner=$("sql-owner").value.trim(), sql=$("sql-q").value.trim();
+  const out=$("sql-result");
+  if(!ns){ out.textContent="enter a db namespace"; return; }
+  if(!sql){ out.textContent="enter a query"; return; }
+  out.textContent="querying…";
+  try{
+    const u=`/api/sql?token=${TOKEN}&ns=${encodeURIComponent(ns)}&sql=${encodeURIComponent(sql)}`+(owner?`&owner=${encodeURIComponent(owner)}`:"");
+    const r=await fetch(u);
+    if(r.ok){ out.innerHTML=sqlTable(await r.json()); } else out.textContent="error: "+(await r.text());
+  }catch(e){ out.textContent="error: "+e; }
+}
+function sqlTable(j){
+  const cols=(j&&j.columns)||[], rows=(j&&j.rows)||[];
+  if(!rows.length) return '<div class="muted">(no rows)</div>';
+  return '<table><thead><tr>'+cols.map(c=>`<th style="text-align:left;border-bottom:1px solid var(--line)">${esc(c)}</th>`).join("")
+    +'</tr></thead><tbody>'+rows.map(r=>'<tr>'+r.map(x=>`<td style="padding:.15rem .5rem .15rem 0">${esc(String(x))}</td>`).join("")+'</tr>').join("")+'</tbody></table>';
+}
+async function loadAttestation(){
+  const el=$("attest-body"); if(!el) return;
+  try{
+    const r=await fetch("/api/attestation?token="+TOKEN);
+    if(!r.ok){ el.textContent="unavailable"; return; }
+    const j=await r.json();
+    el.innerHTML=`
+      <div class="kv"><span>status</span><b>${esc(j.status)}</b></div>
+      <div class="kv"><span>model</span><b>${esc(j.model)}</b></div>
+      <div class="kv"><span>registry program</span><span class="mono" onclick="copyCid('${j.registry_program}')" title="copy">${j.registry_program.slice(0,16)}…</span></div>
+      <div class="kv"><span>registry account (PDA)</span><span class="mono" onclick="copyCid('${j.registry_account}')" title="copy">${j.registry_account.slice(0,16)}…</span></div>
+      <div class="muted" style="margin-top:.6rem">${esc(j.note)}</div>
+      <div class="muted" style="margin-top:.5rem;font-size:.74rem;line-height:1.5">A publisher signs a head (name→cid). A deterministic k-of-n committee runs the registry program and attests the append — a wrong output can't reach quorum, so no keyholder is trusted. The program-owned (PDA) registry advances, durable as any content.</div>`;
+  }catch(e){ el.textContent="error: "+e; }
 }
 async function doInvoke(){
   const app=$("inv-app").value.trim(), wasm=$("inv-wasm").value.trim();

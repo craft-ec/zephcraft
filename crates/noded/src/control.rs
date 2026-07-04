@@ -990,26 +990,37 @@ async fn rpc_deploy(
         Ok(b) => b,
         Err(e) => return rpc_err(id, format!("read {path}: {e}")),
     };
-    match state.engine.publish_system(&bytes).await {
-        Ok(cid) => {
-            // Next version = current published head + 1 (or 1 on first deploy).
-            let version = match parse_node_id(&state.node_id) {
-                Some(own) => match state.routing.resolve_app(own, &name).await {
-                    Ok(Some(rec)) => rec.version + 1,
-                    _ => 1,
-                },
-                None => 1,
-            };
-            // Publish the SIGNED name→cid head so the app resolves by name
-            // network-wide (KIND_APP), then record it locally.
-            let _ = state.routing.announce_app(&name, cid, version).await;
-            apps_add(state, &name, &cid.to_hex(), version).await;
-            serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
-                "name": name, "cid": cid.to_hex(), "size": bytes.len(), "version": version
-            }})
-        }
-        Err(e) => rpc_err(id, format!("deploy failed: {e}")),
+    match deploy_bytes(state, &name, &bytes).await {
+        Ok(result) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}),
+        Err(e) => rpc_err(id, e),
     }
+}
+
+/// Deploy `bytes` as a system app under `name`: publish a want-based system object,
+/// announce the signed KIND_APP head (version = prev+1), and record it locally. Shared
+/// by the CLI (`rpc_deploy`, reads a file) and the dashboard (`api_deploy`, hex bytes).
+async fn deploy_bytes(
+    state: &State,
+    name: &str,
+    bytes: &[u8],
+) -> Result<serde_json::Value, String> {
+    let cid = state
+        .engine
+        .publish_system(bytes)
+        .await
+        .map_err(|e| format!("deploy failed: {e}"))?;
+    let version = match parse_node_id(&state.node_id) {
+        Some(own) => match state.routing.resolve_app(own, name).await {
+            Ok(Some(rec)) => rec.version + 1,
+            _ => 1,
+        },
+        None => 1,
+    };
+    let _ = state.routing.announce_app(name, cid, version).await;
+    apps_add(state, name, &cid.to_hex(), version).await;
+    Ok(serde_json::json!({
+        "name": name, "cid": cid.to_hex(), "size": bytes.len(), "version": version
+    }))
 }
 
 /// Invoke a CraftCOM app LOCALLY: run `func` from the WASM at `wasm_cid` against
@@ -1392,6 +1403,91 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         axum::Json(apps_list(&ctx.state).await).into_response()
     }
 
+    #[derive(serde::Deserialize)]
+    struct SqlParams {
+        #[serde(default)]
+        token: String,
+        ns: String,
+        sql: String,
+        #[serde(default)]
+        owner: String,
+    }
+
+    // Read a query against one of YOUR databases (or another owner's, cross-owner read).
+    async fn api_sql(
+        AxumState(ctx): AxumState<HttpCtx>,
+        Query(q): Query<SqlParams>,
+    ) -> axum::response::Response {
+        if q.token != *ctx.token {
+            return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
+        }
+        let owner = if q.owner.trim().is_empty() {
+            parse_node_id(&ctx.state.node_id)
+        } else {
+            parse_node_id(q.owner.trim())
+        };
+        let Some(owner) = owner else {
+            return (StatusCode::BAD_REQUEST, "bad owner id").into_response();
+        };
+        let db = match ctx.state.craftsql.open_reader(owner, &q.ns).await {
+            Ok(d) => d,
+            Err(e) => return (StatusCode::BAD_REQUEST, format!("open: {e}")).into_response(),
+        };
+        let sql = q.sql.clone();
+        match tokio::task::spawn_blocking(move || db.query(&sql)).await {
+            Ok(Ok(v)) => axum::Json(v).into_response(),
+            Ok(Err(e)) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        }
+    }
+
+    #[derive(serde::Deserialize)]
+    struct DeployBody {
+        name: String,
+        /// hex-encoded WASM bytes.
+        wasm: String,
+    }
+
+    async fn api_deploy(
+        AxumState(ctx): AxumState<HttpCtx>,
+        Query(params): Query<TokenParam>,
+        axum::Json(body): axum::Json<DeployBody>,
+    ) -> axum::response::Response {
+        if params.token != *ctx.token {
+            return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
+        }
+        let Ok(bytes) = hex::decode(body.wasm.trim()) else {
+            return (StatusCode::BAD_REQUEST, "wasm must be hex").into_response();
+        };
+        if bytes.is_empty() {
+            return (StatusCode::BAD_REQUEST, "empty wasm").into_response();
+        }
+        match deploy_bytes(&ctx.state, body.name.trim(), &bytes).await {
+            Ok(v) => axum::Json(v).into_response(),
+            Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+        }
+    }
+
+    // The attestation / program-owned-registry model (designed; head wiring is phase 4c).
+    async fn api_attestation(
+        AxumState(ctx): AxumState<HttpCtx>,
+        Query(params): Query<TokenParam>,
+    ) -> axum::response::Response {
+        if params.token != *ctx.token {
+            return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
+        }
+        let program = zeph_com::registry_program_cid();
+        let account = zeph_com::pda(&program, zeph_com::REGISTRY_SEED);
+        axum::Json(serde_json::json!({
+            "status": "designed",
+            "model": "deterministic k-of-n attestation - program-owned (PDA) registry",
+            "registry_program": hex::encode(program),
+            "registry_account": hex::encode(account.0),
+            "note": "attestation substrate built (phases 1-4b); live head resolution is phase 4c",
+        }))
+        .into_response()
+    }
+
     let ctx = HttpCtx {
         state,
         token: Arc::new(token),
@@ -1405,6 +1501,9 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         .route("/api/invoke", axum::routing::post(api_invoke))
         .route("/api/app_query", get(api_app_query))
         .route("/api/apps", get(api_apps))
+        .route("/api/sql", get(api_sql))
+        .route("/api/deploy", axum::routing::post(api_deploy))
+        .route("/api/attestation", get(api_attestation))
         .with_state(ctx);
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
