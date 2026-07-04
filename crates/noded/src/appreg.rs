@@ -23,7 +23,8 @@ use zeph_com::{
 use zeph_core::{Cid, NodeId};
 use zeph_crypto::NodeIdentity;
 use zeph_membership::Membership;
-use zeph_obj::ObjEngine;
+use zeph_obj::{ConsumeMode, ObjEngine};
+use zeph_routing::ContentRouting;
 use zeph_transport::Transport;
 
 /// Target committee size + quorum, and the epoch length. `select_committee` clamps `n`
@@ -31,6 +32,10 @@ use zeph_transport::Transport;
 const COMMITTEE_N: usize = 5;
 const COMMITTEE_K: usize = 3;
 const EPOCH_MILLIS: u64 = 3_600_000; // 1h — the committee is stable within an epoch
+/// Reserved app-name under which a node announces its registry HEAD pointer
+/// (owner, this) -> current registry-state cid. Contains a control char so it can
+/// never collide with a user app name (deploy rejects control chars).
+pub const REGISTRY_HEAD_NAME: &str = "\u{1}registry-head";
 
 /// Live-committee coordination inputs (set once membership is up).
 struct Coordinator {
@@ -46,11 +51,19 @@ pub struct AppRegistry {
     state: RwLock<RegistryState>,
     path: PathBuf,
     coord: RwLock<Option<Coordinator>>,
+    routing: Arc<dyn ContentRouting>,
+    /// The authority mode of the last registration ("none" | "self" | "committee").
+    mode: RwLock<&'static str>,
 }
 
 impl AppRegistry {
     /// Open the registry, loading any persisted state from `<data_dir>/registry.state`.
-    pub fn open(identity: Arc<NodeIdentity>, obj: Arc<ObjEngine>, data_dir: &Path) -> Self {
+    pub fn open(
+        identity: Arc<NodeIdentity>,
+        obj: Arc<ObjEngine>,
+        routing: Arc<dyn ContentRouting>,
+        data_dir: &Path,
+    ) -> Self {
         let path = data_dir.join("registry.state");
         let state = std::fs::read(&path)
             .ok()
@@ -62,6 +75,8 @@ impl AppRegistry {
             state: RwLock::new(state),
             path,
             coord: RwLock::new(None),
+            routing,
+            mode: RwLock::new("none"),
         }
     }
 
@@ -113,9 +128,18 @@ impl AppRegistry {
         };
         let encoded = next.encode();
         std::fs::write(&self.path, &encoded)?;
-        let _ = self.obj.publish_system(&encoded).await;
+        // Publish the state as durable content, then announce our registry-head pointer
+        // (owner, REGISTRY_HEAD_NAME) -> state cid, so other nodes resolve it. Version =
+        // HLC millis (monotonic) satisfies the announce CAS.
+        if let Ok(head_cid) = self.obj.publish_system(&encoded).await {
+            let _ = self
+                .routing
+                .announce_app(REGISTRY_HEAD_NAME, head_cid, now_millis)
+                .await;
+        }
         let root = next.root();
         *guard = next;
+        *self.mode.write().await = mode;
         tracing::info!(name, version, mode, "registry head advanced");
         Ok(root)
     }
@@ -188,6 +212,46 @@ impl AppRegistry {
             committee.k,
         )?;
         (agreed == next.root()).then_some(next)
+    }
+
+    /// Cross-node resolve: fetch `owner`'s announced (committee-attested) registry
+    /// state from the network and resolve `name` within it — durable, no need for the
+    /// owner to be online. Returns None if the owner has no registry head or `name`.
+    pub async fn resolve_cross(&self, owner: [u8; 32], name: &str) -> Option<[u8; 32]> {
+        let rec = self
+            .routing
+            .resolve_app(NodeId(owner), REGISTRY_HEAD_NAME)
+            .await
+            .ok()??;
+        let raw = self.obj.get(rec.wasm_cid, ConsumeMode::Drop).await.ok()?;
+        // publish_system wraps content in a File manifest — follow it to the bytes.
+        let bytes = match zeph_obj::Manifest::decode(&raw) {
+            Some(zeph_obj::Manifest::File { content, .. }) => {
+                self.obj.get(Cid(content), ConsumeMode::Drop).await.ok()?
+            }
+            _ => raw,
+        };
+        RegistryState::decode(&bytes)?
+            .resolve(&owner, name)
+            .map(|e| e.cid)
+    }
+
+    /// Committee status for the dashboard: (eligible peers incl. self, n, k, last mode).
+    pub async fn committee_status(&self) -> (usize, usize, usize, &'static str) {
+        let eligible = match self.coord.read().await.as_ref() {
+            Some(c) => {
+                1 + c
+                    .membership
+                    .snapshot()
+                    .await
+                    .active
+                    .iter()
+                    .filter(|(_, ps)| ps.alive)
+                    .count()
+            }
+            None => 1,
+        };
+        (eligible, COMMITTEE_N, COMMITTEE_K, *self.mode.read().await)
     }
 
     /// Resolve a name published by `owner` to its current cid.

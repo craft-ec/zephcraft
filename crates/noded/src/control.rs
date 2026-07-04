@@ -1006,6 +1006,9 @@ async fn deploy_bytes(
     name: &str,
     bytes: &[u8],
 ) -> Result<serde_json::Value, String> {
+    if name.is_empty() || name.chars().any(|c| c.is_control()) {
+        return Err("invalid app name (empty or control chars reserved)".into());
+    }
     let cid = state
         .engine
         .publish_system(bytes)
@@ -1057,8 +1060,11 @@ async fn rpc_invoke(
         let Some(publisher) = publisher else {
             return rpc_err(id, "name: bad publisher (expected <hex>/<app>)".into());
         };
-        // Phase 4c: durable registry first (own names), then KIND_APP (network) fallback.
+        // Registry resolution: local first (own names), then cross-node (fetch the
+        // owner's committee-attested registry head), then KIND_APP (legacy) fallback.
         if let Some(cid) = state.appreg.resolve(publisher.0, app_name).await {
+            (cid, app_name.to_string())
+        } else if let Some(cid) = state.appreg.resolve_cross(publisher.0, app_name).await {
             (cid, app_name.to_string())
         } else {
             match state.routing.resolve_app(publisher, app_name).await {
@@ -1494,6 +1500,7 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         let program = zeph_com::registry_program_cid();
         let account = ctx.state.appreg.account();
         let (count, root) = ctx.state.appreg.summary().await;
+        let (eligible, cn, ck, mode) = ctx.state.appreg.committee_status().await;
         let rows: Vec<serde_json::Value> = ctx
             .state
             .appreg
@@ -1503,14 +1510,21 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
             .map(|(owner, name, cid, ver)| serde_json::json!([owner, name, cid, ver]))
             .collect();
         axum::Json(serde_json::json!({
-            "status": if count > 0 { "live (v1 ramp: self-attested)" } else { "live (empty)" },
+            "registry": "app registry",
+            "status": "live",
             "model": "deterministic k-of-n attestation - program-owned (PDA) registry",
             "registry_program": hex::encode(program),
             "registry_account": hex::encode(account.0),
+            "app_registry_root": root,
             "entries": count,
-            "root": root,
             "rows": rows,
-            "note": "durable self-attested registry live; multi-node committee head-store is phase 4d",
+            "committee": {
+                "eligible": eligible,
+                "n": cn.min(eligible),
+                "k": ck.min(cn.min(eligible)),
+                "last_mode": mode,
+            },
+            "note": "app-name registry; other protocol registries (program, config, committee) will be separate roots",
         }))
         .into_response()
     }

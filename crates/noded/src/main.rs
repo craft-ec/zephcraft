@@ -851,6 +851,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let appreg_store = std::sync::Arc::new(appreg::AppRegistry::open(
         identity.clone(),
         engine.clone(),
+        routing.clone(),
         data_dir,
     ));
     let state = Arc::new(control::State {

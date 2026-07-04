@@ -573,21 +573,26 @@ async function loadAttestation(){
     const r=await fetch("/api/attestation?token="+TOKEN);
     if(!r.ok){ el.textContent="unavailable"; return; }
     const j=await r.json();
+    const c=j.committee||{};
     const rows=(j.rows||[]);
     const table = rows.length
-      ? '<table style="margin-top:.5rem"><thead><tr><th style="text-align:left">name</th><th style="text-align:left">ver</th><th style="text-align:left">cid</th></tr></thead><tbody>'
-        + rows.map(r=>`<tr><td style="padding:.15rem .8rem .15rem 0"><b>${esc(r[1])}</b></td><td style="padding:.15rem .8rem .15rem 0">v${r[3]}</td><td class="mono muted" style="padding:.15rem 0">${String(r[2]).slice(0,16)}…</td></tr>`).join("")
+      ? '<table style="margin-top:.5rem"><thead><tr><th style="text-align:left">name</th><th style="text-align:left">ver</th><th style="text-align:left">owner</th><th style="text-align:left">cid</th></tr></thead><tbody>'
+        + rows.map(x=>`<tr><td style="padding:.15rem .8rem .15rem 0"><b>${esc(x[1])}</b></td><td style="padding:.15rem .8rem .15rem 0">v${x[3]}</td><td class="mono muted" style="padding:.15rem .8rem .15rem 0">${String(x[0]).slice(0,8)}\u2026</td><td class="mono muted" style="padding:.15rem 0">${String(x[2]).slice(0,12)}\u2026</td></tr>`).join("")
         + '</tbody></table>'
-      : '<div class="muted" style="margin-top:.4rem">no heads registered yet — deploy an app</div>';
+      : '<div class="muted" style="margin-top:.4rem">no heads registered yet \u2014 deploy an app</div>';
+    const modeChip = c.last_mode==="committee"
+      ? '<span class="chip providing" title="last write was attested by a k-of-n committee">committee-attested</span>'
+      : (c.last_mode==="self" ? '<span class="chip pinned" title="self-attested (no committee could form)">self-attested</span>' : '<span class="chip muted">idle</span>');
     el.innerHTML=`
-      <div class="kv"><span>status</span><b>${esc(j.status)}</b></div>
-      <div class="kv"><span>model</span><b>${esc(j.model)}</b></div>
+      <div class="kv"><span>registry</span><b>${esc(j.registry||"app registry")} ${modeChip}</b></div>
+      <div class="kv"><span>authority</span><b>${esc(j.model)}</b></div>
+      <div class="kv"><span>committee</span><b>${c.eligible||1} eligible \u00b7 k=${c.k||1} of n=${c.n||1}</b></div>
       <div class="kv"><span>registered heads</span><b>${j.entries!=null?j.entries:0}</b></div>
-      <div class="kv"><span>registry root</span><span class="mono" onclick="copyCid('${j.root||''}')" title="copy">${(j.root||'').slice(0,16)}…</span></div>
-      <div class="kv"><span>registry account (PDA)</span><span class="mono" onclick="copyCid('${j.registry_account}')" title="copy">${j.registry_account.slice(0,16)}…</span></div>
+      <div class="kv"><span>app-registry root</span><span class="mono" onclick="copyCid('${j.app_registry_root||''}')" title="copy">${(j.app_registry_root||'').slice(0,16)}\u2026</span></div>
+      <div class="kv"><span>registry account (PDA)</span><span class="mono" onclick="copyCid('${j.registry_account}')" title="copy">${(j.registry_account||'').slice(0,16)}\u2026</span></div>
       ${table}
       <div class="muted" style="margin-top:.6rem">${esc(j.note)}</div>
-      <div class="muted" style="margin-top:.5rem;font-size:.74rem;line-height:1.5">A publisher signs a head (name→cid). A deterministic k-of-n committee runs the registry program and attests the append — a wrong output can't reach quorum, so no keyholder is trusted. The program-owned (PDA) registry advances, durable as any content.</div>`;
+      <div class="muted" style="margin-top:.5rem;font-size:.74rem;line-height:1.5">This is the <b>app-name registry</b> \u2014 a publisher signs a head (name\u2192cid), a deterministic k-of-n committee runs the registry program and attests the append (a wrong output can\u0027t reach quorum, so no keyholder is trusted), and other nodes resolve it from the durable state. Future protocol registries (program, config, committee, bans) will be separate roots.</div>`;
   }catch(e){ el.textContent="error: "+e; }
 }
 async function doInvoke(){
