@@ -401,8 +401,9 @@ function renderContent(s){
   const el = $("content-groups");
   // Exclude your own files (they're in My Drive) — this list is OTHER content you
   // know: cids you hold, want, or fetched.
+  // BANNED items always show (even if once your own file) so you can unban them.
   const drive = window.driveCids || new Set();
-  const cs = (s.content || []).filter(c => !drive.has(c.cid));
+  const cs = (s.content || []).filter(c => c.local_tombstoned || !drive.has(c.cid));
   if(!cs.length){ el.innerHTML = '<div class="muted">nothing tracked — fetch or want a cid to add it (your own files are in My Drive)</div>'; return; }
   const sorted = [...cs].sort((a,b) => (b.local_pieces||0) - (a.local_pieces||0));
   el.innerHTML = sorted.map(citem).join("");
