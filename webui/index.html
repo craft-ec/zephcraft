@@ -148,6 +148,21 @@
   </div>
 
   <div class="card">
+    <div class="cardhead">craftcom <span class="muted">(sovereign apps — sandboxed WASM against your <span class="mono">app.&lt;ns&gt;</span> namespace)</span></div>
+    <div class="cidbar">
+      <input id="inv-app" class="cidin" style="flex:0 0 9rem" placeholder="app (e.g. feed)" spellcheck="false">
+      <input id="inv-wasm" class="cidin" placeholder="app wasm cid (64 hex)" spellcheck="false">
+      <input id="inv-func" class="cidin" style="flex:0 0 6rem" placeholder="func" value="run" spellcheck="false">
+    </div>
+    <div class="cidbar">
+      <input id="inv-input" class="cidin" placeholder="input — optional text for invoke, or SQL for view state" spellcheck="false">
+      <button class="btn" onclick="doInvoke()">invoke</button>
+      <button class="btn" title="query this app's own state (app.&lt;ns&gt;)" onclick="viewApp()">view state</button>
+    </div>
+    <div id="inv-result" class="muted" style="font-size:.8rem;margin-top:.5rem;word-break:break-all"></div>
+  </div>
+
+  <div class="card">
     <div class="cardhead">activity <span class="muted">(node event bus §52 — the reactive stream apps subscribe to)</span></div>
     <div id="activity"><div class="muted">no events yet</div></div>
   </div>
@@ -310,17 +325,20 @@ function renderDriveInto(el, rows){
   // columns: cid, name, size, mime, is_dir, published_at, is_private
   el.innerHTML = rows.map(r => {
     const cid=r[0], name=r[1], size=r[2], mime=r[3], is_dir=r[4], pub=r[5], priv_=r[6];
-    const icon = priv_ ? "🔒" : (is_dir ? "📁" : "📄");
-    const kind = is_dir ? "folder" : (mime || "file");
+    const app = isApp(name, mime);
+    const icon = app ? "⚙" : (priv_ ? "🔒" : (is_dir ? "📁" : "📄"));
+    const kind = app ? "craftcom app" : (is_dir ? "folder" : (mime || "file"));
     const meta = [fmtSize(size), esc(kind), fmtAgoMs(pub)].filter(Boolean).join(" · ");
-    const chip = priv_ ? ' <span class="chip pinned" title="encrypted — only you can read it">private</span>' : '';
+    const chip = app ? ' <span class="chip providing" title="a CraftCOM app — invoke it">app</span>'
+      : (priv_ ? ' <span class="chip pinned" title="encrypted — only you can read it">private</span>' : '');
+    const invoke = app ? `<button class="btn" title="load into the CraftCOM invoker" onclick="useApp('${cid}',${JSON.stringify(name)})">invoke</button>` : '';
     return `<div class="citem">
       <div class="cicon">${icon}</div>
       <div class="cbody">
         <div class="crow1"><span class="ctitle">${esc(name)}</span>${chip}</div>
         <div class="cmeta muted"><span class="cidcell mono" title="click to copy the cid" onclick="copyCid('${cid}')">${cid.slice(0,12)}…</span> · ${meta}</div>
       </div>
-      <div class="cacts"><button class="btn" title="copy cid" onclick="copyCid('${cid}')">copy cid</button><button class="btn" title="remove from your drive + unpin so it fades" onclick="if(confirm('delete '+${JSON.stringify(name)}+' from your drive?'))act('delete','${cid}')">delete</button></div>
+      <div class="cacts">${invoke}<button class="btn" title="copy cid" onclick="copyCid('${cid}')">copy cid</button><button class="btn" title="remove from your drive + unpin so it fades" onclick="if(confirm('delete '+${JSON.stringify(name)}+' from your drive?'))act('delete','${cid}')">delete</button></div>
     </div>`;
   }).join("");
 }
@@ -469,6 +487,40 @@ function showTab(name){
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('on', b.dataset.tab === name));
   try { localStorage.setItem('zeph-tab', name); } catch(e){}
 }
+async function doInvoke(){
+  const app=$("inv-app").value.trim(), wasm=$("inv-wasm").value.trim();
+  const func=$("inv-func").value.trim()||"run", input=$("inv-input").value;
+  const out=$("inv-result");
+  if(!app || wasm.length!==64){ out.textContent="need an app namespace + a 64-hex wasm cid"; return; }
+  out.textContent="running\u2026";
+  try{
+    const r=await fetch("/api/invoke?token="+TOKEN,{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({app,wasm,func,input:input||null})});
+    if(r.ok){ const j=await r.json(); out.innerHTML=`\u2699 <b>${func}</b> returned <b>${j.value}</b> \u00b7 fuel ${j.fuel_used}`; tick(); }
+    else { out.textContent="error: "+(await r.text()); }
+  }catch(e){ out.textContent="error: "+e; }
+}
+async function viewApp(){
+  const app=$("inv-app").value.trim(); const out=$("inv-result");
+  if(!app){ out.textContent="enter an app namespace"; return; }
+  const sql=$("inv-input").value.trim() || "SELECT name FROM sqlite_master WHERE type='table'";
+  try{
+    const r=await fetch(`/api/app_query?token=${TOKEN}&app=${encodeURIComponent(app)}&sql=${encodeURIComponent(sql)}`);
+    if(r.ok){ const j=await r.json(); const rows=(j&&j.rows)||[]; const cols=(j&&j.columns)||[];
+      out.innerHTML = rows.length
+        ? `<span class="mono">app.${esc(app)}</span> \u2014 ${cols.join(" | ")}<br>` + rows.map(x=>x.join(" | ")).map(esc).join("<br>")
+        : `<span class="mono">app.${esc(app)}</span> \u2014 (no rows)`;
+    } else { out.textContent="error: "+(await r.text()); }
+  }catch(e){ out.textContent="error: "+e; }
+}
+// Prefill the invoke form from a drive app file (name.wasm/.wat -> app "name").
+function useApp(cid, name){
+  const app=(name||"").replace(/\.(wasm|wat)$/i,"");
+  $("inv-app").value=app; $("inv-wasm").value=cid; $("inv-func").value="run";
+  $("inv-result").textContent="loaded "+esc(name)+" \u2014 set func/input, then invoke";
+  $("inv-app").scrollIntoView({behavior:"smooth",block:"center"});
+}
+function isApp(name, mime){ return /\.(wasm|wat)$/i.test(name||"") || (mime||"")==="application/wasm"; }
 function fmtDur(s){
   if(!s) return "—";
   if(s < 60) return s + "s";

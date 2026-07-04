@@ -1198,6 +1198,72 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
             .into_response()
     }
 
+    // CraftCOM: invoke a user-level app locally (caller = this node). Body:
+    // {app, wasm (cid), func, input?}. Returns the agent's return value + fuel.
+    #[derive(serde::Deserialize)]
+    struct InvokeBody {
+        app: String,
+        wasm: String,
+        #[serde(default = "default_func")]
+        func: String,
+        input: Option<String>,
+    }
+    fn default_func() -> String {
+        "run".into()
+    }
+    async fn api_invoke(
+        AxumState(ctx): AxumState<HttpCtx>,
+        Query(params): Query<TokenParam>,
+        axum::Json(body): axum::Json<InvokeBody>,
+    ) -> axum::response::Response {
+        if params.token != *ctx.token {
+            return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
+        }
+        let Some(cid) = parse_cid(&body.wasm) else {
+            return (StatusCode::BAD_REQUEST, "bad wasm cid").into_response();
+        };
+        let Some(caller) = parse_node_id(&ctx.state.node_id) else {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "self id").into_response();
+        };
+        let ireq = zeph_com::InvokeRequest {
+            app_ns: body.app,
+            wasm_cid: cid.0,
+            func: body.func,
+            input: body.input.map(|s| s.into_bytes()).unwrap_or_default(),
+        };
+        match ctx.state.com.invoke(&ireq, caller.0).await {
+            Ok(out) => axum::Json(serde_json::json!({
+                "value": out.value, "fuel_used": out.fuel_used
+            }))
+            .into_response(),
+            Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        }
+    }
+
+    // Read a user-level app's OWN namespace (this node's `app.<app>` DB).
+    #[derive(serde::Deserialize)]
+    struct AppQuery {
+        token: String,
+        app: String,
+        sql: String,
+    }
+    async fn api_app_query(
+        AxumState(ctx): AxumState<HttpCtx>,
+        Query(q): Query<AppQuery>,
+    ) -> axum::response::Response {
+        if q.token != *ctx.token {
+            return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
+        }
+        let ns = format!("app.{}", q.app);
+        match ctx.state.craftsql.open(&ns).await {
+            Ok(db) => match db.query(&q.sql) {
+                Ok(v) => axum::Json(v).into_response(),
+                Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+            },
+            Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        }
+    }
+
     let ctx = HttpCtx {
         state,
         token: Arc::new(token),
@@ -1208,6 +1274,8 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         .route("/api/files", get(api_files))
         .route("/api/events", get(api_events))
         .route("/api/action", axum::routing::post(api_action))
+        .route("/api/invoke", axum::routing::post(api_invoke))
+        .route("/api/app_query", get(api_app_query))
         .with_state(ctx);
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
