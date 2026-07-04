@@ -10,6 +10,7 @@ zeph-core.workspace = true
 zeph-erasure.workspace = true
 zeph-store.workspace = true
 zeph-events.workspace = true
+zeph-cipher.workspace = true
 zeph-routing.workspace = true
 zeph-transport.workspace = true
 zeph-wire.workspace = true

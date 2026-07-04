@@ -17,6 +17,24 @@ pub const KIND_WANT: u8 = 4;
 pub const KIND_META: u8 = 5;
 pub const KIND_ROOT: u8 = 6;
 pub const KIND_MANIFEST: u8 = 7;
+/// RESERVED (ENCRYPTION_DESIGN.md §sharing): a signed grant — "owner grants
+/// recipient access to CID". The on-wire shape is fixed now so sharing (a CraftCOM
+/// app doing proxy re-encryption) needs no routing rework. NOT yet enforced or
+/// wired into the registry — enforcement is a CraftCOM concern, not the tracker's.
+pub const KIND_GRANT: u8 = 8;
+
+/// Payload of a KIND_GRANT record (RESERVED — see `KIND_GRANT`). Not yet enforced.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GrantPayload {
+    /// The content this grant is for.
+    pub cid: [u8; 32],
+    /// Recipient's PRE public key (compressed).
+    pub recipient: Vec<u8>,
+    /// Re-encryption key fragments, added by the sharing app (empty = reserved).
+    pub kfrags: Vec<u8>,
+    /// Advancing sequence for revoke / supersede.
+    pub seq: u64,
+}
 
 /// "I hold pieces for `cid`" — advisory piece_count, dialable `addr`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

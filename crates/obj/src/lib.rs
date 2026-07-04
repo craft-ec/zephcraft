@@ -25,7 +25,9 @@ use zeph_store::{Generation, Store};
 use zeph_transport::{Connection, PeerAddr, Transport};
 use zeph_wire as wire;
 
+mod encrypted;
 mod manifest;
+pub use encrypted::{EncryptedEnvelope, PlainFile, Recipient, ENVELOPE_MAGIC};
 pub use manifest::{Entry, Manifest};
 
 /// ALPN for piece exchange.
@@ -127,6 +129,22 @@ const PUSH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Outcome of publishing a file (content + its manifest).
 #[derive(Debug, Clone)]
+/// Result of publishing a PRIVATE file (ENCRYPTION_DESIGN.md phase 2). The
+/// shareable id is `envelope_cid`; resolving it (with the owner's key) decrypts.
+pub struct PrivatePublish {
+    pub envelope_cid: Cid,
+    pub ciphertext_cid: Cid,
+    pub size: u64,
+    pub durable: bool,
+}
+
+/// A decrypted private file.
+pub struct PlainFileOut {
+    pub name: String,
+    pub mime: String,
+    pub content: Vec<u8>,
+}
+
 pub struct FilePublish {
     /// The manifest CID — share this; fetching it restores the file by name.
     pub manifest_cid: Cid,
@@ -164,6 +182,9 @@ pub struct ObjEngine {
     /// health_scan → RepairNeeded, enforce_quota → DiskWatermarkHit. Optional so
     /// tests construct an engine without one.
     events: std::sync::OnceLock<zeph_events::EventBus>,
+    /// The owner's encryption keypair (PRE), set post-construction. Needed for
+    /// publish_private / get_private; None if this node never handles private data.
+    enc: std::sync::OnceLock<zeph_cipher::EncKeypair>,
 }
 
 impl ObjEngine {
@@ -181,6 +202,7 @@ impl ObjEngine {
             demand: Mutex::new(HashMap::new()),
             last_served: Mutex::new(HashMap::new()),
             events: std::sync::OnceLock::new(),
+            enc: std::sync::OnceLock::new(),
         })
     }
 
@@ -194,6 +216,73 @@ impl ObjEngine {
         if let Some(bus) = self.events.get() {
             bus.publish(event);
         }
+    }
+
+    /// Attach the owner's encryption keypair (enables private publish/get).
+    pub fn set_enc_keypair(&self, kp: zeph_cipher::EncKeypair) {
+        let _ = self.enc.set(kp);
+    }
+
+    /// Publish a PRIVATE file: encrypt {name,mime,data} under the owner's key,
+    /// store the ciphertext (erasure-coded like anything else), and publish a
+    /// small envelope pointing at it. The network sees only ciphertext + envelope.
+    pub async fn publish_private(
+        &self,
+        name: &str,
+        mime: &str,
+        data: &[u8],
+        pin: bool,
+    ) -> anyhow::Result<PrivatePublish> {
+        let enc = self
+            .enc
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("no encryption keypair set"))?;
+        let plain = encrypted::PlainFile {
+            name: name.to_string(),
+            mime: mime.to_string(),
+            content: data.to_vec(),
+        };
+        let sealed = zeph_cipher::encrypt(&enc.public(), &plain.encode());
+        let ct = self.publish(&sealed.ciphertext, pin).await?;
+        let envelope = encrypted::EncryptedEnvelope {
+            capsule: sealed.capsule,
+            ciphertext_cid: ct.cid.0,
+            owner: self.transport.node_id().0,
+            recipients: Vec::new(),
+        };
+        let er = self.publish(&envelope.encode(), pin).await?;
+        Ok(PrivatePublish {
+            envelope_cid: er.cid,
+            ciphertext_cid: ct.cid,
+            size: data.len() as u64,
+            durable: ct.durable,
+        })
+    }
+
+    /// Resolve + decrypt a private object by its envelope CID (needs our key).
+    pub async fn get_private(&self, envelope_cid: Cid) -> anyhow::Result<PlainFileOut> {
+        let enc = self
+            .enc
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("no encryption keypair set"))?;
+        let ebytes = self.get(envelope_cid, ConsumeMode::Drop).await?;
+        let envelope = encrypted::EncryptedEnvelope::decode(&ebytes)
+            .ok_or_else(|| anyhow::anyhow!("not an encrypted envelope"))?;
+        let ct = self
+            .get(Cid(envelope.ciphertext_cid), ConsumeMode::Drop)
+            .await?;
+        let sealed = zeph_cipher::SealedObject {
+            capsule: envelope.capsule,
+            ciphertext: ct,
+        };
+        let plaintext = zeph_cipher::decrypt_self(enc, &sealed)?;
+        let pf = encrypted::PlainFile::decode(&plaintext)
+            .ok_or_else(|| anyhow::anyhow!("corrupt plaintext"))?;
+        Ok(PlainFileOut {
+            name: pf.name,
+            mime: pf.mime,
+            content: pf.content,
+        })
     }
 
     pub fn store(&self) -> &Arc<Store> {

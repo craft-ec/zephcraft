@@ -49,6 +49,9 @@ enum Command {
         /// Do not pin (uploader pins by default).
         #[arg(long)]
         no_pin: bool,
+        /// Encrypt: publish a PRIVATE object (only you can read it). Files only.
+        #[arg(long)]
+        private: bool,
     },
     /// Fetch content by CID alone — the daemon resolves providers via the
     /// tracker (no peer address needed).
@@ -243,7 +246,11 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Some(Command::Status) => cmd_status(&data_dir).await,
-        Some(Command::Publish { file, no_pin }) => cmd_publish(&data_dir, &file, !no_pin).await,
+        Some(Command::Publish {
+            file,
+            no_pin,
+            private,
+        }) => cmd_publish(&data_dir, &file, !no_pin, private).await,
         Some(Command::Get { cid, output }) => cmd_get(&data_dir, &cid, &output).await,
         Some(Command::Pin { cid }) => cmd_cid_op(&data_dir, "pin", &cid).await,
         Some(Command::Unpin { cid }) => cmd_cid_op(&data_dir, "unpin", &cid).await,
@@ -261,19 +268,21 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn cmd_publish(data_dir: &Path, file: &Path, pin: bool) -> anyhow::Result<()> {
+async fn cmd_publish(data_dir: &Path, file: &Path, pin: bool, private: bool) -> anyhow::Result<()> {
     let abs =
         std::fs::canonicalize(file).with_context(|| format!("resolving {}", file.display()))?;
-    let params = serde_json::json!({"path": abs.to_string_lossy(), "pin": pin});
+    let params = serde_json::json!({"path": abs.to_string_lossy(), "pin": pin, "private": private});
     let r = control::query_unix_params(&data_dir.join("zeph.sock"), "publish", params).await?;
     let cid = r.get("cid").and_then(|v| v.as_str()).unwrap_or("?");
     let name = r.get("name").and_then(|v| v.as_str()).unwrap_or("item");
     let size = r.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+    let is_private = r.get("private").and_then(|v| v.as_bool()).unwrap_or(false);
     if r.get("is_dir").and_then(|v| v.as_bool()).unwrap_or(false) {
         println!("published folder {name}/ ({size} bytes total)");
     } else {
         println!(
-            "published {name} ({size} bytes · {}) — durable={}, pinned={}",
+            "published {}{name} ({size} bytes · {}) — durable={}, pinned={}",
+            if is_private { "🔒 private " } else { "" },
             r.get("mime")
                 .and_then(|v| v.as_str())
                 .unwrap_or("application/octet-stream"),
@@ -281,7 +290,11 @@ async fn cmd_publish(data_dir: &Path, file: &Path, pin: bool) -> anyhow::Result<
             r.get("pinned").and_then(|v| v.as_bool()).unwrap_or(false),
         );
     }
-    println!("cid {cid}   (share this — `zeph get {cid} -o <path>` restores it by name)");
+    if is_private {
+        println!("cid {cid}   (PRIVATE — only your node can `zeph get {cid} -o <path>`)");
+    } else {
+        println!("cid {cid}   (share this — `zeph get {cid} -o <path>` restores it by name)");
+    }
     println!("ZEPH_CID {cid}");
     Ok(())
 }
@@ -304,6 +317,12 @@ async fn cmd_get(data_dir: &Path, cid: &str, output: &Path) -> anyhow::Result<()
         println!(
             "restored {} → {path} (resolved via tracker, cid verified)",
             r.get("name").and_then(|v| v.as_str()).unwrap_or("file"),
+        );
+    } else if r.get("private").and_then(|v| v.as_bool()).unwrap_or(false) {
+        println!(
+            "🔓 decrypted {} → {path} ({} bytes · private)",
+            r.get("name").and_then(|v| v.as_str()).unwrap_or("file"),
+            r.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0),
         );
     } else {
         println!(
@@ -628,6 +647,11 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
             eviction_cooldown: Duration::from_secs(cfg.eviction_cooldown_secs),
         },
     );
+    // The owner's encryption keypair (PRE), derived from the identity seed —
+    // enables `publish --private` / private reads (ENCRYPTION_DESIGN.md).
+    engine.set_enc_keypair(zeph_cipher::EncKeypair::from_identity_seed(
+        &identity.secret_key_bytes(),
+    ));
 
     // CraftSQL: SQLite over content-addressed pages; single-writer head via
     // KIND_ROOT, cross-node page fetch over the transport.

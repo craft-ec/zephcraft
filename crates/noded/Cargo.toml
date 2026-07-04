@@ -22,6 +22,7 @@ zeph-obj.workspace = true
 zeph-sql.workspace = true
 zeph-events.workspace = true
 zeph-sched.workspace = true
+zeph-cipher.workspace = true
 futures.workspace = true
 tokio-stream = "0.1"
 postcard.workspace = true

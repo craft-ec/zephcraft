@@ -586,12 +586,18 @@ async fn rpc_publish(
         return rpc_err(id, "publish needs a 'path'".into());
     };
     let pin = param(req, "pin").and_then(|v| v.as_bool()).unwrap_or(true);
+    let private = param(req, "private")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let name = std::path::Path::new(path)
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "file".into());
     // Directory → recursive folder manifest.
     if std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false) {
+        if private {
+            return rpc_err(id, "private publish supports files only (phase 2)".into());
+        }
         return match publish_path(state.engine.clone(), PathBuf::from(path), pin).await {
             Ok((cid, size, _)) => {
                 owned_add(state, &cid.to_hex()).await;
@@ -612,6 +618,23 @@ async fn rpc_publish(
         Err(e) => return rpc_err(id, format!("reading {path}: {e}")),
     };
     let mime = guess_mime(&name);
+    if private {
+        return match state.engine.publish_private(&name, &mime, &data, pin).await {
+            Ok(pp) => {
+                owned_add(state, &pp.envelope_cid.to_hex()).await;
+                state.events.publish(zeph_events::Event::CidWritten {
+                    cid: pp.envelope_cid,
+                    name: Some(name.clone()),
+                    pinned: pin,
+                });
+                serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
+                    "cid": pp.envelope_cid.to_hex(), "name": name, "mime": mime,
+                    "size": pp.size, "private": true, "durable": pp.durable, "pinned": pin,
+                }})
+            }
+            Err(e) => rpc_err(id, format!("private publish failed: {e}")),
+        };
+    }
     match state.engine.publish_file(&name, &mime, &data, pin).await {
         Ok(fp) => {
             owned_add(state, &fp.manifest_cid.to_hex()).await;
@@ -668,6 +691,29 @@ async fn rpc_get(
     let Some(cid) = parse_cid(cid_hex) else {
         return rpc_err(id, "cid must be 64 hex chars".into());
     };
+    // Encrypted? An envelope CID decrypts (owner only) to the private file.
+    if let Ok(bytes) = state.engine.get(cid, zeph_obj::ConsumeMode::Drop).await {
+        if zeph_obj::EncryptedEnvelope::is_envelope(&bytes) {
+            return match state.engine.get_private(cid).await {
+                Ok(pf) => {
+                    let out_path = std::path::Path::new(output);
+                    let dest = if out_path.is_dir() {
+                        out_path.join(&pf.name)
+                    } else {
+                        out_path.to_path_buf()
+                    };
+                    match std::fs::write(&dest, &pf.content) {
+                        Ok(()) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
+                            "path": dest.to_string_lossy(), "name": pf.name,
+                            "is_dir": false, "private": true, "bytes": pf.content.len(),
+                        }}),
+                        Err(e) => rpc_err(id, format!("writing {}: {e}", dest.display())),
+                    }
+                }
+                Err(e) => rpc_err(id, format!("decrypt failed (not your content?): {e}")),
+            };
+        }
+    }
     // A manifest CID restores a named file or a folder tree; a raw content CID
     // just writes bytes.
     match state.engine.fetch_manifest(cid).await {
