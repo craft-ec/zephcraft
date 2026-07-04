@@ -623,6 +623,9 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // Machine-readable self address — paste into another node's --peer flag.
     println!("ZEPH_ADDR {}", transport.addr());
 
+    // The node event bus (foundation §52): subsystems publish, apps subscribe.
+    let events = zeph_events::EventBus::default();
+
     // Control state, shared by the heartbeat loop and the control servers.
     let state = Arc::new(control::State {
         clock: transport.clock(),
@@ -656,6 +659,23 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         content: tokio::sync::RwLock::new(Vec::new()),
         health: tokio::sync::RwLock::new((0, 0, 0, 0, 0, 0, 0)),
         craftsql: craftsql.clone(),
+        events: events.clone(),
+        recent_events: tokio::sync::RwLock::new(std::collections::VecDeque::new()),
+    });
+
+    // Activity feed: drain the event bus into the bounded recent-events buffer
+    // (foundation §52 consumer). Any other subscriber — or the control API — can
+    // subscribe independently for its own reactive logic.
+    let feed_state = state.clone();
+    let mut feed_rx = events.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match feed_rx.recv().await {
+                Ok(ev) => feed_state.push_event(ev.describe()).await,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
     });
 
     let control_state = state.clone();

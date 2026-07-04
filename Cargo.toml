@@ -20,6 +20,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 # ── zephcraft internal crates ──
 zeph-core = { path = "crates/core" }
+zeph-events = { path = "crates/events" }
 zeph-crypto = { path = "crates/crypto" }
 zeph-wire = { path = "crates/wire" }
 zeph-erasure = { path = "crates/erasure" }
@@ -28,6 +29,7 @@ zeph-membership = { path = "crates/membership" }
 zeph-routing = { path = "crates/routing" }
 zeph-store = { path = "crates/store" }
 zeph-obj = { path = "crates/obj" }
+zeph-sql = { path = "crates/sql" }
 
 # ── Async ──
 tokio = { version = "1", features = ["full"] }

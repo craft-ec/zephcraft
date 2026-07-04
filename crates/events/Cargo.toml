@@ -1,0 +1,10 @@
+[package]
+name = "zeph-events"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+zeph-core.workspace = true
+tokio.workspace = true

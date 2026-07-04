@@ -20,6 +20,7 @@ zeph-routing.workspace = true
 zeph-store.workspace = true
 zeph-obj.workspace = true
 zeph-sql.workspace = true
+zeph-events.workspace = true
 postcard.workspace = true
 tokio.workspace = true
 anyhow.workspace = true

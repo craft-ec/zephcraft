@@ -57,6 +57,8 @@
   .grp { font-size:.7rem; text-transform:uppercase; letter-spacing:.06em; color:var(--accent);
          margin:1rem 0 .35rem; } .grp:first-child { margin-top:0; }
   .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .evline { font-size:.78rem; padding:.12rem 0; border-bottom:1px solid var(--line); }
+  .evline:last-child { border-bottom:none; }
   .citem { display:flex; align-items:flex-start; gap:.7rem; padding:.55rem .1rem;
            border-bottom:1px solid var(--line); }
   .citem:last-child { border-bottom:none; }
@@ -122,6 +124,11 @@
     <div id="content-groups"><div class="muted">no content yet — publish a file or fetch a cid</div></div>
   </div>
 
+  <div class="card">
+    <div class="cardhead">activity <span class="muted">(node event bus §52 — the reactive stream apps subscribe to)</span></div>
+    <div id="activity"><div class="muted">no events yet</div></div>
+  </div>
+
   <footer>ZephCraft — Craftec decentralized storage · local dashboard (127.0.0.1) · refresh 1s</footer>
 </main>
 <script>
@@ -147,6 +154,11 @@ function render(s){
   $("listen").textContent = s.listen;
   $("uptime").textContent = fmtUptime(s.uptime_secs);
   renderContent(s);
+  const act = $("activity");
+  const ev = s.recent_events || [];
+  act.innerHTML = ev.length
+    ? ev.map(e => `<div class="evline muted mono">· ${esc(e)}</div>`).join("")
+    : '<div class="muted">no events yet</div>';
   const body = $("peers");
   if (!s.peers.length){
     body.innerHTML = '<tr><td colspan="6" class="muted">no peers in view yet — joining…</td></tr>'; return; }

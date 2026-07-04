@@ -90,6 +90,8 @@ pub struct Status {
     pub health_degraded: u64,
     pub health_fading: u64,
     pub peers: Vec<PeerStatus>,
+    /// Recent node events (activity feed), newest first.
+    pub recent_events: Vec<String>,
 }
 
 pub struct State {
@@ -108,6 +110,10 @@ pub struct State {
     pub content: RwLock<Vec<ContentInfo>>,
     pub health: RwLock<(usize, usize, u64, u64, u64, u64, u64)>, // scanned, at_risk, repaired, moved, scaled, degraded, fading
     pub craftsql: std::sync::Arc<zeph_sql::CraftSql>,
+    /// The node event bus (foundation §52) — producers publish, apps subscribe.
+    pub events: zeph_events::EventBus,
+    /// Recent event descriptions for the dashboard activity feed (newest last).
+    pub recent_events: RwLock<std::collections::VecDeque<String>>,
 }
 
 impl State {
@@ -145,6 +151,23 @@ impl State {
             health_degraded: self.health.read().await.5,
             health_fading: self.health.read().await.6,
             peers: self.peers.read().await.clone(),
+            recent_events: self
+                .recent_events
+                .read()
+                .await
+                .iter()
+                .rev()
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// Record an event description in the bounded activity feed (last 40).
+    pub async fn push_event(&self, desc: String) {
+        let mut q = self.recent_events.write().await;
+        q.push_back(desc);
+        while q.len() > 40 {
+            q.pop_front();
         }
     }
 
@@ -187,8 +210,28 @@ impl State {
         h.6 = fading as u64;
     }
 
-    /// Replace the peer table wholesale (fed by the membership layer).
+    /// Replace the peer table wholesale (fed by the membership layer). Emits
+    /// PeerConnected/PeerDisconnected events for the delta in the alive set.
     pub async fn set_peers(&self, peers: Vec<PeerStatus>, passive: u32) {
+        use std::collections::HashSet;
+        let alive = |ps: &[PeerStatus]| -> HashSet<String> {
+            ps.iter()
+                .filter(|p| p.alive)
+                .map(|p| p.id.clone())
+                .collect()
+        };
+        let new_alive = alive(&peers);
+        let old_alive = alive(&self.peers.read().await);
+        for id in new_alive.difference(&old_alive) {
+            if let Some(n) = parse_node_id(id) {
+                self.events.publish(zeph_events::Event::PeerConnected(n));
+            }
+        }
+        for id in old_alive.difference(&new_alive) {
+            if let Some(n) = parse_node_id(id) {
+                self.events.publish(zeph_events::Event::PeerDisconnected(n));
+            }
+        }
         *self.peers.write().await = peers;
         self.passive_peers
             .store(passive, std::sync::atomic::Ordering::Relaxed);
@@ -477,6 +520,11 @@ async fn rpc_publish(
         return match publish_path(state.engine.clone(), PathBuf::from(path), pin).await {
             Ok((cid, size, _)) => {
                 owned_add(state, &cid.to_hex()).await;
+                state.events.publish(zeph_events::Event::CidWritten {
+                    cid,
+                    name: Some(name.clone()),
+                    pinned: pin,
+                });
                 serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
                     "cid": cid.to_hex(), "name": name, "size": size, "is_dir": true, "pinned": pin,
                 }})
@@ -492,6 +540,11 @@ async fn rpc_publish(
     match state.engine.publish_file(&name, &mime, &data, pin).await {
         Ok(fp) => {
             owned_add(state, &fp.manifest_cid.to_hex()).await;
+            state.events.publish(zeph_events::Event::CidWritten {
+                cid: fp.manifest_cid,
+                name: Some(name.clone()),
+                pinned: fp.pinned,
+            });
             serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
                 "cid": fp.manifest_cid.to_hex(), "content_cid": fp.content_cid.to_hex(),
                 "name": name, "mime": mime, "size": fp.size,
