@@ -137,21 +137,34 @@ pub fn attest_run(
     fuel: u64,
 ) -> anyhow::Result<(Attestation, Vec<u8>)> {
     let output = rt.run(wasm, func, request, fuel)?;
+    let att = attest_transition(identity, program_cid, prev_root, request, &output);
+    Ok((att, output))
+}
+
+/// Sign an attestation over a deterministic transition computed by ANY means — used
+/// for **native network-owned programs** (e.g. the registry, §4) whose code is the
+/// node's own and thus already identical on every agent, so it needn't run through the
+/// WASM sandbox. The quorum check is unchanged: k agents must still agree on the same
+/// `output`, so a wrong output is outvoted exactly as with [`attest_run`]. The caller
+/// guarantees the transition is deterministic.
+pub fn attest_transition(
+    identity: &NodeIdentity,
+    program_cid: [u8; 32],
+    prev_root: [u8; 32],
+    request: &[u8],
+    output: &[u8],
+) -> Attestation {
     let request_hash = Cid::of(request).0;
-    let output_root = Cid::of(&output).0;
+    let output_root = Cid::of(output).0;
     let msg = signing_bytes(&program_cid, &prev_root, &request_hash, &output_root);
-    let signature = identity.sign(&msg).to_vec();
-    Ok((
-        Attestation {
-            program_cid,
-            prev_root,
-            request_hash,
-            output_root,
-            agent: identity.node_id().0,
-            signature,
-        },
-        output,
-    ))
+    Attestation {
+        program_cid,
+        prev_root,
+        request_hash,
+        output_root,
+        agent: identity.node_id().0,
+        signature: identity.sign(&msg).to_vec(),
+    }
 }
 
 /// Verify one attestation's signature (does NOT check agent-set membership — that's

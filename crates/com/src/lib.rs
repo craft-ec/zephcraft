@@ -33,10 +33,11 @@ mod attest;
 mod coordinate;
 mod craft;
 mod invoke;
+mod registry;
 pub use attest::{
-    attest_run, committee_hash, endorse_checkpoint, epoch_of, pda, select_committee, verify,
-    verify_chain, verify_commit, verify_quorum, Attestation, AttestedCommit, AttestedRuntime,
-    Committee, CommitteeCheckpoint, Endorsement, PdaAdvance,
+    attest_run, attest_transition, committee_hash, endorse_checkpoint, epoch_of, pda,
+    select_committee, verify, verify_chain, verify_commit, verify_quorum, Attestation,
+    AttestedCommit, AttestedRuntime, Committee, CommitteeCheckpoint, Endorsement, PdaAdvance,
 };
 pub use coordinate::{
     collect_commit, request_attestation, serve_attestations, AttestRequest, AttestService,
@@ -44,6 +45,7 @@ pub use coordinate::{
 };
 pub use craft::CraftBackend;
 pub use invoke::{invoke_remote, serve_invocations, InvokeRequest, InvokeService, INVOKE_ALPN};
+pub use registry::{HeadEntry, HeadSubmission, RegistryState};
 
 /// Default fuel budget per invocation — roughly proportional to executed WASM
 /// instructions (foundation §38). A runaway loop exhausts this and traps.
