@@ -504,7 +504,15 @@ async fn owned_add(state: &State, cid: &str) {
 /// entry from its manifest (name/size/mime/is_dir). No denormalized copy — the
 /// manifest is the source of truth; the drive is a view. `{columns, rows}`.
 async fn drive_list(state: &State, owner: zeph_core::NodeId) -> serde_json::Value {
-    let cols = serde_json::json!(["cid", "name", "size", "mime", "is_dir", "published_at"]);
+    let cols = serde_json::json!([
+        "cid",
+        "name",
+        "size",
+        "mime",
+        "is_dir",
+        "published_at",
+        "is_private"
+    ]);
     let empty = serde_json::json!({"columns": cols, "rows": []});
     let db = match state.craftsql.open_reader(owner, "owned").await {
         Ok(d) => d,
@@ -531,20 +539,30 @@ async fn drive_list(state: &State, owner: zeph_core::NodeId) -> serde_json::Valu
         let Some(cid) = parse_cid(cid_hex) else {
             continue;
         };
-        let (name, size, mime, is_dir) = match state.engine.fetch_manifest(cid).await {
-            Ok(m) => {
-                let mime = match &m {
-                    zeph_obj::Manifest::File { mime, .. } => mime.clone(),
-                    _ => "inode/directory".to_string(),
-                };
-                (m.name().to_string(), m.size(), mime, m.is_dir())
+        // A private item is an EncryptedEnvelope — decrypt it for name/size/mime;
+        // a public item resolves via its manifest.
+        let is_private = state
+            .engine
+            .get(cid, zeph_obj::ConsumeMode::Drop)
+            .await
+            .map(|b| zeph_obj::EncryptedEnvelope::is_envelope(&b))
+            .unwrap_or(false);
+        let (name, size, mime, is_dir) = if is_private {
+            match state.engine.get_private(cid).await {
+                Ok(pf) => (pf.name, pf.content.len() as u64, pf.mime, false),
+                Err(_) => ("(locked)".to_string(), 0, "encrypted".to_string(), false),
             }
-            Err(_) => (
-                "(manifest unavailable)".to_string(),
-                0u64,
-                String::new(),
-                false,
-            ),
+        } else {
+            match state.engine.fetch_manifest(cid).await {
+                Ok(m) => {
+                    let mime = match &m {
+                        zeph_obj::Manifest::File { mime, .. } => mime.clone(),
+                        _ => "inode/directory".to_string(),
+                    };
+                    (m.name().to_string(), m.size(), mime, m.is_dir())
+                }
+                Err(_) => ("(unavailable)".to_string(), 0u64, String::new(), false),
+            }
         };
         out.push(serde_json::json!([
             cid_hex,
@@ -552,7 +570,8 @@ async fn drive_list(state: &State, owner: zeph_core::NodeId) -> serde_json::Valu
             size,
             mime,
             i32::from(is_dir),
-            pub_at
+            pub_at,
+            is_private
         ]));
     }
     serde_json::json!({"columns": cols, "rows": out})

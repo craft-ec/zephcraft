@@ -291,19 +291,20 @@ function renderDrive(v){
     el.innerHTML = '<div class="muted">no files yet — publish with <span class="mono">zeph publish &lt;path&gt;</span></div>';
     return;
   }
-  // columns: cid, name, size, mime, is_dir, published_at
+  // columns: cid, name, size, mime, is_dir, published_at, is_private
   el.innerHTML = rows.map(r => {
-    const cid=r[0], name=r[1], size=r[2], mime=r[3], is_dir=r[4], pub=r[5];
-    const icon = is_dir ? "📁" : "📄";
+    const cid=r[0], name=r[1], size=r[2], mime=r[3], is_dir=r[4], pub=r[5], priv_=r[6];
+    const icon = priv_ ? "🔒" : (is_dir ? "📁" : "📄");
     const kind = is_dir ? "folder" : (mime || "file");
     const meta = [fmtSize(size), esc(kind), fmtAgoMs(pub)].filter(Boolean).join(" · ");
+    const chip = priv_ ? ' <span class="chip pinned" title="encrypted — only you can read it">private</span>' : '';
     return `<div class="citem">
       <div class="cicon">${icon}</div>
       <div class="cbody">
-        <div class="crow1"><span class="ctitle">${esc(name)}</span></div>
+        <div class="crow1"><span class="ctitle">${esc(name)}</span>${chip}</div>
         <div class="cmeta muted"><span class="cidcell mono" title="click to copy the cid" onclick="copyCid('${cid}')">${cid.slice(0,12)}…</span> · ${meta}</div>
       </div>
-      <div class="cacts"><button class="btn" title="copy cid — share it or fetch elsewhere" onclick="copyCid('${cid}')">copy cid</button></div>
+      <div class="cacts"><button class="btn" title="copy cid" onclick="copyCid('${cid}')">copy cid</button></div>
     </div>`;
   }).join("");
 }

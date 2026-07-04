@@ -436,10 +436,16 @@ async fn cmd_files(data_dir: &Path, owner: Option<&str>) -> anyhow::Result<()> {
         let size = a.get(2).and_then(|v| v.as_u64()).unwrap_or(0);
         let is_dir = a.get(4).and_then(|v| v.as_i64()).unwrap_or(0) != 0;
         let mime = a.get(3).and_then(|v| v.as_str()).unwrap_or("");
+        let private = a.get(6).and_then(|v| v.as_bool()).unwrap_or(false);
         let kind = if is_dir { "folder" } else { mime };
+        let name = if private {
+            format!("🔒 {name}")
+        } else {
+            name.to_string()
+        };
         println!(
             "{:<28} {:>9}  {:<22} {}",
-            trunc(name, 28),
+            trunc(&name, 28),
             human_size(size),
             trunc(kind, 22),
             &cid[..16.min(cid.len())]
