@@ -667,7 +667,10 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         zeph_sql::CraftSql::register(&sql_dir, sql_heads, transport.node_id())?
             .with_source(sql_source)
             .with_durable(Arc::new(zeph_sql::ObjDurable::new(engine.clone())))
-            .with_manifests(sql_manifests),
+            .with_manifests(sql_manifests)
+            .with_enc_keypair(Arc::new(zeph_cipher::EncKeypair::from_identity_seed(
+                &identity.secret_key_bytes(),
+            ))),
     );
 
     tracing::info!(

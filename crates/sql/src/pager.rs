@@ -26,6 +26,10 @@ pub(crate) struct RootIndex {
     pub depth: u8,
     /// CID of the top node (meaningless if depth == 0).
     pub root_cid: [u8; 32],
+    /// Wrapped DB data-key (serialized PRE capsule) for a PRIVATE db; empty = the
+    /// db is public (plaintext pages). Rides the root object (plaintext), so any
+    /// node resolving the head can retrieve it and — with the owner key — unwrap.
+    pub wrapped_dek: Vec<u8>,
 }
 
 pub(crate) fn decode_root(bytes: &[u8]) -> Result<RootIndex> {
@@ -73,6 +77,9 @@ pub struct Pager {
     /// decrypted on read — a private DB. Index nodes + root stay plaintext (they
     /// carry only ciphertext-page CIDs, revealing structure not content).
     cipher: Option<zeph_cipher::Dek>,
+    /// Serialized wrapped DB key (PRE capsule) written into the root on commit;
+    /// empty for a public db. Loaded from the root on open.
+    wrapped_dek: Vec<u8>,
 }
 
 impl Pager {
@@ -87,6 +94,7 @@ impl Pager {
             depth: 0,
             remote: None,
             cipher: None,
+            wrapped_dek: Vec::new(),
         }
     }
 
@@ -118,6 +126,7 @@ impl Pager {
             depth: ri.depth,
             remote: None,
             cipher: None,
+            wrapped_dek: Vec::new(),
         })
     }
 
@@ -131,6 +140,16 @@ impl Pager {
     /// decrypted on read (a private DB). Must be set before page reads/commits.
     pub fn set_cipher(&mut self, dek: zeph_cipher::Dek) {
         self.cipher = Some(dek);
+    }
+
+    /// Set the serialized wrapped DB key to persist in the root on commit.
+    pub fn set_wrapped_dek(&mut self, wrapped: Vec<u8>) {
+        self.wrapped_dek = wrapped;
+    }
+
+    /// The wrapped DB key loaded from the root (empty = public db).
+    pub fn wrapped_dek(&self) -> &[u8] {
+        &self.wrapped_dek
     }
 
     /// A page/object's bytes: local store first, else fetch from the network and
@@ -248,6 +267,7 @@ impl Pager {
             page_count: self.page_count,
             depth: self.depth,
             root_cid,
+            wrapped_dek: self.wrapped_dek.clone(),
         };
         let blob = postcard::to_allocvec(&ri).map_err(|e| SqlError::Serde(e.to_string()))?;
         Ok(self.store.put(&blob)?)

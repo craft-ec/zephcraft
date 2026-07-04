@@ -145,6 +145,10 @@ pub struct CraftSql {
     durable: Option<Arc<dyn DurableStore>>,
     manifests: Option<Arc<dyn ManifestStore>>,
     fetchers: crate::vfs::Fetchers,
+    /// This node's encryption keypair — unwraps private-DB keys / wraps new ones.
+    enc: Option<Arc<zeph_cipher::EncKeypair>>,
+    /// Per-db page ciphers (private dbs), shared with the VFS.
+    ciphers: crate::vfs::Ciphers,
 }
 
 impl CraftSql {
@@ -160,6 +164,7 @@ impl CraftSql {
         let vfs = CraftVfs::new(store_dir.clone());
         let roots = vfs.roots();
         let fetchers = vfs.fetchers();
+        let ciphers = vfs.ciphers();
         sqlite_vfs::register(&vfs_name, vfs, false)
             .map_err(|e| SqlError::Sqlite(format!("vfs register: {e:?}")))?;
         Ok(Self {
@@ -172,7 +177,16 @@ impl CraftSql {
             durable: None,
             manifests: None,
             fetchers,
+            enc: None,
+            ciphers,
         })
+    }
+
+    /// Attach this node's encryption keypair — enables PRIVATE databases (encrypted
+    /// pages): `open_private` for owners, auto-decrypt for readers with the key.
+    pub fn with_enc_keypair(mut self, kp: Arc<zeph_cipher::EncKeypair>) -> Self {
+        self.enc = Some(kp);
+        self
     }
 
     /// Attach a network page source so readers can sync DB pages they don't hold
@@ -306,15 +320,68 @@ impl CraftSql {
 
     /// Open this node's own DB `namespace` for reading and writing.
     pub async fn open(&self, namespace: &str) -> Result<CraftDb> {
-        self.open_as(self.owner, namespace, true).await
+        self.open_as(self.owner, namespace, true, false).await
+    }
+
+    /// Open (or create) one of your own databases as PRIVATE — pages encrypted
+    /// under your key. Existing dbs keep their public/private nature; the flag
+    /// only decides a *new* db.
+    pub async fn open_private(&self, namespace: &str) -> Result<CraftDb> {
+        self.open_as(self.owner, namespace, true, true).await
     }
 
     /// Open another identity's DB `namespace` read-only (a reader/replica).
+    /// Auto-detects a private db (decrypts if we hold the key).
     pub async fn open_reader(&self, owner: NodeId, namespace: &str) -> Result<CraftDb> {
-        self.open_as(owner, namespace, false).await
+        self.open_as(owner, namespace, false, false).await
     }
 
-    async fn open_as(&self, owner: NodeId, namespace: &str, writable: bool) -> Result<CraftDb> {
+    /// For an EXISTING db: if its root carries a wrapped DEK (private) and we can
+    /// unwrap it with our key, register the page cipher. A foreign private db we
+    /// can't unwrap registers nothing → its pages read as ciphertext (open fails).
+    fn register_cipher_existing(&self, key: &str, root: Cid) -> Result<()> {
+        let Some(kp) = &self.enc else { return Ok(()) };
+        let store = ObjectStore::open(&self.store_dir)?;
+        let Some(bytes) = store.get(&root) else {
+            return Ok(());
+        };
+        let ri = crate::pager::decode_root(&bytes)?;
+        if ri.wrapped_dek.is_empty() {
+            return Ok(()); // public db
+        }
+        let capsule: zeph_cipher::DekCapsule =
+            postcard::from_bytes(&ri.wrapped_dek).map_err(|e| SqlError::Serde(e.to_string()))?;
+        if let Ok(dek) = zeph_cipher::open_capsule(kp, &capsule) {
+            self.ciphers
+                .lock()
+                .expect("ciphers")
+                .insert(key.to_string(), (dek, ri.wrapped_dek));
+        }
+        Ok(())
+    }
+
+    /// For a NEW private db: generate a DEK, wrap it under our key, register both
+    /// (the wrapped DEK is written into the root on the first commit).
+    fn register_cipher_new(&self, key: &str) -> Result<()> {
+        let Some(kp) = &self.enc else { return Ok(()) };
+        let dek = zeph_cipher::Dek::generate();
+        let capsule = zeph_cipher::encapsulate(&kp.public(), &dek);
+        let wrapped =
+            postcard::to_allocvec(&capsule).map_err(|e| SqlError::Serde(e.to_string()))?;
+        self.ciphers
+            .lock()
+            .expect("ciphers")
+            .insert(key.to_string(), (dek, wrapped));
+        Ok(())
+    }
+
+    async fn open_as(
+        &self,
+        owner: NodeId,
+        namespace: &str,
+        writable: bool,
+        private_hint: bool,
+    ) -> Result<CraftDb> {
         let key = format!("{}_{}", &owner.to_hex()[..16], namespace);
         // Resolve the authoritative head. If the tracker lost it (restart) and
         // this is our own DB, recover it from the local sidecar so the owner is
@@ -346,10 +413,14 @@ impl CraftSql {
                     .lock()
                     .expect("roots")
                     .insert(key.clone(), root.0);
+                self.register_cipher_existing(&key, root)?;
                 seq
             }
             None => {
                 self.roots.lock().expect("roots").remove(&key);
+                if private_hint {
+                    self.register_cipher_new(&key)?;
+                }
                 0
             }
         };
@@ -766,6 +837,52 @@ mod tests {
             }
             m.insert(key, (root.0, seq));
             Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn private_db_encrypts_pages_and_only_the_owner_reads() {
+        let dir = tempdir().unwrap();
+        let owner = NodeId([9u8; 32]);
+        let heads = MockHeads::new(owner);
+        let kp_a = Arc::new(zeph_cipher::EncKeypair::from_identity_seed(&[1u8; 32]));
+
+        // Owner writes a PRIVATE db.
+        {
+            let w = CraftSql::register(dir.path(), heads.clone(), owner)
+                .unwrap()
+                .with_enc_keypair(kp_a.clone());
+            let mut db = w.open_private("vault").await.unwrap();
+            db.write("CREATE TABLE s(id INTEGER PRIMARY KEY, secret TEXT); INSERT INTO s VALUES (1,'TOPSECRET');")
+                .await
+                .unwrap();
+        }
+
+        // Owner reopens (fresh engine, same key) → auto-detects private, reads back.
+        {
+            let w2 = CraftSql::register(dir.path(), heads.clone(), owner)
+                .unwrap()
+                .with_enc_keypair(kp_a.clone());
+            let db = w2.open("vault").await.unwrap();
+            let rows = db.query("SELECT secret FROM s WHERE id=1").unwrap();
+            assert!(
+                rows.to_string().contains("TOPSECRET"),
+                "owner reads the private db"
+            );
+        }
+
+        // A DIFFERENT identity cannot read it (its key can't unwrap the DB key).
+        {
+            let kp_b = Arc::new(zeph_cipher::EncKeypair::from_identity_seed(&[2u8; 32]));
+            let f = CraftSql::register(dir.path(), heads.clone(), owner)
+                .unwrap()
+                .with_enc_keypair(kp_b);
+            let readable = matches!(f.open_reader(owner, "vault").await, Ok(db)
+                if db.query("SELECT secret FROM s").map(|v| v.to_string().contains("TOPSECRET")).unwrap_or(false));
+            assert!(
+                !readable,
+                "a different identity must not read the private db"
+            );
         }
     }
 

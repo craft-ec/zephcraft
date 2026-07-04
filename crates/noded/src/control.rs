@@ -492,7 +492,8 @@ async fn owned_add(state: &State, cid: &str) {
         sql_esc(cid),
         now,
     );
-    if let Ok(mut db) = state.craftsql.open("owned").await {
+    // The drive is PRIVATE — the owned index is encrypted under this identity's key.
+    if let Ok(mut db) = state.craftsql.open_private("owned").await {
         if let Err(e) = db.write(&sql).await {
             tracing::warn!(%e, "owned index write failed");
         }

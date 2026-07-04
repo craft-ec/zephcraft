@@ -23,12 +23,17 @@ pub type Roots = Arc<Mutex<HashMap<String, [u8; 32]>>>;
 /// Per-db lazy-read fetchers: a reader registers one so the sync VFS can pull
 /// page contents on demand instead of syncing the whole DB up front.
 pub type Fetchers = Arc<Mutex<HashMap<String, crate::fetch::Fetcher>>>;
+/// Per-db page cipher: (DEK, serialized wrapped-DEK). Registered by `open_as` for
+/// a PRIVATE db; the VFS applies it to the pager (encrypt pages) — the VFS itself
+/// stays crypto-agnostic. The wrapped-DEK is written into the root on commit.
+pub type Ciphers = Arc<Mutex<HashMap<String, (zeph_cipher::Dek, Vec<u8>)>>>;
 
 /// A SQLite VFS whose database files are CraftOBJ page objects.
 pub struct CraftVfs {
     dir: PathBuf,
     roots: Roots,
     fetchers: Fetchers,
+    ciphers: Ciphers,
 }
 
 impl CraftVfs {
@@ -37,6 +42,7 @@ impl CraftVfs {
             dir: dir.into(),
             roots: Arc::new(Mutex::new(HashMap::new())),
             fetchers: Arc::new(Mutex::new(HashMap::new())),
+            ciphers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -49,6 +55,11 @@ impl CraftVfs {
     /// Handle to the per-db lazy-read fetcher map.
     pub fn fetchers(&self) -> Fetchers {
         self.fetchers.clone()
+    }
+
+    /// Handle to the per-db page-cipher map (private dbs).
+    pub fn ciphers(&self) -> Ciphers {
+        self.ciphers.clone()
     }
 
     /// Current committed root CID for `name`, if any.
@@ -90,6 +101,11 @@ impl Vfs for CraftVfs {
             // Lazy reader: pull page contents on demand via the registered fetcher.
             if let Some(f) = self.fetchers.lock().expect("fetchers").get(db) {
                 pager.set_remote(f.clone());
+            }
+            // Private db: apply the page cipher + wrapped-DEK registered by open_as.
+            if let Some((dek, wrapped)) = self.ciphers.lock().expect("ciphers").get(db) {
+                pager.set_cipher(dek.clone());
+                pager.set_wrapped_dek(wrapped.clone());
             }
             Ok(CraftHandle {
                 inner: Inner::Db {
