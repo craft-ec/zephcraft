@@ -175,18 +175,40 @@
   <section id="tab-settings" class="tab" hidden>
     <div class="card">
       <div class="cardhead">node settings <span class="muted">(read-only — edit config.toml + restart to change)</span></div>
-      <div class="kv"><span>data dir</span><b id="set-datadir">…</b></div>
+      <div class="grp">network</div>
       <div class="kv"><span>reachability</span><b id="set-reach">…</b></div>
       <div class="kv"><span>listen port (udp)</span><b id="set-listen">…</b></div>
       <div class="kv"><span>dashboard port</span><b id="set-dash">…</b></div>
-      <div class="kv"><span>storage quota</span><b id="set-quota">…</b></div>
+      <div class="kv"><span>heartbeat interval</span><b id="set-heartbeat">…</b></div>
+      <div class="kv"><span>probe timeout (healthscan)</span><b id="set-probe">…</b></div>
       <div class="kv"><span>fallback relays</span><b id="set-fallback">…</b></div>
+
+      <div class="grp">storage & erasure</div>
+      <div class="kv"><span>storage quota</span><b id="set-quota">…</b></div>
+      <div class="kv"><span>erasure k (decode threshold)</span><b id="set-k">…</b></div>
+      <div class="kv"><span>durability threshold (distinct peers)</span><b id="set-dur">…</b></div>
+
+      <div class="grp">lifecycle tunables</div>
+      <div class="kv"><span>scale threshold (pulls/cycle → recruit)</span><b id="set-scale">…</b></div>
+      <div class="kv"><span>degrade threshold (pulls/cycle → shed)</span><b id="set-degrade">…</b></div>
+      <div class="kv"><span>fade grace (demand-alive window)</span><b id="set-fade">…</b></div>
+      <div class="kv"><span>eviction cooldown (anti-thrash)</span><b id="set-cooldown">…</b></div>
+
+      <div class="grp">background intervals</div>
+      <div class="kv"><span>health scan / lifecycle</span><b id="set-hscan">…</b></div>
+      <div class="kv"><span>re-announce (providers + heads)</span><b id="set-reann">…</b></div>
+
       <div class="grp">relays</div>
       <div id="set-relays"><div class="muted">none</div></div>
       <div class="grp">trackers</div>
       <div id="set-trackers"><div class="muted">none</div></div>
+      <div class="grp">operated relays (vouched)</div>
+      <div id="set-relayops"><div class="muted">none</div></div>
       <div class="grp">bootstrap peers</div>
       <div id="set-peers"><div class="muted">none</div></div>
+
+      <div class="grp">paths</div>
+      <div class="kv"><span>data dir</span><b id="set-datadir">…</b></div>
     </div>
   </section>
 
@@ -390,6 +412,14 @@ function renderContent(s){
 function showTab(name){
   document.querySelectorAll('.tab').forEach(t => { t.hidden = (t.id !== 'tab-'+name); });
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('on', b.dataset.tab === name));
+  try { localStorage.setItem('zeph-tab', name); } catch(e){}
+}
+function fmtDur(s){
+  if(!s) return "—";
+  if(s < 60) return s + "s";
+  if(s < 3600) return Math.round(s/60) + "m";
+  if(s < 86400) return Math.round(s/3600) + "h";
+  return Math.round(s/86400) + "d";
 }
 function renderStatus(s){
   const eb = s.event_stats || {};
@@ -417,17 +447,36 @@ function renderStatus(s){
 }
 function renderSettings(s){
   const st = s.settings || {};
-  $("set-datadir").textContent = st.data_dir || "—";
-  $("set-reach").textContent = st.reach || "—";
-  $("set-listen").textContent = (st.listen_port === 0) ? "OS-assigned (0)" : (st.listen_port || "—");
-  $("set-dash").textContent = st.dashboard_port || "—";
-  $("set-quota").textContent = (st.storage_quota_gib || 0) + " GiB";
-  $("set-fallback").textContent = st.fallback_relays ? "yes — n0 public relays appended" : "no — our mesh only";
+  const g = (id, v) => { const e = $(id); if(e) e.textContent = v; };
+  // network
+  g("set-reach", st.reach || "—");
+  g("set-listen", (st.listen_port === 0) ? "OS-assigned (0)" : (st.listen_port || "—"));
+  g("set-dash", st.dashboard_port || "—");
+  g("set-heartbeat", fmtDur(st.heartbeat_secs));
+  g("set-probe", fmtDur(st.probe_timeout_secs));
+  g("set-fallback", st.fallback_relays ? "yes — n0 public relays appended" : "no — our mesh only");
+  // storage & erasure
+  g("set-quota", (st.storage_quota_gib || 0) + " GiB");
+  g("set-k", st.erasure_k || "—");
+  g("set-dur", st.durability_threshold || "—");
+  // lifecycle tunables
+  g("set-scale", (st.scale_threshold || 0) + " pulls/cycle");
+  g("set-degrade", (st.degrade_threshold || 0) + " pulls/cycle");
+  g("set-fade", fmtDur(st.fade_grace_secs));
+  g("set-cooldown", fmtDur(st.eviction_cooldown_secs));
+  // intervals
+  g("set-hscan", fmtDur(st.health_scan_secs));
+  g("set-reann", fmtDur(st.reannounce_secs));
+  // paths
+  g("set-datadir", st.data_dir || "—");
   const list = (a) => (a && a.length) ? a.map(x => `<div class="evline mono">${esc(x)}</div>`).join("") : '<div class="muted">none</div>';
   $("set-relays").innerHTML = list(st.relay_urls);
   $("set-trackers").innerHTML = list(st.trackers);
+  $("set-relayops").innerHTML = list(st.relay_operator_urls);
   $("set-peers").innerHTML = list(st.peers);
 }
+// Restore the last-selected tab (persists across reloads).
+showTab((() => { try { return localStorage.getItem('zeph-tab'); } catch(e){ return null; } })() || 'overview');
 tick(); setInterval(tick, 1000);
 </script>
 </body>

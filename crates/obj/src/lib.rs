@@ -200,6 +200,11 @@ impl ObjEngine {
         &self.store
     }
 
+    /// The effective engine configuration (for the Settings view).
+    pub fn config(&self) -> &ObjConfig {
+        &self.config
+    }
+
     /// Content is "alive" — worth maintaining/spreading — iff it is pinned
     /// (locally or by a provider), wanted (locally or network-wide), or fetched
     /// within the fade grace window. Otherwise it fades (Repair + Distribution

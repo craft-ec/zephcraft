@@ -64,14 +64,30 @@ pub struct ContentInfo {
 /// restart to change).
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct NodeSettings {
+    // ── network ──
     pub reach: String,
     pub listen_port: u16,
     pub dashboard_port: u16,
-    pub relay_urls: Vec<String>,
+    pub heartbeat_secs: u64,
     pub fallback_relays: bool,
+    pub probe_timeout_secs: u64,
+    pub relay_urls: Vec<String>,
     pub trackers: Vec<String>,
-    pub storage_quota_gib: f64,
+    pub relay_operator_urls: Vec<String>,
     pub peers: Vec<String>,
+    // ── storage & erasure ──
+    pub storage_quota_gib: f64,
+    pub erasure_k: usize,
+    pub durability_threshold: usize,
+    // ── lifecycle tunables (obj engine) ──
+    pub scale_threshold: u32,
+    pub degrade_threshold: u32,
+    pub fade_grace_secs: u64,
+    pub eviction_cooldown_secs: u64,
+    // ── background intervals ──
+    pub health_scan_secs: u64,
+    pub reannounce_secs: u64,
+    // ── paths ──
     pub data_dir: String,
 }
 

@@ -670,16 +670,30 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         recent_events: tokio::sync::RwLock::new(std::collections::VecDeque::new()),
         jobs: jobs.clone(),
         event_counts: tokio::sync::RwLock::new(std::collections::BTreeMap::new()),
-        settings: control::NodeSettings {
-            reach: cfg.reach.clone(),
-            listen_port: cfg.listen_port,
-            dashboard_port: cfg.dashboard_port,
-            relay_urls: cfg.relay_urls.clone(),
-            fallback_relays: cfg.fallback_relays,
-            trackers: cfg.trackers.clone(),
-            storage_quota_gib: cfg.storage_quota_gib,
-            peers: cfg.peers.clone(),
-            data_dir: data_dir.display().to_string(),
+        settings: {
+            let oc = engine.config();
+            control::NodeSettings {
+                reach: cfg.reach.clone(),
+                listen_port: cfg.listen_port,
+                dashboard_port: cfg.dashboard_port,
+                heartbeat_secs: cfg.heartbeat_secs,
+                fallback_relays: cfg.fallback_relays,
+                probe_timeout_secs: oc.probe_timeout.as_secs(),
+                relay_urls: cfg.relay_urls.clone(),
+                trackers: cfg.trackers.clone(),
+                relay_operator_urls: cfg.relay_operator_urls.clone(),
+                peers: cfg.peers.clone(),
+                storage_quota_gib: cfg.storage_quota_gib,
+                erasure_k: oc.k,
+                durability_threshold: oc.durability_threshold,
+                scale_threshold: oc.scale_threshold,
+                degrade_threshold: oc.degrade_threshold,
+                fade_grace_secs: oc.fade_grace.as_secs(),
+                eviction_cooldown_secs: oc.eviction_cooldown.as_secs(),
+                health_scan_secs: 30,
+                reannounce_secs: 120,
+                data_dir: data_dir.display().to_string(),
+            }
         },
     });
 
