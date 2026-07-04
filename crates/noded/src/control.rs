@@ -53,6 +53,8 @@ pub struct ContentInfo {
     pub name: Option<String>,
     pub size: u64,
     pub is_dir: bool,
+    /// MIME type (files only; None for folders/raw), for drive-parity display.
+    pub mime: Option<String>,
     /// Metadata envelope (default view = earliest publisher): first-published
     /// unix millis, that publisher's short id, and their comment.
     pub published_at: Option<u64>,

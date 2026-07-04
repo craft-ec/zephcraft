@@ -389,9 +389,12 @@ function citem(c){
   const icon = c.name ? (c.is_dir?"📁":"📄") : "🔗";
   const title = c.name ? esc(c.name) : `<span class="mono">${c.cid.slice(0,20)}…</span>`;
 
+  // Meta line mirrors the Drive: cid · size · kind · [pieces].
+  const kind = c.is_dir ? "folder" : (c.mime || (c.name ? "file" : ""));
   const bits = [`<span class="cidcell mono" title="click to copy the full cid" onclick="copyCid('${c.cid}')">${c.cid.slice(0,12)}…</span>`];
   if(c.size) bits.push(fmtSize(c.size));
-  if(c.local_pieces>0 && !c.local_pinned) bits.push(`${c.local_pieces} pcs held`);
+  if(kind) bits.push(esc(kind));
+  if(c.local_pieces>0 && !c.local_pinned) bits.push(`${c.local_pieces} pcs`);
 
   let acts;
   if(c.local_tombstoned){

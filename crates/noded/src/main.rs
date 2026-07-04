@@ -984,8 +984,10 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         // Resolved names for curated cids we can't decode locally (too few pieces)
         // — fetched once from the network, then cached so the tab stays named.
-        let mut name_cache: std::collections::HashMap<[u8; 32], (String, u64, bool)> =
-            std::collections::HashMap::new();
+        let mut name_cache: std::collections::HashMap<
+            [u8; 32],
+            (String, u64, bool, Option<String>),
+        > = std::collections::HashMap::new();
         loop {
             interval.tick().await;
             // A DHT has no global enumeration: the content list is LOCAL knowledge
@@ -1044,44 +1046,49 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                     name: None,
                     size: 0,
                     is_dir: false,
+                    mime: None,
                     published_at: None,
                     publisher: None,
                     comment: None,
                 };
+                let mut big = false;
                 if let Some(gen) = content_store.generation(&cid) {
                     e.k = gen.k as usize;
                     e.floor = zeph_obj::floor_for_k(gen.k as usize);
-                    // Small enough to be a manifest? Decode it locally so
-                    // files/folders show by name, not by hash.
-                    if gen.total_len <= 64 * 1024 {
-                        // Name it, best-first: (1) decode from local pieces; else
-                        // (2) a cached name; else (3) fetch the manifest from the
-                        // network ONCE (capped per pass) and cache it. Skip fetching
-                        // for banned cids — we refuse that content, don't pull it.
-                        if let Some(m) = content_state
-                            .engine
-                            .decode_local(&cid)
-                            .and_then(|b| zeph_obj::Manifest::decode(&b))
-                        {
-                            e.name = Some(m.name().to_string());
-                            e.size = m.size();
-                            e.is_dir = m.is_dir();
-                            name_cache.insert(cid.0, (m.name().to_string(), m.size(), m.is_dir()));
-                        } else if let Some((n, s, dir)) = name_cache.get(&cid.0) {
-                            e.name = Some(n.clone());
-                            e.size = *s;
-                            e.is_dir = *dir;
-                        } else if fetches < 4 && !banned.contains(&cid) {
+                    big = gen.total_len > 64 * 1024;
+                }
+                // Resolve name/size/type/mime, best-first: (1) decode from local
+                // pieces; else (2) a cached name; else (3) fetch the manifest from
+                // the network ONCE (capped per pass) and cache it. Works for BANNED
+                // cids too — fetch_manifest reads the label in-memory (Drop), it
+                // does not re-host the content.
+                if !big && !name_cache.contains_key(&cid.0) {
+                    let m = content_state
+                        .engine
+                        .decode_local(&cid)
+                        .and_then(|b| zeph_obj::Manifest::decode(&b));
+                    let m = match m {
+                        Some(m) => Some(m),
+                        None if fetches < 4 => {
                             fetches += 1;
-                            if let Ok(m) = content_state.engine.fetch_manifest(cid).await {
-                                e.name = Some(m.name().to_string());
-                                e.size = m.size();
-                                e.is_dir = m.is_dir();
-                                name_cache
-                                    .insert(cid.0, (m.name().to_string(), m.size(), m.is_dir()));
-                            }
+                            content_state.engine.fetch_manifest(cid).await.ok()
                         }
+                        None => None,
+                    };
+                    if let Some(m) = m {
+                        let mime = match &m {
+                            zeph_obj::Manifest::File { mime, .. } => Some(mime.clone()),
+                            _ => None,
+                        };
+                        name_cache
+                            .insert(cid.0, (m.name().to_string(), m.size(), m.is_dir(), mime));
                     }
+                }
+                if let Some((n, s, dir, mime)) = name_cache.get(&cid.0) {
+                    e.name = Some(n.clone());
+                    e.size = *s;
+                    e.is_dir = *dir;
+                    e.mime = mime.clone();
                 }
                 out.push(e);
             }
