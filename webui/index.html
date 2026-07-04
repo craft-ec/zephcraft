@@ -434,7 +434,10 @@ function renderStorage(){
   set('sc-want', wants.length); set('sc-ban', bans.length);
   const h = s.hosting_cids||0;
   const hn=$('hosting-note');
-  if(hn) hn.textContent = h ? `⛁ also hosting ${h} cid${h==1?"":"s"} for the network — managed automatically (they fade / evict on their own)` : "";
+  const serving = s.providing || 0;
+  if(hn) hn.textContent = serving
+    ? `⛁ serving ${serving} cids to the network` + (h ? ` — ${h} ${h==1?"is":"are"} other publishers' content you host (rest are your files + database)` : ` (all your own files + database)`)
+    : "";
   const sub = window.curSub || 'drive';
   const body=$('storage-body'), desc=$('sub-desc');
   const DESC = {
