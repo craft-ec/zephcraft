@@ -29,8 +29,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use wasmtime::{Caller, Config, Engine, Extern, Linker, Memory, Module, Store};
 
+mod attest;
 mod craft;
 mod invoke;
+pub use attest::{attest_run, verify, verify_quorum, Attestation, AttestedRuntime};
 pub use craft::CraftBackend;
 pub use invoke::{invoke_remote, serve_invocations, InvokeRequest, InvokeService, INVOKE_ALPN};
 

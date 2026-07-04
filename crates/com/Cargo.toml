@@ -10,6 +10,7 @@ anyhow.workspace = true
 async-trait.workspace = true
 wasmtime = { version = "27", features = ["async"] }
 zeph-core.workspace = true
+zeph-crypto.workspace = true
 zeph-sql.workspace = true
 zeph-obj.workspace = true
 zeph-transport.workspace = true
