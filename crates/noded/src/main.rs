@@ -66,6 +66,10 @@ enum Command {
     Pin { cid: String },
     /// Unpin a CID (revert to normal, evictable lifecycle).
     Unpin { cid: String },
+    /// Want a CID: keep-alive intent (holds the whole file alive; cascades).
+    Want { cid: String },
+    /// Unwant a CID (drop the keep-alive intent; cascades).
+    Unwant { cid: String },
     /// Remove a file from your drive: unlist it + unpin so it fades from the
     /// network (nothing wants it). Re-publishable. For a private file, also unpins
     /// the ciphertext (best-effort crypto-shred). Your copies go; network copies
@@ -260,6 +264,8 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Get { cid, output }) => cmd_get(&data_dir, &cid, &output).await,
         Some(Command::Pin { cid }) => cmd_cid_op(&data_dir, "pin", &cid).await,
         Some(Command::Unpin { cid }) => cmd_cid_op(&data_dir, "unpin", &cid).await,
+        Some(Command::Want { cid }) => cmd_cid_op(&data_dir, "want", &cid).await,
+        Some(Command::Unwant { cid }) => cmd_cid_op(&data_dir, "unwant", &cid).await,
         Some(Command::Delete { cid }) => cmd_cid_op(&data_dir, "delete", &cid).await,
         Some(Command::Ban { cid }) => cmd_cid_op(&data_dir, "ban", &cid).await,
         Some(Command::SqlExec { ns, sql }) => cmd_sql_exec(&data_dir, &ns, &sql).await,

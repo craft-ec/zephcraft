@@ -375,6 +375,7 @@ async fn handle_rpc(state: &State, line: &str) -> serde_json::Value {
         Some("unwant") => rpc_cid_op(state, &request, id, "unwant").await,
         Some("fetch") => rpc_cid_op(state, &request, id, "fetch").await,
         Some("delete") => rpc_cid_op(state, &request, id, "delete").await,
+        Some("ban") => rpc_cid_op(state, &request, id, "ban").await,
         Some("unban") => rpc_cid_op(state, &request, id, "unban").await,
         Some("setmeta") => rpc_setmeta(state, &request, id).await,
         Some("delmeta") => rpc_cid_op(state, &request, id, "delmeta").await,
