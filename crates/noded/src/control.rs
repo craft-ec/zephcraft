@@ -362,25 +362,81 @@ fn sql_esc(s: &str) -> String {
 /// Record a published item in this identity's DRIVE — a per-identity CraftSQL DB
 /// indexing everything you've published (your files on the grid). Best-effort:
 /// a drive hiccup never fails the publish itself.
-async fn drive_add(state: &State, cid: &str, name: &str, size: u64, mime: &str, is_dir: bool) {
+/// SUBSTRATE: record a published CID in this identity's OWNED INDEX — a minimal,
+/// always-maintained CraftSQL DB (`owned`: cid, published_at) so a publishing
+/// node never loses track of its own content (content-addressing is one-way).
+/// The rich "drive" view below is DERIVED from this + the manifests (app on top).
+async fn owned_add(state: &State, cid: &str) {
     let now = state.clock.now().millis();
     let sql = format!(
-        "CREATE TABLE IF NOT EXISTS files(cid TEXT PRIMARY KEY, name TEXT, size INTEGER, \
-         mime TEXT, is_dir INTEGER, published_at INTEGER);\n\
-         INSERT OR REPLACE INTO files(cid,name,size,mime,is_dir,published_at) \
-         VALUES ('{}','{}',{},'{}',{},{});",
+        "CREATE TABLE IF NOT EXISTS owned(cid TEXT PRIMARY KEY, published_at INTEGER);\n\
+         INSERT OR IGNORE INTO owned(cid, published_at) VALUES ('{}', {});",
         sql_esc(cid),
-        sql_esc(name),
-        size,
-        sql_esc(mime),
-        i32::from(is_dir),
         now,
     );
-    if let Ok(mut db) = state.craftsql.open("drive").await {
+    if let Ok(mut db) = state.craftsql.open("owned").await {
         if let Err(e) = db.write(&sql).await {
-            tracing::warn!(%e, "drive index write failed");
+            tracing::warn!(%e, "owned index write failed");
         }
     }
+}
+
+/// The DRIVE (bundled reference app): read `owner`'s owned index and enrich each
+/// entry from its manifest (name/size/mime/is_dir). No denormalized copy — the
+/// manifest is the source of truth; the drive is a view. `{columns, rows}`.
+async fn drive_list(state: &State, owner: zeph_core::NodeId) -> serde_json::Value {
+    let cols = serde_json::json!(["cid", "name", "size", "mime", "is_dir", "published_at"]);
+    let empty = serde_json::json!({"columns": cols, "rows": []});
+    let db = match state.craftsql.open_reader(owner, "owned").await {
+        Ok(d) => d,
+        Err(_) => return empty,
+    };
+    let owned = match tokio::task::spawn_blocking(move || {
+        db.query("SELECT cid, published_at FROM owned ORDER BY published_at DESC")
+    })
+    .await
+    {
+        Ok(Ok(v)) => v,
+        _ => return empty,
+    };
+    let rows_in = owned
+        .get("rows")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for r in rows_in {
+        let Some(a) = r.as_array() else { continue };
+        let cid_hex = a.first().and_then(|v| v.as_str()).unwrap_or("");
+        let pub_at = a.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
+        let Some(cid) = parse_cid(cid_hex) else {
+            continue;
+        };
+        let (name, size, mime, is_dir) = match state.engine.fetch_manifest(cid).await {
+            Ok(m) => {
+                let mime = match &m {
+                    zeph_obj::Manifest::File { mime, .. } => mime.clone(),
+                    _ => "inode/directory".to_string(),
+                };
+                (m.name().to_string(), m.size(), mime, m.is_dir())
+            }
+            Err(_) => (
+                "(manifest unavailable)".to_string(),
+                0u64,
+                String::new(),
+                false,
+            ),
+        };
+        out.push(serde_json::json!([
+            cid_hex,
+            name,
+            size,
+            mime,
+            i32::from(is_dir),
+            pub_at
+        ]));
+    }
+    serde_json::json!({"columns": cols, "rows": out})
 }
 
 /// List this identity's DRIVE (or another owner's via `owner`) — the files
@@ -390,8 +446,6 @@ async fn rpc_files(
     req: &serde_json::Value,
     id: serde_json::Value,
 ) -> serde_json::Value {
-    let empty =
-        || serde_json::json!({"jsonrpc":"2.0","id":id.clone(),"result":{"columns":[],"rows":[]}});
     let owner = match param(req, "owner").and_then(|v| v.as_str()) {
         Some(h) => match parse_node_id(h) {
             Some(n) => n,
@@ -399,18 +453,10 @@ async fn rpc_files(
         },
         None => match parse_node_id(&state.node_id) {
             Some(n) => n,
-            None => return empty(),
+            None => return rpc_err(id, "self node id unparseable".into()),
         },
     };
-    let db = match state.craftsql.open_reader(owner, "drive").await {
-        Ok(d) => d,
-        Err(_) => return empty(),
-    };
-    let q = "SELECT cid,name,size,mime,is_dir,published_at FROM files ORDER BY published_at DESC";
-    match tokio::task::spawn_blocking(move || db.query(q)).await {
-        Ok(Ok(v)) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":v}),
-        _ => empty(),
-    }
+    serde_json::json!({"jsonrpc":"2.0","id":id,"result": drive_list(state, owner).await})
 }
 
 async fn rpc_publish(
@@ -430,7 +476,7 @@ async fn rpc_publish(
     if std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false) {
         return match publish_path(state.engine.clone(), PathBuf::from(path), pin).await {
             Ok((cid, size, _)) => {
-                drive_add(state, &cid.to_hex(), &name, size, "inode/directory", true).await;
+                owned_add(state, &cid.to_hex()).await;
                 serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
                     "cid": cid.to_hex(), "name": name, "size": size, "is_dir": true, "pinned": pin,
                 }})
@@ -445,15 +491,7 @@ async fn rpc_publish(
     let mime = guess_mime(&name);
     match state.engine.publish_file(&name, &mime, &data, pin).await {
         Ok(fp) => {
-            drive_add(
-                state,
-                &fp.manifest_cid.to_hex(),
-                &name,
-                fp.size,
-                &mime,
-                false,
-            )
-            .await;
+            owned_add(state, &fp.manifest_cid.to_hex()).await;
             serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
                 "cid": fp.manifest_cid.to_hex(), "content_cid": fp.content_cid.to_hex(),
                 "name": name, "mime": mime, "size": fp.size,
@@ -846,22 +884,10 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         if params.token != *ctx.token {
             return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
         }
-        let empty = serde_json::json!({"columns": [], "rows": []});
         let Some(owner) = parse_node_id(&ctx.state.node_id) else {
-            return axum::Json(empty).into_response();
+            return axum::Json(serde_json::json!({"columns": [], "rows": []})).into_response();
         };
-        let db = match ctx.state.craftsql.open_reader(owner, "drive").await {
-            Ok(d) => d,
-            Err(_) => return axum::Json(empty).into_response(),
-        };
-        let q =
-            "SELECT cid,name,size,mime,is_dir,published_at FROM files ORDER BY published_at DESC";
-        let v = tokio::task::spawn_blocking(move || db.query(q))
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .unwrap_or(empty);
-        axum::Json(v).into_response()
+        axum::Json(drive_list(&ctx.state, owner).await).into_response()
     }
 
     let ctx = HttpCtx {
