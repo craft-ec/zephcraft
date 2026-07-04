@@ -181,6 +181,8 @@ pub struct State {
     pub com: std::sync::Arc<zeph_com::InvokeService>,
     /// Content routing — for resolving/announcing signed app-name heads (KIND_APP).
     pub routing: std::sync::Arc<dyn zeph_routing::ContentRouting>,
+    /// Phase 4c: durable app-name registry backing (program-owned, self-attested ramp).
+    pub appreg: std::sync::Arc<crate::appreg::AppRegistry>,
 }
 
 impl State {
@@ -1017,6 +1019,10 @@ async fn deploy_bytes(
         None => 1,
     };
     let _ = state.routing.announce_app(name, cid, version).await;
+    // Phase 4c: also register into the durable program-owned registry (self-attested).
+    if let Err(e) = state.appreg.register(name, cid.0, version).await {
+        tracing::warn!(%e, "registry register failed (KIND_APP path still applied)");
+    }
     apps_add(state, name, &cid.to_hex(), version).await;
     Ok(serde_json::json!({
         "name": name, "cid": cid.to_hex(), "size": bytes.len(), "version": version
@@ -1047,9 +1053,14 @@ async fn rpc_invoke(
         let Some(publisher) = publisher else {
             return rpc_err(id, "name: bad publisher (expected <hex>/<app>)".into());
         };
-        match state.routing.resolve_app(publisher, app_name).await {
-            Ok(Some(rec)) => (rec.wasm_cid.0, app_name.to_string()),
-            _ => return rpc_err(id, format!("app '{nm}' not found (deploy it first?)")),
+        // Phase 4c: durable registry first (own names), then KIND_APP (network) fallback.
+        if let Some(cid) = state.appreg.resolve(publisher.0, app_name).await {
+            (cid, app_name.to_string())
+        } else {
+            match state.routing.resolve_app(publisher, app_name).await {
+                Ok(Some(rec)) => (rec.wasm_cid.0, app_name.to_string()),
+                _ => return rpc_err(id, format!("app '{nm}' not found (deploy it first?)")),
+            }
         }
     } else {
         let wasm_hex = p.get("wasm_cid").and_then(|v| v.as_str()).unwrap_or("");
@@ -1477,13 +1488,25 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
             return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
         }
         let program = zeph_com::registry_program_cid();
-        let account = zeph_com::pda(&program, zeph_com::REGISTRY_SEED);
+        let account = ctx.state.appreg.account();
+        let (count, root) = ctx.state.appreg.summary().await;
+        let rows: Vec<serde_json::Value> = ctx
+            .state
+            .appreg
+            .rows()
+            .await
+            .into_iter()
+            .map(|(owner, name, cid, ver)| serde_json::json!([owner, name, cid, ver]))
+            .collect();
         axum::Json(serde_json::json!({
-            "status": "designed",
+            "status": if count > 0 { "live (v1 ramp: self-attested)" } else { "live (empty)" },
             "model": "deterministic k-of-n attestation - program-owned (PDA) registry",
             "registry_program": hex::encode(program),
             "registry_account": hex::encode(account.0),
-            "note": "attestation substrate built (phases 1-4b); live head resolution is phase 4c",
+            "entries": count,
+            "root": root,
+            "rows": rows,
+            "note": "durable self-attested registry live; multi-node committee head-store is phase 4d",
         }))
         .into_response()
     }

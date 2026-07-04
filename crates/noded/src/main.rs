@@ -4,6 +4,7 @@
 //! Boot order (foundation §12, skeleton subset): identity → transport →
 //! control servers → serve loop → heartbeat.
 
+mod appreg;
 mod control;
 
 use std::path::{Path, PathBuf};
@@ -836,6 +837,12 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let jobs = zeph_sched::JobCoordinator::new(1);
 
     // Control state, shared by the heartbeat loop and the control servers.
+    // Phase 4c: the durable app-name registry backing (self-attested v1 ramp).
+    let appreg_store = std::sync::Arc::new(appreg::AppRegistry::open(
+        identity.clone(),
+        engine.clone(),
+        data_dir,
+    ));
     let state = Arc::new(control::State {
         clock: transport.clock(),
         node_id: identity.node_id().to_hex(),
@@ -875,6 +882,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         hosting_cids: std::sync::atomic::AtomicU64::new(0),
         com: com_service.clone(),
         routing: routing.clone(),
+        appreg: appreg_store.clone(),
         settings: {
             let oc = engine.config();
             control::NodeSettings {

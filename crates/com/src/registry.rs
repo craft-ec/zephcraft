@@ -129,6 +129,11 @@ impl RegistryState {
             .binary_search_by(|e| e.owner.cmp(owner).then_with(|| e.name.as_str().cmp(name)))
     }
 
+    /// All current entries (canonical order) — for enumeration / the dashboard.
+    pub fn entries(&self) -> &[HeadEntry] {
+        &self.entries
+    }
+
     /// Resolve the current head for `(owner, name)`.
     pub fn resolve(&self, owner: &[u8; 32], name: &str) -> Option<&HeadEntry> {
         self.find(owner, name).ok().map(|i| &self.entries[i])
