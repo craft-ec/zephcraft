@@ -78,6 +78,17 @@ enum Command {
     /// Ban a CID on THIS node: tombstone it — refuse to host + block resurrection.
     /// For moderating content off your node; sticky until unbanned.
     Ban { cid: String },
+    /// Invoke a CraftCOM app on this node: run WASM (published, by CID) against your
+    /// `app.<ns>` namespace. Prints the agent's return value.
+    Invoke {
+        #[arg(long)]
+        app: String,
+        /// CID of the published .wasm (or .wat) app.
+        #[arg(long)]
+        wasm: String,
+        #[arg(long, default_value = "run")]
+        func: String,
+    },
     /// Execute write SQL against your own CraftSQL database `ns`
     /// (commits + publishes the KIND_ROOT head).
     SqlExec {
@@ -268,6 +279,9 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Unwant { cid }) => cmd_cid_op(&data_dir, "unwant", &cid).await,
         Some(Command::Delete { cid }) => cmd_cid_op(&data_dir, "delete", &cid).await,
         Some(Command::Ban { cid }) => cmd_cid_op(&data_dir, "ban", &cid).await,
+        Some(Command::Invoke { app, wasm, func }) => {
+            cmd_invoke(&data_dir, &app, &wasm, &func).await
+        }
         Some(Command::SqlExec { ns, sql }) => cmd_sql_exec(&data_dir, &ns, &sql).await,
         Some(Command::SqlQuery { ns, sql, owner }) => {
             cmd_sql_query(&data_dir, owner.as_deref(), &ns, &sql).await
@@ -350,6 +364,15 @@ async fn cmd_cid_op(data_dir: &Path, op: &str, cid: &str) -> anyhow::Result<()> 
     let params = serde_json::json!({"cid": cid});
     control::query_unix_params(&data_dir.join("zeph.sock"), op, params).await?;
     println!("{op} {cid} ok");
+    Ok(())
+}
+
+async fn cmd_invoke(data_dir: &Path, app: &str, wasm: &str, func: &str) -> anyhow::Result<()> {
+    let params = serde_json::json!({"app_ns": app, "wasm_cid": wasm, "func": func});
+    let res = control::query_unix_params(&data_dir.join("zeph.sock"), "invoke", params).await?;
+    let value = res.get("value").and_then(|v| v.as_i64()).unwrap_or(-1);
+    let fuel = res.get("fuel_used").and_then(|v| v.as_u64()).unwrap_or(0);
+    println!("app '{app}' returned {value}  (fuel {fuel})");
     Ok(())
 }
 
@@ -634,6 +657,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                 zeph_membership::ALPN.to_vec(),
                 zeph_obj::ALPN.to_vec(),
                 zeph_sql::PAGE_ALPN.to_vec(),
+                zeph_com::INVOKE_ALPN.to_vec(),
             ],
             cfg.listen_port,
             relay_urls,
@@ -691,6 +715,20 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                 &identity.secret_key_bytes(),
             ))),
     );
+
+    // CraftCOM: the sovereign-app runtime. Apps run sandboxed against this node's
+    // CraftBackend (writes its own `app.<ns>` namespaces), invoked locally (control
+    // API) or remotely (INVOKE_ALPN, caller = the authenticated peer).
+    let com_backend: Arc<dyn zeph_com::AppBackend> = Arc::new(zeph_com::CraftBackend::new(
+        craftsql.clone(),
+        engine.clone(),
+        transport.clock(),
+    ));
+    let com_service = Arc::new(zeph_com::InvokeService::new(
+        zeph_com::Runtime::new()?,
+        engine.clone(),
+        com_backend,
+    ));
 
     tracing::info!(
         node_id = %identity.node_id().to_hex(),
@@ -750,6 +788,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         jobs: jobs.clone(),
         event_counts: tokio::sync::RwLock::new(std::collections::BTreeMap::new()),
         hosting_cids: std::sync::atomic::AtomicU64::new(0),
+        com: com_service.clone(),
         settings: {
             let oc = engine.config();
             control::NodeSettings {
@@ -816,6 +855,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let (member_tx, member_rx) = tokio::sync::mpsc::channel(32);
     let (piece_tx, piece_rx) = tokio::sync::mpsc::channel(32);
     let (sqlpage_tx, sqlpage_rx) = tokio::sync::mpsc::channel(32);
+    let (invoke_tx, invoke_rx) = tokio::sync::mpsc::channel(32);
     let server = transport.clone();
     tokio::spawn(async move {
         server
@@ -824,11 +864,13 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                 (zeph_membership::ALPN.to_vec(), member_tx),
                 (zeph_obj::ALPN.to_vec(), piece_tx),
                 (zeph_sql::PAGE_ALPN.to_vec(), sqlpage_tx),
+                (zeph_com::INVOKE_ALPN.to_vec(), invoke_tx),
             ])
             .await
     });
     tokio::spawn(engine.clone().serve(piece_rx));
     tokio::spawn(zeph_sql::serve_pages(sql_dir.clone(), sqlpage_rx));
+    tokio::spawn(zeph_com::serve_invocations(invoke_rx, com_service.clone()));
 
     // Announce this node into the tracker's node registry (map/census),
     // immediately and periodically.

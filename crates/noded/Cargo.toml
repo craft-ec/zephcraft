@@ -20,6 +20,7 @@ zeph-routing.workspace = true
 zeph-store.workspace = true
 zeph-obj.workspace = true
 zeph-sql.workspace = true
+zeph-com.workspace = true
 zeph-events.workspace = true
 zeph-sched.workspace = true
 zeph-cipher.workspace = true

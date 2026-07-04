@@ -177,6 +177,8 @@ pub struct State {
     pub hosting_cids: std::sync::atomic::AtomicU64,
     /// Node configuration snapshot (Settings view).
     pub settings: NodeSettings,
+    /// CraftCOM invocation service — run user-level app WASM (local invoke).
+    pub com: std::sync::Arc<zeph_com::InvokeService>,
 }
 
 impl State {
@@ -379,6 +381,7 @@ async fn handle_rpc(state: &State, line: &str) -> serde_json::Value {
         Some("delete") => rpc_cid_op(state, &request, id, "delete").await,
         Some("ban") => rpc_cid_op(state, &request, id, "ban").await,
         Some("unban") => rpc_cid_op(state, &request, id, "unban").await,
+        Some("invoke") => rpc_invoke(state, &request, id).await,
         Some("setmeta") => rpc_setmeta(state, &request, id).await,
         Some("delmeta") => rpc_cid_op(state, &request, id, "delmeta").await,
         Some("sql_exec") => rpc_sql_exec(state, &request, id).await,
@@ -914,6 +917,38 @@ async fn rpc_sql_recover(
     match state.craftsql.recover_owner(owner, ns).await {
         Ok(n) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"restored": n}}),
         Err(e) => rpc_err(id, format!("recover failed: {e}")),
+    }
+}
+
+/// Invoke a CraftCOM app LOCALLY: run `func` from the WASM at `wasm_cid` against
+/// this node's `app.<app_ns>` namespace. Caller = this node's own identity (a local
+/// invocation); remote callers come in over INVOKE_ALPN with their own identity.
+async fn rpc_invoke(
+    state: &State,
+    req: &serde_json::Value,
+    id: serde_json::Value,
+) -> serde_json::Value {
+    let p = &req["params"];
+    let app_ns = p.get("app_ns").and_then(|v| v.as_str()).unwrap_or("");
+    let func = p.get("func").and_then(|v| v.as_str()).unwrap_or("run");
+    let wasm_hex = p.get("wasm_cid").and_then(|v| v.as_str()).unwrap_or("");
+    let Some(cid) = parse_cid(wasm_hex) else {
+        return rpc_err(id, "wasm_cid: expected 64 hex chars".into());
+    };
+    let caller = match parse_node_id(&state.node_id) {
+        Some(n) => n.0,
+        None => return rpc_err(id, "self node id unparseable".into()),
+    };
+    let ireq = zeph_com::InvokeRequest {
+        app_ns: app_ns.to_string(),
+        wasm_cid: cid.0,
+        func: func.to_string(),
+    };
+    match state.com.invoke(&ireq, caller).await {
+        Ok(out) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
+            "value": out.value, "fuel_used": out.fuel_used
+        }}),
+        Err(e) => rpc_err(id, format!("invoke failed: {e}")),
     }
 }
 

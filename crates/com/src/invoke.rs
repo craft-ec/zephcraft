@@ -46,9 +46,18 @@ impl InvokeService {
         }
     }
 
-    /// Load the app's WASM by CID and run `func` with the given `caller`.
+    /// Load the app's WASM by CID and run `func` with the given `caller`. The CID
+    /// may be a raw-content CID OR a file manifest CID (what `zeph publish` prints)
+    /// — a File manifest is followed to its content, so publishing an `app.wasm`
+    /// just works.
     pub async fn invoke(&self, req: &InvokeRequest, caller: [u8; 32]) -> anyhow::Result<Outcome> {
-        let wasm = self.obj.get(Cid(req.wasm_cid), ConsumeMode::Drop).await?;
+        let raw = self.obj.get(Cid(req.wasm_cid), ConsumeMode::Drop).await?;
+        let wasm = match zeph_obj::Manifest::decode(&raw) {
+            Some(zeph_obj::Manifest::File { content, .. }) => {
+                self.obj.get(Cid(content), ConsumeMode::Drop).await?
+            }
+            _ => raw,
+        };
         let ctx = HostCtx {
             caller,
             app_ns: req.app_ns.clone(),
