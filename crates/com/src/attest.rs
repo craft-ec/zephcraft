@@ -366,7 +366,7 @@ pub fn committee_hash(c: &Committee) -> [u8; 32] {
 }
 
 /// One outgoing-committee member's endorsement of the next committee.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Endorsement {
     pub agent: [u8; 32],
     pub signature: Vec<u8>,
@@ -376,7 +376,7 @@ pub struct Endorsement {
 /// to the previous committee by `prev_hash`, endorsed by a quorum of the PRECEDING
 /// committee. Readers follow the chain from a trusted genesis anchor; each committee
 /// is only accepted if the one before it vouched for it (ATTESTATION_DESIGN §5).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommitteeCheckpoint {
     pub committee: Committee,
     pub prev_hash: [u8; 32],
@@ -435,6 +435,99 @@ pub fn verify_chain(genesis: &Committee, checkpoints: &[CommitteeCheckpoint]) ->
         current = cp.committee.clone();
     }
     Some(current)
+}
+
+/// The committee chain as **durable, program-owned state** — the sequence of epoch
+/// committees, each endorsed by the previous. Stored ONCE as content (erasure-coded)
+/// and fetched on demand, NOT full-replicated to every node like a blockchain. That is
+/// the design's advantage over a chain: content-addressed durable storage + read the
+/// epoch you need, instead of every node holding the entire history.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommitteeChain {
+    pub genesis: Committee,
+    pub checkpoints: Vec<CommitteeCheckpoint>,
+}
+
+impl CommitteeChain {
+    pub fn new(genesis: Committee) -> Self {
+        Self {
+            genesis,
+            checkpoints: Vec::new(),
+        }
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        postcard::from_bytes(bytes).ok()
+    }
+    pub fn encode(&self) -> Vec<u8> {
+        postcard::to_allocvec(self).unwrap_or_default()
+    }
+    /// Content root of the whole chain (its cid when stored durably).
+    pub fn root(&self) -> [u8; 32] {
+        Cid::of(&self.encode()).0
+    }
+
+    /// Append the next epoch's checkpoint (endorsed by the current committee). Returns
+    /// false if it doesn't validly extend the chain.
+    pub fn append(&mut self, cp: CommitteeCheckpoint) -> bool {
+        let Some(current) = self.current() else {
+            return false;
+        };
+        if cp.prev_hash != committee_hash(&current) || cp.committee.epoch <= current.epoch {
+            return false;
+        }
+        if endorsers_of(&cp, &current) < current.k {
+            return false;
+        }
+        self.checkpoints.push(cp);
+        true
+    }
+
+    /// The current (latest) committee — the whole chain verified from genesis.
+    pub fn current(&self) -> Option<Committee> {
+        verify_chain(&self.genesis, &self.checkpoints)
+    }
+
+    /// The committee governing `epoch` — the latest committee whose epoch ≤ `epoch`,
+    /// verifying every checkpoint up to it. This is what a reader fetches to check an
+    /// attestation made during that epoch.
+    pub fn committee_at(&self, epoch: u64) -> Option<Committee> {
+        if epoch < self.genesis.epoch {
+            return None;
+        }
+        let mut current = self.genesis.clone();
+        let mut prev_hash = committee_hash(&current);
+        let mut best = Some(current.clone());
+        for cp in &self.checkpoints {
+            if cp.committee.epoch > epoch {
+                break;
+            }
+            if cp.prev_hash != prev_hash || endorsers_of(cp, &current) < current.k {
+                return None;
+            }
+            current = cp.committee.clone();
+            prev_hash = committee_hash(&current);
+            best = Some(current.clone());
+        }
+        best
+    }
+}
+
+/// Count DISTINCT valid endorsements of `cp` by members of the `by` committee.
+fn endorsers_of(cp: &CommitteeCheckpoint, by: &Committee) -> usize {
+    let msg = checkpoint_bytes(&cp.committee, &cp.prev_hash);
+    let mut set = HashSet::new();
+    for e in &cp.endorsements {
+        if !by.is_member(&e.agent) {
+            continue;
+        }
+        if let Ok(sig) = <[u8; 64]>::try_from(e.signature.as_slice()) {
+            if NodeIdentity::verify(&NodeId(e.agent), &msg, &sig) {
+                set.insert(e.agent);
+            }
+        }
+    }
+    set.len()
 }
 
 /// The agent's exported linear memory, if present.
@@ -1013,5 +1106,50 @@ mod tests {
             verify_chain(&genesis, &[cp1]).is_none(),
             "only the preceding committee can endorse the next"
         );
+    }
+
+    // ---- phase 4f: durable committee chain ----
+
+    #[test]
+    fn committee_chain_resolves_the_epoch_committee() {
+        let g = agents(3);
+        let genesis = committee_of(&g, 0, 2);
+        let c1_ids = agents(3);
+        let c1 = committee_of(&c1_ids, 1, 2);
+        let c2 = committee_of(&agents(3), 2, 2);
+        let mut chain = CommitteeChain::new(genesis.clone());
+        assert!(chain.append(checkpoint(&g, &c1, committee_hash(&genesis), 2)));
+        assert!(chain.append(checkpoint(&c1_ids, &c2, committee_hash(&c1), 2)));
+        assert_eq!(chain.current(), Some(c2.clone()));
+        assert_eq!(chain.committee_at(0), Some(genesis));
+        assert_eq!(chain.committee_at(1), Some(c1));
+        assert_eq!(chain.committee_at(2), Some(c2.clone()));
+        assert_eq!(
+            chain.committee_at(9),
+            Some(c2),
+            "the latest committee governs future epochs"
+        );
+    }
+
+    #[test]
+    fn committee_chain_encode_roundtrips() {
+        let g = agents(3);
+        let genesis = committee_of(&g, 0, 2);
+        let c1 = committee_of(&agents(3), 1, 2);
+        let mut chain = CommitteeChain::new(genesis.clone());
+        chain.append(checkpoint(&g, &c1, committee_hash(&genesis), 2));
+        assert_eq!(CommitteeChain::decode(&chain.encode()).unwrap(), chain);
+    }
+
+    #[test]
+    fn committee_chain_rejects_a_sub_quorum_handoff() {
+        let g = agents(3);
+        let genesis = committee_of(&g, 0, 2);
+        let c1 = committee_of(&agents(3), 1, 2);
+        let mut chain = CommitteeChain::new(genesis.clone());
+        // only 1 endorsement, but genesis.k = 2 → append rejected, chain unchanged.
+        assert!(!chain.append(checkpoint(&g, &c1, committee_hash(&genesis), 1)));
+        assert!(chain.checkpoints.is_empty());
+        assert_eq!(chain.current(), Some(genesis));
     }
 }

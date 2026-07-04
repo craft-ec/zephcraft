@@ -37,7 +37,8 @@ mod registry;
 pub use attest::{
     attest_run, attest_transition, committee_hash, endorse_checkpoint, epoch_of, pda,
     select_committee, verify, verify_chain, verify_commit, verify_quorum, Attestation,
-    AttestedCommit, AttestedRuntime, Committee, CommitteeCheckpoint, Endorsement, PdaAdvance,
+    AttestedCommit, AttestedRuntime, Committee, CommitteeChain, CommitteeCheckpoint, Endorsement,
+    PdaAdvance,
 };
 pub use coordinate::{
     collect_commit, request_attestation, serve_attestations, AttestRequest, AttestService,
