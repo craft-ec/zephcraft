@@ -305,14 +305,15 @@ impl ObjEngine {
     /// (locally or by a provider), wanted (locally or network-wide), or fetched
     /// within the fade grace window. Otherwise it fades (Repair + Distribution
     /// both skip it).
-    fn is_alive(&self, cid: &Cid, wanted: &HashSet<[u8; 32]>, provider_pinned: bool) -> bool {
+    /// Fade decision — should this content keep being repaired, or be left to fade? True if
+    /// it is pinned, a system generation (CraftSQL), locally wanted, provider-pinned, or
+    /// recently served. Only if NONE of those cheap local checks hold does it consult the
+    /// network — a per-cid `is_wanted` DHT lookup, checked LAST so it runs only for otherwise
+    /// cold content (never enumerates; foundation §290 HAVE/WANT).
+    async fn is_alive(&self, cid: &Cid, provider_pinned: bool) -> bool {
         self.store.is_pinned(cid)
-            // System pieces (CraftSQL generations) are kept alive locally by every
-            // holder — the marker travels with the piece, so no WANT record floods
-            // the network. Never fades; degrades + repairs like normal content.
             || self.store.is_system(cid)
             || self.store.is_wanted(cid)
-            || wanted.contains(&cid.0)
             || provider_pinned
             || self
                 .last_served
@@ -320,6 +321,7 @@ impl ObjEngine {
                 .expect("last_served")
                 .get(&cid.0)
                 .is_some_and(|t| t.elapsed() < self.config.fade_grace)
+            || self.routing.is_wanted(*cid).await.unwrap_or(false)
     }
 
     /// Current wall-clock time (unix millis) from the HLC — for metadata
@@ -1139,14 +1141,6 @@ impl ObjEngine {
         let me = self.transport.node_id();
         // The set of CIDs the network WANTs — content outside it (and unpinned,
         // undemanded) is left to fade (FADE: absence of repair).
-        let wanted: HashSet<[u8; 32]> = self
-            .routing
-            .wanted_cids()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|c| c.0)
-            .collect();
 
         // Pre-resolve every held cid's providers CONCURRENTLY — the per-cid tracker resolve
         // (186 sequential round-trips) was the last network cost that kept a pass at ~130s.
@@ -1264,7 +1258,9 @@ impl ObjEngine {
             // NOT repaired; churn erodes it (passive death). Fail-safe: a later
             // WANT/pin resumes repair (the pieces are still there). Holding alone
             // is no longer implicit want.
-            let alive = self.is_alive(&cid, &wanted, providers.iter().any(|p| p.pinned));
+            let alive = self
+                .is_alive(&cid, providers.iter().any(|p| p.pinned))
+                .await;
             if !alive {
                 report.fading += 1;
                 continue;
@@ -1400,14 +1396,6 @@ impl ObjEngine {
     pub async fn distribute(&self) -> DistributeReport {
         let mut report = DistributeReport::default();
         let me = self.transport.node_id();
-        let wanted: HashSet<[u8; 32]> = self
-            .routing
-            .wanted_cids()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|c| c.0)
-            .collect();
         // Live peers ONCE (was re-fetched per cid), and pre-resolve providers for every
         // candidate CONCURRENTLY (was a per-cid resolve + a probe of every node for every
         // cid — O(cids x nodes) round-trips that made a pass take minutes).
@@ -1442,7 +1430,10 @@ impl ObjEngine {
             };
             // FADE-gate: don't spread content nothing wants — let it stay cold so
             // churn/eviction reclaim it (no bandwidth on dead content).
-            if !self.is_alive(&cid, &wanted, providers.iter().any(|p| p.pinned)) {
+            if !self
+                .is_alive(&cid, providers.iter().any(|p| p.pinned))
+                .await
+            {
                 continue;
             }
             report.scanned += 1;

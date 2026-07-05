@@ -557,20 +557,24 @@ async fn eviction_cooldown_blocks_refill_until_wanted() {
         "in cooldown after eviction"
     );
 
-    // Re-publish → the lifecycle tries to refill s, but ingest REJECTS it.
-    publisher.engine.publish(&payload, false).await.unwrap();
-    assert_eq!(
-        s.engine.store().piece_count(&cid),
-        0,
-        "cooldown blocked the refill"
+    // While in cooldown the lifecycle refuses to refill the CID (ingest rejects it).
+    assert!(
+        s.engine
+            .store()
+            .is_in_cooldown(&cid, std::time::Duration::from_secs(3600)),
+        "still in cooldown → refill blocked"
     );
 
-    // Manual WANT clears the cooldown — now re-acquisition is allowed.
+    // A manual WANT overrides the cooldown, re-enabling re-acquisition. (Under the
+    // publish-once model the publisher no longer re-pushes; delivery is then the network's
+    // job — a repair from a piece-holder or a fetch — so the mechanism under test here is the
+    // cooldown gate itself: eviction sets it, want clears it.)
     s.engine.want(cid).await.unwrap();
-    publisher.engine.publish(&payload, false).await.unwrap();
     assert!(
-        s.engine.store().piece_count(&cid) > 0,
-        "want cleared cooldown → refill accepted"
+        !s.engine
+            .store()
+            .is_in_cooldown(&cid, std::time::Duration::from_secs(3600)),
+        "want cleared the eviction cooldown → re-acquisition allowed"
     );
 }
 
