@@ -70,6 +70,11 @@ impl CommitteeChainStore {
         *self.membership.write().await = Some(membership);
     }
 
+    /// The configured epoch length (ms) — for the dashboard countdown.
+    pub fn epoch_len_ms(&self) -> u64 {
+        self.epoch_ms
+    }
+
     /// The eligible pool (self + alive peers) and a node-id → dial-address map.
     async fn eligible(&self) -> (Vec<[u8; 32]>, HashMap<[u8; 32], PeerAddr>) {
         let Some(m) = self.membership.read().await.clone() else {
@@ -88,12 +93,13 @@ impl CommitteeChainStore {
     }
 
     /// Publish the chain as durable content + announce its head (owner = this node).
-    async fn publish(&self, chain: &CommitteeChain) {
+    async fn publish(&self, chain: &CommitteeChain, version: u64) {
         if let Ok(cid) = self.obj.publish_system(&chain.encode()).await {
-            let epoch = chain.current().map(|c| c.epoch).unwrap_or(0);
+            // version = monotonic wall-clock (not epoch) so it survives epoch-length
+            // changes and the newest published chain always wins the announce CAS.
             let _ = self
                 .routing
-                .announce_app(COMMITTEE_HEAD_NAME, cid, epoch)
+                .announce_app(COMMITTEE_HEAD_NAME, cid, version)
                 .await;
         }
     }
@@ -167,7 +173,7 @@ impl CommitteeChainStore {
         if chain.is_none() {
             let genesis = select_committee(&eligible, epoch, COMMITTEE_N, COMMITTEE_K);
             let c = CommitteeChain::new(genesis);
-            self.publish(&c).await;
+            self.publish(&c, now_millis).await;
             tracing::info!(
                 epoch,
                 size = c.genesis.members.len(),
@@ -186,7 +192,7 @@ impl CommitteeChainStore {
         }
         if let Some(cp) = self.build_checkpoint(&current, epoch, &addr_of).await {
             if c.append(cp) {
-                self.publish(c).await;
+                self.publish(c, now_millis).await;
                 tracing::info!(epoch, "committee chain rolled to new epoch");
             }
         }

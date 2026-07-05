@@ -1505,6 +1505,9 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         let (eligible, cn, ck, mode) = ctx.state.appreg.committee_status().await;
         let (chain_len, chain_epoch, chain_size, chain_root, _) =
             ctx.state.committee.status().await;
+        let now = ctx.state.clock.now().millis();
+        let epoch_ms = ctx.state.committee.epoch_len_ms();
+        let next_rollover_ms = epoch_ms - (now % epoch_ms.max(1));
         let rows: Vec<serde_json::Value> = ctx
             .state
             .appreg
@@ -1533,6 +1536,8 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
                 "epoch": chain_epoch,
                 "committee_size": chain_size,
                 "root": chain_root,
+                "epoch_ms": epoch_ms,
+                "next_rollover_ms": next_rollover_ms,
             },
             "note": "app-name registry; other protocol registries (program, config, committee) will be separate roots",
         }))
