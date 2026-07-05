@@ -1408,10 +1408,31 @@ impl ObjEngine {
             .into_iter()
             .map(|c| c.0)
             .collect();
-        for cid in self.store.cids() {
-            if self.store.is_tombstoned(&cid) {
-                continue;
-            }
+        // Live peers ONCE (was re-fetched per cid), and pre-resolve providers for every
+        // candidate CONCURRENTLY (was a per-cid resolve + a probe of every node for every
+        // cid — O(cids x nodes) round-trips that made a pass take minutes).
+        let peers: Vec<(NodeId, PeerAddr)> = self
+            .routing
+            .nodes()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(id, _)| *id != me)
+            .filter_map(|(id, np)| np.addr.parse::<PeerAddr>().ok().map(|a| (id, a)))
+            .collect();
+        let candidates: Vec<Cid> = self
+            .store
+            .cids()
+            .into_iter()
+            .filter(|c| !self.store.is_tombstoned(c) && self.store.piece_count(c) > 2)
+            .collect();
+        let resolved =
+            futures::future::join_all(candidates.into_iter().map(|cid| async move {
+                (cid, self.routing.resolve(cid).await.unwrap_or_default())
+            }))
+            .await;
+
+        for (cid, providers) in resolved {
             let my_pieces = self.store.piece_count(&cid);
             if my_pieces <= 2 {
                 continue;
@@ -1419,37 +1440,24 @@ impl ObjEngine {
             let Some(gen) = self.store.generation(&cid) else {
                 continue;
             };
-            // FADE-gate: don't spread content nothing wants — let it stay cold
-            // so churn/eviction reclaim it (no bandwidth on dead content).
-            let provider_pinned = self
-                .routing
-                .resolve(cid)
-                .await
-                .unwrap_or_default()
-                .iter()
-                .any(|p| p.pinned);
-            if !self.is_alive(&cid, &wanted, provider_pinned) {
+            // FADE-gate: don't spread content nothing wants — let it stay cold so
+            // churn/eviction reclaim it (no bandwidth on dead content).
+            if !self.is_alive(&cid, &wanted, providers.iter().any(|p| p.pinned)) {
                 continue;
             }
             report.scanned += 1;
 
-            // Least-full live peer (empty peers report piece_count 0).
-            let mut best: Option<(PeerAddr, u32)> = None;
-            for (id, np) in self.routing.nodes().await.unwrap_or_default() {
-                if id == me {
-                    continue;
-                }
-                let Ok(addr) = np.addr.parse::<PeerAddr>() else {
-                    continue;
-                };
-                let Some(ack) = self.probe_availability(&addr, cid).await else {
-                    continue;
-                };
-                if best.as_ref().is_none_or(|(_, c)| ack.piece_count < *c) {
-                    best = Some((addr, ack.piece_count));
-                }
-            }
-            let Some((addr, tcount)) = best else {
+            // Least-full live peer, from RECORDS: a node holding the cid reports its
+            // piece_count; a non-holder holds 0 (the emptiest, and the natural move target).
+            let held_by: HashMap<NodeId, u32> = providers
+                .iter()
+                .map(|p| (p.node_id, p.piece_count))
+                .collect();
+            let Some((addr, tcount)) = peers
+                .iter()
+                .map(|(id, addr)| (addr, held_by.get(id).copied().unwrap_or(0)))
+                .min_by_key(|(_, c)| *c)
+            else {
                 continue;
             };
             // Move only if it strictly reduces imbalance (no ping-pong).
@@ -1465,7 +1473,7 @@ impl ObjEngine {
                 continue;
             };
             let pid = piece.piece_id();
-            if self.push_piece(&addr, cid, &gen, &piece).await.is_ok() {
+            if self.push_piece(addr, cid, &gen, &piece).await.is_ok() {
                 let _ = self.store.remove_piece(&cid, &pid);
                 report.moved += 1;
             }
@@ -1534,17 +1542,6 @@ impl ObjEngine {
             }
         }
         report
-    }
-
-    /// Live availability probe: "do you hold `cid`?" — no piece transfer.
-    /// Short-timeout so a dead holder resolves to "unavailable" quickly rather
-    /// than stalling the scan.
-    async fn probe_availability(&self, peer: &PeerAddr, cid: Cid) -> Option<wire::AvailabilityAck> {
-        let msg = wire::Message::AvailabilityProbe(wire::AvailabilityProbe { cid: cid.0 });
-        match tokio::time::timeout(self.config.probe_timeout, self.request(peer, &msg)).await {
-            Ok(Ok(wire::Message::AvailabilityAck(ack))) => Some(ack),
-            _ => None,
-        }
     }
 
     /// Drop one stored coded piece (Degradation MOVE-less shed — reduces
