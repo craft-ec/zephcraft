@@ -4,6 +4,7 @@
 //! Boot order (foundation §12, skeleton subset): identity → transport →
 //! control servers → serve loop → heartbeat.
 
+mod account;
 mod appreg;
 mod committee;
 mod control;
@@ -113,6 +114,22 @@ enum Command {
     Apps,
     /// Publish a WASM program to the grid (returns its content cid).
     PublishProgram { file: String },
+    /// Advance a generic attested account: run <program> on its state under committee.
+    AttestAdvance {
+        #[arg(long)]
+        program: String,
+        #[arg(long)]
+        seed: String,
+        #[arg(long, default_value = "")]
+        request: String,
+    },
+    /// Read a generic attested account's state.
+    AttestResolve {
+        #[arg(long)]
+        program: String,
+        #[arg(long)]
+        seed: String,
+    },
     /// List network-owned programs and their canonical cids.
     Programs,
     /// Show the governance set (governors, threshold, seq).
@@ -351,6 +368,14 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Deploy { file, name }) => cmd_deploy(&data_dir, &file, name.as_deref()).await,
         Some(Command::Apps) => cmd_apps(&data_dir).await,
         Some(Command::PublishProgram { file }) => cmd_publish_program(&data_dir, &file).await,
+        Some(Command::AttestAdvance {
+            program,
+            seed,
+            request,
+        }) => cmd_attest_advance(&data_dir, &program, &seed, &request).await,
+        Some(Command::AttestResolve { program, seed }) => {
+            cmd_attest_resolve(&data_dir, &program, &seed).await
+        }
         Some(Command::Programs) => cmd_programs(&data_dir).await,
         Some(Command::Gov) => cmd_gov(&data_dir).await,
         Some(Command::GovPropose {
@@ -477,6 +502,49 @@ async fn cmd_deploy(data_dir: &Path, file: &Path, name: Option<&str>) -> anyhow:
     let ver = r.get("version").and_then(|v| v.as_u64()).unwrap_or(1);
     println!("deployed app '{n}' v{ver} ({size} bytes, system object) - cid {cid}");
     println!("invoke by name: zeph invoke --name {n}");
+    Ok(())
+}
+
+async fn cmd_attest_advance(
+    data_dir: &Path,
+    program: &str,
+    seed: &str,
+    request: &str,
+) -> anyhow::Result<()> {
+    let params = serde_json::json!({"program": program, "seed": seed, "request": request});
+    let res =
+        control::query_unix_params(&data_dir.join("zeph.sock"), "attest_advance", params).await?;
+    println!(
+        "account {}",
+        res.get("account").and_then(|v| v.as_str()).unwrap_or("")
+    );
+    println!(
+        "root {}  ({})",
+        res.get("root").and_then(|v| v.as_str()).unwrap_or(""),
+        res.get("mode").and_then(|v| v.as_str()).unwrap_or("")
+    );
+    Ok(())
+}
+
+async fn cmd_attest_resolve(data_dir: &Path, program: &str, seed: &str) -> anyhow::Result<()> {
+    let params = serde_json::json!({"program": program, "seed": seed});
+    let res =
+        control::query_unix_params(&data_dir.join("zeph.sock"), "attest_resolve", params).await?;
+    let st = res.get("state").and_then(|v| v.as_str()).unwrap_or("");
+    println!(
+        "account {}",
+        res.get("account").and_then(|v| v.as_str()).unwrap_or("")
+    );
+    println!(
+        "state ({} bytes): {}",
+        res.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
+        st
+    );
+    if let Ok(b) = hex::decode(st) {
+        if let Ok(a) = <[u8; 8]>::try_from(b.as_slice()) {
+            println!("as u64: {}", u64::from_le_bytes(a));
+        }
+    }
     Ok(())
 }
 
@@ -1006,6 +1074,13 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         routing.clone(),
         data_dir,
     ));
+    // Generic attested accounts — any user program's committee-attested state.
+    let account_store = std::sync::Arc::new(account::AttestedAccountStore::open(
+        identity.clone(),
+        engine.clone(),
+        routing.clone(),
+        data_dir,
+    ));
     // Governance: one durable, self-verifying chain that derives BOTH the governor set
     // and the program registry, published + resolved cross-node (seeded 1-of-1 with this
     // node's key by default).
@@ -1071,6 +1146,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         appreg: appreg_store.clone(),
         committee: committee_store.clone(),
         gov: governance_store.clone(),
+        accounts: account_store.clone(),
         settings: {
             let oc = engine.config();
             control::NodeSettings {
@@ -1270,6 +1346,9 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     committee_store.set_membership(membership.clone()).await;
     governance_store.set_membership(membership.clone()).await;
     appreg_store.set_programs(governance_store.clone()).await;
+    account_store
+        .set_coordinator(transport.clone(), membership.clone())
+        .await;
 
     // Discover peers from the tracker's node registry and seed membership —
     // a node bootstraps from the network without any hardcoded peer.
