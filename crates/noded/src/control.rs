@@ -1678,7 +1678,15 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         if params.token != *ctx.token {
             return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
         }
-        let program = zeph_com::registry_program_cid();
+        let native = zeph_com::registry_program_cid();
+        // The program the registry attestation actually runs is RESOLVED via the program
+        // registry (governance-upgradeable), not the hardcoded constant.
+        let program = ctx
+            .state
+            .programs
+            .resolve("app-registry")
+            .await
+            .unwrap_or(native);
         let account = ctx.state.appreg.account();
         let (count, root) = ctx.state.appreg.summary().await;
         let (eligible, cn, ck, mode) = ctx.state.appreg.committee_status().await;
@@ -1700,6 +1708,7 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
             "status": "live",
             "model": "deterministic k-of-n attestation - program-owned (PDA) registry",
             "registry_program": hex::encode(program),
+            "program_source": if program == native { "native (binary-baked)" } else { "upgraded WASM (via program registry)" },
             "registry_account": hex::encode(account.0),
             "app_registry_root": root,
             "entries": count,

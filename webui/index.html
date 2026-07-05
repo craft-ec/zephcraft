@@ -590,6 +590,7 @@ async function loadAttestation(){
     el.innerHTML=`
       <div class="kv"><span>registry</span><b>${esc(j.registry||"app registry")} ${modeChip}</b></div>
       <div class="kv"><span>authority</span><b>${esc(j.model)}</b></div>
+      <div class="kv"><span>registry program</span><b>${esc(j.program_source||'')}</b> <span class="mono muted" onclick="copyCid('${j.registry_program||''}')" title="resolved via the program registry">${(j.registry_program||'').slice(0,14)}\u2026</span></div>
       <div class="kv"><span>committee</span><b>${c.eligible||1} eligible \u00b7 k=${c.k||1} of n=${c.n||1}</b></div>
       ${j.chain&&j.chain.checkpoints?`<div class="kv"><span>committee chain</span><b>${j.chain.checkpoints} checkpoints \u00b7 epoch ${j.chain.epoch} \u00b7 committee ${j.chain.committee_size}</b></div>`:''}
       ${j.chain&&j.chain.epoch_ms?`<div class="kv"><span>next rollover</span><b id="epoch-timer" class="mono">\u2026</b></div>`:''}
