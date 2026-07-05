@@ -1267,7 +1267,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         let mut iv = tokio::time::interval(std::time::Duration::from_secs(12));
         loop {
             iv.tick().await;
-            pending_engine.refresh_pending().await;
+            pending_engine.distribute_pending().await;
         }
     });
     let tick_store = committee_store.clone();

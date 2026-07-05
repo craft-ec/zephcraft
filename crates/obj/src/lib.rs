@@ -1289,13 +1289,23 @@ impl ObjEngine {
     /// when the verified health scan is slow. For each copy we retain (whole content, not
     /// user-pinned) whose OTHER-node pieces are below the erasure floor, record its
     /// progress. This is what the publisher is still holding + spreading.
-    pub async fn refresh_pending(&self) {
+    pub async fn distribute_pending(&self) {
         let me = self.transport.node_id();
+        let candidates: Vec<PeerAddr> = self
+            .routing
+            .nodes()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(id, _)| *id != me)
+            .filter_map(|(_, np)| np.addr.parse().ok())
+            .collect();
+        // "Complete" = reached as many distinct peers as the durability target OR the whole
+        // cluster can offer — then never pushed again.
+        let target = self.config.durability_threshold.min(candidates.len().max(1));
         let mut out: Vec<([u8; 32], u32, u32)> = Vec::new();
         for cid in self.store.cids() {
-            // Content we hold whole (files + system db/app generations) that is not yet
-            // COMPLETE — still spreading toward the erasure floor on peers. Once marked
-            // distributed it is complete and drops out of the pending view.
+            // Everything we hold whole (files + db/app generations) that is not yet complete.
             if self.store.is_tombstoned(&cid)
                 || !self.store.has_content(&cid)
                 || self.store.is_distributed(&cid)
@@ -1305,18 +1315,49 @@ impl ObjEngine {
             let Some(gen) = self.store.generation(&cid) else {
                 continue;
             };
-            let floor = target_pieces(gen.k as usize) as u32;
-            let have_others: u32 = self
+            let floor = target_pieces(gen.k as usize);
+            let have_others: usize = self
                 .routing
                 .resolve(cid)
                 .await
                 .unwrap_or_default()
                 .iter()
                 .filter(|p| p.node_id != me)
-                .map(|p| p.piece_count)
+                .map(|p| p.piece_count as usize)
                 .sum();
-            if have_others < floor {
-                out.push((cid.0, have_others, floor));
+            if have_others >= floor {
+                let _ = self.store.set_distributed(cid);
+                continue;
+            }
+            if candidates.is_empty() {
+                out.push((cid.0, have_others as u32, floor as u32));
+                continue;
+            }
+            // Complete the distribution: mint the deficit from our retained content and push
+            // it toward the floor. This is the tail of PUBLISH (make sure the erasure is
+            // pushed), NOT ongoing repair — once it reaches the target it is marked complete
+            // and never pushed again, so it cannot grow the cluster without bound. Pushes
+            // that fail land nothing (no growth); pushes that succeed converge to the floor.
+            let deficit = (floor - have_others).min(floor);
+            let pieces = self
+                .store
+                .serve_pieces(&cid, &HashSet::new(), deficit)
+                .unwrap_or_default();
+            let mut distinct = HashSet::new();
+            for (i, piece) in pieces.iter().enumerate() {
+                let peer = &candidates[i % candidates.len()];
+                if tokio::time::timeout(PUSH_TIMEOUT, self.push_piece(peer, cid, &gen, piece))
+                    .await
+                    .map(|r| r.is_ok())
+                    .unwrap_or(false)
+                {
+                    distinct.insert(peer.node_id());
+                }
+            }
+            if distinct.len() >= target {
+                let _ = self.store.set_distributed(cid);
+            } else {
+                out.push((cid.0, (have_others + distinct.len()) as u32, floor as u32));
             }
         }
         out.sort_by_key(|(_, have, _)| *have); // least-durable first
