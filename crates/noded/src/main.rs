@@ -1332,6 +1332,9 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let announce_relays = cfg.relay_operator_urls.clone();
     let announce_sql = craftsql.clone();
     let announce_jobs = jobs.clone();
+    let announce_appreg = appreg_store.clone();
+    let announce_accounts = account_store.clone();
+    let announce_clock = transport.clock();
     let reannounce_secs = cfg.reannounce_secs.max(1);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(reannounce_secs));
@@ -1340,6 +1343,9 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
             let e = announce_engine.clone();
             let relays = announce_relays.clone();
             let sql = announce_sql.clone();
+            let appreg = announce_appreg.clone();
+            let accounts = announce_accounts.clone();
+            let clock = announce_clock.clone();
             // Distribution priority: getting records to peers matters, but yields
             // to Repair. Deduped so a slow re-announce can't stack.
             announce_jobs.submit(
@@ -1350,6 +1356,9 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                     let e = e.clone();
                     let relays = relays.clone();
                     let sql = sql.clone();
+                    let appreg = appreg.clone();
+                    let accounts = accounts.clone();
+                    let clock = clock.clone();
                     async move {
                         let _ = e.announce_node().await;
                         for relay in &relays {
@@ -1366,6 +1375,11 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                         if h > 0 {
                             tracing::info!(dbs = h, "re-announced CraftSQL heads/manifests");
                         }
+                        // App-registry + attested-account heads (no other periodic
+                        // re-publish) — TTL keep-alive + backend migration (tracker→DHT).
+                        let now = clock.now().millis();
+                        appreg.republish(now).await;
+                        accounts.republish_all(now).await;
                         Ok(())
                     }
                 },
@@ -1442,10 +1456,21 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let seed_membership = membership.clone();
     let seed_routing = routing.clone();
     let me_id = transport.node_id();
+    // Configured seed peers — the tracker-free bootstrap (same list the DHT uses). On the DHT
+    // path routing.nodes() is empty, so these carry membership; on the tracker path both feed
+    // it. SWIM probing takes over from there.
+    let config_seeds: Vec<PeerAddr> = cfg
+        .dht_seeds
+        .iter()
+        .filter_map(|s| s.parse().ok())
+        .collect();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(10));
         loop {
             interval.tick().await;
+            if !config_seeds.is_empty() {
+                seed_membership.seed(config_seeds.clone()).await;
+            }
             if let Ok(nodes) = seed_routing.nodes().await {
                 let candidates: Vec<PeerAddr> = nodes
                     .into_iter()

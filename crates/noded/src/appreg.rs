@@ -156,6 +156,24 @@ impl AppRegistry {
         pda(&registry_program_cid(), REGISTRY_SEED)
     }
 
+    /// Re-announce the current registry head — TTL keep-alive + backend migration
+    /// (tracker→DHT). No-op if this node holds no registrations.
+    pub async fn republish(&self, now_millis: u64) {
+        let encoded = {
+            let state = self.state.read().await;
+            if state.entries().is_empty() {
+                return;
+            }
+            state.encode()
+        };
+        if let Ok(head_cid) = self.obj.publish_system(&encoded).await {
+            let _ = self
+                .routing
+                .announce_app(REGISTRY_HEAD_NAME, head_cid, now_millis)
+                .await;
+        }
+    }
+
     /// Register (or advance) an app head under THIS node's identity. Attests via the
     /// membership committee when one can form, else self-attests (v1 ramp). Persists the
     /// new state locally + publishes it as a durable object. Returns the new root.

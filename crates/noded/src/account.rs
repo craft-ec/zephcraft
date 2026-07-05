@@ -220,6 +220,37 @@ impl AttestedAccountStore {
         )
     }
 
+    /// Re-announce all local account heads — TTL keep-alive + backend migration (tracker→DHT).
+    pub async fn republish_all(&self, now_millis: u64) {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("state") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Ok(state) = std::fs::read(&path) else {
+                continue;
+            };
+            let Some(id) = hex::decode(stem)
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+            else {
+                continue;
+            };
+            if let Ok(cid) = self.obj.publish_system(&state).await {
+                let _ = self
+                    .routing
+                    .announce_app(&Self::head_name(id), cid, now_millis)
+                    .await;
+            }
+        }
+    }
+
     /// The current state of `pda(program_cid, seed)` (local copy).
     pub async fn resolve(&self, program_cid: [u8; 32], seed: &[u8]) -> Vec<u8> {
         self.load_state(pda(&program_cid, seed).0)
