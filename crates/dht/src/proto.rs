@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use zeph_core::NodeId;
 use zeph_transport::PeerAddr;
 
+use crate::record::StoredRecord;
 use crate::table::Contact;
 
 /// A contact as it travels on the wire: id + its dialable address (text form).
@@ -52,6 +53,17 @@ pub enum DhtMessage {
     FindNode { from: WireContact, target: [u8; 32] },
     /// The K closest contacts the responder knows to the queried target.
     Nodes { contacts: Vec<WireContact> },
+    /// "Store this signed record" — sent to the K nodes closest to `record.key`.
+    Store { record: StoredRecord },
+    /// Ack of a store (false = rejected: bad signature or stale seq).
+    StoreAck { stored: bool },
+    /// "Give me the records under `key`, and your K closest to it (so I can recurse)."
+    FindValue { from: WireContact, key: [u8; 32] },
+    /// Records the responder holds for the key, plus its K closest contacts for recursion.
+    Value {
+        records: Vec<StoredRecord>,
+        closer: Vec<WireContact>,
+    },
 }
 
 impl DhtMessage {

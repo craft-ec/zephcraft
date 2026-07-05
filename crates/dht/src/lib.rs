@@ -12,10 +12,12 @@
 
 mod node;
 mod proto;
+mod record;
 mod table;
 
 pub use node::DhtNode;
 pub use proto::{DhtMessage, WireContact};
+pub use record::{RecordStore, StoredRecord};
 pub use table::{bucket_index, closer_to, distance, Contact, RoutingTable, BUCKETS, K};
 
 /// Concurrency of iterative lookups (Kademlia α).

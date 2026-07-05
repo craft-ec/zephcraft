@@ -8,9 +8,11 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use zeph_core::NodeId;
+use zeph_crypto::NodeIdentity;
 use zeph_transport::{Connection, PeerAddr, Transport};
 
 use crate::proto::{DhtMessage, WireContact};
+use crate::record::{RecordStore, StoredRecord};
 use crate::table::{closer_to, Contact, RoutingTable, K};
 use crate::{ALPHA, ALPN};
 
@@ -18,18 +20,54 @@ const MAX_FRAME: usize = 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct DhtNode {
+    identity: Arc<NodeIdentity>,
     me: Contact,
     table: Mutex<RoutingTable>,
+    store: RecordStore,
     transport: Arc<Transport>,
 }
 
 impl DhtNode {
-    pub fn new(me: Contact, transport: Arc<Transport>) -> Arc<Self> {
+    pub fn new(
+        identity: Arc<NodeIdentity>,
+        transport: Arc<Transport>,
+        record_ttl_millis: u64,
+    ) -> Arc<Self> {
+        let me = Contact {
+            id: NodeId(identity.node_id().0),
+            addr: transport.addr(),
+        };
         Arc::new(Self {
             table: Mutex::new(RoutingTable::new(me.id)),
+            store: RecordStore::new(record_ttl_millis),
+            identity,
             me,
             transport,
         })
+    }
+
+    /// This node's own dialable contact.
+    pub fn contact(&self) -> Contact {
+        self.me.clone()
+    }
+
+    /// Wall-clock milliseconds — the record store's TTL reference.
+    fn now_millis(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Records held locally (this node is among the K closest to their keys).
+    pub fn stored_len(&self) -> usize {
+        self.store.len()
+    }
+
+    /// Drop expired records — called periodically by the owner (records live 48h; the
+    /// publisher republishes every 22h, a policy owned by the routing layer).
+    pub fn expire(&self) -> usize {
+        self.store.expire(self.now_millis())
     }
 
     fn self_wire(&self) -> WireContact {
@@ -77,6 +115,22 @@ impl DhtNode {
                 DhtMessage::Nodes {
                     contacts: closest.iter().map(WireContact::from).collect(),
                 }
+            }
+            DhtMessage::Store { record } => {
+                let stored = self.store.put(record, self.now_millis());
+                DhtMessage::StoreAck { stored }
+            }
+            DhtMessage::FindValue { from, key } => {
+                if let Some(c) = from.into_contact() {
+                    self.learn([c]);
+                }
+                let records = self.store.get(&key, self.now_millis());
+                let closer = self
+                    .closest_local(&key)
+                    .iter()
+                    .map(WireContact::from)
+                    .collect();
+                DhtMessage::Value { records, closer }
             }
             other => {
                 tracing::debug!(
@@ -191,16 +245,96 @@ impl DhtNode {
         let found = self.lookup(self.me.id.0).await;
         self.learn(found);
     }
+
+    // ---- records -----------------------------------------------------------------
+
+    /// Publish a signed record (`value` under `key`, at `seq`) to the K nodes closest to
+    /// `key`. Signs with our identity, keeps a local copy, and stores on the responsible
+    /// nodes found by an iterative lookup.
+    pub async fn put(&self, key: [u8; 32], seq: u64, value: Vec<u8>) {
+        let record = StoredRecord::sign(&self.identity, key, seq, value);
+        self.store.put(record.clone(), self.now_millis());
+        let targets = self.lookup(key).await;
+        let msg = DhtMessage::Store { record };
+        futures::future::join_all(targets.iter().map(|c| self.request(&c.addr, &msg))).await;
+    }
+
+    /// Fetch all records under `key` from the overlay: iterative FIND_VALUE, verifying every
+    /// returned record and keeping the highest seq per publisher (many publishers coexist).
+    pub async fn get(&self, key: [u8; 32]) -> Vec<StoredRecord> {
+        let mut known: HashMap<NodeId, Contact> = HashMap::new();
+        for c in self.closest_local(&key) {
+            known.insert(c.id, c);
+        }
+        let mut queried: HashSet<NodeId> = HashSet::new();
+        let mut best: HashMap<[u8; 32], StoredRecord> = HashMap::new();
+        for r in self.store.get(&key, self.now_millis()) {
+            merge(&mut best, r);
+        }
+
+        loop {
+            let mut shortlist: Vec<Contact> = known.values().cloned().collect();
+            shortlist.sort_by(|a, b| closer_to(&key, &a.id.0, &b.id.0));
+            shortlist.truncate(K);
+            let batch: Vec<Contact> = shortlist
+                .iter()
+                .filter(|c| !queried.contains(&c.id))
+                .take(ALPHA)
+                .cloned()
+                .collect();
+            if batch.is_empty() {
+                break;
+            }
+            for c in &batch {
+                queried.insert(c.id);
+            }
+            let replies = futures::future::join_all(batch.iter().map(|c| {
+                let msg = DhtMessage::FindValue {
+                    from: self.self_wire(),
+                    key,
+                };
+                async move { self.request(&c.addr, &msg).await }
+            }))
+            .await;
+            for reply in replies.into_iter().flatten() {
+                if let DhtMessage::Value { records, closer } = reply {
+                    for r in records {
+                        if r.key == key && r.verify() {
+                            merge(&mut best, r);
+                        }
+                    }
+                    let contacts: Vec<Contact> = closer
+                        .into_iter()
+                        .filter_map(|w| w.into_contact())
+                        .collect();
+                    self.learn(contacts.iter().cloned());
+                    for c in contacts {
+                        known.insert(c.id, c);
+                    }
+                }
+            }
+        }
+        best.into_values().collect()
+    }
+}
+
+/// Keep the highest-seq record per publisher.
+fn merge(best: &mut HashMap<[u8; 32], StoredRecord>, r: StoredRecord) {
+    match best.get(&r.publisher) {
+        Some(existing) if existing.seq >= r.seq => {}
+        _ => {
+            best.insert(r.publisher, r);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeph_crypto::NodeIdentity;
     use zeph_transport::Reach;
 
-    async fn spawn_node() -> (Arc<DhtNode>, Contact) {
-        let id = NodeIdentity::generate();
+    async fn spawn_node() -> Arc<DhtNode> {
+        let id = Arc::new(NodeIdentity::generate());
         let transport = Arc::new(
             Transport::bind(
                 id.secret_key_bytes(),
@@ -211,45 +345,53 @@ mod tests {
             .await
             .expect("bind"),
         );
-        let me = Contact {
-            id: NodeId(id.node_id().0),
-            addr: transport.addr(),
-        };
-        let node = DhtNode::new(me.clone(), transport.clone());
+        let node = DhtNode::new(id, transport.clone(), 3_600_000);
         let (tx, rx) = mpsc::channel(64);
         let t = transport.clone();
         tokio::spawn(async move { t.serve(vec![(ALPN.to_vec(), tx)]).await });
         node.clone().serve(rx);
-        (node, me)
+        node
+    }
+
+    /// One seed + `joiners` nodes that bootstrap off it in turn.
+    async fn overlay(joiners: usize) -> Vec<Arc<DhtNode>> {
+        let seed = spawn_node().await;
+        let seed_contact = seed.contact();
+        let mut nodes = vec![seed];
+        for _ in 0..joiners {
+            let n = spawn_node().await;
+            n.bootstrap(vec![seed_contact.clone()]).await;
+            nodes.push(n);
+        }
+        nodes
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn overlay_bootstraps_and_locates_peers() {
-        // One seed; four joiners bootstrap off it in turn.
-        let (seed, seed_contact) = spawn_node().await;
-        let mut joiners = Vec::new();
-        let mut contacts = Vec::new();
-        for _ in 0..4 {
-            let (n, c) = spawn_node().await;
-            n.bootstrap(vec![seed_contact.clone()]).await;
-            joiners.push(n);
-            contacts.push(c);
-        }
-
-        // The seed learned every joiner from their FIND_NODE(self) queries.
+        let nodes = overlay(4).await;
         assert!(
-            seed.table_len() >= 4,
+            nodes[0].table_len() >= 4,
             "seed should know all joiners, has {}",
-            seed.table_len()
+            nodes[0].table_len()
         );
-
-        // The last joiner can locate the first joiner by id via iterative lookup through the
-        // overlay (it only ever knew the seed directly).
-        let target = contacts[0].id.0;
-        let found = joiners[3].lookup(target).await;
+        // The last joiner locates the first purely by iterative lookup through the overlay.
+        let target = nodes[1].contact().id.0;
+        let found = nodes[4].lookup(target).await;
         assert!(
             found.iter().any(|c| c.id.0 == target),
             "iterative lookup should locate the target peer"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn record_put_is_gettable_across_the_overlay() {
+        let nodes = overlay(4).await;
+        // A node that did NOT publish can fetch a record published by another.
+        let key = [42u8; 32];
+        nodes[1].put(key, 1, b"i-hold-cid-X".to_vec()).await;
+        let got = nodes[4].get(key).await;
+        assert_eq!(got.len(), 1, "record retrievable across the overlay");
+        assert_eq!(got[0].value, b"i-hold-cid-X");
+        assert!(got[0].verify());
     }
 }
