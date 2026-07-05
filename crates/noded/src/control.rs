@@ -286,13 +286,12 @@ impl State {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn set_health(
+    /// Health-scan results (its own coordinator job).
+    pub async fn set_scan(
         &self,
         scanned: usize,
         at_risk: usize,
         repaired_delta: u64,
-        moved_delta: u64,
-        scaled_delta: u64,
         degraded_delta: u64,
         fading: usize,
     ) {
@@ -300,10 +299,15 @@ impl State {
         h.0 = scanned;
         h.1 = at_risk;
         h.2 += repaired_delta;
-        h.3 += moved_delta;
-        h.4 += scaled_delta;
         h.5 += degraded_delta;
         h.6 = fading as u64;
+    }
+
+    /// Distribute/scale results (the separate Distribution job).
+    pub async fn set_flow(&self, moved_delta: u64, scaled_delta: u64) {
+        let mut h = self.health.write().await;
+        h.3 += moved_delta;
+        h.4 += scaled_delta;
     }
 
     /// Replace the peer table wholesale (fed by the membership layer). Emits

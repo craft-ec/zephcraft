@@ -1060,11 +1060,14 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let events = zeph_events::EventBus::default();
     engine.set_events(events.clone());
 
-    // Background job coordinator (foundation §51): the periodic lifecycle +
-    // re-announce run THROUGH it — prioritized, deduped (a slow pass can't
-    // stack), retried, and metered. Serial for now (concurrency 1); the
-    // primitive supports more for future per-item reactive jobs.
-    let jobs = zeph_sched::JobCoordinator::new(1);
+    // Background job coordinator (foundation §51): the periodic lifecycle, re-announce, and
+    // future per-item reactive jobs run THROUGH it — prioritized, deduped (a slow pass can't
+    // stack), retried, and metered. It is a BOUNDED-CONCURRENCY scheduler, so it runs as a
+    // small worker pool: priority ORDERS contended work without starving a class. At
+    // concurrency 1 it degenerated into a serial queue where a long, frequent Distribution
+    // job (re-announce, which grows with held content) perpetually starved the lowest
+    // priority — HealthScan, the durability-maintenance pass — so it never ran (scanned=0).
+    let jobs = zeph_sched::JobCoordinator::new(4);
 
     // Control state, shared by the heartbeat loop and the control servers.
     // Phase 4c: the durable app-name registry backing (self-attested v1 ramp).
@@ -1395,46 +1398,58 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
             interval.tick().await;
             let e = health_engine.clone();
             let st = health_state.clone();
-            // The self-healing pass runs THROUGH the coordinator: HealthScan
-            // priority, deduped so a pass that runs long can't stack on the next
-            // tick. (Runs as one unit to preserve the proven scan→distribute→
-            // scale→evict order; split into per-priority jobs when scale needs it.)
+            // PROPER coordinator use: two INDEPENDENT jobs, not one monolith. The fast,
+            // record-based health scan (durability assessment + repair) runs on its own
+            // HealthScan cadence and updates promptly; the heavier distribute/scale passes
+            // (which push pieces per cid) run as a separate Distribution job. Each is deduped
+            // by its own key and they run concurrently (worker pool), so a slow distribute
+            // can NEVER stall the health scan again.
+            let (eh, sth) = (e.clone(), st.clone());
             health_jobs.submit(
-                "lifecycle",
+                "health-scan",
                 zeph_sched::Priority::HealthScan,
                 1,
                 move || {
-                    let e = e.clone();
-                    let st = st.clone();
+                    let (e, st) = (eh.clone(), sth.clone());
                     async move {
                         let r = e.health_scan().await;
-                        let d = e.distribute().await;
-                        let sc = e.scale().await;
-                        e.enforce_quota().await;
-                        st.set_health(
+                        st.set_scan(
                             r.scanned,
                             r.at_risk,
                             r.repaired as u64,
-                            d.moved as u64,
-                            sc.scaled as u64,
                             r.degraded as u64,
                             r.fading,
                         )
                         .await;
-                        if r.repaired > 0
-                            || d.moved > 0
-                            || sc.scaled > 0
-                            || r.degraded > 0
-                            || r.offloaded > 0
-                        {
+                        if r.repaired > 0 || r.degraded > 0 || r.offloaded > 0 {
                             tracing::info!(
                                 at_risk = r.at_risk,
                                 repaired = r.repaired,
-                                moved = d.moved,
-                                scaled = sc.scaled,
                                 degraded = r.degraded,
                                 offloaded = r.offloaded,
-                                "lifecycle: repair / distribute / scale / degrade / offload"
+                                "health scan: repair / degrade / offload"
+                            );
+                        }
+                        Ok(())
+                    }
+                },
+            );
+            health_jobs.submit(
+                "distribute",
+                zeph_sched::Priority::Distribution,
+                1,
+                move || {
+                    let (e, st) = (e.clone(), st.clone());
+                    async move {
+                        let d = e.distribute().await;
+                        let sc = e.scale().await;
+                        e.enforce_quota().await;
+                        st.set_flow(d.moved as u64, sc.scaled as u64).await;
+                        if d.moved > 0 || sc.scaled > 0 {
+                            tracing::info!(
+                                moved = d.moved,
+                                scaled = sc.scaled,
+                                "distribute / scale"
                             );
                         }
                         Ok(())

@@ -1074,23 +1074,36 @@ impl ObjEngine {
     /// pinned or not — silently become unreachable once their records
     /// expire, even though the bytes are on disk. Returns the count announced.
     pub async fn reannounce_providers(&self) -> usize {
-        let mut announced = 0;
-        for cid in self.store.cids() {
-            let count = self.store.piece_count(&cid) as u32;
-            let pinned = self.store.is_pinned(&cid);
-            // A provider is any node that can serve the CID: it holds pieces,
-            // OR the whole content (pin or seed cache → serves by encoding).
-            if count == 0 && !self.store.has_content(&cid) {
-                continue;
-            }
-            if self.routing.announce(cid, count, pinned).await.is_ok() {
-                announced += 1;
-            }
-        }
-        // Re-announce WANT interest (keep-alive intent survives TTL/restart).
-        for cid in self.store.wanted_cids() {
-            let _ = self.routing.announce_want(cid).await;
-        }
+        // Gather records locally (cheap), then announce CONCURRENTLY. Sequential announces
+        // over every held cid turned this into a ~140s job that monopolized the single
+        // coordinator slot and STARVED the health scan (stuck at scanned=0) — the more
+        // content the node held, the longer it blocked.
+        let records: Vec<(Cid, u32, bool)> = self
+            .store
+            .cids()
+            .into_iter()
+            .filter_map(|cid| {
+                let count = self.store.piece_count(&cid) as u32;
+                let pinned = self.store.is_pinned(&cid);
+                // A provider is any node that can serve the CID: it holds pieces, OR the
+                // whole content (pin or seed cache → serves by encoding).
+                (count > 0 || self.store.has_content(&cid)).then_some((cid, count, pinned))
+            })
+            .collect();
+        let results =
+            futures::future::join_all(records.into_iter().map(|(cid, count, pinned)| async move {
+                self.routing.announce(cid, count, pinned).await.is_ok()
+            }))
+            .await;
+        let announced = results.iter().filter(|ok| **ok).count();
+        // Re-announce WANT interest (keep-alive intent survives TTL/restart), concurrently.
+        futures::future::join_all(
+            self.store
+                .wanted_cids()
+                .into_iter()
+                .map(|cid| async move { self.routing.announce_want(cid).await }),
+        )
+        .await;
         announced
     }
 
@@ -1135,7 +1148,15 @@ impl ObjEngine {
             .map(|c| c.0)
             .collect();
 
-        for cid in self.store.cids() {
+        // Pre-resolve every held cid's providers CONCURRENTLY — the per-cid tracker resolve
+        // (186 sequential round-trips) was the last network cost that kept a pass at ~130s.
+        let resolved =
+            futures::future::join_all(self.store.cids().into_iter().map(|cid| async move {
+                (cid, self.routing.resolve(cid).await.unwrap_or_default())
+            }))
+            .await;
+
+        for (cid, providers) in resolved {
             if self.store.is_tombstoned(&cid) {
                 continue;
             }
@@ -1144,11 +1165,9 @@ impl ObjEngine {
             };
             report.scanned += 1;
             let floor = target_pieces(gen.k as usize);
-            let providers = self.routing.resolve(cid).await.unwrap_or_default();
 
-            // VERIFIED availability: probe each provider live; unreachable
-            // holders simply don't answer and so don't count. Record live
-            // holders (addr + count) to both elect a repairer and target one.
+            // Availability from live provider records (no per-cid probe). Record holders
+            // (addr + count) to both elect a repairer and target one.
             let mut have = 0usize;
             let mut capable: Vec<NodeId> = Vec::new();
             let mut live: Vec<(NodeId, PeerAddr, u32, bool)> = Vec::new();
@@ -1163,23 +1182,20 @@ impl ObjEngine {
                     }
                 }
             }
-            // Probe ALL peer providers CONCURRENTLY — sequential probes turned one pass
-            // into (providers x cids x timeout) round-trips, so a few unreachable paths
-            // stalled the whole self-healing loop. Now each cid costs one probe round-trip.
-            let acks = futures::future::join_all(providers.iter().filter(|p| p.node_id != me).map(
-                |p| async move { (p.node_id, p.addr.clone(), self.probe_availability(&p.addr, cid).await) },
-            ))
-            .await;
-            for (node_id, addr, ack) in acks {
-                let Some(ack) = ack else { continue };
-                if !ack.has {
+            // Read provider RECORDS directly — NO per-cid network probe. `resolve` already
+            // returns only live (non-expired) provider records with their piece counts, so
+            // probing each turned a single pass into 186 x providers x 2s timeouts. A repair
+            // PUSH verifies a holder's reachability at the moment it matters, so records are
+            // the right, fast signal for a periodic maintenance scan.
+            for p in &providers {
+                if p.node_id == me {
                     continue;
                 }
-                have += ack.piece_count as usize;
-                if ack.piece_count >= 2 || ack.pinned {
-                    capable.push(node_id);
+                have += p.piece_count as usize;
+                if p.piece_count >= 2 || p.pinned {
+                    capable.push(p.node_id);
                 }
-                live.push((node_id, addr, ack.piece_count, ack.pinned));
+                live.push((p.node_id, p.addr.clone(), p.piece_count, p.pinned));
             }
             // Include self if we hold but aren't (yet) in the provider records.
             if !seen_self {
@@ -1262,8 +1278,8 @@ impl ObjEngine {
             // system generation makes us mint + push fresh coded pieces each pass, and the
             // cluster accumulates pieces without bound. Only pinned content (or a real
             // piece-holder) repairs; the retained copy just waits, safe.
-            let can_i =
-                self.store.piece_count(&cid) >= 2 || (self.store.has_content(&cid) && self.store.is_pinned(&cid));
+            let can_i = self.store.piece_count(&cid) >= 2
+                || (self.store.has_content(&cid) && self.store.is_pinned(&cid));
             if !can_i {
                 continue;
             }
@@ -1302,7 +1318,10 @@ impl ObjEngine {
             .collect();
         // "Complete" = reached as many distinct peers as the durability target OR the whole
         // cluster can offer — then never pushed again.
-        let target = self.config.durability_threshold.min(candidates.len().max(1));
+        let target = self
+            .config
+            .durability_threshold
+            .min(candidates.len().max(1));
         let mut out: Vec<([u8; 32], u32, u32)> = Vec::new();
         for cid in self.store.cids() {
             // Everything we hold whole (files + db/app generations) that is not yet complete.
