@@ -24,8 +24,8 @@ use crate::records::{
     KIND_MANIFEST, KIND_META, KIND_PROVIDER, KIND_ROOT, KIND_WANT,
 };
 use crate::{
-    AppRecord, ContentEntry, ContentRouting, ManifestRecord, MetaRecord, NodePayload, RelayPayload,
-    Result, RootRecord,
+    AppRecord, ContentRouting, ManifestRecord, MetaRecord, NodePayload, RelayPayload, Result,
+    RootRecord,
 };
 
 /// Content routing over the DHT.
@@ -348,9 +348,6 @@ impl ContentRouting for DhtRouting {
     }
     async fn announce_relay_registry(&self, _relay_url: String) -> Result<()> {
         Ok(())
-    }
-    async fn content(&self) -> Result<Vec<ContentEntry>> {
-        Ok(Vec::new())
     }
 }
 

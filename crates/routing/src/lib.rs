@@ -28,21 +28,6 @@ pub use server::serve;
 /// ALPN for the tracker protocol.
 pub const ALPN: &[u8] = b"/craftec/tracker/1";
 
-/// A content entry for network-wide content listing: a CID and how many
-/// providers hold it (and how many pin it).
-#[derive(Debug, Clone)]
-pub struct ContentEntry {
-    pub cid: Cid,
-    pub providers: usize,
-    pub pinned: usize,
-    /// Sum of advisory piece_counts across providers (≈ network HAVE).
-    pub pieces: usize,
-    /// Number of WANT interest signals for this CID.
-    pub wants: usize,
-    /// Editable metadata envelopes (one per publisher). Empty if none.
-    pub metas: Vec<MetaRecord>,
-}
-
 /// A resolved metadata envelope (`KIND_META`) — one publisher's editable claim
 /// about a manifest CID. The default view takes `min(published_at)` across
 /// these; the full set is the "who published what" expansion.
@@ -124,7 +109,6 @@ pub trait ContentRouting: Send + Sync {
     async fn announce_relay_registry(&self, relay_url: String) -> Result<()>;
     /// Enumerate the network's content (all CIDs the tracker knows), grouped
     /// with provider + pinned counts. Empty on backends that can't enumerate.
-    async fn content(&self) -> Result<Vec<ContentEntry>>;
     /// Announce a WANT interest signal for `cid` (keep-alive intent; no holding).
     async fn announce_want(&self, cid: Cid) -> Result<()>;
     /// Withdraw this node's WANT for `cid`.
@@ -376,82 +360,6 @@ impl ContentRouting for TrackerRouting {
             })
             .await?;
         Ok(records.iter().filter_map(records::relay).collect())
-    }
-
-    async fn content(&self) -> Result<Vec<ContentEntry>> {
-        let records = self
-            .query(zeph_wire::TrackerResolve {
-                query_kind: 4,
-                cid: [0; 32],
-                max: 4096,
-            })
-            .await?;
-        // Group provider records by CID → (providers, pinned, pieces).
-        let mut by_cid: std::collections::HashMap<[u8; 32], (usize, usize, usize)> =
-            std::collections::HashMap::new();
-        for r in &records {
-            if let Some(p) = records::provider(r) {
-                let e = by_cid.entry(p.cid).or_insert((0, 0, 0));
-                e.0 += 1;
-                if p.pinned {
-                    e.1 += 1;
-                }
-                e.2 += p.piece_count as usize;
-            }
-        }
-        // Merge WANT counts (kind 5).
-        let mut wants: std::collections::HashMap<[u8; 32], usize> =
-            std::collections::HashMap::new();
-        if let Ok(wrecs) = self
-            .query(zeph_wire::TrackerResolve {
-                query_kind: 5,
-                cid: [0; 32],
-                max: 4096,
-            })
-            .await
-        {
-            for r in &wrecs {
-                if let Some(w) = records::want(r) {
-                    *wants.entry(w.cid).or_insert(0) += 1;
-                    by_cid.entry(w.cid).or_insert((0, 0, 0));
-                }
-            }
-        }
-        // Merge metadata envelopes (kind 6).
-        let mut metas: std::collections::HashMap<[u8; 32], Vec<MetaRecord>> =
-            std::collections::HashMap::new();
-        if let Ok(mrecs) = self
-            .query(zeph_wire::TrackerResolve {
-                query_kind: 6,
-                cid: [0; 32],
-                max: 4096,
-            })
-            .await
-        {
-            for r in &mrecs {
-                if let Some(m) = records::meta(r) {
-                    metas.entry(m.cid).or_default().push(MetaRecord {
-                        publisher: NodeId(r.node_id),
-                        published_at: m.published_at,
-                        comment: m.comment,
-                    });
-                    by_cid.entry(m.cid).or_insert((0, 0, 0));
-                }
-            }
-        }
-        let mut out: Vec<ContentEntry> = by_cid
-            .into_iter()
-            .map(|(cid, (providers, pinned, pieces))| ContentEntry {
-                cid: Cid(cid),
-                providers,
-                pinned,
-                pieces,
-                wants: wants.get(&cid).copied().unwrap_or(0),
-                metas: metas.remove(&cid).unwrap_or_default(),
-            })
-            .collect();
-        out.sort_by(|a, b| b.providers.cmp(&a.providers));
-        Ok(out)
     }
 
     async fn announce_node_registry(&self, used_bytes: u64, capacity_bytes: u64) -> Result<()> {

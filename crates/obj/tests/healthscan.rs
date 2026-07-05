@@ -704,28 +704,24 @@ async fn metadata_envelope_publish_edit_multiwriter_withdraw() {
         .unwrap()
         .manifest_cid;
 
-    let find = |cs: &Vec<zeph_routing::ContentEntry>, cid: zeph_core::Cid| {
-        cs.iter().find(|c| c.cid == cid).cloned()
-    };
-
     // Auto-announced envelope on publish.
-    let e = find(&a.routing.content().await.unwrap(), cid).expect("cid listed");
-    assert_eq!(e.metas.len(), 1, "one envelope after publish");
-    let t0 = e.metas[0].published_at;
-    assert!(t0 > 0 && e.metas[0].comment.is_none());
+    let metas = a.routing.metas(cid).await.unwrap();
+    assert_eq!(metas.len(), 1, "one envelope after publish");
+    let t0 = metas[0].published_at;
+    assert!(t0 > 0 && metas[0].comment.is_none());
 
     // Edit the comment — published_at is PRESERVED, record superseded.
     a.engine.set_meta(cid, Some("draft".into())).await.unwrap();
-    let e = find(&a.routing.content().await.unwrap(), cid).unwrap();
-    assert_eq!(e.metas.len(), 1);
-    assert_eq!(e.metas[0].comment.as_deref(), Some("draft"));
-    assert_eq!(e.metas[0].published_at, t0, "edit preserves published_at");
+    let metas = a.routing.metas(cid).await.unwrap();
+    assert_eq!(metas.len(), 1);
+    assert_eq!(metas[0].comment.as_deref(), Some("draft"));
+    assert_eq!(metas[0].published_at, t0, "edit preserves published_at");
 
     // A SECOND publisher attaches its own envelope (multi-writer).
     b.engine.set_meta(cid, Some("mirror".into())).await.unwrap();
-    let e = find(&b.routing.content().await.unwrap(), cid).unwrap();
-    assert_eq!(e.metas.len(), 2, "two independent envelopes");
-    let first = e.metas.iter().map(|m| m.published_at).min().unwrap();
+    let metas = b.routing.metas(cid).await.unwrap();
+    assert_eq!(metas.len(), 2, "two independent envelopes");
+    let first = metas.iter().map(|m| m.published_at).min().unwrap();
     assert_eq!(
         first, t0,
         "min(published_at) resolves the canonical first-published"
@@ -733,9 +729,9 @@ async fn metadata_envelope_publish_edit_multiwriter_withdraw() {
 
     // A withdraws its envelope — only its claim goes; B's remains.
     a.engine.del_meta(cid).await.unwrap();
-    let e = find(&a.routing.content().await.unwrap(), cid).unwrap();
-    assert_eq!(e.metas.len(), 1, "only the withdrawing publisher removed");
-    assert_eq!(e.metas[0].comment.as_deref(), Some("mirror"));
+    let metas = a.routing.metas(cid).await.unwrap();
+    assert_eq!(metas.len(), 1, "only the withdrawing publisher removed");
+    assert_eq!(metas[0].comment.as_deref(), Some("mirror"));
 }
 
 /// KIND_ROOT: the single-writer DB root pointer with compare-and-swap — the
@@ -860,16 +856,17 @@ async fn want_signal_propagates_and_withdraws() {
 
     // Any node observes the want via the tracker content list.
     let observer = node(&tracker, dirs[2].path()).await;
-    let want_count = |list: &[zeph_routing::ContentEntry]| {
-        list.iter().find(|c| c.cid == cid).map_or(0, |c| c.wants)
-    };
-    let content = observer.routing.content().await.unwrap();
-    assert!(want_count(&content) >= 1, "want is visible network-wide");
+    assert!(
+        observer.routing.is_wanted(cid).await.unwrap(),
+        "want is visible network-wide"
+    );
 
     // Withdraw clears it.
     wanter.engine.unwant(cid).await.unwrap();
-    let content = observer.routing.content().await.unwrap();
-    assert_eq!(want_count(&content), 0, "unwant clears the interest");
+    assert!(
+        !observer.routing.is_wanted(cid).await.unwrap(),
+        "unwant clears the interest"
+    );
 }
 
 /// DST CHURN HARNESS (M2 capstone): a seeded, multi-round churn simulation.
