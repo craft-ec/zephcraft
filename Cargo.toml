@@ -30,6 +30,7 @@ zeph-erasure = { path = "crates/erasure" }
 zeph-transport = { path = "crates/transport" }
 zeph-membership = { path = "crates/membership" }
 zeph-routing = { path = "crates/routing" }
+zeph-dht = { path = "crates/dht" }
 zeph-store = { path = "crates/store" }
 zeph-obj = { path = "crates/obj" }
 zeph-sql = { path = "crates/sql" }
