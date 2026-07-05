@@ -95,6 +95,15 @@ pub extern "C" fn run() {
         Err(_) => return,
     };
 
+    // v2: committee-enforced name validity — non-empty, <= 32 bytes, no control chars
+    // (< 0x20). Enforcing this in the attested program (not just the daemon) makes it
+    // trustless: a modified client can't inject a reserved-namespace or state-bloating
+    // name, because the committee runs THIS check and a bad name can't reach quorum.
+    let name = sub.name.as_bytes();
+    if name.is_empty() || name.len() > 32 || name.iter().any(|&b| b < 0x20) {
+        return; // rejected
+    }
+
     if sub.signature.len() != 64 {
         return;
     }

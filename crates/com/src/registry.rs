@@ -173,14 +173,12 @@ pub fn registry_program_cid() -> [u8; 32] {
     Cid::of(b"craftec/program/registry/1").0
 }
 
-/// The app-name registry compiled to WASM (governance-upgradeable). Governance sets
-/// `app-registry` to [`registry_wasm_cid`] to run THIS instead of the native program.
-pub const REGISTRY_WASM: &[u8] = include_bytes!("../registry.wasm");
-
-/// Content cid of [`REGISTRY_WASM`].
-pub fn registry_wasm_cid() -> [u8; 32] {
-    Cid::of(REGISTRY_WASM).0
-}
+/// The app-name registry compiled to WASM, kept as a **test fixture only** — the release
+/// binary no longer embeds it. Genesis is the native `RegistryProgram`; upgrades are
+/// published WASM chosen by governance (`publish-program` + `SetProgram`). Mirrors the
+/// source in `apps/registry-wasm`.
+#[cfg(test)]
+const REGISTRY_WASM: &[u8] = include_bytes!("../registry.wasm");
 
 /// The seed for the registry PDA account (so `pda(registry_program_cid(), REGISTRY_SEED)`
 /// is the account whose head advances as the registry).
@@ -475,6 +473,24 @@ mod tests {
                 .cid,
             [1u8; 32]
         );
+    }
+
+    #[test]
+    fn wasm_registry_v2_rejects_an_overlong_name() {
+        use crate::AttestedRuntime;
+        let rt = AttestedRuntime::new().unwrap();
+        let long = "x".repeat(40); // > 32 bytes
+        let sub = HeadSubmission::sign(&id(), &long, [1u8; 32], 1);
+        let out = rt
+            .run_transition(
+                REGISTRY_WASM,
+                "run",
+                &[],
+                &sub.encode(),
+                crate::DEFAULT_FUEL,
+            )
+            .unwrap();
+        assert!(out.is_empty(), "v2 rejects a name longer than 32 bytes");
     }
 
     #[test]
