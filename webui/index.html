@@ -97,6 +97,14 @@
   .kv { font-size:.78rem; padding:.14rem 0; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; gap:1rem; }
   .kv:last-child { border-bottom:none; }
   .kv b { font-weight:600; }
+  .flowstrip { display:flex; align-items:center; flex-wrap:wrap; gap:.5rem 0; padding:.6rem 1rem;
+    margin-bottom:1rem; background:var(--panel); border:1px solid var(--line); border-radius:8px; font-family:var(--mono); }
+  .flownode { display:flex; flex-direction:column; padding:0 .1rem; }
+  .flownode b { color:var(--accent); font-size:.72rem; text-transform:uppercase; letter-spacing:.05em; }
+  .flownode span { color:var(--dim); font-size:.64rem; }
+  .flowarrow { color:var(--dim); font-size:.64rem; padding:0 .7rem; white-space:nowrap; }
+  .note { color:var(--dim); font-size:.74rem; line-height:1.55; margin-top:.6rem; }
+  .note b { color:var(--fg); font-weight:600; }
 </style>
 </head>
 <body>
@@ -193,13 +201,24 @@
   </section>
 
   <section id="tab-attest" class="tab" hidden>
+    <div class="flowstrip">
+      <span class="flownode"><b>governance</b><span>manual · decides policy</span></span>
+      <span class="flowarrow">— sets canonical program →</span>
+      <span class="flownode"><b>attestation</b><span>automated · proves facts</span></span>
+      <span class="flowarrow">— attests each write →</span>
+      <span class="flownode"><b>registry</b><span>state · records heads</span></span>
+    </div>
     <div class="card">
-      <div class="cardhead">attestation &amp; registry <span class="muted">(program-owned durable heads — foundation §41/§56)</span></div>
+      <div class="cardhead">governance <span class="muted">— manual control · k-of-n governor multisig (user apps need none)</span></div>
+      <div id="gov-body"><div class="muted">loading…</div></div>
+    </div>
+    <div class="card">
+      <div class="cardhead">attestation <span class="muted">— automated proof · deterministic k-of-n committee (foundation §41/§56)</span></div>
       <div id="attest-body"><div class="muted">loading…</div></div>
     </div>
     <div class="card">
-      <div class="cardhead">governance <span class="muted">(protocol-tier approvals — k-of-n governor multisig; user apps need no approval)</span></div>
-      <div id="gov-body"><div class="muted">loading…</div></div>
+      <div class="cardhead">registry <span class="muted">— application state · the app-name registry, proven by the committee</span></div>
+      <div id="registry-body"><div class="muted">loading…</div></div>
     </div>
   </section>
 
@@ -578,45 +597,53 @@ async function loadAttestation(){
     if(!r.ok){ el.textContent="unavailable"; return; }
     const j=await r.json();
     const c=j.committee||{};
-    const rows=(j.rows||[]);
-    const table = rows.length
-      ? '<table style="margin-top:.5rem"><thead><tr><th style="text-align:left">name</th><th style="text-align:left">ver</th><th style="text-align:left">owner</th><th style="text-align:left">cid</th></tr></thead><tbody>'
-        + rows.map(x=>`<tr><td style="padding:.15rem .8rem .15rem 0"><b>${esc(x[1])}</b></td><td style="padding:.15rem .8rem .15rem 0">v${x[3]}</td><td class="mono muted" style="padding:.15rem .8rem .15rem 0">${String(x[0]).slice(0,8)}\u2026</td><td class="mono muted" style="padding:.15rem 0">${String(x[2]).slice(0,12)}\u2026</td></tr>`).join("")
-        + '</tbody></table>'
-      : '<div class="muted" style="margin-top:.4rem">no heads registered yet \u2014 deploy an app</div>';
-    const modeChip = c.last_mode==="committee"
-      ? '<span class="chip providing" title="last write was attested by a k-of-n committee">committee-attested</span>'
-      : (c.last_mode==="self" ? '<span class="chip pinned" title="self-attested (no committee could form)">self-attested</span>' : '<span class="chip muted">idle</span>');
+    // ATTESTATION — the automated proof engine
     el.innerHTML=`
-      <div class="kv"><span>registry</span><b>${esc(j.registry||"app registry")} ${modeChip}</b></div>
-      <div class="kv"><span>authority</span><b>${esc(j.model)}</b></div>
-      <div class="kv"><span>registry program</span><b>${esc(j.program_source||'')}</b> <span class="mono muted" onclick="copyCid('${j.registry_program||''}')" title="resolved via the program registry">${(j.registry_program||'').slice(0,14)}\u2026</span></div>
-      <div class="kv"><span>committee</span><b>${c.eligible||1} eligible \u00b7 k=${c.k||1} of n=${c.n||1}</b></div>
-      ${j.chain&&j.chain.checkpoints?`<div class="kv"><span>committee chain</span><b>${j.chain.checkpoints} checkpoints \u00b7 epoch ${j.chain.epoch} \u00b7 committee ${j.chain.committee_size}</b></div>`:''}
-      ${j.chain&&j.chain.epoch_ms?`<div class="kv"><span>next rollover</span><b id="epoch-timer" class="mono">\u2026</b></div>`:''}
-      <div class="kv"><span>registered heads</span><b>${j.entries!=null?j.entries:0}</b></div>
-      <div class="kv"><span>app-registry root</span><span class="mono" onclick="copyCid('${j.app_registry_root||''}')" title="copy">${(j.app_registry_root||'').slice(0,16)}\u2026</span></div>
-      <div class="kv"><span>registry account (PDA)</span><span class="mono" onclick="copyCid('${j.registry_account}')" title="copy">${(j.registry_account||'').slice(0,16)}\u2026</span></div>
-      ${table}
-      <div class="muted" style="margin-top:.6rem">${esc(j.note)}</div>
-      <div class="muted" style="margin-top:.5rem;font-size:.74rem;line-height:1.5">This is the <b>app-name registry</b> \u2014 a publisher signs a head (name\u2192cid), a deterministic k-of-n committee runs the registry program and attests the append (a wrong output can\u0027t reach quorum, so no keyholder is trusted), and other nodes resolve it from the durable state. Future protocol registries (program, config, committee, bans) will be separate roots.</div>`;
+      <div class="kv"><span>model</span><b>${esc(j.model)}</b></div>
+      <div class="kv"><span>committee</span><b>${c.eligible||1} eligible · k=${c.k||1} of n=${c.n||1}</b></div>
+      ${j.chain&&j.chain.checkpoints?`<div class="kv"><span>committee chain</span><b>${j.chain.checkpoints} checkpoints · epoch ${j.chain.epoch} · size ${j.chain.committee_size}</b></div>`:''}
+      ${j.chain&&j.chain.epoch_ms?`<div class="kv"><span>next rollover</span><b id="epoch-timer" class="mono">…</b></div>`:''}
+      <div class="note">A deterministic k-of-n committee runs a program on a pinned input and signs the output. A wrong output cannot reach quorum, so no single keyholder is trusted — this is what proves every registry write.</div>`;
     if(j.chain&&j.chain.next_rollover_ms!=null) startEpochTimer(j.chain.next_rollover_ms);
-    try{
-      const gr=await fetch("/api/governance?token="+TOKEN);
-      if(gr.ok){ const g=await gr.json(); const gel=$("gov-body");
-        if(gel){ const govs=(g.governors||[]);
-          let html=`<div class="kv"><span>governance</span><b>${g.threshold}-of-${govs.length} \u00b7 seq ${g.seq}${g.is_governor?' \u00b7 <span class="chip providing">you are a governor</span>':''}</b></div>`
-            + govs.map(h=>`<div class="kv"><span>governor</span><span class="mono muted" onclick="copyCid('${h}')" title="copy">${h.slice(0,20)}\u2026</span></div>`).join("");
-          try{ const pr=await fetch("/api/programs?token="+TOKEN);
-            if(pr.ok){ const p=await pr.json(); const rows=(p.programs||[]);
-              html+='<div class="grp" style="margin-top:.5rem">network-owned programs (upgradeable via governance)</div>'
-                + (rows.length?rows.map(r=>`<div class="kv"><span>${esc(r[0])} <span class="chip pinned">v${r[2]}</span></span><span class="mono muted" onclick="copyCid('${r[1]}')" title="copy">${String(r[1]).slice(0,20)}\u2026</span></div>`).join(""):'<div class="muted">none</div>');
-            }
-          }catch(_){}
-          gel.innerHTML=html;
+    // REGISTRY — application state, proven by attestation
+    const rel=$("registry-body");
+    if(rel){
+      const rows=(j.rows||[]);
+      const modeChip = c.last_mode==="committee"
+        ? '<span class="chip providing" title="last write attested by a k-of-n committee">committee-attested</span>'
+        : (c.last_mode==="self" ? '<span class="chip pinned" title="self-attested (no committee could form)">self-attested</span>' : '<span class="chip net">idle</span>');
+      const table = rows.length
+        ? '<table style="margin-top:.6rem"><thead><tr><th style="text-align:left">name</th><th style="text-align:left">ver</th><th style="text-align:left">owner</th><th style="text-align:left">cid</th></tr></thead><tbody>'
+          + rows.map(x=>`<tr><td style="padding:.15rem .8rem .15rem 0"><b>${esc(x[1])}</b></td><td style="padding:.15rem .8rem .15rem 0">v${x[3]}</td><td class="mono muted" style="padding:.15rem .8rem .15rem 0">${String(x[0]).slice(0,8)}…</td><td class="mono muted" style="padding:.15rem 0">${String(x[2]).slice(0,12)}…</td></tr>`).join("")
+          + '</tbody></table>'
+        : '<div class="muted" style="margin-top:.4rem">no heads registered yet — deploy an app</div>';
+      rel.innerHTML=`
+        <div class="kv"><span>last write</span><b>${modeChip}</b></div>
+        <div class="kv"><span>program</span><b>${esc(j.program_source||'')}</b> <span class="mono muted cidcell" onclick="copyCid('${j.registry_program||''}')" title="chosen by governance; resolved via the program registry">${(j.registry_program||'').slice(0,14)}…</span></div>
+        <div class="kv"><span>registered heads</span><b>${j.entries!=null?j.entries:0}</b></div>
+        <div class="kv"><span>registry root</span><span class="mono cidcell" onclick="copyCid('${j.app_registry_root||''}')" title="copy">${(j.app_registry_root||'').slice(0,16)}…</span></div>
+        <div class="kv"><span>account (PDA)</span><span class="mono cidcell" onclick="copyCid('${j.registry_account}')" title="copy">${(j.registry_account||'').slice(0,16)}…</span></div>
+        ${table}
+        <div class="note">A publisher signs a head (name→cid); the <b>committee above</b> attests the append; other nodes resolve it from durable state. The <b>program</b> that runs it is set by governance — today the WASM app-registry.</div>`;
+    }
+    // GOVERNANCE — the manual control plane
+    const gel=$("gov-body");
+    if(gel){
+      try{
+        const gr=await fetch("/api/governance?token="+TOKEN);
+        const g=gr.ok?await gr.json():{};
+        const govs=(g.governors||[]);
+        let html=`<div class="kv"><span>governor set</span><b>${g.threshold||0}-of-${govs.length} · seq ${g.seq||0}${g.is_governor?' · <span class="chip providing">you are a governor</span>':''}</b></div>`
+          + govs.map(h=>`<div class="kv"><span>governor</span><span class="mono muted cidcell" onclick="copyCid('${h}')" title="copy">${h.slice(0,20)}…</span></div>`).join("");
+        const pr=await fetch("/api/programs?token="+TOKEN);
+        if(pr.ok){ const p=await pr.json(); const prg=(p.programs||[]);
+          html+='<div class="grp">network-owned programs — upgradeable via governance</div>'
+            + (prg.length?prg.map(x=>`<div class="kv"><span>${esc(x[0])} <span class="chip pinned">v${x[2]}</span></span><span class="mono muted cidcell" onclick="copyCid('${x[1]}')" title="copy">${String(x[1]).slice(0,20)}…</span></div>`).join(""):'<div class="muted">none</div>');
         }
-      }
-    }catch(_){}
+        html+='<div class="note">A k-of-n governor multisig for <b>network policy only</b> — which WASM is canonical for each program above, and the governor set itself. User-space apps publish freely and need no approval.</div>';
+        gel.innerHTML=html;
+      }catch(_){ gel.innerHTML='<div class="muted">unavailable</div>'; }
+    }
   }catch(e){ el.textContent="error: "+e; }
 }
 let epochInterval=null;
