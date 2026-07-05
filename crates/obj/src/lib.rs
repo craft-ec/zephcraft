@@ -33,6 +33,12 @@ pub use manifest::{Entry, Manifest};
 /// ALPN for piece exchange.
 pub const ALPN: &[u8] = b"/craftec/piece/1";
 
+/// Re-announce a provider record this long after its last announce (foundation §462:
+/// 22h re-announce inside a 48h DHT TTL). Per-cid scheduling — NOT every cycle.
+const REPUBLISH_MS: u64 = 22 * 3600 * 1000;
+/// Cids scanned per health-scan pass (rotating). Bounds per-pass DHT gets; the full held set
+/// is covered over ceil(N / HEALTH_BATCH) passes.
+const HEALTH_BATCH: usize = 64;
 const MAX_FRAME: usize = wire::MAX_MESSAGE_SIZE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,6 +224,15 @@ pub struct ObjEngine {
     /// (cid, coded pieces on OTHER nodes, floor = target n). Drives the dashboard's
     /// "pending distribution" view.
     pending: Mutex<Vec<([u8; 32], u32, u32)>>,
+    /// Per-cid last-announce time (ms) — drives TTL-aware re-announce scheduling so a record
+    /// is refreshed ~every 22h, not every cycle.
+    announced_at: Mutex<HashMap<[u8; 32], u64>>,
+    /// Rotating cursor into the held-cid list for the incremental health scan (a bounded
+    /// batch per pass, not all cids every time).
+    scan_cursor: Mutex<usize>,
+    /// Cids currently believed at-risk (rolling — updated as the rotating scan covers each
+    /// batch), so the dashboard reports the full-set estimate, not one batch.
+    at_risk_ids: Mutex<HashSet<[u8; 32]>>,
 }
 
 impl ObjEngine {
@@ -253,6 +268,9 @@ impl ObjEngine {
             events: std::sync::OnceLock::new(),
             enc: std::sync::OnceLock::new(),
             pending: Mutex::new(Vec::new()),
+            announced_at: Mutex::new(HashMap::new()),
+            scan_cursor: Mutex::new(0),
+            at_risk_ids: Mutex::new(HashSet::new()),
         })
     }
 
@@ -1118,29 +1136,44 @@ impl ObjEngine {
     /// pinned or not — silently become unreachable once their records
     /// expire, even though the bytes are on disk. Returns the count announced.
     pub async fn reannounce_providers(&self) -> usize {
-        // Gather records locally (cheap), then announce CONCURRENTLY. Sequential announces
-        // over every held cid turned this into a ~140s job that monopolized the single
-        // coordinator slot and STARVED the health scan (stuck at scanned=0) — the more
-        // content the node held, the longer it blocked.
-        let records: Vec<(Cid, u32, bool)> = self
-            .store
-            .cids()
-            .into_iter()
-            .filter_map(|cid| {
-                let count = self.store.piece_count(&cid) as u32;
-                let pinned = self.store.is_pinned(&cid);
-                // A provider is any node that can serve the CID: it holds pieces, OR the
-                // whole content (pin or seed cache → serves by encoding).
-                (count > 0 || self.store.has_content(&cid)).then_some((cid, count, pinned))
-            })
-            .collect();
+        // TTL-aware PER-CID scheduling: re-announce a record only when it is DUE (past the
+        // republish window for its DHT TTL), not every cycle. Steady-state → near-zero
+        // re-announces; startup/restart (empty schedule) → refresh everything once.
+        let now = self.now_millis();
+        let records: Vec<(Cid, u32, bool)> = {
+            let sched = self.announced_at.lock().expect("announced_at");
+            self.store
+                .cids()
+                .into_iter()
+                .filter_map(|cid| {
+                    let due = sched
+                        .get(&cid.0)
+                        .is_none_or(|t| now.saturating_sub(*t) >= REPUBLISH_MS);
+                    if !due {
+                        return None;
+                    }
+                    let count = self.store.piece_count(&cid) as u32;
+                    let pinned = self.store.is_pinned(&cid);
+                    (count > 0 || self.store.has_content(&cid)).then_some((cid, count, pinned))
+                })
+                .collect()
+        };
+        let due: Vec<Cid> = records.iter().map(|(c, _, _)| *c).collect();
         let results =
             futures::future::join_all(records.into_iter().map(|(cid, count, pinned)| async move {
                 self.routing.announce(cid, count, pinned).await.is_ok()
             }))
             .await;
+        {
+            let mut sched = self.announced_at.lock().expect("announced_at");
+            for (cid, ok) in due.iter().zip(&results) {
+                if *ok {
+                    sched.insert(cid.0, now);
+                }
+            }
+        }
         let announced = results.iter().filter(|ok| **ok).count();
-        // Re-announce WANT interest (keep-alive intent survives TTL/restart), concurrently.
+        // WANT interest (the node's own wants — few); re-announce each cycle (cheap).
         futures::future::join_all(
             self.store
                 .wanted_cids()
@@ -1184,10 +1217,24 @@ impl ObjEngine {
         // The set of CIDs the network WANTs — content outside it (and unpinned,
         // undemanded) is left to fade (FADE: absence of repair).
 
-        // Pre-resolve every held cid's providers CONCURRENTLY — the per-cid tracker resolve
-        // (186 sequential round-trips) was the last network cost that kept a pass at ~130s.
+        // ROTATING incremental scan: resolve a bounded BATCH of held cids per pass, advancing
+        // a cursor, so each cid is covered over several passes instead of resolving ALL every
+        // time. Per-pass DHT gets are bounded by HEALTH_BATCH (this used to be O(N)/pass).
+        let all = self.store.cids();
+        let all_len = all.len();
+        let batch: Vec<Cid> = if all.is_empty() {
+            Vec::new()
+        } else {
+            let mut cur = self.scan_cursor.lock().expect("scan_cursor");
+            let start = *cur % all.len();
+            let take = HEALTH_BATCH.min(all.len());
+            *cur = start + take;
+            all.iter().cycle().skip(start).take(take).cloned().collect()
+        };
+        let batch_ids: HashSet<[u8; 32]> = batch.iter().map(|c| c.0).collect();
+        let mut batch_at_risk: HashSet<[u8; 32]> = HashSet::new();
         let resolved =
-            futures::future::join_all(self.store.cids().into_iter().map(|cid| async move {
+            futures::future::join_all(batch.into_iter().map(|cid| async move {
                 (cid, self.routing.resolve(cid).await.unwrap_or_default())
             }))
             .await;
@@ -1307,6 +1354,7 @@ impl ObjEngine {
                 report.fading += 1;
                 continue;
             }
+            batch_at_risk.insert(cid.0);
             report.at_risk += 1;
 
             // Only a capable holder can repair; rendezvous-elect exactly one so
@@ -1335,6 +1383,20 @@ impl ObjEngine {
                 report.repaired += 1;
             }
         }
+        // Roll this batch's verdict into the persistent at-risk set (add newly at-risk, clear
+        // those in the batch that are now healthy); report the full-set estimate + total held.
+        {
+            let mut ids = self.at_risk_ids.lock().expect("at_risk_ids");
+            for cid in &batch_ids {
+                if batch_at_risk.contains(cid) {
+                    ids.insert(*cid);
+                } else {
+                    ids.remove(cid);
+                }
+            }
+            report.at_risk = ids.len();
+        }
+        report.scanned = all_len;
         report
     }
 
