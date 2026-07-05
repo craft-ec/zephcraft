@@ -587,6 +587,7 @@ async function loadAttestation(){
       <div class="kv"><span>registry</span><b>${esc(j.registry||"app registry")} ${modeChip}</b></div>
       <div class="kv"><span>authority</span><b>${esc(j.model)}</b></div>
       <div class="kv"><span>committee</span><b>${c.eligible||1} eligible \u00b7 k=${c.k||1} of n=${c.n||1}</b></div>
+      ${j.chain&&j.chain.checkpoints?`<div class="kv"><span>committee chain</span><b>${j.chain.checkpoints} checkpoints \u00b7 epoch ${j.chain.epoch} \u00b7 committee ${j.chain.committee_size}</b></div>`:''}
       <div class="kv"><span>registered heads</span><b>${j.entries!=null?j.entries:0}</b></div>
       <div class="kv"><span>app-registry root</span><span class="mono" onclick="copyCid('${j.app_registry_root||''}')" title="copy">${(j.app_registry_root||'').slice(0,16)}\u2026</span></div>
       <div class="kv"><span>registry account (PDA)</span><span class="mono" onclick="copyCid('${j.registry_account}')" title="copy">${(j.registry_account||'').slice(0,16)}\u2026</span></div>
