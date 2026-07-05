@@ -215,19 +215,12 @@ impl CraftSql {
     /// node, and every page object — into the local store (each verified by CID),
     /// so the sync VFS can then read locally. Walks the tree so only the DB's
     /// live pages are fetched.
-    async fn sync_reachable(
-        &self,
-        owner: NodeId,
-        root: Cid,
-        fetch_pages: bool,
-        local_only: bool,
-    ) -> Result<()> {
-        if self.source.is_none() && !local_only {
+    async fn sync_reachable(&self, owner: NodeId, root: Cid, fetch_pages: bool) -> Result<()> {
+        let Some(source) = &self.source else {
             return Ok(());
-        }
+        };
         let store = ObjectStore::open(&self.store_dir)?;
-        let src: Option<&dyn PageSource> =
-            if local_only { None } else { self.source.as_ref().map(|s| s.as_ref()) };
+        let src = source.as_ref();
         let root_bytes = ensure(&store, src, owner, root).await?;
         let ri = crate::pager::decode_root(&root_bytes)?;
         if ri.depth == 0 {
@@ -390,36 +383,23 @@ impl CraftSql {
         private_hint: bool,
     ) -> Result<CraftDb> {
         let key = format!("{}_{}", &owner.to_hex()[..16], namespace);
-        // Resolve the head. Reading our OWN db, we trust the LOCAL sidecar (authoritative
-        // + present locally) and never fetch our own pages over the network — a stale
-        // tracker head or an interrupted write would otherwise lock the owner out of its
-        // own db, and fetching our own pages would try to connect to ourself.
-        let own_reader = !writable && owner == self.owner;
-        let head = if own_reader {
-            let m = load_manifest(&self.store_dir, &key);
-            match m.last_root {
-                Some(r) => Some((Cid(r), m.seq)),
-                None => self.heads.resolve(owner, namespace).await?,
+        // Resolve the authoritative head. If the tracker lost it (restart) and
+        // this is our own DB, recover it from the local sidecar so the owner is
+        // never locked out of its own database by tracker liveness.
+        let head = match self.heads.resolve(owner, namespace).await? {
+            Some(rs) => Some(rs),
+            None if writable => {
+                let m = load_manifest(&self.store_dir, &key);
+                m.last_root.map(|r| (Cid(r), m.seq))
             }
-        } else {
-            match self.heads.resolve(owner, namespace).await? {
-                Some(rs) => Some(rs),
-                None if writable => {
-                    let m = load_manifest(&self.store_dir, &key);
-                    m.last_root.map(|r| (Cid(r), m.seq))
-                }
-                None => None,
-            }
+            None => None,
         };
         let seq = match head {
             Some((root, seq)) => {
-                if own_reader {
-                    // Our own db: verify the reachable set is present LOCALLY (no network).
-                    self.sync_reachable(owner, root, true, true).await?;
-                } else if !writable && self.source.is_some() {
-                    // Lazy reader of ANOTHER owner's db: sync the (tiny) index; pull page
-                    // contents on demand as the query touches them.
-                    self.sync_reachable(owner, root, false, false).await?;
+                if !writable && self.source.is_some() {
+                    // Lazy reader: sync only the (tiny) index; pull page contents
+                    // on demand as the query touches them.
+                    self.sync_reachable(owner, root, false).await?;
                     let fetcher = self.spawn_fetcher(owner);
                     self.fetchers
                         .lock()
@@ -427,7 +407,7 @@ impl CraftSql {
                         .insert(key.clone(), fetcher);
                 } else {
                     // Writer (all local) or source-less: ensure everything present.
-                    self.sync_reachable(owner, root, true, false).await?;
+                    self.sync_reachable(owner, root, true).await?;
                 }
                 self.roots
                     .lock()
@@ -719,17 +699,13 @@ fn save_manifest(store_dir: &Path, key: &str, m: &GenManifest) -> Result<()> {
 /// source if missing. Returns its bytes.
 async fn ensure(
     store: &ObjectStore,
-    source: Option<&dyn PageSource>,
+    source: &dyn PageSource,
     owner: NodeId,
     cid: Cid,
 ) -> Result<Vec<u8>> {
     if let Some(b) = store.get(&cid) {
         return Ok(b);
     }
-    // Local-only (reading our OWN db): a missing page is a clean error, never a network
-    // fetch — fetching our own pages would try to connect to ourself.
-    let source = source
-        .ok_or_else(|| SqlError::CorruptIndex(format!("missing local object {}", cid.to_hex())))?;
     let bytes = source
         .fetch(owner, cid)
         .await?
