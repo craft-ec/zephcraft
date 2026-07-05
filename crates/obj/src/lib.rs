@@ -101,6 +101,8 @@ pub struct HealthReport {
     pub degraded: usize,
     /// At-risk CIDs left to FADE this pass (nothing wants them — no repair).
     pub fading: usize,
+    /// Retained copies dropped this pass because they are now durable on >= k peers.
+    pub offloaded: usize,
 }
 
 /// One Distribution pass' outcome.
@@ -437,11 +439,45 @@ impl ObjEngine {
             let _ = self.routing.announce(cid, 0, true).await;
         }
 
+        // DURABILITY GATE. The first distribution is the critical moment: if it lands
+        // fewer than `durability_threshold` distinct peers (a commit into a no-peer
+        // window, an under-sized cluster, or partial push failures), the content must NOT
+        // be left with zero recoverable copies. The publisher RETAINS its own copy so at
+        // least one always exists; the health scan then re-mints pieces from it and keeps
+        // redistributing to fresh peers until it is durable. The retained copy is kept
+        // ALIVE the way its class already is — system content by its marker, pinned
+        // content by its pin, anything else by an explicit want — so it never fades before
+        // it is safe. (Without this, a `pin=false` publish with no peers kept nothing and
+        // was silently, permanently lost.)
+        // The publisher RETAINS its own copy of everything it publishes and keeps it
+        // ALIVE (system content by its marker, pinned content by its pin, anything else by
+        // an explicit want). The health scan then gradually distributes pieces to peers as
+        // they come online and repairs until the content is durable on enough distinct
+        // nodes. This makes the first distribution safe: a commit into a no-peer window (or
+        // an under-sized cluster) is never left with zero copies — the publisher holds it
+        // and it heals as the network grows. (A durable copy on the publisher is offloaded
+        // only once >= k distinct peers confirm holding it — see health_scan.)
+        if !self.store.has_content(&cid) {
+            self.store.put_content(cid, data, false)?;
+        }
+        if !system && !pin {
+            self.store.set_want(cid)?;
+        }
+        let durable = distinct.len() >= self.config.durability_threshold;
+        if !durable {
+            tracing::warn!(
+                cid = %cid.to_hex(),
+                distinct_peers = distinct.len(),
+                threshold = self.config.durability_threshold,
+                "publish not yet durable — retained locally; health scan will redistribute"
+            );
+        }
+
         Ok(PublishReport {
             cid,
             pieces_pushed: pushed,
             distinct_peers: distinct.len(),
-            durable: distinct.len() >= self.config.durability_threshold,
+            durable,
             pinned: pin,
         })
     }
@@ -1134,6 +1170,25 @@ impl ObjEngine {
                         capable.push(me);
                     }
                 }
+            }
+
+            // OFFLOAD (tail of the durability gate): a copy we retained for durability —
+            // we hold the whole content, but it is NOT user-pinned or user-wanted — may be
+            // dropped ONLY once the network holds the FULL baseline erasure set on OTHER
+            // nodes: >= `floor` (= target_pieces(k) = n) coded pieces across live peers.
+            // Releasing merely at k distinct holders is zero-margin — each could hold a
+            // single piece, and losing one node would drop below the decode threshold.
+            // Requiring the full erasure set means peers can lose n - k pieces and still
+            // reconstruct (and repair among themselves) before we ever drop out.
+            let have_others: usize = live.iter().map(|(_, _, c, _)| *c as usize).sum();
+            if self.store.has_content(&cid)
+                && !self.store.is_pinned(&cid)
+                && !self.store.is_wanted(&cid)
+                && have_others >= floor
+            {
+                let _ = self.store.forget(&cid);
+                report.offloaded += 1;
+                continue;
             }
 
             // The distributed floor is maintained REGARDLESS of pins (a pin is

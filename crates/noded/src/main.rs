@@ -1411,14 +1411,20 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                             r.fading,
                         )
                         .await;
-                        if r.repaired > 0 || d.moved > 0 || sc.scaled > 0 || r.degraded > 0 {
+                        if r.repaired > 0
+                            || d.moved > 0
+                            || sc.scaled > 0
+                            || r.degraded > 0
+                            || r.offloaded > 0
+                        {
                             tracing::info!(
                                 at_risk = r.at_risk,
                                 repaired = r.repaired,
                                 moved = d.moved,
                                 scaled = sc.scaled,
                                 degraded = r.degraded,
-                                "lifecycle: repair / distribute / scale / degrade"
+                                offloaded = r.offloaded,
+                                "lifecycle: repair / distribute / scale / degrade / offload"
                             );
                         }
                         Ok(())
