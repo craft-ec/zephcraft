@@ -57,8 +57,9 @@ pub struct AttestedRuntime {
     engine: Engine,
 }
 
-/// Per-run context: the request bytes in, the committed output out.
+/// Per-run context: the prior state + request bytes in, the committed output out.
 struct AttestCtx {
+    prev_state: Vec<u8>,
     input: Vec<u8>,
     output: Vec<u8>,
 }
@@ -82,10 +83,24 @@ impl AttestedRuntime {
         request: &[u8],
         fuel: u64,
     ) -> anyhow::Result<Vec<u8>> {
+        self.run_transition(wasm, func, &[], request, fuel)
+    }
+
+    /// Run a state-transition program: the prior state is exposed via the `state` host
+    /// function, the request via `input`. The output is what the program commits.
+    pub fn run_transition(
+        &self,
+        wasm: &[u8],
+        func: &str,
+        prev_state: &[u8],
+        request: &[u8],
+        fuel: u64,
+    ) -> anyhow::Result<Vec<u8>> {
         let module = Module::new(&self.engine, wasm)?;
         let mut store = Store::new(
             &self.engine,
             AttestCtx {
+                prev_state: prev_state.to_vec(),
                 input: request.to_vec(),
                 output: Vec::new(),
             },
@@ -597,6 +612,44 @@ fn bind_deterministic(linker: &mut Linker<AttestCtx>) -> anyhow::Result<()> {
             n
         },
     )?;
+    linker.func_wrap(
+        ATTEST_MODULE,
+        "state",
+        |mut caller: Caller<'_, AttestCtx>, out: i32, cap: i32| -> i32 {
+            let ps = caller.data().prev_state.clone();
+            let Some(mem) = det_memory(&mut caller) else {
+                return -1;
+            };
+            det_write(&mut caller, &mem, out, cap, &ps)
+        },
+    )?;
+    // Deterministic ed25519 verification — the one crypto primitive an attested program
+    // needs (e.g. the registry program checking an owner's signed submission). Reads a
+    // 32-byte pubkey, `msg_len` message bytes, and a 64-byte signature from guest memory;
+    // returns 1 if valid, else 0. Verification is deterministic, so it's safe here.
+    linker.func_wrap(
+        ATTEST_MODULE,
+        "ed25519_verify",
+        |mut caller: Caller<'_, AttestCtx>, pk: i32, msg: i32, msg_len: i32, sig: i32| -> i32 {
+            let Some(mem) = det_memory(&mut caller) else {
+                return 0;
+            };
+            let (Some(pk), Some(m), Some(s)) = (
+                det_read(&caller, &mem, pk, 32),
+                det_read(&caller, &mem, msg, msg_len),
+                det_read(&caller, &mem, sig, 64),
+            ) else {
+                return 0;
+            };
+            let (Ok(pk), Ok(s)) = (
+                <[u8; 32]>::try_from(pk.as_slice()),
+                <[u8; 64]>::try_from(s.as_slice()),
+            ) else {
+                return 0;
+            };
+            i32::from(NodeIdentity::verify(&NodeId(pk), &m, &s))
+        },
+    )?;
     Ok(())
 }
 
@@ -615,6 +668,42 @@ mod tests {
         (i32.store8 (i32.const 100) (i32.load8_u (i32.const 0)))
         (i32.store8 (i32.const 101) (i32.mul (i32.load8_u (i32.const 0)) (i32.const 2)))
         (drop (call $commit (i32.const 100) (i32.const 2)))))"#;
+
+    // Reads input = pubkey(32) | msg(4) | sig(64); commits [ed25519_verify result].
+    const VERIFY_WAT: &[u8] = br#"(module
+      (import "craftcom" "input"  (func $input  (param i32 i32) (result i32)))
+      (import "craftcom" "commit" (func $commit (param i32 i32) (result i32)))
+      (import "craftcom" "ed25519_verify" (func $verify (param i32 i32 i32 i32) (result i32)))
+      (memory (export "memory") 1)
+      (func (export "run")
+        (drop (call $input (i32.const 0) (i32.const 200)))
+        (i32.store8 (i32.const 300)
+          (call $verify (i32.const 0) (i32.const 32) (i32.const 4) (i32.const 36)))
+        (drop (call $commit (i32.const 300) (i32.const 1)))))"#;
+
+    #[test]
+    fn ed25519_verify_host_function() {
+        let rt = AttestedRuntime::new().unwrap();
+        let id = NodeIdentity::generate();
+        let msg = [1u8, 2, 3, 4];
+        let sig = id.sign(&msg);
+        let mut input = Vec::new();
+        input.extend_from_slice(&id.node_id().0);
+        input.extend_from_slice(&msg);
+        input.extend_from_slice(&sig);
+        assert_eq!(
+            rt.run(VERIFY_WAT, "run", &input, DEFAULT_FUEL).unwrap(),
+            vec![1],
+            "a valid signature verifies inside the sandbox"
+        );
+        let mut bad = input.clone();
+        bad[36] ^= 0xFF; // corrupt the signature
+        assert_eq!(
+            rt.run(VERIFY_WAT, "run", &bad, DEFAULT_FUEL).unwrap(),
+            vec![0],
+            "a tampered signature is rejected"
+        );
+    }
 
     fn agents(n: usize) -> Vec<NodeIdentity> {
         (0..n).map(|_| NodeIdentity::generate()).collect()

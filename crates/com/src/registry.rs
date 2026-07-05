@@ -173,6 +173,15 @@ pub fn registry_program_cid() -> [u8; 32] {
     Cid::of(b"craftec/program/registry/1").0
 }
 
+/// The app-name registry compiled to WASM (governance-upgradeable). Governance sets
+/// `app-registry` to [`registry_wasm_cid`] to run THIS instead of the native program.
+pub const REGISTRY_WASM: &[u8] = include_bytes!("../registry.wasm");
+
+/// Content cid of [`REGISTRY_WASM`].
+pub fn registry_wasm_cid() -> [u8; 32] {
+    Cid::of(REGISTRY_WASM).0
+}
+
 /// The seed for the registry PDA account (so `pda(registry_program_cid(), REGISTRY_SEED)`
 /// is the account whose head advances as the registry).
 pub const REGISTRY_SEED: &[u8] = b"apps";
@@ -436,5 +445,53 @@ mod tests {
         let s2 = s.set("app-registry", [9u8; 32], 2).unwrap();
         assert_eq!(s2.resolve("app-registry"), Some([9u8; 32]));
         assert_ne!(s.root(), s2.root());
+    }
+
+    #[test]
+    fn wasm_registry_matches_native() {
+        use crate::AttestedRuntime;
+        let rt = AttestedRuntime::new().unwrap();
+        let publisher = id();
+        let sub = HeadSubmission::sign(&publisher, "feed", [1u8; 32], 1);
+        let prev = RegistryState::default();
+        // Run the WASM registry over (prev_state, submission).
+        let out = rt
+            .run_transition(
+                REGISTRY_WASM,
+                "run",
+                &prev.encode(),
+                &sub.encode(),
+                crate::DEFAULT_FUEL,
+            )
+            .expect("wasm runs");
+        let wasm_state = RegistryState::decode(&out).expect("wasm output decodes as RegistryState");
+        // It must equal the NATIVE transition, byte for byte.
+        let native = prev.apply(&sub).unwrap();
+        assert_eq!(wasm_state, native, "wasm registry == native registry");
+        assert_eq!(
+            wasm_state
+                .resolve(&publisher.node_id().0, "feed")
+                .unwrap()
+                .cid,
+            [1u8; 32]
+        );
+    }
+
+    #[test]
+    fn wasm_registry_rejects_a_forged_submission() {
+        use crate::AttestedRuntime;
+        let rt = AttestedRuntime::new().unwrap();
+        let mut sub = HeadSubmission::sign(&id(), "feed", [1u8; 32], 1);
+        sub.cid = [9u8; 32]; // break the signature
+        let out = rt
+            .run_transition(
+                REGISTRY_WASM,
+                "run",
+                &[],
+                &sub.encode(),
+                crate::DEFAULT_FUEL,
+            )
+            .unwrap();
+        assert!(out.is_empty(), "a bad signature commits nothing");
     }
 }

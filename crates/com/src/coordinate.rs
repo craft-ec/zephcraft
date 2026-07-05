@@ -18,8 +18,8 @@ use zeph_obj::{ConsumeMode, ObjEngine};
 use zeph_transport::{Connection, PeerAddr, Transport};
 
 use crate::{
-    attest_run, attest_transition, verify_quorum, Attestation, AttestedCommit, AttestedRuntime,
-    Committee, DEFAULT_FUEL,
+    attest_transition, verify_quorum, Attestation, AttestedCommit, AttestedRuntime, Committee,
+    DEFAULT_FUEL,
 };
 
 /// ALPN for attestation requests.
@@ -138,17 +138,24 @@ impl AttestService {
             }
             _ => raw,
         };
-        let (att, _output) = attest_run(
-            &self.identity,
-            &self.runtime,
+        anyhow::ensure!(
+            req.prev_state.is_empty() || Cid::of(&req.prev_state).0 == req.prev_root,
+            "prev_state does not hash to prev_root"
+        );
+        let output = self.runtime.run_transition(
             &wasm,
             &req.func,
-            req.program_cid,
-            req.prev_root,
+            &req.prev_state,
             &req.request,
             DEFAULT_FUEL,
         )?;
-        Ok(att)
+        Ok(attest_transition(
+            &self.identity,
+            req.program_cid,
+            req.prev_root,
+            &req.request,
+            &output,
+        ))
     }
 }
 

@@ -49,8 +49,8 @@ pub use craft::CraftBackend;
 pub use gov::{GovAction, GovSignature, GovernanceApproval, GovernanceProposal, GovernanceSet};
 pub use invoke::{invoke_remote, serve_invocations, InvokeRequest, InvokeService, INVOKE_ALPN};
 pub use registry::{
-    registry_program_cid, HeadEntry, HeadSubmission, ProgramRegistryState, RegistryProgram,
-    RegistryState, REGISTRY_SEED,
+    registry_program_cid, registry_wasm_cid, HeadEntry, HeadSubmission, ProgramRegistryState,
+    RegistryProgram, RegistryState, REGISTRY_SEED, REGISTRY_WASM,
 };
 
 /// Default fuel budget per invocation — roughly proportional to executed WASM

@@ -9,6 +9,7 @@ members = [
     "apps/*",
     "tests",
 ]
+exclude = ["apps/registry-wasm"]
 
 [workspace.package]
 version = "0.1.0"
