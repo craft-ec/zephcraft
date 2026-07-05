@@ -111,5 +111,4 @@ impl GovernanceStore {
         *guard = next.clone();
         Ok(next)
     }
-
 }
