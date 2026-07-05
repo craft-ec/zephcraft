@@ -1,0 +1,430 @@
+//! `DhtRouting` — the `ContentRouting` implementation backed by the Kademlia DHT
+//! (`zeph-dht`) instead of the central tracker. Each routing record maps to a DHT key/value:
+//!
+//! - **provider / want / meta** — keyed by the CID (namespaced per kind), one signed record
+//!   per publisher, all coexisting (many providers per CID). `seq` is a wall-clock stamp so
+//!   re-announces (and 22h republishes) always advance and refresh; a withdraw stores an
+//!   empty tombstone that supersedes and is skipped on read.
+//! - **root / app / manifest** — owner-keyed heads, **highest-seq/version wins** (no strict
+//!   CAS; a DHT has no single authority — foundation §62). The key embeds the owner and reads
+//!   filter to the owner's own signature, so only the owner can advance their head.
+//!
+//! Census + enumeration (`nodes`/`relays`/`content`/`wanted_cids`) are NOT DHT-native: a DHT
+//! can't list all keys or all nodes. Those stay on the tracker (composed in P4); here they
+//! return empty. Fade moves to per-CID want lookups (P5).
+
+use async_trait::async_trait;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use zeph_core::{Cid, NodeId};
+use zeph_dht::DhtNode;
+
+use crate::records::{
+    AppPayload, ManifestPayload, MetaPayload, ProviderPayload, RootPayload, WantPayload, KIND_APP,
+    KIND_MANIFEST, KIND_META, KIND_PROVIDER, KIND_ROOT, KIND_WANT,
+};
+use crate::{
+    AppRecord, ContentEntry, ContentRouting, ManifestRecord, MetaRecord, NodePayload, RelayPayload,
+    Result, RootRecord,
+};
+
+/// Content routing over the DHT.
+pub struct DhtRouting {
+    dht: Arc<DhtNode>,
+    self_addr: String,
+    /// Monotonic freshness counter for re-announceable records (provider/want/meta): tracks
+    /// wall-clock ms but always advances, so a same-millisecond re-announce or withdraw is
+    /// never rejected as an equal seq.
+    seq: AtomicU64,
+}
+
+impl DhtRouting {
+    pub fn new(dht: Arc<DhtNode>) -> Self {
+        let self_addr = dht.contact().addr.to_string();
+        Self {
+            dht,
+            self_addr,
+            seq: AtomicU64::new(now_millis()),
+        }
+    }
+
+    /// Next freshness seq: monotonic and roughly wall-clock, so re-announces/withdraws in the
+    /// same millisecond still strictly advance.
+    fn next_seq(&self) -> u64 {
+        let now = now_millis();
+        let mut cur = self.seq.load(Ordering::SeqCst);
+        loop {
+            let next = (cur + 1).max(now);
+            match self
+                .seq
+                .compare_exchange_weak(cur, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return next,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// DHT key for a per-CID record kind (provider/want/meta) — namespaced so kinds under
+    /// the same CID never collide.
+    fn cid_key(kind: u8, cid: &Cid) -> [u8; 32] {
+        let mut b = Vec::with_capacity(1 + 32);
+        b.push(kind);
+        b.extend_from_slice(&cid.0);
+        Cid::of(&b).0
+    }
+
+    /// DHT key for an owner-keyed head (root/app/manifest): kind ‖ owner ‖ name.
+    fn owned_key(kind: u8, owner: &[u8; 32], name: &str) -> [u8; 32] {
+        let mut b = Vec::with_capacity(1 + 32 + name.len());
+        b.push(kind);
+        b.extend_from_slice(owner);
+        b.extend_from_slice(name.as_bytes());
+        Cid::of(&b).0
+    }
+
+    fn me(&self) -> [u8; 32] {
+        self.dht.contact().id.0
+    }
+
+    async fn put(&self, key: [u8; 32], value: Vec<u8>, seq: u64) {
+        self.dht.put(key, seq, value).await;
+    }
+}
+
+#[async_trait]
+impl ContentRouting for DhtRouting {
+    // ---- provider records --------------------------------------------------------
+
+    async fn announce(&self, cid: Cid, piece_count: u32, pinned: bool) -> Result<()> {
+        let payload = ProviderPayload {
+            cid: cid.0,
+            piece_count,
+            addr: self.self_addr.clone(),
+            pinned,
+        };
+        let value = postcard::to_allocvec(&payload).expect("provider payload serializes");
+        self.put(Self::cid_key(KIND_PROVIDER, &cid), value, self.next_seq())
+            .await;
+        Ok(())
+    }
+
+    async fn resolve(&self, cid: Cid) -> Result<Vec<crate::ProviderRecord>> {
+        let recs = self.dht.get(Self::cid_key(KIND_PROVIDER, &cid)).await;
+        Ok(recs
+            .into_iter()
+            .filter_map(|r| {
+                let p: ProviderPayload = postcard::from_bytes(&r.value).ok()?;
+                let addr = p.addr.parse().ok()?;
+                Some(crate::ProviderRecord {
+                    node_id: NodeId(r.publisher),
+                    addr,
+                    piece_count: p.piece_count,
+                    pinned: p.pinned,
+                })
+            })
+            .collect())
+    }
+
+    async fn withdraw(&self, cid: Cid) -> Result<()> {
+        // Tombstone: an empty value at a fresh seq supersedes our provider record; readers
+        // fail to decode it and skip us. TTL reclaims it.
+        self.put(
+            Self::cid_key(KIND_PROVIDER, &cid),
+            Vec::new(),
+            self.next_seq(),
+        )
+        .await;
+        Ok(())
+    }
+
+    // ---- want signals ------------------------------------------------------------
+
+    async fn announce_want(&self, cid: Cid) -> Result<()> {
+        let value = postcard::to_allocvec(&WantPayload { cid: cid.0 }).expect("want serializes");
+        self.put(Self::cid_key(KIND_WANT, &cid), value, self.next_seq())
+            .await;
+        Ok(())
+    }
+
+    async fn withdraw_want(&self, cid: Cid) -> Result<()> {
+        self.put(Self::cid_key(KIND_WANT, &cid), Vec::new(), self.next_seq())
+            .await;
+        Ok(())
+    }
+
+    /// A DHT cannot enumerate all wanted CIDs. Fade moves to per-CID want lookups (P5); this
+    /// returns empty rather than a partial-and-misleading list.
+    async fn wanted_cids(&self) -> Result<Vec<Cid>> {
+        Ok(Vec::new())
+    }
+
+    // ---- editable metadata -------------------------------------------------------
+
+    async fn announce_meta(
+        &self,
+        cid: Cid,
+        published_at: u64,
+        comment: Option<String>,
+    ) -> Result<()> {
+        let payload = MetaPayload {
+            cid: cid.0,
+            published_at,
+            comment,
+        };
+        let value = postcard::to_allocvec(&payload).expect("meta serializes");
+        self.put(Self::cid_key(KIND_META, &cid), value, self.next_seq())
+            .await;
+        Ok(())
+    }
+
+    async fn withdraw_meta(&self, cid: Cid) -> Result<()> {
+        self.put(Self::cid_key(KIND_META, &cid), Vec::new(), self.next_seq())
+            .await;
+        Ok(())
+    }
+
+    async fn metas(&self, cid: Cid) -> Result<Vec<MetaRecord>> {
+        let recs = self.dht.get(Self::cid_key(KIND_META, &cid)).await;
+        Ok(recs
+            .into_iter()
+            .filter_map(|r| {
+                let p: MetaPayload = postcard::from_bytes(&r.value).ok()?;
+                Some(MetaRecord {
+                    publisher: NodeId(r.publisher),
+                    published_at: p.published_at,
+                    comment: p.comment,
+                })
+            })
+            .collect())
+    }
+
+    // ---- owner-keyed heads (highest-seq-wins) ------------------------------------
+
+    async fn publish_root(
+        &self,
+        namespace: &str,
+        root_cid: Cid,
+        prev_cid: Option<Cid>,
+        seq: u64,
+    ) -> Result<()> {
+        let payload = RootPayload {
+            namespace: namespace.to_string(),
+            root_cid: root_cid.0,
+            prev_cid: prev_cid.map(|c| c.0).unwrap_or([0u8; 32]),
+            seq,
+        };
+        let value = postcard::to_allocvec(&payload).expect("root serializes");
+        self.put(
+            Self::owned_key(KIND_ROOT, &self.me(), namespace),
+            value,
+            seq,
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn resolve_root(&self, owner: NodeId, namespace: &str) -> Result<Option<RootRecord>> {
+        let recs = self
+            .dht
+            .get(Self::owned_key(KIND_ROOT, &owner.0, namespace))
+            .await;
+        Ok(recs
+            .into_iter()
+            .filter(|r| r.publisher == owner.0) // only the owner's signed head counts
+            .filter_map(|r| postcard::from_bytes::<RootPayload>(&r.value).ok())
+            .max_by_key(|p| p.seq)
+            .map(|p| RootRecord {
+                owner,
+                namespace: p.namespace,
+                root_cid: Cid(p.root_cid),
+                seq: p.seq,
+            }))
+    }
+
+    async fn withdraw_root(&self, namespace: &str) -> Result<()> {
+        // Tombstone at current_version + 1 so it supersedes, and a later publish can still
+        // advance past it. (Head seqs are small versions, not wall-clock stamps.)
+        let owner = NodeId(self.me());
+        let cur = self
+            .resolve_root(owner, namespace)
+            .await?
+            .map(|r| r.seq)
+            .unwrap_or(0);
+        self.put(
+            Self::owned_key(KIND_ROOT, &self.me(), namespace),
+            Vec::new(),
+            cur + 1,
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn announce_app(&self, name: &str, wasm_cid: Cid, version: u64) -> Result<()> {
+        let payload = AppPayload {
+            name: name.to_string(),
+            wasm_cid: wasm_cid.0,
+            version,
+        };
+        let value = postcard::to_allocvec(&payload).expect("app serializes");
+        self.put(Self::owned_key(KIND_APP, &self.me(), name), value, version)
+            .await;
+        Ok(())
+    }
+
+    async fn resolve_app(&self, publisher: NodeId, name: &str) -> Result<Option<AppRecord>> {
+        let recs = self
+            .dht
+            .get(Self::owned_key(KIND_APP, &publisher.0, name))
+            .await;
+        Ok(recs
+            .into_iter()
+            .filter(|r| r.publisher == publisher.0)
+            .filter_map(|r| postcard::from_bytes::<AppPayload>(&r.value).ok())
+            .max_by_key(|p| p.version)
+            .map(|p| AppRecord {
+                publisher,
+                name: p.name,
+                wasm_cid: Cid(p.wasm_cid),
+                version: p.version,
+            }))
+    }
+
+    async fn publish_manifest(&self, namespace: &str, manifest_cid: Cid, seq: u64) -> Result<()> {
+        let payload = ManifestPayload {
+            namespace: namespace.to_string(),
+            manifest_cid: manifest_cid.0,
+            seq,
+        };
+        let value = postcard::to_allocvec(&payload).expect("manifest serializes");
+        self.put(
+            Self::owned_key(KIND_MANIFEST, &self.me(), namespace),
+            value,
+            seq,
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn resolve_manifest(
+        &self,
+        owner: NodeId,
+        namespace: &str,
+    ) -> Result<Option<ManifestRecord>> {
+        let recs = self
+            .dht
+            .get(Self::owned_key(KIND_MANIFEST, &owner.0, namespace))
+            .await;
+        Ok(recs
+            .into_iter()
+            .filter(|r| r.publisher == owner.0)
+            .filter_map(|r| postcard::from_bytes::<ManifestPayload>(&r.value).ok())
+            .max_by_key(|p| p.seq)
+            .map(|p| ManifestRecord {
+                owner,
+                namespace: p.namespace,
+                manifest_cid: Cid(p.manifest_cid),
+                seq: p.seq,
+            }))
+    }
+
+    // ---- census + enumeration: NOT DHT-native (served by the tracker in the composite) --
+
+    async fn nodes(&self) -> Result<Vec<(NodeId, NodePayload)>> {
+        Ok(Vec::new())
+    }
+    async fn relays(&self) -> Result<Vec<RelayPayload>> {
+        Ok(Vec::new())
+    }
+    async fn announce_node_registry(&self, _used_bytes: u64, _capacity_bytes: u64) -> Result<()> {
+        Ok(())
+    }
+    async fn announce_relay_registry(&self, _relay_url: String) -> Result<()> {
+        Ok(())
+    }
+    async fn content(&self) -> Result<Vec<ContentEntry>> {
+        Ok(Vec::new())
+    }
+}
+
+/// Wall-clock milliseconds since the epoch.
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+    use zeph_crypto::NodeIdentity;
+    use zeph_dht::Contact;
+    use zeph_transport::{Reach, Transport};
+
+    async fn node() -> (Arc<DhtNode>, Contact) {
+        let id = Arc::new(NodeIdentity::generate());
+        let transport = Arc::new(
+            Transport::bind(
+                id.secret_key_bytes(),
+                Reach::LocalOnly,
+                vec![zeph_dht::ALPN.to_vec()],
+                0,
+            )
+            .await
+            .expect("bind"),
+        );
+        let n = DhtNode::new(id, transport.clone(), 3_600_000);
+        let (tx, rx) = mpsc::channel(64);
+        let t = transport.clone();
+        tokio::spawn(async move { t.serve(vec![(zeph_dht::ALPN.to_vec(), tx)]).await });
+        n.clone().serve(rx);
+        let c = n.contact();
+        (n, c)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn providers_and_heads_route_over_the_dht() {
+        let (_seed, seed_c) = node().await;
+        let (a_n, _) = node().await;
+        a_n.bootstrap(vec![seed_c.clone()]).await;
+        let (b_n, _) = node().await;
+        b_n.bootstrap(vec![seed_c.clone()]).await;
+        let a = DhtRouting::new(a_n.clone());
+        let b = DhtRouting::new(b_n.clone());
+        let owner = a_n.contact().id;
+
+        // A announces itself as a provider; B resolves and finds A (dialable, with counts).
+        let cid = Cid([7u8; 32]);
+        a.announce(cid, 5, true).await.unwrap();
+        let providers = b.resolve(cid).await.unwrap();
+        assert_eq!(providers.len(), 1, "one provider");
+        assert_eq!(providers[0].node_id, owner);
+        assert_eq!(providers[0].piece_count, 5);
+        assert!(providers[0].pinned);
+
+        // Owner-keyed head: highest-seq-wins across two publishes.
+        a.publish_root("db", Cid([1u8; 32]), None, 1).await.unwrap();
+        a.publish_root("db", Cid([2u8; 32]), Some(Cid([1u8; 32])), 2)
+            .await
+            .unwrap();
+        let root = b.resolve_root(owner, "db").await.unwrap().expect("root");
+        assert_eq!(root.seq, 2);
+        assert_eq!(root.root_cid, Cid([2u8; 32]));
+
+        // Withdraw removes A as a provider.
+        a.withdraw(cid).await.unwrap();
+        assert!(
+            b.resolve(cid).await.unwrap().is_empty(),
+            "withdrawn provider is gone"
+        );
+
+        // A second, independent provider coexists under the same CID.
+        let cid2 = Cid([9u8; 32]);
+        a.announce(cid2, 2, false).await.unwrap();
+        b.announce(cid2, 3, false).await.unwrap();
+        let both = a.resolve(cid2).await.unwrap();
+        assert_eq!(both.len(), 2, "two providers coexist under one cid");
+    }
+}

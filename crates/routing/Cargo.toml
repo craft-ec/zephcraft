@@ -10,6 +10,7 @@ zeph-core.workspace = true
 zeph-crypto.workspace = true
 zeph-wire.workspace = true
 zeph-transport.workspace = true
+zeph-dht.workspace = true
 async-trait.workspace = true
 hex.workspace = true
 serde.workspace = true
