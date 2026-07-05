@@ -97,17 +97,9 @@
   .kv { font-size:.78rem; padding:.14rem 0; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; gap:1rem; }
   .kv:last-child { border-bottom:none; }
   .kv b { font-weight:600; }
-  .primgrid { display:grid; grid-template-columns:repeat(3,1fr); gap:1rem; margin-bottom:.2rem; }
-  @media (max-width:860px){ .primgrid { grid-template-columns:1fr; } }
-  .primcard { border-top:2px solid var(--line); }
-  .pc-gov { border-top-color:var(--warnc); } .pc-att { border-top-color:var(--ok); } .pc-reg { border-top-color:var(--accent); }
-  .ptag { font-size:.58rem; text-transform:uppercase; letter-spacing:.05em; padding:.1rem .4rem; border-radius:4px; margin-left:.35rem; font-family:var(--mono); }
-  .pgov { color:var(--warnc); background:rgba(210,153,34,.14); }
-  .patt { color:var(--ok); background:rgba(63,185,80,.14); }
-  .preg { color:var(--accent); background:rgba(88,166,255,.14); }
-  .pgov-t { color:var(--warnc); } .patt-t { color:var(--ok); } .preg-t { color:var(--accent); }
   .note { color:var(--dim); font-size:.74rem; line-height:1.55; margin-top:.6rem; }
-  .note b { font-weight:600; }
+  .note b { color:var(--fg); font-weight:600; }
+  .mech { margin-top:.2rem; }
 </style>
 </head>
 <body>
@@ -118,7 +110,7 @@
   <nav class="tabnav">
     <button class="tab-btn on" data-tab="overview" onclick="showTab('overview')">overview</button>
     <button class="tab-btn" data-tab="data" onclick="showTab('data')">data</button>
-    <button class="tab-btn" data-tab="attest" onclick="showTab('attest')">attest</button>
+    <button class="tab-btn" data-tab="programs" onclick="showTab('programs')">programs</button>
     <button class="tab-btn" data-tab="status" onclick="showTab('status')">status</button>
     <button class="tab-btn" data-tab="settings" onclick="showTab('settings')">settings</button>
   </nav>
@@ -203,33 +195,15 @@
     </div>
   </section>
 
-  <section id="tab-attest" class="tab" hidden>
-    <div class="grp" style="margin-top:0">primitives · independent, general-purpose building blocks</div>
-    <div class="primgrid">
-      <div class="card primcard pc-gov">
-        <div class="cardhead">governance <span class="ptag pgov">approves</span></div>
-        <div class="muted" style="font-size:.72rem;line-height:1.5;margin-bottom:.5rem">k-of-n multisig. A signed decision anyone can verify — for any network choice.</div>
-        <div id="prim-gov"><div class="muted">…</div></div>
-      </div>
-      <div class="card primcard pc-att">
-        <div class="cardhead">attestation <span class="ptag patt">proves</span></div>
-        <div class="muted" style="font-size:.72rem;line-height:1.5;margin-bottom:.5rem">k-of-n committee. Agrees on the output of a deterministic run — proves any fact.</div>
-        <div id="prim-att"><div class="muted">…</div></div>
-      </div>
-      <div class="card primcard pc-reg">
-        <div class="cardhead">registry <span class="ptag preg">stores</span></div>
-        <div class="muted" style="font-size:.72rem;line-height:1.5;margin-bottom:.5rem">namespaced name→value pointers. Mutable data under a namespace — any dataset.</div>
-        <div id="prim-reg"><div class="muted">…</div></div>
-      </div>
-    </div>
-    <div class="grp">compositions · current use cases, each combining primitives</div>
+  <section id="tab-programs" class="tab" hidden>
+    <div class="muted" style="font-size:.76rem;line-height:1.55;margin-bottom:1rem">Everything the network runs is a <b style="color:var(--fg)">WASM program</b>. A small set are <b style="color:var(--fg)">protocol programs</b> the network owns and governs; everything else is a <b style="color:var(--fg)">user app</b>, listed by the app-registry (itself a protocol program). Governance and attestation are the mechanisms that maintain these two listings — not anything a user app needs.</div>
     <div class="card">
-      <div class="cardhead">app-name registry <span class="ptag preg">registry</span><span class="ptag patt">attestation</span><span class="ptag pgov">governance</span></div>
-      <div id="comp-appreg"><div class="muted">loading…</div></div>
+      <div class="cardhead">protocol programs <span class="muted">— network-owned · canonical WASM set by governance</span></div>
+      <div id="prog-protocol"><div class="muted">loading…</div></div>
     </div>
     <div class="card">
-      <div class="cardhead">program listing <span class="ptag preg">registry</span><span class="ptag pgov">governance</span></div>
-      <div id="comp-proglist"><div class="muted">loading…</div></div>
+      <div class="cardhead">user apps <span class="muted">— published freely by owners · listed by the app-registry</span></div>
+      <div id="prog-user"><div class="muted">loading…</div></div>
     </div>
   </section>
 
@@ -567,7 +541,7 @@ function showTab(name){
   document.querySelectorAll('.tab').forEach(t => { t.hidden = (t.id !== 'tab-'+name); });
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('on', b.dataset.tab === name));
   try { localStorage.setItem('zeph-tab', name); } catch(e){}
-  if(name==="attest") loadAttestation();
+  if(name==="programs") loadPrograms();
 }
 async function doDeploy(){
   const name=$("dep-name").value.trim(); const f=$("dep-file").files[0]; const out=$("dep-result");
@@ -601,8 +575,8 @@ function sqlTable(j){
   return '<table><thead><tr>'+cols.map(c=>`<th style="text-align:left;border-bottom:1px solid var(--line)">${esc(c)}</th>`).join("")
     +'</tr></thead><tbody>'+rows.map(r=>'<tr>'+r.map(x=>`<td style="padding:.15rem .5rem .15rem 0">${esc(String(x))}</td>`).join("")+'</tr>').join("")+'</tbody></table>';
 }
-async function loadAttestation(){
-  const host=$("prim-att"); if(!host) return;
+async function loadPrograms(){
+  const host=$("prog-protocol"); if(!host) return;
   try{
     const [ar,gr,pr]=await Promise.all([
       fetch("/api/attestation?token="+TOKEN),
@@ -614,44 +588,36 @@ async function loadAttestation(){
     const p=pr.ok?await pr.json():{};
     const c=j.committee||{};
     const prg=(p.programs||[]);
-    // PRIMITIVE — governance
     const govs=(g.governors||[]);
-    $("prim-gov").innerHTML=`
-      <div class="kv"><span>set</span><b>${g.threshold||0}-of-${govs.length} · seq ${g.seq||0}</b></div>
-      ${g.is_governor?'<div class="kv"><span>this node</span><span class="chip providing">governor</span></div>':''}
-      ${govs.map(h=>`<div class="kv"><span>key</span><span class="mono muted cidcell" onclick="copyCid('${h}')">${h.slice(0,14)}…</span></div>`).join("")}`;
-    // PRIMITIVE — attestation
-    $("prim-att").innerHTML=`
-      <div class="kv"><span>committee</span><b>k=${c.k||1} of n=${c.n||1}</b></div>
-      <div class="kv"><span>eligible</span><b>${c.eligible||1}</b></div>
-      ${j.chain&&j.chain.checkpoints?`<div class="kv"><span>chain</span><b>${j.chain.checkpoints} ckpt · ep ${j.chain.epoch}</b></div>`:''}
-      ${j.chain&&j.chain.epoch_ms?`<div class="kv"><span>rollover</span><b id="epoch-timer" class="mono">…</b></div>`:''}`;
-    if(j.chain&&j.chain.next_rollover_ms!=null) startEpochTimer(j.chain.next_rollover_ms);
-    // PRIMITIVE — registry (a data pattern; instances listed)
-    $("prim-reg").innerHTML=`
-      <div class="kv"><span>instances</span><b>2</b></div>
-      <div class="kv"><span>app-name registry</span><span class="mono muted">${j.entries!=null?j.entries:0} heads</span></div>
-      <div class="kv"><span>program listing</span><span class="mono muted">${prg.length} programs</span></div>`;
-    // COMPOSITION — app-name registry = registry + attestation + governance
-    const rows=(j.rows||[]);
-    const modeChip = c.last_mode==="committee"?'<span class="chip providing">committee-attested</span>':(c.last_mode==="self"?'<span class="chip pinned">self-attested</span>':'<span class="chip net">idle</span>');
-    const table = rows.length
-      ? '<table style="margin-top:.5rem"><thead><tr><th style="text-align:left">name</th><th style="text-align:left">ver</th><th style="text-align:left">owner</th><th style="text-align:left">cid</th></tr></thead><tbody>'
-        + rows.map(x=>`<tr><td style="padding:.15rem .8rem .15rem 0"><b>${esc(x[1])}</b></td><td style="padding:.15rem .8rem .15rem 0">v${x[3]}</td><td class="mono muted" style="padding:.15rem .8rem .15rem 0">${String(x[0]).slice(0,8)}…</td><td class="mono muted" style="padding:.15rem 0">${String(x[2]).slice(0,12)}…</td></tr>`).join("")
+    // PROTOCOL PROGRAMS — governed
+    const ptable = prg.length
+      ? '<table style="margin-bottom:.3rem"><thead><tr><th style="text-align:left">program</th><th style="text-align:left">ver</th><th style="text-align:left">canonical wasm cid</th></tr></thead><tbody>'
+        + prg.map(x=>`<tr><td style="padding:.15rem .8rem .15rem 0"><b>${esc(x[0])}</b></td><td style="padding:.15rem .8rem .15rem 0">v${x[2]}</td><td class="mono muted cidcell" style="padding:.15rem 0" onclick="copyCid('${x[1]}')">${String(x[1]).slice(0,20)}…</td></tr>`).join("")
         + '</tbody></table>'
-      : '<div class="muted" style="margin-top:.4rem">no heads yet — deploy an app</div>';
-    $("comp-appreg").innerHTML=`
-      <div class="note" style="margin-top:0">Data held in a <b class="preg-t">registry</b>, each write proven by the <b class="patt-t">attestation</b> committee, running a program chosen by <b class="pgov-t">governance</b>.</div>
-      <div class="kv"><span>last write</span><b>${modeChip}</b></div>
-      <div class="kv"><span>program (governance-listed)</span><b>${esc(j.program_source||'')}</b> <span class="mono muted cidcell" onclick="copyCid('${j.registry_program||''}')">${(j.registry_program||'').slice(0,12)}…</span></div>
-      <div class="kv"><span>root</span><span class="mono cidcell" onclick="copyCid('${j.app_registry_root||''}')">${(j.app_registry_root||'').slice(0,14)}…</span></div>
-      <div class="kv"><span>account (PDA)</span><span class="mono cidcell" onclick="copyCid('${j.registry_account}')">${(j.registry_account||'').slice(0,14)}…</span></div>
-      ${table}`;
-    // COMPOSITION — program listing = registry + governance (no attestation)
-    $("comp-proglist").innerHTML=`
-      <div class="note" style="margin-top:0">Data held in a <b class="preg-t">registry</b>, each change approved by <b class="pgov-t">governance</b> — no attestation involved.</div>`
-      + (prg.length?prg.map(x=>`<div class="kv"><span>${esc(x[0])} <span class="chip pinned">v${x[2]}</span></span><span class="mono muted cidcell" onclick="copyCid('${x[1]}')">${String(x[1]).slice(0,18)}…</span></div>`).join(""):'<div class="muted">none</div>');
-  }catch(e){ if($("prim-att")) $("prim-att").textContent="error: "+e; }
+      : '<div class="muted">none</div>';
+    $("prog-protocol").innerHTML=`
+      ${ptable}
+      <div class="grp mech">maintained by governance</div>
+      <div class="kv"><span>governor set</span><b>${g.threshold||0}-of-${govs.length} · seq ${g.seq||0}${g.is_governor?' · <span class="chip providing">you are a governor</span>':''}</b></div>
+      ${govs.map(h=>`<div class="kv"><span>governor</span><span class="mono muted cidcell" onclick="copyCid('${h}')">${h.slice(0,18)}…</span></div>`).join("")}
+      <div class="note">The programs the network itself runs. Governance — a k-of-n governor multisig — approves which WASM cid is canonical for each, so they upgrade with <b>no binary release</b>. The <b>app-registry</b> is the protocol program that lists the user apps below.</div>`;
+    // USER APPS — listed by the app-registry
+    const rows=(j.rows||[]);
+    const utable = rows.length
+      ? '<table style="margin-bottom:.3rem"><thead><tr><th style="text-align:left">app</th><th style="text-align:left">ver</th><th style="text-align:left">owner</th><th style="text-align:left">cid</th></tr></thead><tbody>'
+        + rows.map(x=>`<tr><td style="padding:.15rem .8rem .15rem 0"><b>${esc(x[1])}</b></td><td style="padding:.15rem .8rem .15rem 0">v${x[3]}</td><td class="mono muted" style="padding:.15rem .8rem .15rem 0">${String(x[0]).slice(0,8)}…</td><td class="mono muted cidcell" style="padding:.15rem 0" onclick="copyCid('${x[2]}')">${String(x[2]).slice(0,14)}…</td></tr>`).join("")
+        + '</tbody></table>'
+      : '<div class="muted">no apps yet — deploy one</div>';
+    const modeChip = c.last_mode==="committee"?'<span class="chip providing">committee-attested</span>':(c.last_mode==="self"?'<span class="chip pinned">self-attested</span>':'<span class="chip net">idle</span>');
+    $("prog-user").innerHTML=`
+      ${utable}
+      <div class="grp mech">maintained by the app-registry program</div>
+      <div class="kv"><span>registry program</span><b>${esc(j.program_source||'')}</b> <span class="mono muted cidcell" onclick="copyCid('${j.registry_program||''}')">${(j.registry_program||'').slice(0,12)}…</span></div>
+      <div class="kv"><span>last write</span><b>${modeChip}</b> <span class="muted">committee k=${c.k||1} of n=${c.n||1}${j.chain?` · epoch ${j.chain.epoch}`:''}</span></div>
+      ${j.chain&&j.chain.epoch_ms?`<div class="kv"><span>committee rollover</span><b id="epoch-timer" class="mono">…</b></div>`:''}
+      <div class="note">Anyone publishes an app by signing a head (name→cid); the app-registry records it. Its writes are <b>attested by a k-of-n committee</b> so the listing can't be forged without a trusted keyholder — but a <b>user app itself needs no attestation</b>; it just runs when invoked.</div>`;
+    if(j.chain&&j.chain.next_rollover_ms!=null) startEpochTimer(j.chain.next_rollover_ms);
+  }catch(e){ if($("prog-protocol")) $("prog-protocol").textContent="error: "+e; }
 }
 let epochInterval=null;
 function startEpochTimer(msLeft){
@@ -660,7 +626,7 @@ function startEpochTimer(msLeft){
   const upd=()=>{
     const el=$("epoch-timer"); if(!el){ clearInterval(epochInterval); return; }
     const r=Math.max(0, deadline-Date.now());
-    if(r<=0){ el.textContent="rolling over\u2026"; clearInterval(epochInterval); setTimeout(loadAttestation,1500); return; }
+    if(r<=0){ el.textContent="rolling over\u2026"; clearInterval(epochInterval); setTimeout(loadPrograms,1500); return; }
     const m=Math.floor(r/60000), sec=Math.floor((r%60000)/1000);
     el.textContent=`${m}m ${String(sec).padStart(2,"0")}s`;
   };
