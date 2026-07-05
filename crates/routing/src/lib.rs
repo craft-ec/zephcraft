@@ -9,8 +9,10 @@
 //! Provider records are CANDIDATE LISTS ONLY, never availability truth —
 //! HealthScan verifies live (foundation §62.1).
 
+mod composite;
 mod dht_routing;
 pub mod records;
+pub use composite::CompositeRouting;
 pub use dht_routing::DhtRouting;
 pub mod registry;
 pub mod server;
