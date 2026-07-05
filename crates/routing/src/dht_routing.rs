@@ -153,10 +153,17 @@ impl ContentRouting for DhtRouting {
         Ok(())
     }
 
-    /// A DHT cannot enumerate all wanted CIDs. Fade moves to per-CID want lookups (P5); this
-    /// returns empty rather than a partial-and-misleading list.
+    /// A DHT cannot enumerate all wanted CIDs — Fade uses the per-cid `is_wanted` instead.
     async fn wanted_cids(&self) -> Result<Vec<Cid>> {
         Ok(Vec::new())
+    }
+
+    async fn is_wanted(&self, cid: Cid) -> Result<bool> {
+        let recs = self.dht.get(Self::cid_key(KIND_WANT, &cid)).await;
+        // A live want is a decodable payload; a withdrawn one is an empty tombstone.
+        Ok(recs
+            .iter()
+            .any(|r| postcard::from_bytes::<WantPayload>(&r.value).is_ok()))
     }
 
     // ---- editable metadata -------------------------------------------------------
@@ -426,5 +433,16 @@ mod tests {
         b.announce(cid2, 3, false).await.unwrap();
         let both = a.resolve(cid2).await.unwrap();
         assert_eq!(both.len(), 2, "two providers coexist under one cid");
+
+        // Per-cid want signal (Fade's replacement for wanted_cids enumeration).
+        let wcid = Cid([11u8; 32]);
+        assert!(!b.is_wanted(wcid).await.unwrap(), "nothing wants it yet");
+        a.announce_want(wcid).await.unwrap();
+        assert!(
+            b.is_wanted(wcid).await.unwrap(),
+            "want visible network-wide"
+        );
+        a.withdraw_want(wcid).await.unwrap();
+        assert!(!b.is_wanted(wcid).await.unwrap(), "withdrawn want is gone");
     }
 }

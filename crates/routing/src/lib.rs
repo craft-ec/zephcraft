@@ -9,10 +9,8 @@
 //! Provider records are CANDIDATE LISTS ONLY, never availability truth —
 //! HealthScan verifies live (foundation §62.1).
 
-mod composite;
 mod dht_routing;
 pub mod records;
-pub use composite::CompositeRouting;
 pub use dht_routing::DhtRouting;
 pub mod registry;
 pub mod server;
@@ -134,6 +132,12 @@ pub trait ContentRouting: Send + Sync {
     /// CIDs the network currently WANTs (has ≥1 want record). Used by Fade to
     /// decide which content to keep repairing.
     async fn wanted_cids(&self) -> Result<Vec<Cid>>;
+    /// Is `cid` wanted by anyone? The per-cid replacement for `wanted_cids()` — a DHT cannot
+    /// enumerate all wants, so Fade asks per held CID. Default enumerates + checks (tracker);
+    /// the DHT overrides with a direct keyed lookup.
+    async fn is_wanted(&self, cid: Cid) -> Result<bool> {
+        Ok(self.wanted_cids().await?.contains(&cid))
+    }
     /// Announce/replace this node's editable metadata envelope for `cid`
     /// (`published_at` preserved by the caller across edits; superseded by HLC).
     async fn announce_meta(
