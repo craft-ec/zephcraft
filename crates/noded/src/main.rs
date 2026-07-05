@@ -9,6 +9,7 @@ mod appreg;
 mod committee;
 mod control;
 mod governance;
+mod peers;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,7 +20,7 @@ use clap::{Parser, Subcommand};
 use zeph_crypto::Keystore;
 use zeph_membership::Membership;
 use zeph_obj::{ObjConfig, ObjEngine};
-use zeph_routing::{ContentRouting, TrackerRouting};
+use zeph_routing::TrackerRouting;
 use zeph_store::Store;
 use zeph_transport::{alpn, PeerAddr, Reach, Transport};
 
@@ -271,6 +272,10 @@ struct Config {
     /// Governance genesis threshold (k). Default 1.
     #[serde(default = "one")]
     governance_threshold: usize,
+    /// Route CONTENT over the Kademlia DHT instead of the tracker (experimental). Default false.
+    routing_dht: bool,
+    /// DHT bootstrap seed peer addresses (only used when routing_dht). Default empty.
+    dht_seeds: Vec<String>,
 }
 
 fn one() -> usize {
@@ -301,6 +306,8 @@ impl Default for Config {
             reannounce_secs: 120,
             governance_governors: Vec::new(),
             governance_threshold: 1,
+            routing_dht: false,
+            dht_seeds: Vec::new(),
         }
     }
 }
@@ -953,19 +960,23 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         .collect::<anyhow::Result<Vec<_>>>()?;
 
     let identity = Arc::new(Keystore::new(data_dir.join("keys")).init_or_load()?);
+    let mut alpns = vec![
+        alpn::PING.to_vec(),
+        zeph_membership::ALPN.to_vec(),
+        zeph_obj::ALPN.to_vec(),
+        zeph_sql::PAGE_ALPN.to_vec(),
+        zeph_com::INVOKE_ALPN.to_vec(),
+        zeph_com::ATTEST_ALPN.to_vec(),
+        zeph_com::ENDORSE_ALPN.to_vec(),
+    ];
+    if cfg.routing_dht {
+        alpns.push(zeph_dht::ALPN.to_vec());
+    }
     let transport = Arc::new(
         Transport::bind_with_relays(
             identity.secret_key_bytes(),
             reach,
-            vec![
-                alpn::PING.to_vec(),
-                zeph_membership::ALPN.to_vec(),
-                zeph_obj::ALPN.to_vec(),
-                zeph_sql::PAGE_ALPN.to_vec(),
-                zeph_com::INVOKE_ALPN.to_vec(),
-                zeph_com::ATTEST_ALPN.to_vec(),
-                zeph_com::ENDORSE_ALPN.to_vec(),
-            ],
+            alpns,
             cfg.listen_port,
             relay_urls,
             cfg.fallback_relays,
@@ -976,16 +987,39 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // Storage engine: persistent store + tracker routing + obj.
     let store = Arc::new(Store::open(data_dir.join("store"))?);
     let tracker_addrs: Vec<PeerAddr> = cfg.trackers.iter().filter_map(|t| t.parse().ok()).collect();
-    let routing = Arc::new(TrackerRouting::new(
+    let tracker = Arc::new(TrackerRouting::new(
         transport.clone(),
         identity.clone(),
         tracker_addrs,
         env!("CARGO_PKG_VERSION").to_string(),
     ));
-    let engine = ObjEngine::new(
+    // Content-routing backend: the Kademlia DHT (experimental, flag-gated) or the tracker.
+    let dht_node = if cfg.routing_dht {
+        Some(zeph_dht::DhtNode::new(
+            identity.clone(),
+            transport.clone(),
+            48 * 3600 * 1000, // 48h record TTL (foundation §3)
+        ))
+    } else {
+        None
+    };
+    let routing: Arc<dyn zeph_routing::ContentRouting> = match &dht_node {
+        Some(dht) => Arc::new(zeph_routing::DhtRouting::new(dht.clone())),
+        None => tracker.clone(),
+    };
+    // Candidate-peer source: SWIM membership when on the DHT (census is in-network), else the
+    // tracker node registry. The membership handle is injected after membership is built.
+    let mem_peers = peers::MembershipPeers::new();
+    let peer_source: Arc<dyn zeph_obj::PeerSource> = if dht_node.is_some() {
+        mem_peers.clone()
+    } else {
+        Arc::new(zeph_obj::RoutingPeerSource(routing.clone()))
+    };
+    let engine = ObjEngine::with_peer_source(
         transport.clone(),
         store.clone(),
         routing.clone(),
+        peer_source,
         ObjConfig {
             k: cfg.erasure_k,
             durability_threshold: cfg.durability_threshold,
@@ -1219,20 +1253,22 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let (invoke_tx, invoke_rx) = tokio::sync::mpsc::channel(32);
     let (attest_tx, attest_rx) = tokio::sync::mpsc::channel(32);
     let (endorse_tx, mut endorse_rx) = tokio::sync::mpsc::channel(32);
+    let (dht_tx, dht_rx) = tokio::sync::mpsc::channel(32);
+    let mut handlers = vec![
+        (alpn::PING.to_vec(), ping_tx),
+        (zeph_membership::ALPN.to_vec(), member_tx),
+        (zeph_obj::ALPN.to_vec(), piece_tx),
+        (zeph_sql::PAGE_ALPN.to_vec(), sqlpage_tx),
+        (zeph_com::INVOKE_ALPN.to_vec(), invoke_tx),
+        (zeph_com::ATTEST_ALPN.to_vec(), attest_tx),
+        (zeph_com::ENDORSE_ALPN.to_vec(), endorse_tx),
+    ];
+    if let Some(dht) = &dht_node {
+        handlers.push((zeph_dht::ALPN.to_vec(), dht_tx));
+        dht.clone().serve(dht_rx);
+    }
     let server = transport.clone();
-    tokio::spawn(async move {
-        server
-            .serve(vec![
-                (alpn::PING.to_vec(), ping_tx),
-                (zeph_membership::ALPN.to_vec(), member_tx),
-                (zeph_obj::ALPN.to_vec(), piece_tx),
-                (zeph_sql::PAGE_ALPN.to_vec(), sqlpage_tx),
-                (zeph_com::INVOKE_ALPN.to_vec(), invoke_tx),
-                (zeph_com::ATTEST_ALPN.to_vec(), attest_tx),
-                (zeph_com::ENDORSE_ALPN.to_vec(), endorse_tx),
-            ])
-            .await
-    });
+    tokio::spawn(async move { server.serve(handlers).await });
     tokio::spawn(engine.clone().serve(piece_rx));
     tokio::spawn(zeph_sql::serve_pages(sql_dir.clone(), sqlpage_rx));
     tokio::spawn(zeph_com::serve_invocations(invoke_rx, com_service.clone()));
@@ -1362,6 +1398,44 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     account_store
         .set_coordinator(transport.clone(), membership.clone())
         .await;
+    mem_peers.set(membership.clone()).await;
+    // DHT overlay (flag-gated): bootstrap from seed peers, then expire stale records hourly.
+    // Provider republish rides on the existing re-announce loop (routing.announce → DHT put).
+    if let Some(dht) = &dht_node {
+        let seeds: Vec<zeph_dht::Contact> = cfg
+            .dht_seeds
+            .iter()
+            .filter_map(|entry| {
+                let addr: PeerAddr = entry.parse().ok()?;
+                let id_bytes: [u8; 32] = hex::decode(entry.split('@').next()?)
+                    .ok()?
+                    .try_into()
+                    .ok()?;
+                Some(zeph_dht::Contact {
+                    id: zeph_core::NodeId(id_bytes),
+                    addr,
+                })
+            })
+            .collect();
+        let seeded = seeds.len();
+        let dht_b = dht.clone();
+        tokio::spawn(async move {
+            dht_b.bootstrap(seeds).await;
+            tracing::info!(seeds = seeded, "dht overlay bootstrapped");
+        });
+        let dht_e = dht.clone();
+        tokio::spawn(async move {
+            let mut iv = tokio::time::interval(Duration::from_secs(3600));
+            iv.tick().await;
+            loop {
+                iv.tick().await;
+                let n = dht_e.expire();
+                if n > 0 {
+                    tracing::debug!(expired = n, "dht records expired");
+                }
+            }
+        });
+    }
 
     // Discover peers from the tracker's node registry and seed membership —
     // a node bootstraps from the network without any hardcoded peer.
