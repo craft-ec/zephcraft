@@ -13,8 +13,10 @@
 use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
-use zeph_core::NodeId;
+use zeph_core::{Cid, NodeId};
 use zeph_crypto::NodeIdentity;
+
+use crate::registry::{registry_program_cid, ProgramRegistryState};
 
 const GOV_DOMAIN: &[u8] = b"craftec/gov/1";
 
@@ -153,6 +155,83 @@ impl GovernanceSet {
     }
 }
 
+/// A durable, **self-verifying** chain of governance approvals from a genesis governor
+/// set. Every node derives the SAME current governor set + program registry by folding
+/// the approvals from genesis — so governance state is content-addressed and resolvable
+/// cross-node, needing NO gossip. Approvals are seq-ordered, so the chain is totally
+/// ordered (no forks) and the **longest valid chain wins**. This is the governance
+/// analogue of the committee chain (durable state, pulled on demand).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GovernanceChain {
+    pub genesis: GovernanceSet,
+    pub approvals: Vec<GovernanceApproval>,
+}
+
+impl GovernanceChain {
+    pub fn new(genesis: GovernanceSet) -> Self {
+        Self {
+            genesis,
+            approvals: Vec::new(),
+        }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        postcard::to_allocvec(self).unwrap_or_default()
+    }
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        postcard::from_bytes(bytes).ok()
+    }
+    pub fn root(&self) -> [u8; 32] {
+        Cid::of(&self.encode()).0
+    }
+
+    /// Current governance seq = genesis seq + one per approval.
+    pub fn seq(&self) -> u64 {
+        self.genesis.seq + self.approvals.len() as u64
+    }
+
+    /// Fold `apply` from genesis. `Some(final_set)` iff EVERY approval validly extends the
+    /// chain; `None` if any approval is invalid (bad quorum / wrong seq) — the whole chain
+    /// is then rejected, so a tampered chain can't be adopted.
+    pub fn current(&self) -> Option<GovernanceSet> {
+        let mut set = self.genesis.clone();
+        for a in &self.approvals {
+            set = set.apply(a)?;
+        }
+        Some(set)
+    }
+
+    /// Append an approval iff it validly extends the current chain (returns success).
+    pub fn append(&mut self, approval: GovernanceApproval) -> bool {
+        match self.current() {
+            Some(cur) if cur.apply(&approval).is_some() => {
+                self.approvals.push(approval);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The program registry derived from the chain: seed `app-registry` -> the native
+    /// program at v0, then replay every `SetProgram` approval (version = its seq). Every
+    /// node computes the identical result from the same chain.
+    pub fn program_registry(&self) -> ProgramRegistryState {
+        let mut prg = ProgramRegistryState::default()
+            .set("app-registry", registry_program_cid(), 0)
+            .unwrap_or_default();
+        let mut seq = self.genesis.seq;
+        for a in &self.approvals {
+            seq += 1;
+            if let GovAction::SetProgram { name, cid } = &a.proposal.action {
+                if let Ok(next) = prg.set(name, *cid, seq) {
+                    prg = next;
+                }
+            }
+        }
+        prg
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,6 +310,58 @@ mod tests {
         assert_eq!(next.governors.len(), 4);
         // the same approval can't be replayed (seq is now 1, needs 2)
         assert!(next.apply(&a).is_none());
+    }
+
+    #[test]
+    fn chain_folds_verifies_and_derives_program_registry() {
+        let g = govs(1);
+        let genesis = set(&g, 1);
+        let mut chain = GovernanceChain::new(genesis.clone());
+        assert_eq!(chain.seq(), 0);
+        assert_eq!(chain.current(), Some(genesis));
+        // genesis program registry: app-registry -> native, v0
+        let native = crate::registry_program_cid();
+        assert_eq!(
+            chain.program_registry().resolve("app-registry"),
+            Some(native)
+        );
+
+        // append a SetProgram approval -> derived program registry updates
+        let a = approve(
+            &g,
+            1,
+            GovAction::SetProgram {
+                name: "app-registry".into(),
+                cid: [7u8; 32],
+            },
+            1,
+        );
+        assert!(chain.append(a), "valid approval appends");
+        assert_eq!(chain.seq(), 1);
+        assert!(chain.current().is_some());
+        assert_eq!(
+            chain.program_registry().resolve("app-registry"),
+            Some([7u8; 32]),
+            "SetProgram is reflected in the derived registry"
+        );
+        // a wrong-seq approval does not append
+        let bad = approve(&g, 1, GovAction::SetThreshold { threshold: 1 }, 5);
+        assert!(!chain.append(bad));
+        // encode/decode roundtrip
+        assert_eq!(GovernanceChain::decode(&chain.encode()), Some(chain));
+    }
+
+    #[test]
+    fn chain_rejects_a_tampered_approval() {
+        let g = govs(3);
+        let mut chain = GovernanceChain::new(set(&g, 2));
+        // only 1 of 3 signs (threshold 2) -> invalid; a chain carrying it verifies to None
+        let weak = approve(&g, 1, GovAction::SetThreshold { threshold: 1 }, 1);
+        chain.approvals.push(weak); // force it in, bypassing append
+        assert!(
+            chain.current().is_none(),
+            "a chain with a sub-quorum approval is wholly rejected"
+        );
     }
 
     #[test]

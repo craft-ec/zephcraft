@@ -18,7 +18,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use zeph_com::{
     attest_transition, epoch_of, pda, registry_program_cid, request_attestation, select_committee,
-    verify_quorum, AttestRequest, HeadSubmission, RegistryState, REGISTRY_SEED,
+    verify_quorum, AttestRequest, AttestedRuntime, HeadSubmission, RegistryState, DEFAULT_FUEL,
+    REGISTRY_SEED,
 };
 use zeph_core::{Cid, NodeId};
 use zeph_crypto::NodeIdentity;
@@ -51,8 +52,11 @@ pub struct AppRegistry {
     state: RwLock<RegistryState>,
     path: PathBuf,
     coord: RwLock<Option<Coordinator>>,
-    programs: RwLock<Option<Arc<crate::progreg::ProgramRegistryStore>>>,
+    programs: RwLock<Option<Arc<crate::governance::GovernanceChainStore>>>,
     routing: Arc<dyn ContentRouting>,
+    /// Deterministic runtime for running the RESOLVED registry program (native or WASM),
+    /// so a governance-upgraded WASM program is authoritative on the coordinator too.
+    runtime: AttestedRuntime,
     /// The authority mode of the last registration ("none" | "self" | "committee").
     mode: RwLock<&'static str>,
 }
@@ -78,8 +82,44 @@ impl AppRegistry {
             coord: RwLock::new(None),
             programs: RwLock::new(None),
             routing,
+            runtime: AttestedRuntime::new().expect("attested runtime"),
             mode: RwLock::new("none"),
         }
+    }
+
+    /// Fetch a program's WASM bytes by cid (following a File manifest to its content).
+    async fn fetch_program(&self, cid: [u8; 32]) -> Option<Vec<u8>> {
+        let raw = self.obj.get(Cid(cid), ConsumeMode::Drop).await.ok()?;
+        match zeph_obj::Manifest::decode(&raw) {
+            Some(zeph_obj::Manifest::File { content, .. }) => {
+                self.obj.get(Cid(content), ConsumeMode::Drop).await.ok()
+            }
+            _ => Some(raw),
+        }
+    }
+
+    /// Compute the registry transition by running the RESOLVED program. When the program
+    /// is the native genesis cid, that's `RegistryState::apply`; when governance has
+    /// upgraded it to WASM, the coordinator runs THAT wasm — so the upgraded logic is
+    /// authoritative and not silently shadowed by native `apply`. `None` = the program
+    /// rejected the submission (empty output) or the wasm is unavailable.
+    async fn run_program(
+        &self,
+        prev: &RegistryState,
+        sub: &HeadSubmission,
+    ) -> Option<RegistryState> {
+        let program = self.program_cid().await;
+        if program == registry_program_cid() {
+            return prev.apply(sub).ok(); // native genesis program
+        }
+        let wasm = self.fetch_program(program).await?;
+        let out = self
+            .runtime
+            .run_transition(&wasm, "run", &prev.encode(), &sub.encode(), DEFAULT_FUEL)
+            .ok()?;
+        (!out.is_empty())
+            .then(|| RegistryState::decode(&out))
+            .flatten()
     }
 
     /// Wire the live committee coordinator (call once membership is running). Until then
@@ -95,7 +135,7 @@ impl AppRegistry {
 
     /// Wire the program registry so the app-registry program cid is resolved THROUGH it
     /// (upgradeable) rather than hardcoded.
-    pub async fn set_programs(&self, programs: Arc<crate::progreg::ProgramRegistryStore>) {
+    pub async fn set_programs(&self, programs: Arc<crate::governance::GovernanceChainStore>) {
         *self.programs.write().await = Some(programs);
     }
 
@@ -133,9 +173,10 @@ impl AppRegistry {
         let (next, mode) = match self.try_committee(&sub, &prev, now_millis).await {
             Some(n) => (n, "committee"),
             None => {
-                let n = prev
-                    .apply(&sub)
-                    .map_err(|e| anyhow::anyhow!("registry: {e}"))?;
+                let n = self
+                    .run_program(&prev, &sub)
+                    .await
+                    .ok_or_else(|| anyhow::anyhow!("registry program rejected the submission"))?;
                 let _ = attest_transition(
                     &self.identity,
                     self.program_cid().await,
@@ -192,7 +233,7 @@ impl AppRegistry {
             return None; // no real committee yet — caller self-attests
         }
 
-        let next = prev.apply(sub).ok()?;
+        let next = self.run_program(prev, sub).await?;
         let program = self.program_cid().await;
         let prev_root = prev.root();
         let request = sub.encode();

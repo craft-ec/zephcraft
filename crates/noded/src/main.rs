@@ -8,7 +8,6 @@ mod appreg;
 mod committee;
 mod control;
 mod governance;
-mod progreg;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -112,10 +111,10 @@ enum Command {
     },
     /// List your deployed CraftCOM apps.
     Apps,
+    /// Publish a WASM program to the grid (returns its content cid).
+    PublishProgram { file: String },
     /// List network-owned programs and their canonical cids.
     Programs,
-    /// Activate the WASM app-registry via governance (SetProgram app-registry -> wasm cid).
-    GovActivateRegistry,
     /// Show the governance set (governors, threshold, seq).
     Gov,
     /// Propose a governance change (signs with this node's key; applies at 1-of-1).
@@ -351,8 +350,8 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Deploy { file, name }) => cmd_deploy(&data_dir, &file, name.as_deref()).await,
         Some(Command::Apps) => cmd_apps(&data_dir).await,
+        Some(Command::PublishProgram { file }) => cmd_publish_program(&data_dir, &file).await,
         Some(Command::Programs) => cmd_programs(&data_dir).await,
-        Some(Command::GovActivateRegistry) => cmd_gov_activate_registry(&data_dir).await,
         Some(Command::Gov) => cmd_gov(&data_dir).await,
         Some(Command::GovPropose {
             add,
@@ -481,25 +480,16 @@ async fn cmd_deploy(data_dir: &Path, file: &Path, name: Option<&str>) -> anyhow:
     Ok(())
 }
 
-async fn cmd_gov_activate_registry(data_dir: &Path) -> anyhow::Result<()> {
-    let cid = hex::encode(zeph_com::registry_wasm_cid());
-    let params = serde_json::json!({"action": "set_program", "name": "app-registry", "cid": cid});
+async fn cmd_publish_program(data_dir: &Path, file: &str) -> anyhow::Result<()> {
+    let bytes = std::fs::read(file)?;
+    let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let params = serde_json::json!({ "wasm": hex });
     let res =
-        control::query_unix_params(&data_dir.join("zeph.sock"), "gov_propose", params).await?;
-    if res
-        .get("applied")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        println!("activated WASM app-registry -> {}", &cid[..24]);
-        println!("(the committee now runs the WASM registry program)");
-    } else {
-        println!("proposal drafted (needs more governor signatures)");
-        println!(
-            "approval: {}",
-            res.get("approval").and_then(|v| v.as_str()).unwrap_or("")
-        );
-    }
+        control::query_unix_params(&data_dir.join("zeph.sock"), "publish_program", params).await?;
+    let cid = res.get("cid").and_then(|v| v.as_str()).unwrap_or("");
+    println!("published {} ({} bytes)", file, bytes.len());
+    println!("cid: {cid}");
+    println!("activate: zeph gov-propose --set-program <name>={cid}");
     Ok(())
 }
 
@@ -1016,20 +1006,21 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         routing.clone(),
         data_dir,
     ));
-    // Program registry: native bootstrap map (program name -> canonical cid), seeded
-    // with the app-registry program; governance-authorized.
-    let program_store = std::sync::Arc::new(progreg::ProgramRegistryStore::open(data_dir));
-    // Governance: the live governor set (seeded 1-of-1 with this node's key by default).
+    // Governance: one durable, self-verifying chain that derives BOTH the governor set
+    // and the program registry, published + resolved cross-node (seeded 1-of-1 with this
+    // node's key by default).
     let gov_governors: Vec<[u8; 32]> = cfg
         .governance_governors
         .iter()
         .filter_map(|h| <[u8; 32]>::try_from(hex::decode(h.trim()).ok()?.as_slice()).ok())
         .collect();
-    let governance_store = std::sync::Arc::new(governance::GovernanceStore::open(
+    let governance_store = std::sync::Arc::new(governance::GovernanceChainStore::open(
         identity.clone(),
         data_dir,
         &gov_governors,
         cfg.governance_threshold,
+        engine.clone(),
+        routing.clone(),
     ));
     // Phase 4g: the committee-chain store (membership wired once it is up).
     let committee_store = std::sync::Arc::new(committee::CommitteeChainStore::new(
@@ -1079,8 +1070,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         routing: routing.clone(),
         appreg: appreg_store.clone(),
         committee: committee_store.clone(),
-        governance: governance_store.clone(),
-        programs: program_store.clone(),
+        gov: governance_store.clone(),
         settings: {
             let oc = engine.config();
             control::NodeSettings {
@@ -1193,23 +1183,16 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
             });
         }
     });
-    // Publish the registry WASM so the committee can fetch it once governance activates
-    // it (app-registry -> registry_wasm_cid).
-    let wasm_engine = engine.clone();
-    tokio::spawn(async move {
-        match wasm_engine.publish_system(zeph_com::REGISTRY_WASM).await {
-            Ok(cid) => tracing::info!(cid = %cid.to_hex(), "published registry WASM"),
-            Err(e) => tracing::warn!(%e, "publishing registry WASM failed"),
-        }
-    });
     // Committee-chain tick loop: genesis bootstrap + epoch rollover.
     let tick_store = committee_store.clone();
+    let gov_tick = governance_store.clone();
     let tick_clock = transport.clock();
     tokio::spawn(async move {
         let mut iv = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             iv.tick().await;
             tick_store.tick(tick_clock.now().millis()).await;
+            gov_tick.tick().await;
         }
     });
 
@@ -1285,7 +1268,8 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         .set_coordinator(transport.clone(), membership.clone())
         .await;
     committee_store.set_membership(membership.clone()).await;
-    appreg_store.set_programs(program_store.clone()).await;
+    governance_store.set_membership(membership.clone()).await;
+    appreg_store.set_programs(governance_store.clone()).await;
 
     // Discover peers from the tracker's node registry and seed membership —
     // a node bootstraps from the network without any hardcoded peer.
