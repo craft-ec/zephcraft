@@ -41,8 +41,8 @@ pub use attest::{
     PdaAdvance,
 };
 pub use coordinate::{
-    collect_commit, request_attestation, serve_attestations, AttestRequest, AttestService,
-    NativeProgram, ATTEST_ALPN,
+    collect_commit, request_attestation, request_endorsement, serve_attestations, AttestRequest,
+    AttestService, EndorseRequest, NativeProgram, ATTEST_ALPN, ENDORSE_ALPN,
 };
 pub use craft::CraftBackend;
 pub use invoke::{invoke_remote, serve_invocations, InvokeRequest, InvokeService, INVOKE_ALPN};

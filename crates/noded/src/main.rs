@@ -5,6 +5,7 @@
 //! control servers → serve loop → heartbeat.
 
 mod appreg;
+mod committee;
 mod control;
 
 use std::path::{Path, PathBuf};
@@ -745,6 +746,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                 zeph_sql::PAGE_ALPN.to_vec(),
                 zeph_com::INVOKE_ALPN.to_vec(),
                 zeph_com::ATTEST_ALPN.to_vec(),
+                zeph_com::ENDORSE_ALPN.to_vec(),
             ],
             cfg.listen_port,
             relay_urls,
@@ -854,6 +856,13 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         routing.clone(),
         data_dir,
     ));
+    // Phase 4g: the committee-chain store (membership wired once it is up).
+    let committee_store = std::sync::Arc::new(committee::CommitteeChainStore::new(
+        identity.clone(),
+        engine.clone(),
+        routing.clone(),
+        transport.clone(),
+    ));
     let state = Arc::new(control::State {
         clock: transport.clock(),
         node_id: identity.node_id().to_hex(),
@@ -894,6 +903,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         com: com_service.clone(),
         routing: routing.clone(),
         appreg: appreg_store.clone(),
+        committee: committee_store.clone(),
         settings: {
             let oc = engine.config();
             control::NodeSettings {
@@ -962,6 +972,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let (sqlpage_tx, sqlpage_rx) = tokio::sync::mpsc::channel(32);
     let (invoke_tx, invoke_rx) = tokio::sync::mpsc::channel(32);
     let (attest_tx, attest_rx) = tokio::sync::mpsc::channel(32);
+    let (endorse_tx, mut endorse_rx) = tokio::sync::mpsc::channel(32);
     let server = transport.clone();
     tokio::spawn(async move {
         server
@@ -972,6 +983,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                 (zeph_sql::PAGE_ALPN.to_vec(), sqlpage_tx),
                 (zeph_com::INVOKE_ALPN.to_vec(), invoke_tx),
                 (zeph_com::ATTEST_ALPN.to_vec(), attest_tx),
+                (zeph_com::ENDORSE_ALPN.to_vec(), endorse_tx),
             ])
             .await
     });
@@ -982,6 +994,38 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         attest_rx,
         attest_service.clone(),
     ));
+    // Serve committee-endorsement requests (epoch rollover).
+    let endorse_store = committee_store.clone();
+    tokio::spawn(async move {
+        while let Some(conn) = endorse_rx.recv().await {
+            let store = endorse_store.clone();
+            tokio::spawn(async move {
+                while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                    let Ok(bytes) = recv.read_to_end(64 * 1024).await else {
+                        break;
+                    };
+                    let reply = match postcard::from_bytes::<zeph_com::EndorseRequest>(&bytes) {
+                        Ok(req) => store.endorse(&req).await,
+                        Err(_) => None,
+                    };
+                    let _ = send
+                        .write_all(&postcard::to_allocvec(&reply).unwrap_or_default())
+                        .await;
+                    let _ = send.finish();
+                }
+            });
+        }
+    });
+    // Committee-chain tick loop: genesis bootstrap + epoch rollover.
+    let tick_store = committee_store.clone();
+    let tick_clock = transport.clock();
+    tokio::spawn(async move {
+        let mut iv = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            iv.tick().await;
+            tick_store.tick(tick_clock.now().millis()).await;
+        }
+    });
 
     // Announce this node into the tracker's node registry (map/census),
     // immediately and periodically.
@@ -1054,6 +1098,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     appreg_store
         .set_coordinator(transport.clone(), membership.clone())
         .await;
+    committee_store.set_membership(membership.clone()).await;
 
     // Discover peers from the tracker's node registry and seed membership —
     // a node bootstraps from the network without any hardcoded peer.

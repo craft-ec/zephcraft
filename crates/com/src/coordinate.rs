@@ -25,6 +25,35 @@ use crate::{
 /// ALPN for attestation requests.
 pub const ATTEST_ALPN: &[u8] = b"/craftec/attest/1";
 
+/// ALPN for committee-chain endorsement requests (epoch rollover).
+pub const ENDORSE_ALPN: &[u8] = b"/craftec/endorse/1";
+
+/// A proposal to endorse the next epoch's committee: recompute it from your own
+/// membership and, if it matches, sign the hand-off.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct EndorseRequest {
+    pub epoch: u64,
+    pub committee_members: Vec<[u8; 32]>,
+    pub k: usize,
+    pub prev_hash: [u8; 32],
+}
+
+/// Ask ONE member of the outgoing committee to endorse the proposed next committee.
+pub async fn request_endorsement(
+    transport: &Transport,
+    addr: &PeerAddr,
+    req: &EndorseRequest,
+) -> anyhow::Result<crate::Endorsement> {
+    let conn = transport.connect(addr, ENDORSE_ALPN).await?;
+    let (mut send, mut recv) = conn.open_bi().await?;
+    send.write_all(&postcard::to_allocvec(req)?).await?;
+    send.finish()?;
+    let resp = recv.read_to_end(64 * 1024).await?;
+    conn.close(0u32.into(), b"done");
+    let reply: Option<crate::Endorsement> = postcard::from_bytes(&resp)?;
+    reply.ok_or_else(|| anyhow::anyhow!("member declined to endorse"))
+}
+
 /// A request to attest a deterministic program run: which program (by CID), which
 /// export, the prior state root it builds on, and the request bytes.
 #[derive(Serialize, Deserialize, Clone, Default)]

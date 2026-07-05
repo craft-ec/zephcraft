@@ -183,6 +183,8 @@ pub struct State {
     pub routing: std::sync::Arc<dyn zeph_routing::ContentRouting>,
     /// Phase 4c: durable app-name registry backing (program-owned, self-attested ramp).
     pub appreg: std::sync::Arc<crate::appreg::AppRegistry>,
+    /// Phase 4g: the live committee chain (genesis + epoch rollover, durable state).
+    pub committee: std::sync::Arc<crate::committee::CommitteeChainStore>,
 }
 
 impl State {
@@ -1501,6 +1503,8 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         let account = ctx.state.appreg.account();
         let (count, root) = ctx.state.appreg.summary().await;
         let (eligible, cn, ck, mode) = ctx.state.appreg.committee_status().await;
+        let (chain_len, chain_epoch, chain_size, chain_root, _) =
+            ctx.state.committee.status().await;
         let rows: Vec<serde_json::Value> = ctx
             .state
             .appreg
@@ -1523,6 +1527,12 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
                 "n": cn.min(eligible),
                 "k": ck.min(cn.min(eligible)),
                 "last_mode": mode,
+            },
+            "chain": {
+                "checkpoints": chain_len,
+                "epoch": chain_epoch,
+                "committee_size": chain_size,
+                "root": chain_root,
             },
             "note": "app-name registry; other protocol registries (program, config, committee) will be separate roots",
         }))
