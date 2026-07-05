@@ -199,7 +199,7 @@ impl AppRegistry {
         let req = AttestRequest {
             program_cid: program,
             prev_root,
-            func: String::new(),
+            func: "run".to_string(), // the registry WASM exports `run` (native ignores this)
             request: request.clone(),
             prev_state: prev.encode(),
         };

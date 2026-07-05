@@ -114,6 +114,8 @@ enum Command {
     Apps,
     /// List network-owned programs and their canonical cids.
     Programs,
+    /// Activate the WASM app-registry via governance (SetProgram app-registry -> wasm cid).
+    GovActivateRegistry,
     /// Show the governance set (governors, threshold, seq).
     Gov,
     /// Propose a governance change (signs with this node's key; applies at 1-of-1).
@@ -350,6 +352,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Deploy { file, name }) => cmd_deploy(&data_dir, &file, name.as_deref()).await,
         Some(Command::Apps) => cmd_apps(&data_dir).await,
         Some(Command::Programs) => cmd_programs(&data_dir).await,
+        Some(Command::GovActivateRegistry) => cmd_gov_activate_registry(&data_dir).await,
         Some(Command::Gov) => cmd_gov(&data_dir).await,
         Some(Command::GovPropose {
             add,
@@ -475,6 +478,28 @@ async fn cmd_deploy(data_dir: &Path, file: &Path, name: Option<&str>) -> anyhow:
     let ver = r.get("version").and_then(|v| v.as_u64()).unwrap_or(1);
     println!("deployed app '{n}' v{ver} ({size} bytes, system object) - cid {cid}");
     println!("invoke by name: zeph invoke --name {n}");
+    Ok(())
+}
+
+async fn cmd_gov_activate_registry(data_dir: &Path) -> anyhow::Result<()> {
+    let cid = hex::encode(zeph_com::registry_wasm_cid());
+    let params = serde_json::json!({"action": "set_program", "name": "app-registry", "cid": cid});
+    let res =
+        control::query_unix_params(&data_dir.join("zeph.sock"), "gov_propose", params).await?;
+    if res
+        .get("applied")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        println!("activated WASM app-registry -> {}", &cid[..24]);
+        println!("(the committee now runs the WASM registry program)");
+    } else {
+        println!("proposal drafted (needs more governor signatures)");
+        println!(
+            "approval: {}",
+            res.get("approval").and_then(|v| v.as_str()).unwrap_or("")
+        );
+    }
     Ok(())
 }
 
@@ -1166,6 +1191,15 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                     let _ = send.finish();
                 }
             });
+        }
+    });
+    // Publish the registry WASM so the committee can fetch it once governance activates
+    // it (app-registry -> registry_wasm_cid).
+    let wasm_engine = engine.clone();
+    tokio::spawn(async move {
+        match wasm_engine.publish_system(zeph_com::REGISTRY_WASM).await {
+            Ok(cid) => tracing::info!(cid = %cid.to_hex(), "published registry WASM"),
+            Err(e) => tracing::warn!(%e, "publishing registry WASM failed"),
         }
     });
     // Committee-chain tick loop: genesis bootstrap + epoch rollover.
