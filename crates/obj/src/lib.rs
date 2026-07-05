@@ -395,6 +395,23 @@ impl ObjEngine {
             self.store.pin(cid, data)?;
         }
 
+        // Already distributed: a previous publish's erasure set reached the network, so a
+        // re-publish must NOT re-push — that re-erasure-codes and mints FRESH random coded
+        // pieces every time, growing the cluster's piece count without bound. Just refresh
+        // the announce and return.
+        if self.store.is_distributed(&cid) {
+            if pin {
+                let _ = self.routing.announce(cid, 0, true).await;
+            }
+            return Ok(PublishReport {
+                cid,
+                pieces_pushed: 0,
+                distinct_peers: 0,
+                durable: true,
+                pinned: pin,
+            });
+        }
+
         // Candidate storage peers from the node registry (exclude self).
         let me = self.transport.node_id();
         let candidates: Vec<PeerAddr> = self
@@ -444,29 +461,23 @@ impl ObjEngine {
             let _ = self.routing.announce(cid, 0, true).await;
         }
 
-        // DURABILITY GATE. The first distribution is the critical moment: if it lands
-        // fewer than `durability_threshold` distinct peers (a commit into a no-peer
-        // window, an under-sized cluster, or partial push failures), the content must NOT
-        // be left with zero recoverable copies. The publisher RETAINS its own copy so at
-        // least one always exists; the health scan then re-mints pieces from it and keeps
-        // redistributing to fresh peers until it is durable. The retained copy is kept
-        // ALIVE the way its class already is — system content by its marker, pinned
-        // content by its pin, anything else by an explicit want — so it never fades before
-        // it is safe. (Without this, a `pin=false` publish with no peers kept nothing and
-        // was silently, permanently lost.)
-        // The publisher RETAINS its own copy of everything it publishes and keeps it
-        // ALIVE (system content by its marker, pinned content by its pin, anything else by
-        // an explicit want). The health scan then gradually distributes pieces to peers as
-        // they come online and repairs until the content is durable on enough distinct
-        // nodes. This makes the first distribution safe: a commit into a no-peer window (or
-        // an under-sized cluster) is never left with zero copies — the publisher holds it
-        // and it heals as the network grows. (A durable copy on the publisher is offloaded
-        // only once >= k distinct peers confirm holding it — see health_scan.)
+        // DURABILITY GATE + COMPLETION. The publisher RETAINS its own copy of everything
+        // it publishes (kept alive by its class — system marker / pin / want), so the first
+        // distribution is never left with zero copies even into a no-peer window. When the
+        // erasure set has REACHED the network — all n coded pieces pushed, or as many
+        // distinct peers as this cluster can offer — mark it DISTRIBUTED so re-publishes
+        // stop re-pushing (no unbounded piece growth). From there the health scan maintains
+        // it as stable content, and the publisher offloads its own copy once the full
+        // erasure set is durable on peers.
         if !self.store.has_content(&cid) {
             self.store.put_content(cid, data, false)?;
         }
         if !system && !pin {
             self.store.set_want(cid)?;
+        }
+        let target = self.config.durability_threshold.min(candidates.len());
+        if !candidates.is_empty() && (pushed >= n || distinct.len() >= target) {
+            let _ = self.store.set_distributed(cid);
         }
         let durable = distinct.len() >= self.config.durability_threshold;
         if !durable {
@@ -1142,36 +1153,40 @@ impl ObjEngine {
             let mut capable: Vec<NodeId> = Vec::new();
             let mut live: Vec<(NodeId, PeerAddr, u32, bool)> = Vec::new();
             let mut seen_self = false;
-            for p in &providers {
-                if p.node_id == me {
-                    seen_self = true;
-                    let c = self.store.piece_count(&cid);
-                    if c > 0 || self.store.has_content(&cid) {
-                        have += c;
-                        if c >= 2 || self.store.has_content(&cid) {
-                            capable.push(me);
-                        }
+            if providers.iter().any(|p| p.node_id == me) {
+                seen_self = true;
+                let c = self.store.piece_count(&cid);
+                if c > 0 || self.store.has_content(&cid) {
+                    have += c;
+                    if c >= 2 || (self.store.has_content(&cid) && self.store.is_pinned(&cid)) {
+                        capable.push(me);
                     }
-                    continue;
                 }
-                let Some(ack) = self.probe_availability(&p.addr, cid).await else {
-                    continue;
-                };
+            }
+            // Probe ALL peer providers CONCURRENTLY — sequential probes turned one pass
+            // into (providers x cids x timeout) round-trips, so a few unreachable paths
+            // stalled the whole self-healing loop. Now each cid costs one probe round-trip.
+            let acks = futures::future::join_all(providers.iter().filter(|p| p.node_id != me).map(
+                |p| async move { (p.node_id, p.addr.clone(), self.probe_availability(&p.addr, cid).await) },
+            ))
+            .await;
+            for (node_id, addr, ack) in acks {
+                let Some(ack) = ack else { continue };
                 if !ack.has {
                     continue;
                 }
                 have += ack.piece_count as usize;
                 if ack.piece_count >= 2 || ack.pinned {
-                    capable.push(p.node_id);
+                    capable.push(node_id);
                 }
-                live.push((p.node_id, p.addr.clone(), ack.piece_count, ack.pinned));
+                live.push((node_id, addr, ack.piece_count, ack.pinned));
             }
             // Include self if we hold but aren't (yet) in the provider records.
             if !seen_self {
                 let c = self.store.piece_count(&cid);
                 if c > 0 || self.store.has_content(&cid) {
                     have += c;
-                    if c >= 2 || self.store.has_content(&cid) {
+                    if c >= 2 || (self.store.has_content(&cid) && self.store.is_pinned(&cid)) {
                         capable.push(me);
                     }
                 }
@@ -1242,7 +1257,13 @@ impl ObjEngine {
 
             // Only a capable holder can repair; rendezvous-elect exactly one so
             // holders don't all repair at once (thundering herd).
-            let can_i = self.store.piece_count(&cid) >= 2 || self.store.has_content(&cid);
+            // A DURABILITY-RETAINED copy (we hold the content but it is NOT user-pinned)
+            // is a PASSIVE backup — it must NOT drive repair. Otherwise every retained
+            // system generation makes us mint + push fresh coded pieces each pass, and the
+            // cluster accumulates pieces without bound. Only pinned content (or a real
+            // piece-holder) repairs; the retained copy just waits, safe.
+            let can_i =
+                self.store.piece_count(&cid) >= 2 || (self.store.has_content(&cid) && self.store.is_pinned(&cid));
             if !can_i {
                 continue;
             }
@@ -1272,9 +1293,12 @@ impl ObjEngine {
         let me = self.transport.node_id();
         let mut out: Vec<([u8; 32], u32, u32)> = Vec::new();
         for cid in self.store.cids() {
+            // Content we hold whole (files + system db/app generations) that is not yet
+            // COMPLETE — still spreading toward the erasure floor on peers. Once marked
+            // distributed it is complete and drops out of the pending view.
             if self.store.is_tombstoned(&cid)
                 || !self.store.has_content(&cid)
-                || self.store.is_pinned(&cid)
+                || self.store.is_distributed(&cid)
             {
                 continue;
             }

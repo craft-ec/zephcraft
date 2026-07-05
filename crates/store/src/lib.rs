@@ -93,6 +93,9 @@ pub struct Store {
     tombstones: Mutex<HashSet<Cid>>,
     /// WANT interest markers — CIDs this node wants kept alive (may not hold).
     wanted: Mutex<HashSet<Cid>>,
+    /// Content whose erasure set has been successfully pushed to peers — publish
+    /// stops re-pushing it (idempotent re-announce), so re-publishes don't grow pieces.
+    distributed: Mutex<HashSet<Cid>>,
     /// Eviction cooldown — CIDs recently evicted (cid → unix secs). While in
     /// cooldown the lifecycle won't refill; the record is purged after the TTL.
     evicted: Mutex<HashMap<Cid, u64>>,
@@ -106,12 +109,14 @@ impl Store {
         fs::create_dir_all(root.join("cid"))?;
         fs::create_dir_all(root.join("tombstones"))?;
         fs::create_dir_all(root.join("wanted"))?;
+        fs::create_dir_all(root.join("distributed"))?;
         fs::create_dir_all(root.join("evicted"))?;
         let store = Self {
             root,
             index: Mutex::new(HashMap::new()),
             tombstones: Mutex::new(HashSet::new()),
             wanted: Mutex::new(HashSet::new()),
+            distributed: Mutex::new(HashSet::new()),
             evicted: Mutex::new(HashMap::new()),
         };
         store.reload()?;
@@ -143,6 +148,17 @@ impl Store {
             }
         }
         drop(wanted);
+        let mut distributed = self.distributed.lock().expect("distributed");
+        distributed.clear();
+        let d_dir = self.root.join("distributed");
+        if d_dir.is_dir() {
+            for entry in fs::read_dir(&d_dir)? {
+                if let Some(cid) = parse_cid(&entry?.file_name().to_string_lossy()) {
+                    distributed.insert(cid);
+                }
+            }
+        }
+        drop(distributed);
         let mut evicted = self.evicted.lock().expect("evicted");
         evicted.clear();
         let e_dir = self.root.join("evicted");
@@ -483,7 +499,9 @@ impl Store {
     pub fn forget(&self, cid: &Cid) -> Result<()> {
         self.index.lock().expect("index").remove(cid);
         self.wanted.lock().expect("wanted").remove(cid);
+        self.distributed.lock().expect("distributed").remove(cid);
         let _ = fs::remove_file(self.root.join("wanted").join(cid.to_hex()));
+        let _ = fs::remove_file(self.root.join("distributed").join(cid.to_hex()));
         let _ = fs::remove_dir_all(self.cid_dir(cid));
         Ok(())
     }
@@ -501,6 +519,17 @@ impl Store {
     }
     pub fn is_wanted(&self, cid: &Cid) -> bool {
         self.wanted.lock().expect("wanted").contains(cid)
+    }
+
+    /// Mark a CID's erasure set as successfully distributed to peers (publish stops
+    /// re-pushing it). Persistent so it survives restart.
+    pub fn set_distributed(&self, cid: Cid) -> Result<()> {
+        write_atomic(&self.root.join("distributed").join(cid.to_hex()), b"")?;
+        self.distributed.lock().expect("distributed").insert(cid);
+        Ok(())
+    }
+    pub fn is_distributed(&self, cid: &Cid) -> bool {
+        self.distributed.lock().expect("distributed").contains(cid)
     }
     pub fn wanted_cids(&self) -> Vec<Cid> {
         self.wanted
