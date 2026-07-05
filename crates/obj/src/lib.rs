@@ -1539,35 +1539,51 @@ impl ObjEngine {
             }
             report.scanned += 1;
 
-            // Least-full live peer, from RECORDS: a node holding the cid reports its
-            // piece_count; a non-holder holds 0 (the emptiest, and the natural move target).
-            let held_by: HashMap<NodeId, u32> = providers
+            // Balance this CID WITHIN the pass. Seed a local belief of each peer's piece count
+            // from the (possibly stale) provider records, then move pieces to the least-full
+            // peer, updating the belief as we go — so we CONVERGE in a single pass regardless
+            // of record freshness. Records only seed the starting estimate; the belief tracks
+            // our own moves, so stale records no longer pile every piece on the first holder.
+            let mut belief: HashMap<NodeId, u32> = peers
                 .iter()
-                .map(|p| (p.node_id, p.piece_count))
+                .map(|(id, _)| {
+                    let c = providers
+                        .iter()
+                        .find(|p| p.node_id == *id)
+                        .map_or(0, |p| p.piece_count);
+                    (*id, c)
+                })
                 .collect();
-            let Some((addr, tcount)) = peers
-                .iter()
-                .map(|(id, addr)| (addr, held_by.get(id).copied().unwrap_or(0)))
-                .min_by_key(|(_, c)| *c)
-            else {
-                continue;
-            };
-            // Move only if it strictly reduces imbalance (no ping-pong).
-            if tcount as usize + 1 >= my_pieces {
-                continue;
-            }
-
-            // MOVE one stored piece: push it, delete locally on ack.
-            let Ok(held) = self.store.serve_pieces(&cid, &HashSet::new(), 1) else {
-                continue;
-            };
-            let Some(piece) = held.into_iter().next() else {
-                continue;
-            };
-            let pid = piece.piece_id();
-            if self.push_piece(addr, cid, &gen, &piece).await.is_ok() {
-                let _ = self.store.remove_piece(&cid, &pid);
-                report.moved += 1;
+            let mut mine = my_pieces;
+            loop {
+                let Some((tid, taddr, tcount)) = peers
+                    .iter()
+                    .map(|(id, addr)| (*id, addr, *belief.get(id).unwrap_or(&0)))
+                    .min_by_key(|(_, _, c)| *c)
+                else {
+                    break;
+                };
+                // Stop when a move would no longer strictly reduce imbalance (no ping-pong);
+                // keep >=2 pieces locally so we stay repair-eligible.
+                if tcount as usize + 1 >= mine || mine <= 2 {
+                    break;
+                }
+                // MOVE one stored piece: push it, delete locally on ack, credit the belief.
+                let Ok(held) = self.store.serve_pieces(&cid, &HashSet::new(), 1) else {
+                    break;
+                };
+                let Some(piece) = held.into_iter().next() else {
+                    break;
+                };
+                let pid = piece.piece_id();
+                if self.push_piece(taddr, cid, &gen, &piece).await.is_ok() {
+                    let _ = self.store.remove_piece(&cid, &pid);
+                    *belief.entry(tid).or_insert(0) += 1;
+                    mine -= 1;
+                    report.moved += 1;
+                } else {
+                    break;
+                }
             }
         }
         report
@@ -1859,7 +1875,9 @@ impl ObjEngine {
         if push.system {
             let _ = self.store.mark_system(&cid);
         }
-        // Announce as provider on first piece for this CID.
+        // Announce as provider on first piece for this CID. (Distribution no longer relies on
+        // this record being fresh — it balances within a pass via a local belief — so a single
+        // first-piece announce suffices and we avoid an announce-per-ingest flood.)
         if was_empty {
             let count = self.store.piece_count(&cid) as u32;
             let _ = self.routing.announce(cid, count, false).await;
