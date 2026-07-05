@@ -1260,6 +1260,16 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         }
     });
     // Committee-chain tick loop: genesis bootstrap + epoch rollover.
+    // Cheap "pending distribution" refresh (provider records, no probing) — independent
+    // of the verified health scan so the dashboard stays fresh.
+    let pending_engine = engine.clone();
+    tokio::spawn(async move {
+        let mut iv = tokio::time::interval(std::time::Duration::from_secs(12));
+        loop {
+            iv.tick().await;
+            pending_engine.refresh_pending().await;
+        }
+    });
     let tick_store = committee_store.clone();
     let gov_tick = governance_store.clone();
     let tick_clock = transport.clock();

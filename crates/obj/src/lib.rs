@@ -187,6 +187,10 @@ pub struct ObjEngine {
     /// The owner's encryption keypair (PRE), set post-construction. Needed for
     /// publish_private / get_private; None if this node never handles private data.
     enc: std::sync::OnceLock<zeph_cipher::EncKeypair>,
+    /// Snapshot from the last health scan: retained content not yet durable —
+    /// (cid, coded pieces on OTHER nodes, floor = target n). Drives the dashboard's
+    /// "pending distribution" view.
+    pending: Mutex<Vec<([u8; 32], u32, u32)>>,
 }
 
 impl ObjEngine {
@@ -205,6 +209,7 @@ impl ObjEngine {
             last_served: Mutex::new(HashMap::new()),
             events: std::sync::OnceLock::new(),
             enc: std::sync::OnceLock::new(),
+            pending: Mutex::new(Vec::new()),
         })
     }
 
@@ -1256,6 +1261,47 @@ impl ObjEngine {
             }
         }
         report
+    }
+
+    /// Recompute the "pending distribution" snapshot CHEAPLY — from provider RECORDS
+    /// (their claimed piece_count via `resolve`, no per-peer probe), so it stays fresh even
+    /// when the verified health scan is slow. For each copy we retain (whole content, not
+    /// user-pinned) whose OTHER-node pieces are below the erasure floor, record its
+    /// progress. This is what the publisher is still holding + spreading.
+    pub async fn refresh_pending(&self) {
+        let me = self.transport.node_id();
+        let mut out: Vec<([u8; 32], u32, u32)> = Vec::new();
+        for cid in self.store.cids() {
+            if self.store.is_tombstoned(&cid)
+                || !self.store.has_content(&cid)
+                || self.store.is_pinned(&cid)
+            {
+                continue;
+            }
+            let Some(gen) = self.store.generation(&cid) else {
+                continue;
+            };
+            let floor = target_pieces(gen.k as usize) as u32;
+            let have_others: u32 = self
+                .routing
+                .resolve(cid)
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|p| p.node_id != me)
+                .map(|p| p.piece_count)
+                .sum();
+            if have_others < floor {
+                out.push((cid.0, have_others, floor));
+            }
+        }
+        out.sort_by_key(|(_, have, _)| *have); // least-durable first
+        *self.pending.lock().expect("pending") = out;
+    }
+
+    /// The last "pending distribution" snapshot: (cid, pieces on OTHER nodes, floor).
+    pub fn pending_durability(&self) -> Vec<([u8; 32], u32, u32)> {
+        self.pending.lock().expect("pending").clone()
     }
 
     /// One Distribution pass — the spin-up / spread behavior. For each CID

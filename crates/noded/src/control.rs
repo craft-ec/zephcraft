@@ -1711,6 +1711,25 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         }
     }
 
+    async fn api_pending(
+        AxumState(ctx): AxumState<HttpCtx>,
+        Query(params): Query<TokenParam>,
+    ) -> axum::response::Response {
+        if params.token != *ctx.token {
+            return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
+        }
+        let rows: Vec<serde_json::Value> = ctx
+            .state
+            .engine
+            .pending_durability()
+            .into_iter()
+            .map(|(cid, have, floor)| {
+                serde_json::json!({"cid": hex::encode(cid), "have": have, "floor": floor})
+            })
+            .collect();
+        axum::Json(serde_json::json!({ "pending": rows })).into_response()
+    }
+
     async fn api_programs(
         AxumState(ctx): AxumState<HttpCtx>,
         Query(params): Query<TokenParam>,
@@ -1821,6 +1840,7 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         .route("/api/attestation", get(api_attestation))
         .route("/api/governance", get(api_governance))
         .route("/api/programs", get(api_programs))
+        .route("/api/pending", get(api_pending))
         .with_state(ctx);
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
