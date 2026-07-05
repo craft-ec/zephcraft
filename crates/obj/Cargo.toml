@@ -6,6 +6,7 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 zeph-core.workspace = true
 zeph-erasure.workspace = true
 zeph-store.workspace = true

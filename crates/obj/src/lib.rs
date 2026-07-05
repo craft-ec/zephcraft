@@ -167,10 +167,37 @@ pub struct PublishReport {
     pub pinned: bool,
 }
 
+/// Source of live candidate peers to place pieces on. Production backs this with SWIM
+/// membership (real-time, in-network liveness); the tracker-backed `RoutingPeerSource` below
+/// is a transition/testing adapter. Replaces the old `ContentRouting::nodes()` census lookup.
+#[async_trait::async_trait]
+pub trait PeerSource: Send + Sync {
+    /// Live peers (id + dialable addr). May include self; callers filter it out.
+    async fn peers(&self) -> Vec<(NodeId, PeerAddr)>;
+}
+
+/// A `PeerSource` backed by the `ContentRouting` node registry (tracker) — for tests and
+/// while the tracker still serves census. Production uses a membership-backed source.
+pub struct RoutingPeerSource(pub Arc<dyn ContentRouting>);
+
+#[async_trait::async_trait]
+impl PeerSource for RoutingPeerSource {
+    async fn peers(&self) -> Vec<(NodeId, PeerAddr)> {
+        self.0
+            .nodes()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(id, np)| np.addr.parse::<PeerAddr>().ok().map(|a| (id, a)))
+            .collect()
+    }
+}
+
 pub struct ObjEngine {
     transport: Arc<Transport>,
     store: Arc<Store>,
     routing: Arc<dyn ContentRouting>,
+    peer_source: Arc<dyn PeerSource>,
     config: ObjConfig,
     /// Observed download demand: pulls (served piece requests) per CID since
     /// the last Scaling pass. This is ACTUAL fetch traffic, not the WANT
@@ -200,10 +227,26 @@ impl ObjEngine {
         routing: Arc<dyn ContentRouting>,
         config: ObjConfig,
     ) -> Arc<Self> {
+        // Default peer source: the tracker node registry (transition + tests). Production
+        // wires a membership-backed source via `with_peer_source`.
+        let peer_source = Arc::new(RoutingPeerSource(routing.clone()));
+        Self::with_peer_source(transport, store, routing, peer_source, config)
+    }
+
+    /// Construct with an explicit [`PeerSource`] — production passes a membership-backed one
+    /// so candidate peers come from live SWIM state, not the tracker.
+    pub fn with_peer_source(
+        transport: Arc<Transport>,
+        store: Arc<Store>,
+        routing: Arc<dyn ContentRouting>,
+        peer_source: Arc<dyn PeerSource>,
+        config: ObjConfig,
+    ) -> Arc<Self> {
         Arc::new(Self {
             transport,
             store,
             routing,
+            peer_source,
             config,
             demand: Mutex::new(HashMap::new()),
             last_served: Mutex::new(HashMap::new()),
@@ -417,13 +460,12 @@ impl ObjEngine {
         // Candidate storage peers from the node registry (exclude self).
         let me = self.transport.node_id();
         let candidates: Vec<PeerAddr> = self
-            .routing
-            .nodes()
+            .peer_source
+            .peers()
             .await
-            .unwrap_or_default()
             .into_iter()
             .filter(|(id, _)| *id != me)
-            .filter_map(|(_, np)| np.addr.parse().ok())
+            .map(|(_, addr)| addr)
             .collect();
 
         let n = target_pieces(k);
@@ -1304,13 +1346,12 @@ impl ObjEngine {
     pub async fn distribute_pending(&self) {
         let me = self.transport.node_id();
         let candidates: Vec<PeerAddr> = self
-            .routing
-            .nodes()
+            .peer_source
+            .peers()
             .await
-            .unwrap_or_default()
             .into_iter()
             .filter(|(id, _)| *id != me)
-            .filter_map(|(_, np)| np.addr.parse().ok())
+            .map(|(_, addr)| addr)
             .collect();
         // "Complete" = reached as many distinct peers as the durability target OR the whole
         // cluster can offer — then never pushed again.
@@ -1400,13 +1441,11 @@ impl ObjEngine {
         // candidate CONCURRENTLY (was a per-cid resolve + a probe of every node for every
         // cid — O(cids x nodes) round-trips that made a pass take minutes).
         let peers: Vec<(NodeId, PeerAddr)> = self
-            .routing
-            .nodes()
+            .peer_source
+            .peers()
             .await
-            .unwrap_or_default()
             .into_iter()
             .filter(|(id, _)| *id != me)
-            .filter_map(|(id, np)| np.addr.parse::<PeerAddr>().ok().map(|a| (id, a)))
             .collect();
         let candidates: Vec<Cid> = self
             .store
@@ -1520,15 +1559,13 @@ impl ObjEngine {
                 continue;
             };
             // Recruit one new provider: a live peer not already holding the CID.
-            for (id, np) in self.routing.nodes().await.unwrap_or_default() {
+            for (id, addr) in self.peer_source.peers().await {
                 if id == me || provider_ids.contains(&id) {
                     continue;
                 }
-                if let Ok(addr) = np.addr.parse::<PeerAddr>() {
-                    if self.push_piece(&addr, cid, &gen, &piece).await.is_ok() {
-                        report.scaled += 1;
-                        break;
-                    }
+                if self.push_piece(&addr, cid, &gen, &piece).await.is_ok() {
+                    report.scaled += 1;
+                    break;
                 }
             }
         }
@@ -1594,20 +1631,19 @@ impl ObjEngine {
         }
         // Sole survivor: recruit a brand-new holder from the node registry.
         let holder_ids: HashSet<NodeId> = live.iter().map(|(id, _, _, _)| *id).collect();
-        for (id, np) in self.routing.nodes().await.unwrap_or_default() {
+        for (id, addr) in self.peer_source.peers().await {
             if id == me || holder_ids.contains(&id) {
                 continue;
             }
-            if let Ok(addr) = np.addr.parse::<PeerAddr>() {
-                if self.push_piece(&addr, *cid, gen, &piece).await.is_ok() {
-                    return true;
-                }
+            if self.push_piece(&addr, *cid, gen, &piece).await.is_ok() {
+                return true;
             }
         }
         false
     }
 
-    /// Announce a relay this node operates into the relay registry (§26).
+    /// Announce a relay this node operates into the relay registry (§26). (Tracker-era
+    /// self-registration; removed when census moves to membership in P4c.)
     pub async fn announce_relay(&self, relay_url: String) -> anyhow::Result<()> {
         self.routing
             .announce_relay_registry(relay_url)
@@ -1615,8 +1651,8 @@ impl ObjEngine {
             .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
-    /// Announce this node into the tracker's node registry (map/census),
-    /// reporting real bytes stored + offered capacity.
+    /// Announce this node into the tracker's node registry (map/census), reporting real
+    /// bytes stored + offered capacity. (Removed when census moves to membership in P4c.)
     pub async fn announce_node(&self) -> anyhow::Result<()> {
         let used = self.store.stats().bytes;
         self.routing
