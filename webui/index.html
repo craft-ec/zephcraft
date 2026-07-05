@@ -604,8 +604,15 @@ async function loadAttestation(){
       const gr=await fetch("/api/governance?token="+TOKEN);
       if(gr.ok){ const g=await gr.json(); const gel=$("gov-body");
         if(gel){ const govs=(g.governors||[]);
-          gel.innerHTML=`<div class="kv"><span>governance</span><b>${g.threshold}-of-${govs.length} \u00b7 seq ${g.seq}${g.is_governor?' \u00b7 <span class="chip providing">you are a governor</span>':''}</b></div>`
-            + govs.map(h=>`<div class="kv"><span></span><span class="mono muted" onclick="copyCid('${h}')" title="copy">${h.slice(0,24)}\u2026</span></div>`).join("");
+          let html=`<div class="kv"><span>governance</span><b>${g.threshold}-of-${govs.length} \u00b7 seq ${g.seq}${g.is_governor?' \u00b7 <span class="chip providing">you are a governor</span>':''}</b></div>`
+            + govs.map(h=>`<div class="kv"><span>governor</span><span class="mono muted" onclick="copyCid('${h}')" title="copy">${h.slice(0,20)}\u2026</span></div>`).join("");
+          try{ const pr=await fetch("/api/programs?token="+TOKEN);
+            if(pr.ok){ const p=await pr.json(); const rows=(p.programs||[]);
+              html+='<div class="grp" style="margin-top:.5rem">network-owned programs (upgradeable via governance)</div>'
+                + (rows.length?rows.map(r=>`<div class="kv"><span>${esc(r[0])} <span class="chip pinned">v${r[2]}</span></span><span class="mono muted" onclick="copyCid('${r[1]}')" title="copy">${String(r[1]).slice(0,20)}\u2026</span></div>`).join(""):'<div class="muted">none</div>');
+            }
+          }catch(_){}
+          gel.innerHTML=html;
         }
       }
     }catch(_){}

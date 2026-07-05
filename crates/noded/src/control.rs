@@ -187,6 +187,8 @@ pub struct State {
     pub committee: std::sync::Arc<crate::committee::CommitteeChainStore>,
     /// Governance: the live governor set (protocol-tier approvals).
     pub governance: std::sync::Arc<crate::governance::GovernanceStore>,
+    /// Program registry: canonical cid per network-owned program (governance-approved).
+    pub programs: std::sync::Arc<crate::progreg::ProgramRegistryStore>,
 }
 
 impl State {
@@ -395,6 +397,7 @@ async fn handle_rpc(state: &State, line: &str) -> serde_json::Value {
         Some("gov_propose") => rpc_gov_propose(state, &request, id).await,
         Some("gov_sign") => rpc_gov_sign(state, &request, id).await,
         Some("gov_submit") => rpc_gov_submit(state, &request, id).await,
+        Some("programs") => rpc_programs(state, id).await,
         Some("apps") => {
             serde_json::json!({"jsonrpc": "2.0", "id": id, "result": apps_list(state).await})
         }
@@ -1048,6 +1051,17 @@ fn gov_set_json(set: &zeph_com::GovernanceSet, is_gov: bool) -> serde_json::Valu
     })
 }
 
+async fn rpc_programs(state: &State, id: serde_json::Value) -> serde_json::Value {
+    let rows: Vec<serde_json::Value> = state
+        .programs
+        .rows()
+        .await
+        .into_iter()
+        .map(|(name, cid, ver)| serde_json::json!([name, cid, ver]))
+        .collect();
+    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"programs": rows}})
+}
+
 async fn rpc_gov(state: &State, id: serde_json::Value) -> serde_json::Value {
     let set = state.governance.current().await;
     let ig = state.governance.is_governor().await;
@@ -1069,8 +1083,11 @@ async fn rpc_gov_propose(
     let approval = state.governance.draft(action).await;
     // Try to apply now (sufficient at 1-of-1); else hand back the partial for co-signing.
     match state.governance.submit(&approval).await {
-        Ok(set) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result":
-            {"applied": true, "set": gov_set_json(&set, true)}}),
+        Ok(set) => {
+            apply_program_effect(state, &approval, set.seq).await;
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "result":
+                {"applied": true, "set": gov_set_json(&set, true)}})
+        }
         Err(_) => {
             let hex = hex::encode(postcard::to_allocvec(&approval).unwrap_or_default());
             serde_json::json!({"jsonrpc": "2.0", "id": id, "result":
@@ -1098,6 +1115,15 @@ async fn rpc_gov_sign(
         Ok(()) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result":
             {"approval": hex::encode(postcard::to_allocvec(&approval).unwrap_or_default())}}),
         Err(e) => rpc_err(id, e.to_string()),
+    }
+}
+
+/// If an approved action was SetProgram, record it in the program registry.
+async fn apply_program_effect(state: &State, approval: &zeph_com::GovernanceApproval, seq: u64) {
+    if let zeph_com::GovAction::SetProgram { name, cid } = &approval.proposal.action {
+        if let Err(e) = state.programs.record(name, *cid, seq).await {
+            tracing::warn!(%e, "program registry record failed");
+        }
     }
 }
 
@@ -1614,6 +1640,24 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         }
     }
 
+    async fn api_programs(
+        AxumState(ctx): AxumState<HttpCtx>,
+        Query(params): Query<TokenParam>,
+    ) -> axum::response::Response {
+        if params.token != *ctx.token {
+            return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
+        }
+        let rows: Vec<serde_json::Value> = ctx
+            .state
+            .programs
+            .rows()
+            .await
+            .into_iter()
+            .map(|(name, cid, ver)| serde_json::json!([name, cid, ver]))
+            .collect();
+        axum::Json(serde_json::json!({ "programs": rows })).into_response()
+    }
+
     async fn api_governance(
         AxumState(ctx): AxumState<HttpCtx>,
         Query(params): Query<TokenParam>,
@@ -1696,6 +1740,7 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         .route("/api/deploy", axum::routing::post(api_deploy))
         .route("/api/attestation", get(api_attestation))
         .route("/api/governance", get(api_governance))
+        .route("/api/programs", get(api_programs))
         .with_state(ctx);
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;

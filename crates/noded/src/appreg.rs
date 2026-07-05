@@ -51,6 +51,7 @@ pub struct AppRegistry {
     state: RwLock<RegistryState>,
     path: PathBuf,
     coord: RwLock<Option<Coordinator>>,
+    programs: RwLock<Option<Arc<crate::progreg::ProgramRegistryStore>>>,
     routing: Arc<dyn ContentRouting>,
     /// The authority mode of the last registration ("none" | "self" | "committee").
     mode: RwLock<&'static str>,
@@ -75,6 +76,7 @@ impl AppRegistry {
             state: RwLock::new(state),
             path,
             coord: RwLock::new(None),
+            programs: RwLock::new(None),
             routing,
             mode: RwLock::new("none"),
         }
@@ -89,6 +91,24 @@ impl AppRegistry {
             membership,
             self_id,
         });
+    }
+
+    /// Wire the program registry so the app-registry program cid is resolved THROUGH it
+    /// (upgradeable) rather than hardcoded.
+    pub async fn set_programs(&self, programs: Arc<crate::progreg::ProgramRegistryStore>) {
+        *self.programs.write().await = Some(programs);
+    }
+
+    /// The canonical app-registry program cid — resolved via the program registry
+    /// (governance-upgradeable), falling back to the native cid.
+    async fn program_cid(&self) -> [u8; 32] {
+        match self.programs.read().await.as_ref() {
+            Some(p) => p
+                .resolve("app-registry")
+                .await
+                .unwrap_or_else(registry_program_cid),
+            None => registry_program_cid(),
+        }
     }
 
     /// The registry PDA account (program-derived; no keyholder).
@@ -118,7 +138,7 @@ impl AppRegistry {
                     .map_err(|e| anyhow::anyhow!("registry: {e}"))?;
                 let _ = attest_transition(
                     &self.identity,
-                    registry_program_cid(),
+                    self.program_cid().await,
                     prev.root(),
                     &sub.encode(),
                     &n.encode(),
@@ -173,7 +193,7 @@ impl AppRegistry {
         }
 
         let next = prev.apply(sub).ok()?;
-        let program = registry_program_cid();
+        let program = self.program_cid().await;
         let prev_root = prev.root();
         let request = sub.encode();
         let req = AttestRequest {

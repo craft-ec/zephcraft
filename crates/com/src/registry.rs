@@ -196,6 +196,66 @@ impl crate::NativeProgram for RegistryProgram {
     }
 }
 
+/// The **program registry** state: `network-program name → (canonical wasm cid,
+/// version)`. This is the native bootstrap map that makes every OTHER network-owned
+/// program upgradeable — its writes are authorized by governance (a `SetProgram`
+/// approval), and nodes resolve a program's canonical cid here instead of hardcoding it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProgramRegistryState {
+    /// (name, cid, version) sorted by name — one entry per program.
+    programs: Vec<(String, [u8; 32], u64)>,
+}
+
+impl ProgramRegistryState {
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.is_empty() {
+            return Some(Self::default());
+        }
+        postcard::from_bytes(bytes).ok()
+    }
+    pub fn encode(&self) -> Vec<u8> {
+        postcard::to_allocvec(self).unwrap_or_default()
+    }
+    pub fn root(&self) -> [u8; 32] {
+        Cid::of(&self.encode()).0
+    }
+    pub fn entries(&self) -> &[(String, [u8; 32], u64)] {
+        &self.programs
+    }
+
+    /// The canonical wasm cid for a network-owned program.
+    pub fn resolve(&self, name: &str) -> Option<[u8; 32]> {
+        self.programs
+            .binary_search_by(|(n, _, _)| n.as_str().cmp(name))
+            .ok()
+            .map(|i| self.programs[i].1)
+    }
+
+    /// Set a program's canonical cid (upsert). Version must strictly increase for an
+    /// existing program. Returns the new state, or an error.
+    pub fn set(
+        &self,
+        name: &str,
+        cid: [u8; 32],
+        version: u64,
+    ) -> Result<ProgramRegistryState, &'static str> {
+        let mut next = self.clone();
+        match next
+            .programs
+            .binary_search_by(|(n, _, _)| n.as_str().cmp(name))
+        {
+            Ok(i) => {
+                if version <= next.programs[i].2 {
+                    return Err("stale-version");
+                }
+                next.programs[i] = (name.to_string(), cid, version);
+            }
+            Err(i) => next.programs.insert(i, (name.to_string(), cid, version)),
+        }
+        Ok(next)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,5 +418,23 @@ mod tests {
                 .cid,
             [1u8; 32]
         );
+    }
+
+    #[test]
+    fn program_registry_sets_and_resolves() {
+        let s = ProgramRegistryState::default();
+        let s = s.set("app-registry", [1u8; 32], 1).unwrap();
+        let s = s.set("reputation", [2u8; 32], 1).unwrap();
+        assert_eq!(s.resolve("app-registry"), Some([1u8; 32]));
+        assert_eq!(s.resolve("reputation"), Some([2u8; 32]));
+        assert_eq!(s.resolve("nope"), None);
+        // upgrade the app-registry program (version must advance)
+        assert!(
+            s.set("app-registry", [9u8; 32], 1).is_err(),
+            "stale version rejected"
+        );
+        let s2 = s.set("app-registry", [9u8; 32], 2).unwrap();
+        assert_eq!(s2.resolve("app-registry"), Some([9u8; 32]));
+        assert_ne!(s.root(), s2.root());
     }
 }

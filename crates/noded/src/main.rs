@@ -8,6 +8,7 @@ mod appreg;
 mod committee;
 mod control;
 mod governance;
+mod progreg;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -111,6 +112,8 @@ enum Command {
     },
     /// List your deployed CraftCOM apps.
     Apps,
+    /// List network-owned programs and their canonical cids.
+    Programs,
     /// Show the governance set (governors, threshold, seq).
     Gov,
     /// Propose a governance change (signs with this node's key; applies at 1-of-1).
@@ -346,6 +349,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Deploy { file, name }) => cmd_deploy(&data_dir, &file, name.as_deref()).await,
         Some(Command::Apps) => cmd_apps(&data_dir).await,
+        Some(Command::Programs) => cmd_programs(&data_dir).await,
         Some(Command::Gov) => cmd_gov(&data_dir).await,
         Some(Command::GovPropose {
             add,
@@ -471,6 +475,24 @@ async fn cmd_deploy(data_dir: &Path, file: &Path, name: Option<&str>) -> anyhow:
     let ver = r.get("version").and_then(|v| v.as_u64()).unwrap_or(1);
     println!("deployed app '{n}' v{ver} ({size} bytes, system object) - cid {cid}");
     println!("invoke by name: zeph invoke --name {n}");
+    Ok(())
+}
+
+async fn cmd_programs(data_dir: &Path) -> anyhow::Result<()> {
+    let res = control::query_unix(&data_dir.join("zeph.sock"), "programs").await?;
+    let rows = res
+        .get("programs")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    println!("{:<16} {:<5} CANONICAL CID", "PROGRAM", "VER");
+    for r in rows {
+        let a = r.as_array().cloned().unwrap_or_default();
+        let name = a.first().and_then(|v| v.as_str()).unwrap_or("");
+        let cid = a.get(1).and_then(|v| v.as_str()).unwrap_or("");
+        let ver = a.get(2).and_then(|v| v.as_i64()).unwrap_or(0);
+        println!("{:<16} v{:<4} {}", name, ver, &cid[..cid.len().min(24)]);
+    }
     Ok(())
 }
 
@@ -969,6 +991,9 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         routing.clone(),
         data_dir,
     ));
+    // Program registry: native bootstrap map (program name -> canonical cid), seeded
+    // with the app-registry program; governance-authorized.
+    let program_store = std::sync::Arc::new(progreg::ProgramRegistryStore::open(data_dir));
     // Governance: the live governor set (seeded 1-of-1 with this node's key by default).
     let gov_governors: Vec<[u8; 32]> = cfg
         .governance_governors
@@ -1030,6 +1055,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         appreg: appreg_store.clone(),
         committee: committee_store.clone(),
         governance: governance_store.clone(),
+        programs: program_store.clone(),
         settings: {
             let oc = engine.config();
             control::NodeSettings {
@@ -1225,6 +1251,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         .set_coordinator(transport.clone(), membership.clone())
         .await;
     committee_store.set_membership(membership.clone()).await;
+    appreg_store.set_programs(program_store.clone()).await;
 
     // Discover peers from the tracker's node registry and seed membership —
     // a node bootstraps from the network without any hardcoded peer.
