@@ -196,7 +196,7 @@
   </section>
 
   <section id="tab-programs" class="tab" hidden>
-    <div class="muted" style="font-size:.76rem;line-height:1.55;margin-bottom:1rem">Everything the network runs is a <b style="color:var(--fg)">WASM program</b>. A small set are <b style="color:var(--fg)">protocol programs</b> the network owns and governs; everything else is a <b style="color:var(--fg)">user app</b>, listed by the app-registry (itself a protocol program). Governance and attestation are the mechanisms that maintain these two listings — not anything a user app needs.</div>
+    <div class="muted" style="font-size:.76rem;line-height:1.55;margin-bottom:1rem">Everything the network runs is a <b style="color:var(--fg)">WASM program</b>. A small set are <b style="color:var(--fg)">protocol programs</b> the network owns and governs; everything else is a <b style="color:var(--fg)">user app</b>, listed by the app-registry (itself a protocol program). Governance and attestation are the mechanisms that maintain these listings (their stats live in <b style="color:var(--fg)">Status</b>) — not anything a user app needs.</div>
     <div class="card">
       <div class="cardhead">protocol programs <span class="muted">— network-owned · canonical WASM set by governance</span></div>
       <div id="prog-protocol"><div class="muted">loading…</div></div>
@@ -208,6 +208,14 @@
   </section>
 
   <section id="tab-status" class="tab" hidden>
+    <div class="card">
+      <div class="cardhead">governance <span class="muted">— k-of-n governor multisig · approves protocol program listings</span></div>
+      <div id="st-gov"><div class="muted">…</div></div>
+    </div>
+    <div class="card">
+      <div class="cardhead">attestation <span class="muted">— k-of-n committee · proves deterministic runs (maintains the app-registry)</span></div>
+      <div id="st-att"><div class="muted">…</div></div>
+    </div>
     <div class="card">
       <div class="cardhead">event bus <span class="muted">(foundation §52 — the reactive nervous system)</span></div>
       <div class="kv"><span>total events</span><b id="eb-total">…</b></div>
@@ -353,6 +361,7 @@ async function tick(){
     const ra = await fetch("/api/apps?token=" + TOKEN);
     if (ra.ok) renderApps(await ra.json());
   } catch (_) {}
+  if($("tab-status") && !$("tab-status").hidden) loadStatus();
 }
 // My Drive: this identity's CraftSQL file index (name · size · type · age · cid).
 function renderApps(v){
@@ -542,6 +551,7 @@ function showTab(name){
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('on', b.dataset.tab === name));
   try { localStorage.setItem('zeph-tab', name); } catch(e){}
   if(name==="programs") loadPrograms();
+  if(name==="status") loadStatus();
 }
 async function doDeploy(){
   const name=$("dep-name").value.trim(); const f=$("dep-file").files[0]; const out=$("dep-result");
@@ -578,46 +588,52 @@ function sqlTable(j){
 async function loadPrograms(){
   const host=$("prog-protocol"); if(!host) return;
   try{
-    const [ar,gr,pr]=await Promise.all([
+    const [ar,pr]=await Promise.all([
       fetch("/api/attestation?token="+TOKEN),
-      fetch("/api/governance?token="+TOKEN),
       fetch("/api/programs?token="+TOKEN)
     ]);
     const j=ar.ok?await ar.json():{};
-    const g=gr.ok?await gr.json():{};
     const p=pr.ok?await pr.json():{};
-    const c=j.committee||{};
     const prg=(p.programs||[]);
-    const govs=(g.governors||[]);
-    // PROTOCOL PROGRAMS — governed
     const ptable = prg.length
-      ? '<table style="margin-bottom:.3rem"><thead><tr><th style="text-align:left">program</th><th style="text-align:left">ver</th><th style="text-align:left">canonical wasm cid</th></tr></thead><tbody>'
-        + prg.map(x=>`<tr><td style="padding:.15rem .8rem .15rem 0"><b>${esc(x[0])}</b></td><td style="padding:.15rem .8rem .15rem 0">v${x[2]}</td><td class="mono muted cidcell" style="padding:.15rem 0" onclick="copyCid('${x[1]}')">${String(x[1]).slice(0,20)}…</td></tr>`).join("")
+      ? '<table><thead><tr><th style="text-align:left">program</th><th style="text-align:left">ver</th><th style="text-align:left">canonical wasm cid</th></tr></thead><tbody>'
+        + prg.map(x=>`<tr><td style="padding:.15rem .8rem .15rem 0"><b>${esc(x[0])}</b></td><td style="padding:.15rem .8rem .15rem 0">v${x[2]}</td><td class="mono muted cidcell" style="padding:.15rem 0" onclick="copyCid('${x[1]}')">${String(x[1]).slice(0,22)}…</td></tr>`).join("")
         + '</tbody></table>'
       : '<div class="muted">none</div>';
-    $("prog-protocol").innerHTML=`
-      ${ptable}
-      <div class="grp mech">maintained by governance</div>
-      <div class="kv"><span>governor set</span><b>${g.threshold||0}-of-${govs.length} · seq ${g.seq||0}${g.is_governor?' · <span class="chip providing">you are a governor</span>':''}</b></div>
-      ${govs.map(h=>`<div class="kv"><span>governor</span><span class="mono muted cidcell" onclick="copyCid('${h}')">${h.slice(0,18)}…</span></div>`).join("")}
-      <div class="note">The programs the network itself runs. Governance — a k-of-n governor multisig — approves which WASM cid is canonical for each, so they upgrade with <b>no binary release</b>. The <b>app-registry</b> is the protocol program that lists the user apps below.</div>`;
-    // USER APPS — listed by the app-registry
+    $("prog-protocol").innerHTML=`${ptable}
+      <div class="note">The programs the network itself runs. <b>Governance</b> approves which WASM cid is canonical for each, so they upgrade with no binary release (the governor set is in <b>Status</b>). The <b>app-registry</b> is the protocol program that lists the user apps below.</div>`;
     const rows=(j.rows||[]);
     const utable = rows.length
-      ? '<table style="margin-bottom:.3rem"><thead><tr><th style="text-align:left">app</th><th style="text-align:left">ver</th><th style="text-align:left">owner</th><th style="text-align:left">cid</th></tr></thead><tbody>'
+      ? '<table><thead><tr><th style="text-align:left">app</th><th style="text-align:left">ver</th><th style="text-align:left">owner</th><th style="text-align:left">cid</th></tr></thead><tbody>'
         + rows.map(x=>`<tr><td style="padding:.15rem .8rem .15rem 0"><b>${esc(x[1])}</b></td><td style="padding:.15rem .8rem .15rem 0">v${x[3]}</td><td class="mono muted" style="padding:.15rem .8rem .15rem 0">${String(x[0]).slice(0,8)}…</td><td class="mono muted cidcell" style="padding:.15rem 0" onclick="copyCid('${x[2]}')">${String(x[2]).slice(0,14)}…</td></tr>`).join("")
         + '</tbody></table>'
       : '<div class="muted">no apps yet — deploy one</div>';
-    const modeChip = c.last_mode==="committee"?'<span class="chip providing">committee-attested</span>':(c.last_mode==="self"?'<span class="chip pinned">self-attested</span>':'<span class="chip net">idle</span>');
-    $("prog-user").innerHTML=`
-      ${utable}
-      <div class="grp mech">maintained by the app-registry program</div>
-      <div class="kv"><span>registry program</span><b>${esc(j.program_source||'')}</b> <span class="mono muted cidcell" onclick="copyCid('${j.registry_program||''}')">${(j.registry_program||'').slice(0,12)}…</span></div>
-      <div class="kv"><span>last write</span><b>${modeChip}</b> <span class="muted">committee k=${c.k||1} of n=${c.n||1}${j.chain?` · epoch ${j.chain.epoch}`:''}</span></div>
-      ${j.chain&&j.chain.epoch_ms?`<div class="kv"><span>committee rollover</span><b id="epoch-timer" class="mono">…</b></div>`:''}
-      <div class="note">Anyone publishes an app by signing a head (name→cid); the app-registry records it. Its writes are <b>attested by a k-of-n committee</b> so the listing can't be forged without a trusted keyholder — but a <b>user app itself needs no attestation</b>; it just runs when invoked.</div>`;
-    if(j.chain&&j.chain.next_rollover_ms!=null) startEpochTimer(j.chain.next_rollover_ms);
+    $("prog-user").innerHTML=`${utable}
+      <div class="note">Anyone publishes an app by signing a head (name→cid); the app-registry records it (its writes are committee-<b>attested</b> — the committee is in <b>Status</b>). A user app <b>needs no attestation by default</b> — but can opt in for trustless shared state.</div>`;
   }catch(e){ if($("prog-protocol")) $("prog-protocol").textContent="error: "+e; }
+}
+async function loadStatus(){
+  const gh=$("st-gov"); if(!gh) return;
+  try{
+    const [gr,ar]=await Promise.all([
+      fetch("/api/governance?token="+TOKEN),
+      fetch("/api/attestation?token="+TOKEN)
+    ]);
+    const g=gr.ok?await gr.json():{};
+    const j=ar.ok?await ar.json():{};
+    const c=j.committee||{};
+    const govs=(g.governors||[]);
+    gh.innerHTML=`
+      <div class="kv"><span>governor set</span><b>${g.threshold||0}-of-${govs.length} · seq ${g.seq||0}${g.is_governor?' · <span class="chip providing">you are a governor</span>':''}</b></div>
+      ${govs.map(h=>`<div class="kv"><span>governor</span><span class="mono muted cidcell" onclick="copyCid('${h}')">${h.slice(0,20)}…</span></div>`).join("")}`;
+    const modeChip = c.last_mode==="committee"?'<span class="chip providing">committee-attested</span>':(c.last_mode==="self"?'<span class="chip pinned">self-attested</span>':'<span class="chip net">idle</span>');
+    $("st-att").innerHTML=`
+      <div class="kv"><span>committee</span><b>k=${c.k||1} of n=${c.n||1} · ${c.eligible||1} eligible</b></div>
+      ${j.chain&&j.chain.checkpoints?`<div class="kv"><span>committee chain</span><b>${j.chain.checkpoints} checkpoints · epoch ${j.chain.epoch} · size ${j.chain.committee_size}</b></div>`:''}
+      ${j.chain&&j.chain.epoch_ms?`<div class="kv"><span>next rollover</span><b id="epoch-timer" class="mono">…</b></div>`:''}
+      <div class="kv"><span>app-registry last write</span><b>${modeChip}</b></div>`;
+    if(j.chain&&j.chain.next_rollover_ms!=null) startEpochTimer(j.chain.next_rollover_ms);
+  }catch(e){ if($("st-gov")) $("st-gov").textContent="error: "+e; }
 }
 let epochInterval=null;
 function startEpochTimer(msLeft){
@@ -626,7 +642,7 @@ function startEpochTimer(msLeft){
   const upd=()=>{
     const el=$("epoch-timer"); if(!el){ clearInterval(epochInterval); return; }
     const r=Math.max(0, deadline-Date.now());
-    if(r<=0){ el.textContent="rolling over\u2026"; clearInterval(epochInterval); setTimeout(loadPrograms,1500); return; }
+    if(r<=0){ el.textContent="rolling over\u2026"; clearInterval(epochInterval); setTimeout(loadStatus,1500); return; }
     const m=Math.floor(r/60000), sec=Math.floor((r%60000)/1000);
     el.textContent=`${m}m ${String(sec).padStart(2,"0")}s`;
   };
