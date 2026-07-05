@@ -197,6 +197,10 @@
       <div class="cardhead">attestation &amp; registry <span class="muted">(program-owned durable heads — foundation §41/§56)</span></div>
       <div id="attest-body"><div class="muted">loading…</div></div>
     </div>
+    <div class="card">
+      <div class="cardhead">governance <span class="muted">(protocol-tier approvals \u2014 k-of-n governor multisig; user apps need no approval)</span></div>
+      <div id="gov-body"><div class="muted">loading…</div></div>
+    </div>
   </section>
 
   <section id="tab-status" class="tab" hidden>
@@ -596,6 +600,15 @@ async function loadAttestation(){
       <div class="muted" style="margin-top:.6rem">${esc(j.note)}</div>
       <div class="muted" style="margin-top:.5rem;font-size:.74rem;line-height:1.5">This is the <b>app-name registry</b> \u2014 a publisher signs a head (name\u2192cid), a deterministic k-of-n committee runs the registry program and attests the append (a wrong output can\u0027t reach quorum, so no keyholder is trusted), and other nodes resolve it from the durable state. Future protocol registries (program, config, committee, bans) will be separate roots.</div>`;
     if(j.chain&&j.chain.next_rollover_ms!=null) startEpochTimer(j.chain.next_rollover_ms);
+    try{
+      const gr=await fetch("/api/governance?token="+TOKEN);
+      if(gr.ok){ const g=await gr.json(); const gel=$("gov-body");
+        if(gel){ const govs=(g.governors||[]);
+          gel.innerHTML=`<div class="kv"><span>governance</span><b>${g.threshold}-of-${govs.length} \u00b7 seq ${g.seq}${g.is_governor?' \u00b7 <span class="chip providing">you are a governor</span>':''}</b></div>`
+            + govs.map(h=>`<div class="kv"><span></span><span class="mono muted" onclick="copyCid('${h}')" title="copy">${h.slice(0,24)}\u2026</span></div>`).join("");
+        }
+      }
+    }catch(_){}
   }catch(e){ el.textContent="error: "+e; }
 }
 let epochInterval=null;

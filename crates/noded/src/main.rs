@@ -7,6 +7,7 @@
 mod appreg;
 mod committee;
 mod control;
+mod governance;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -110,6 +111,20 @@ enum Command {
     },
     /// List your deployed CraftCOM apps.
     Apps,
+    /// Show the governance set (governors, threshold, seq).
+    Gov,
+    /// Propose a governance change (signs with this node's key; applies at 1-of-1).
+    GovPropose {
+        #[arg(long)]
+        add: Option<String>,
+        #[arg(long)]
+        remove: Option<String>,
+        #[arg(long)]
+        threshold: Option<u64>,
+        /// name=cid : set a network-owned program's canonical wasm cid.
+        #[arg(long)]
+        set_program: Option<String>,
+    },
     /// Execute write SQL against your own CraftSQL database `ns`
     /// (commits + publishes the KIND_ROOT head).
     SqlExec {
@@ -229,6 +244,16 @@ struct Config {
     health_scan_secs: u64,
     /// Provider + CraftSQL-head re-announce interval (seconds). Default 120.
     reannounce_secs: u64,
+    /// Governance genesis: governor node-id hexes. Empty = seed 1-of-1 with this node.
+    #[serde(default)]
+    governance_governors: Vec<String>,
+    /// Governance genesis threshold (k). Default 1.
+    #[serde(default = "one")]
+    governance_threshold: usize,
+}
+
+fn one() -> usize {
+    1
 }
 
 impl Default for Config {
@@ -253,6 +278,8 @@ impl Default for Config {
             eviction_cooldown_secs: 30 * 24 * 60 * 60,
             health_scan_secs: 30,
             reannounce_secs: 120,
+            governance_governors: Vec::new(),
+            governance_threshold: 1,
         }
     }
 }
@@ -319,6 +346,13 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Deploy { file, name }) => cmd_deploy(&data_dir, &file, name.as_deref()).await,
         Some(Command::Apps) => cmd_apps(&data_dir).await,
+        Some(Command::Gov) => cmd_gov(&data_dir).await,
+        Some(Command::GovPropose {
+            add,
+            remove,
+            threshold,
+            set_program,
+        }) => cmd_gov_propose(&data_dir, add, remove, threshold, set_program).await,
         Some(Command::SqlExec { ns, sql }) => cmd_sql_exec(&data_dir, &ns, &sql).await,
         Some(Command::SqlQuery { ns, sql, owner }) => {
             cmd_sql_query(&data_dir, owner.as_deref(), &ns, &sql).await
@@ -437,6 +471,85 @@ async fn cmd_deploy(data_dir: &Path, file: &Path, name: Option<&str>) -> anyhow:
     let ver = r.get("version").and_then(|v| v.as_u64()).unwrap_or(1);
     println!("deployed app '{n}' v{ver} ({size} bytes, system object) - cid {cid}");
     println!("invoke by name: zeph invoke --name {n}");
+    Ok(())
+}
+
+async fn cmd_gov(data_dir: &Path) -> anyhow::Result<()> {
+    let res = control::query_unix(&data_dir.join("zeph.sock"), "gov").await?;
+    let govs = res
+        .get("governors")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    println!(
+        "governance: {}-of-{}  seq {}  (you are {}a governor)",
+        res.get("threshold").and_then(|v| v.as_u64()).unwrap_or(0),
+        govs.len(),
+        res.get("seq").and_then(|v| v.as_u64()).unwrap_or(0),
+        if res
+            .get("is_governor")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            ""
+        } else {
+            "NOT "
+        },
+    );
+    for g in govs {
+        if let Some(h) = g.as_str() {
+            println!("  {}", h);
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_gov_propose(
+    data_dir: &Path,
+    add: Option<String>,
+    remove: Option<String>,
+    threshold: Option<u64>,
+    set_program: Option<String>,
+) -> anyhow::Result<()> {
+    let params = if let Some(h) = add {
+        serde_json::json!({"action": "add", "governor": h})
+    } else if let Some(h) = remove {
+        serde_json::json!({"action": "remove", "governor": h})
+    } else if let Some(t) = threshold {
+        serde_json::json!({"action": "threshold", "value": t})
+    } else if let Some(np) = set_program {
+        let (name, cid) = np
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--set-program name=cid"))?;
+        serde_json::json!({"action": "set_program", "name": name, "cid": cid})
+    } else {
+        anyhow::bail!("give one of --add/--remove/--threshold/--set-program");
+    };
+    let res =
+        control::query_unix_params(&data_dir.join("zeph.sock"), "gov_propose", params).await?;
+    if res
+        .get("applied")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        let set = res.get("set").cloned().unwrap_or_default();
+        println!(
+            "applied. governance now {}-of-{}  seq {}",
+            set.get("threshold").and_then(|v| v.as_u64()).unwrap_or(0),
+            set.get("governors")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0),
+            set.get("seq").and_then(|v| v.as_u64()).unwrap_or(0),
+        );
+    } else {
+        println!("proposal drafted + signed. needs more governor signatures.");
+        println!(
+            "approval: {}",
+            res.get("approval").and_then(|v| v.as_str()).unwrap_or("")
+        );
+        println!("other governors: zeph gov-sign <approval>, then zeph gov-submit <approval>");
+    }
     Ok(())
 }
 
@@ -856,6 +969,18 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         routing.clone(),
         data_dir,
     ));
+    // Governance: the live governor set (seeded 1-of-1 with this node's key by default).
+    let gov_governors: Vec<[u8; 32]> = cfg
+        .governance_governors
+        .iter()
+        .filter_map(|h| <[u8; 32]>::try_from(hex::decode(h.trim()).ok()?.as_slice()).ok())
+        .collect();
+    let governance_store = std::sync::Arc::new(governance::GovernanceStore::open(
+        identity.clone(),
+        data_dir,
+        &gov_governors,
+        cfg.governance_threshold,
+    ));
     // Phase 4g: the committee-chain store (membership wired once it is up).
     let committee_store = std::sync::Arc::new(committee::CommitteeChainStore::new(
         identity.clone(),
@@ -904,6 +1029,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         routing: routing.clone(),
         appreg: appreg_store.clone(),
         committee: committee_store.clone(),
+        governance: governance_store.clone(),
         settings: {
             let oc = engine.config();
             control::NodeSettings {

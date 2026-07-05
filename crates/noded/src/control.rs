@@ -185,6 +185,8 @@ pub struct State {
     pub appreg: std::sync::Arc<crate::appreg::AppRegistry>,
     /// Phase 4g: the live committee chain (genesis + epoch rollover, durable state).
     pub committee: std::sync::Arc<crate::committee::CommitteeChainStore>,
+    /// Governance: the live governor set (protocol-tier approvals).
+    pub governance: std::sync::Arc<crate::governance::GovernanceStore>,
 }
 
 impl State {
@@ -389,6 +391,10 @@ async fn handle_rpc(state: &State, line: &str) -> serde_json::Value {
         Some("unban") => rpc_cid_op(state, &request, id, "unban").await,
         Some("invoke") => rpc_invoke(state, &request, id).await,
         Some("deploy") => rpc_deploy(state, &request, id).await,
+        Some("gov") => rpc_gov(state, id).await,
+        Some("gov_propose") => rpc_gov_propose(state, &request, id).await,
+        Some("gov_sign") => rpc_gov_sign(state, &request, id).await,
+        Some("gov_submit") => rpc_gov_submit(state, &request, id).await,
         Some("apps") => {
             serde_json::json!({"jsonrpc": "2.0", "id": id, "result": apps_list(state).await})
         }
@@ -1000,6 +1006,123 @@ async fn rpc_deploy(
     }
 }
 
+/// Parse a `GovAction` from rpc params.
+fn parse_gov_action(p: &serde_json::Value) -> Result<zeph_com::GovAction, String> {
+    use zeph_com::GovAction;
+    let hex32 = |v: Option<&serde_json::Value>| -> Result<[u8; 32], String> {
+        let h = v.and_then(|x| x.as_str()).ok_or("missing hex field")?;
+        <[u8; 32]>::try_from(hex::decode(h.trim()).map_err(|_| "bad hex")?.as_slice())
+            .map_err(|_| "expected 32 bytes".to_string())
+    };
+    match p.get("action").and_then(|v| v.as_str()) {
+        Some("add") => Ok(GovAction::AddGovernor {
+            governor: hex32(p.get("governor"))?,
+        }),
+        Some("remove") => Ok(GovAction::RemoveGovernor {
+            governor: hex32(p.get("governor"))?,
+        }),
+        Some("threshold") => Ok(GovAction::SetThreshold {
+            threshold: p
+                .get("value")
+                .and_then(|v| v.as_u64())
+                .ok_or("missing value")?,
+        }),
+        Some("set_program") => Ok(GovAction::SetProgram {
+            name: p
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or("missing name")?
+                .to_string(),
+            cid: hex32(p.get("cid"))?,
+        }),
+        _ => Err("unknown action (add|remove|threshold|set_program)".into()),
+    }
+}
+
+fn gov_set_json(set: &zeph_com::GovernanceSet, is_gov: bool) -> serde_json::Value {
+    serde_json::json!({
+        "governors": set.governors.iter().map(hex::encode).collect::<Vec<_>>(),
+        "threshold": set.threshold,
+        "seq": set.seq,
+        "is_governor": is_gov,
+    })
+}
+
+async fn rpc_gov(state: &State, id: serde_json::Value) -> serde_json::Value {
+    let set = state.governance.current().await;
+    let ig = state.governance.is_governor().await;
+    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": gov_set_json(&set, ig)})
+}
+
+async fn rpc_gov_propose(
+    state: &State,
+    req: &serde_json::Value,
+    id: serde_json::Value,
+) -> serde_json::Value {
+    if !state.governance.is_governor().await {
+        return rpc_err(id, "this node is not a governor".into());
+    }
+    let action = match parse_gov_action(&req["params"]) {
+        Ok(a) => a,
+        Err(e) => return rpc_err(id, e),
+    };
+    let approval = state.governance.draft(action).await;
+    // Try to apply now (sufficient at 1-of-1); else hand back the partial for co-signing.
+    match state.governance.submit(&approval).await {
+        Ok(set) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result":
+            {"applied": true, "set": gov_set_json(&set, true)}}),
+        Err(_) => {
+            let hex = hex::encode(postcard::to_allocvec(&approval).unwrap_or_default());
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "result":
+                {"applied": false, "approval": hex, "note": "needs more governor signatures (gov_sign)"}})
+        }
+    }
+}
+
+async fn rpc_gov_sign(
+    state: &State,
+    req: &serde_json::Value,
+    id: serde_json::Value,
+) -> serde_json::Value {
+    let Some(h) = req["params"].get("approval").and_then(|v| v.as_str()) else {
+        return rpc_err(id, "gov_sign needs 'approval' hex".into());
+    };
+    let Ok(bytes) = hex::decode(h.trim()) else {
+        return rpc_err(id, "bad approval hex".into());
+    };
+    let Ok(mut approval) = postcard::from_bytes::<zeph_com::GovernanceApproval>(&bytes) else {
+        return rpc_err(id, "undecodable approval".into());
+    };
+    // Add this node's signature (if a governor + not already present).
+    match state.governance.cosign(&mut approval).await {
+        Ok(()) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result":
+            {"approval": hex::encode(postcard::to_allocvec(&approval).unwrap_or_default())}}),
+        Err(e) => rpc_err(id, e.to_string()),
+    }
+}
+
+async fn rpc_gov_submit(
+    state: &State,
+    req: &serde_json::Value,
+    id: serde_json::Value,
+) -> serde_json::Value {
+    let Some(h) = req["params"].get("approval").and_then(|v| v.as_str()) else {
+        return rpc_err(id, "gov_submit needs 'approval' hex".into());
+    };
+    let Ok(bytes) = hex::decode(h.trim()) else {
+        return rpc_err(id, "bad approval hex".into());
+    };
+    let Ok(approval) = postcard::from_bytes::<zeph_com::GovernanceApproval>(&bytes) else {
+        return rpc_err(id, "undecodable approval".into());
+    };
+    match state.governance.submit(&approval).await {
+        Ok(set) => {
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "result": gov_set_json(&set, true)})
+        }
+        Err(e) => rpc_err(id, e.to_string()),
+    }
+}
+
 /// Deploy `bytes` as a system app under `name`: publish a want-based system object,
 /// announce the signed KIND_APP head (version = prev+1), and record it locally. Shared
 /// by the CLI (`rpc_deploy`, reads a file) and the dashboard (`api_deploy`, hex bytes).
@@ -1491,6 +1614,18 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         }
     }
 
+    async fn api_governance(
+        AxumState(ctx): AxumState<HttpCtx>,
+        Query(params): Query<TokenParam>,
+    ) -> axum::response::Response {
+        if params.token != *ctx.token {
+            return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
+        }
+        let set = ctx.state.governance.current().await;
+        let ig = ctx.state.governance.is_governor().await;
+        axum::Json(gov_set_json(&set, ig)).into_response()
+    }
+
     // The attestation / program-owned-registry model (designed; head wiring is phase 4c).
     async fn api_attestation(
         AxumState(ctx): AxumState<HttpCtx>,
@@ -1560,6 +1695,7 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         .route("/api/sql", get(api_sql))
         .route("/api/deploy", axum::routing::post(api_deploy))
         .route("/api/attestation", get(api_attestation))
+        .route("/api/governance", get(api_governance))
         .with_state(ctx);
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
