@@ -4,9 +4,7 @@
 //! Boot order (foundation §12, skeleton subset): identity → transport →
 //! control servers → serve loop → heartbeat.
 
-mod account;
 mod appreg;
-mod committee;
 mod control;
 mod governance;
 mod peers;
@@ -120,22 +118,6 @@ enum Command {
     Apps,
     /// Publish a WASM program to the grid (returns its content cid).
     PublishProgram { file: String },
-    /// Advance a generic attested account: run <program> on its state under committee.
-    AttestAdvance {
-        #[arg(long)]
-        program: String,
-        #[arg(long)]
-        seed: String,
-        #[arg(long, default_value = "")]
-        request: String,
-    },
-    /// Read a generic attested account's state.
-    AttestResolve {
-        #[arg(long)]
-        program: String,
-        #[arg(long)]
-        seed: String,
-    },
     /// List network-owned programs and their canonical cids.
     Programs,
     /// Show the governance set (governors, threshold, seq).
@@ -375,14 +357,6 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Deploy { file, name }) => cmd_deploy(&data_dir, &file, name.as_deref()).await,
         Some(Command::Apps) => cmd_apps(&data_dir).await,
         Some(Command::PublishProgram { file }) => cmd_publish_program(&data_dir, &file).await,
-        Some(Command::AttestAdvance {
-            program,
-            seed,
-            request,
-        }) => cmd_attest_advance(&data_dir, &program, &seed, &request).await,
-        Some(Command::AttestResolve { program, seed }) => {
-            cmd_attest_resolve(&data_dir, &program, &seed).await
-        }
         Some(Command::Programs) => cmd_programs(&data_dir).await,
         Some(Command::Gov) => cmd_gov(&data_dir).await,
         Some(Command::GovPropose {
@@ -509,49 +483,6 @@ async fn cmd_deploy(data_dir: &Path, file: &Path, name: Option<&str>) -> anyhow:
     let ver = r.get("version").and_then(|v| v.as_u64()).unwrap_or(1);
     println!("deployed app '{n}' v{ver} ({size} bytes, system object) - cid {cid}");
     println!("invoke by name: zeph invoke --name {n}");
-    Ok(())
-}
-
-async fn cmd_attest_advance(
-    data_dir: &Path,
-    program: &str,
-    seed: &str,
-    request: &str,
-) -> anyhow::Result<()> {
-    let params = serde_json::json!({"program": program, "seed": seed, "request": request});
-    let res =
-        control::query_unix_params(&data_dir.join("zeph.sock"), "attest_advance", params).await?;
-    println!(
-        "account {}",
-        res.get("account").and_then(|v| v.as_str()).unwrap_or("")
-    );
-    println!(
-        "root {}  ({})",
-        res.get("root").and_then(|v| v.as_str()).unwrap_or(""),
-        res.get("mode").and_then(|v| v.as_str()).unwrap_or("")
-    );
-    Ok(())
-}
-
-async fn cmd_attest_resolve(data_dir: &Path, program: &str, seed: &str) -> anyhow::Result<()> {
-    let params = serde_json::json!({"program": program, "seed": seed});
-    let res =
-        control::query_unix_params(&data_dir.join("zeph.sock"), "attest_resolve", params).await?;
-    let st = res.get("state").and_then(|v| v.as_str()).unwrap_or("");
-    println!(
-        "account {}",
-        res.get("account").and_then(|v| v.as_str()).unwrap_or("")
-    );
-    println!(
-        "state ({} bytes): {}",
-        res.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
-        st
-    );
-    if let Ok(b) = hex::decode(st) {
-        if let Ok(a) = <[u8; 8]>::try_from(b.as_slice()) {
-            println!("as u64: {}", u64::from_le_bytes(a));
-        }
-    }
     Ok(())
 }
 
@@ -962,8 +893,6 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         zeph_obj::ALPN.to_vec(),
         zeph_sql::PAGE_ALPN.to_vec(),
         zeph_com::INVOKE_ALPN.to_vec(),
-        zeph_com::ATTEST_ALPN.to_vec(),
-        zeph_com::ENDORSE_ALPN.to_vec(),
     ];
     if cfg.routing_dht {
         alpns.push(zeph_dht::ALPN.to_vec());
@@ -1093,15 +1022,6 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         engine.clone(),
         com_backend,
     ));
-    // Attestation service: serve the RegistryProgram to the committee (phase 4d).
-    let attest_service = Arc::new(
-        zeph_com::AttestService::new(
-            zeph_com::AttestedRuntime::new()?,
-            engine.clone(),
-            identity.clone(),
-        )
-        .with_native(Arc::new(zeph_com::RegistryProgram)),
-    );
 
     tracing::info!(
         node_id = %identity.node_id().to_hex(),
@@ -1163,13 +1083,6 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         routing.clone(),
         data_dir,
     ));
-    // Generic attested accounts — any user program's committee-attested state.
-    let account_store = std::sync::Arc::new(account::AttestedAccountStore::open(
-        identity.clone(),
-        engine.clone(),
-        routing.clone(),
-        data_dir,
-    ));
     // Governance: one durable, self-verifying chain that derives BOTH the governor set
     // and the program registry, published + resolved cross-node (seeded 1-of-1 with this
     // node's key by default).
@@ -1185,13 +1098,6 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         cfg.governance_threshold,
         engine.clone(),
         routing.clone(),
-    ));
-    // Phase 4g: the committee-chain store (membership wired once it is up).
-    let committee_store = std::sync::Arc::new(committee::CommitteeChainStore::new(
-        identity.clone(),
-        engine.clone(),
-        routing.clone(),
-        transport.clone(),
     ));
     let state = Arc::new(control::State {
         clock: transport.clock(),
@@ -1231,9 +1137,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         com: com_service.clone(),
         routing: routing.clone(),
         appreg: appreg_store.clone(),
-        committee: committee_store.clone(),
         gov: governance_store.clone(),
-        accounts: account_store.clone(),
         settings: {
             let oc = engine.config();
             control::NodeSettings {
@@ -1300,8 +1204,6 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let (piece_tx, piece_rx) = tokio::sync::mpsc::channel(32);
     let (sqlpage_tx, sqlpage_rx) = tokio::sync::mpsc::channel(32);
     let (invoke_tx, invoke_rx) = tokio::sync::mpsc::channel(32);
-    let (attest_tx, attest_rx) = tokio::sync::mpsc::channel(32);
-    let (endorse_tx, mut endorse_rx) = tokio::sync::mpsc::channel(32);
     let (dht_tx, dht_rx) = tokio::sync::mpsc::channel(32);
     let mut handlers = vec![
         (alpn::PING.to_vec(), ping_tx),
@@ -1309,8 +1211,6 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         (zeph_obj::ALPN.to_vec(), piece_tx),
         (zeph_sql::PAGE_ALPN.to_vec(), sqlpage_tx),
         (zeph_com::INVOKE_ALPN.to_vec(), invoke_tx),
-        (zeph_com::ATTEST_ALPN.to_vec(), attest_tx),
-        (zeph_com::ENDORSE_ALPN.to_vec(), endorse_tx),
     ];
     if let Some(dht) = &dht_node {
         handlers.push((zeph_dht::ALPN.to_vec(), dht_tx));
@@ -1321,33 +1221,6 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     tokio::spawn(engine.clone().serve(piece_rx));
     tokio::spawn(zeph_sql::serve_pages(sql_dir.clone(), sqlpage_rx));
     tokio::spawn(zeph_com::serve_invocations(invoke_rx, com_service.clone()));
-    tokio::spawn(zeph_com::serve_attestations(
-        attest_rx,
-        attest_service.clone(),
-    ));
-    // Serve committee-endorsement requests (epoch rollover).
-    let endorse_store = committee_store.clone();
-    tokio::spawn(async move {
-        while let Some(conn) = endorse_rx.recv().await {
-            let store = endorse_store.clone();
-            tokio::spawn(async move {
-                while let Ok((mut send, mut recv)) = conn.accept_bi().await {
-                    let Ok(bytes) = recv.read_to_end(64 * 1024).await else {
-                        break;
-                    };
-                    let reply = match postcard::from_bytes::<zeph_com::EndorseRequest>(&bytes) {
-                        Ok(req) => store.endorse(&req).await,
-                        Err(_) => None,
-                    };
-                    let _ = send
-                        .write_all(&postcard::to_allocvec(&reply).unwrap_or_default())
-                        .await;
-                    let _ = send.finish();
-                }
-            });
-        }
-    });
-    // Committee-chain tick loop: genesis bootstrap + epoch rollover.
     // Cheap "pending distribution" refresh (provider records, no probing) — independent
     // of the verified health scan so the dashboard stays fresh.
     let pending_engine = engine.clone();
@@ -1358,14 +1231,11 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
             pending_engine.distribute_pending().await;
         }
     });
-    let tick_store = committee_store.clone();
     let gov_tick = governance_store.clone();
-    let tick_clock = transport.clock();
     tokio::spawn(async move {
         let mut iv = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             iv.tick().await;
-            tick_store.tick(tick_clock.now().millis()).await;
             gov_tick.tick().await;
         }
     });
@@ -1378,7 +1248,6 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let announce_sql = craftsql.clone();
     let announce_jobs = jobs.clone();
     let announce_appreg = appreg_store.clone();
-    let announce_accounts = account_store.clone();
     let announce_clock = transport.clock();
     let reannounce_secs = cfg.reannounce_secs.max(1);
     tokio::spawn(async move {
@@ -1388,7 +1257,6 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
             let e = announce_engine.clone();
             let sql = announce_sql.clone();
             let appreg = announce_appreg.clone();
-            let accounts = announce_accounts.clone();
             let clock = announce_clock.clone();
             // Distribution priority: getting records to peers matters, but yields
             // to Repair. Deduped so a slow re-announce can't stack.
@@ -1400,7 +1268,6 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                     let e = e.clone();
                     let sql = sql.clone();
                     let appreg = appreg.clone();
-                    let accounts = accounts.clone();
                     let clock = clock.clone();
                     async move {
                         let n = e.reannounce_providers().await;
@@ -1414,11 +1281,10 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                         if h > 0 {
                             tracing::info!(dbs = h, "re-announced CraftSQL heads/manifests");
                         }
-                        // App-registry + attested-account heads (no other periodic
-                        // re-publish) — TTL keep-alive + backend migration (tracker→DHT).
+                        // App-registry head (no other periodic re-publish) — TTL
+                        // keep-alive + backend migration (tracker→DHT).
                         let now = clock.now().millis();
                         appreg.republish(now).await;
-                        accounts.republish_all(now).await;
                         Ok(())
                     }
                 },
@@ -1441,16 +1307,8 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         },
     );
     membership.start(peers, member_rx);
-    // Wire the registry's live committee coordinator now that membership is up.
-    appreg_store
-        .set_coordinator(transport.clone(), membership.clone())
-        .await;
-    committee_store.set_membership(membership.clone()).await;
     governance_store.set_membership(membership.clone()).await;
     appreg_store.set_programs(governance_store.clone()).await;
-    account_store
-        .set_coordinator(transport.clone(), membership.clone())
-        .await;
     mem_peers.set(membership.clone()).await;
     // Membership is the health scan's LIVENESS source (on both routing paths): a holder that
     // SWIM marks dead is excluded from durability counts so repair fires, instead of its stale

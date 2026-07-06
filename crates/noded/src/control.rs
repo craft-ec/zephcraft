@@ -191,14 +191,10 @@ pub struct State {
     pub com: std::sync::Arc<zeph_com::InvokeService>,
     /// Content routing — for resolving/announcing signed app-name heads (KIND_APP).
     pub routing: std::sync::Arc<dyn zeph_routing::ContentRouting>,
-    /// Phase 4c: durable app-name registry backing (program-owned, self-attested ramp).
+    /// Phase 4c: durable app-name registry backing (open owner-signed CRDT).
     pub appreg: std::sync::Arc<crate::appreg::AppRegistry>,
-    /// Phase 4g: the live committee chain (genesis + epoch rollover, durable state).
-    pub committee: std::sync::Arc<crate::committee::CommitteeChainStore>,
     /// Governance: one durable chain deriving both the governor set and program registry.
     pub gov: std::sync::Arc<crate::governance::GovernanceChainStore>,
-    /// Generic attested accounts (any user program's committee-attested state).
-    pub accounts: std::sync::Arc<crate::account::AttestedAccountStore>,
 }
 
 impl State {
@@ -428,8 +424,6 @@ async fn handle_rpc(state: &State, line: &str) -> serde_json::Value {
         Some("invoke") => rpc_invoke(state, &request, id).await,
         Some("deploy") => rpc_deploy(state, &request, id).await,
         Some("publish_program") => rpc_publish_program(state, &request, id).await,
-        Some("attest_advance") => rpc_attest_advance(state, &request, id).await,
-        Some("attest_resolve") => rpc_attest_resolve(state, &request, id).await,
         Some("gov") => rpc_gov(state, id).await,
         Some("gov_propose") => rpc_gov_propose(state, &request, id).await,
         Some("gov_sign") => rpc_gov_sign(state, &request, id).await,
@@ -1014,69 +1008,6 @@ async fn rpc_sql_recover(
         Ok(n) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"restored": n}}),
         Err(e) => rpc_err(id, format!("recover failed: {e}")),
     }
-}
-
-/// Deploy a CraftCOM app: publish the WASM as a SYSTEM object (durable + managed
-/// like a database, hidden from the drive) and register it by name in the apps
-/// index. Returns {name, cid, size}.
-fn parse_hex32(v: Option<&serde_json::Value>) -> Result<[u8; 32], String> {
-    let h = v.and_then(|x| x.as_str()).ok_or("missing hex field")?;
-    <[u8; 32]>::try_from(hex::decode(h.trim()).map_err(|_| "bad hex")?.as_slice())
-        .map_err(|_| "expected 32 bytes".to_string())
-}
-
-async fn rpc_attest_advance(
-    state: &State,
-    req: &serde_json::Value,
-    id: serde_json::Value,
-) -> serde_json::Value {
-    let program = match parse_hex32(req["params"].get("program")) {
-        Ok(p) => p,
-        Err(e) => return rpc_err(id, e),
-    };
-    let seed = req["params"]
-        .get("seed")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .as_bytes()
-        .to_vec();
-    let request = match req["params"].get("request").and_then(|v| v.as_str()) {
-        Some(h) if !h.is_empty() => match hex::decode(h.trim()) {
-            Ok(b) => b,
-            Err(_) => return rpc_err(id, "bad request hex".into()),
-        },
-        _ => Vec::new(),
-    };
-    match state
-        .accounts
-        .advance(program, &seed, &request, state.clock.now().millis())
-        .await
-    {
-        Ok(r) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":
-            {"account": hex::encode(r.account), "root": hex::encode(r.new_root), "mode": r.mode}}),
-        Err(e) => rpc_err(id, e.to_string()),
-    }
-}
-
-async fn rpc_attest_resolve(
-    state: &State,
-    req: &serde_json::Value,
-    id: serde_json::Value,
-) -> serde_json::Value {
-    let program = match parse_hex32(req["params"].get("program")) {
-        Ok(p) => p,
-        Err(e) => return rpc_err(id, e),
-    };
-    let seed = req["params"]
-        .get("seed")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .as_bytes()
-        .to_vec();
-    let st = state.accounts.resolve(program, &seed).await;
-    let account = hex::encode(zeph_com::pda(&program, &seed).0);
-    serde_json::json!({"jsonrpc":"2.0","id":id,"result":
-        {"account": account, "state": hex::encode(&st), "size": st.len()}})
 }
 
 async fn rpc_publish_program(
@@ -1805,68 +1736,6 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         axum::Json(gov_set_json(&set, ig)).into_response()
     }
 
-    // The attestation / program-owned-registry model (designed; head wiring is phase 4c).
-    async fn api_attestation(
-        AxumState(ctx): AxumState<HttpCtx>,
-        Query(params): Query<TokenParam>,
-    ) -> axum::response::Response {
-        if params.token != *ctx.token {
-            return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
-        }
-        let native = zeph_com::registry_program_cid();
-        // The program the registry attestation actually runs is RESOLVED via the program
-        // registry (governance-upgradeable), not the hardcoded constant.
-        let program = ctx
-            .state
-            .gov
-            .resolve("app-registry")
-            .await
-            .unwrap_or(native);
-        let account = ctx.state.appreg.account();
-        let (count, root) = ctx.state.appreg.summary().await;
-        let (eligible, cn, ck, mode) = ctx.state.appreg.committee_status().await;
-        let (chain_len, chain_epoch, chain_size, chain_root, _) =
-            ctx.state.committee.status().await;
-        let now = ctx.state.clock.now().millis();
-        let epoch_ms = ctx.state.committee.epoch_len_ms();
-        let next_rollover_ms = epoch_ms - (now % epoch_ms.max(1));
-        let rows: Vec<serde_json::Value> = ctx
-            .state
-            .appreg
-            .rows()
-            .await
-            .into_iter()
-            .map(|(owner, name, cid, ver)| serde_json::json!([owner, name, cid, ver]))
-            .collect();
-        axum::Json(serde_json::json!({
-            "registry": "app registry",
-            "status": "live",
-            "model": "deterministic k-of-n attestation - program-owned (PDA) registry",
-            "registry_program": hex::encode(program),
-            "program_source": if program == native { "native (binary-baked)" } else { "upgraded WASM (via program registry)" },
-            "registry_account": hex::encode(account.0),
-            "app_registry_root": root,
-            "entries": count,
-            "rows": rows,
-            "committee": {
-                "eligible": eligible,
-                "n": cn.min(eligible),
-                "k": ck.min(cn.min(eligible)),
-                "last_mode": mode,
-            },
-            "chain": {
-                "checkpoints": chain_len,
-                "epoch": chain_epoch,
-                "committee_size": chain_size,
-                "root": chain_root,
-                "epoch_ms": epoch_ms,
-                "next_rollover_ms": next_rollover_ms,
-            },
-            "note": "app-name registry; other protocol registries (program, config, committee) will be separate roots",
-        }))
-        .into_response()
-    }
-
     let ctx = HttpCtx {
         state,
         token: Arc::new(token),
@@ -1882,7 +1751,6 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         .route("/api/apps", get(api_apps))
         .route("/api/sql", get(api_sql))
         .route("/api/deploy", axum::routing::post(api_deploy))
-        .route("/api/attestation", get(api_attestation))
         .route("/api/governance", get(api_governance))
         .route("/api/programs", get(api_programs))
         .route("/api/pending", get(api_pending))

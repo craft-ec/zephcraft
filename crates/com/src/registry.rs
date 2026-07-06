@@ -184,12 +184,21 @@ const REGISTRY_WASM: &[u8] = include_bytes!("../registry.wasm");
 /// is the account whose head advances as the registry).
 pub const REGISTRY_SEED: &[u8] = b"apps";
 
-/// The registry as a [`crate::NativeProgram`] the attestation committee runs: decode the
-/// prior state, apply the signed submission, re-encode. Deterministic, so every agent
-/// computes the identical new state.
+/// A NATIVE network-owned program run deterministically: `(prev_state, request) →
+/// new_state`. Its code is the node's own (identical on every node), so it needn't run
+/// through the WASM sandbox — the anchor runtime runs it directly (foundation
+/// mechanism/policy split).
+pub trait NativeProgram: Send + Sync {
+    fn program_cid(&self) -> [u8; 32];
+    fn run(&self, prev_state: &[u8], request: &[u8]) -> anyhow::Result<Vec<u8>>;
+}
+
+/// The registry as a [`NativeProgram`] each node runs LOCALLY: decode the prior state,
+/// apply the signed submission, re-encode. Deterministic, so every node computes the
+/// identical new state.
 pub struct RegistryProgram;
 
-impl crate::NativeProgram for RegistryProgram {
+impl NativeProgram for RegistryProgram {
     fn program_cid(&self) -> [u8; 32] {
         registry_program_cid()
     }
@@ -370,61 +379,6 @@ mod tests {
             .apply(&HeadSubmission::sign(&a, "x", [1u8; 32], 1))
             .unwrap();
         assert_eq!(RegistryState::decode(&s.encode()).unwrap(), s);
-    }
-
-    #[test]
-    fn registry_advances_under_a_committee_attestation() {
-        use crate::{attest_transition, pda, select_committee, AttestedCommit};
-
-        // The registry program (native network-owned) — identified by a well-known CID.
-        let program_cid = Cid::of(b"craftec/program/registry/1").0;
-        // A rotating committee of 3, quorum k=2.
-        let agents: Vec<NodeIdentity> = (0..3).map(|_| NodeIdentity::generate()).collect();
-        let eligible: Vec<[u8; 32]> = agents.iter().map(|a| a.node_id().0).collect();
-        let committee = select_committee(&eligible, 1, 3, 2);
-
-        // A publisher submits a signed head.
-        let publisher = id();
-        let sub = HeadSubmission::sign(&publisher, "feed", [1u8; 32], 1);
-        let request = postcard::to_allocvec(&sub).unwrap();
-
-        // Each committee agent runs the registry transition (deterministic) and attests
-        // the (prev_root -> new_root) advance over the encoded new state.
-        let prev = RegistryState::default();
-        let prev_root = prev.root();
-        let new_state = prev.apply(&sub).unwrap();
-        let attestations = agents
-            .iter()
-            .map(|a| attest_transition(a, program_cid, prev_root, &request, &new_state.encode()))
-            .collect();
-        let commit = AttestedCommit {
-            program_cid,
-            seed: b"apps".to_vec(),
-            prev_root,
-            request,
-            new_root: new_state.root(),
-            attestations,
-        };
-
-        // The committee quorum advances the registry PDA's head to the new state...
-        let adv = committee
-            .verify_commit(&commit)
-            .expect("the committee attested the registry advance");
-        assert_eq!(
-            adv.account,
-            pda(&program_cid, b"apps"),
-            "the registry PDA account"
-        );
-        assert_eq!(adv.new_root, new_state.root());
-        assert_eq!(adv.prev_root, prev_root);
-        // ...and that new state resolves the registered name.
-        assert_eq!(
-            new_state
-                .resolve(&publisher.node_id().0, "feed")
-                .unwrap()
-                .cid,
-            [1u8; 32]
-        );
     }
 
     #[test]

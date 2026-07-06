@@ -30,29 +30,19 @@ use async_trait::async_trait;
 use wasmtime::{Caller, Config, Engine, Extern, Linker, Memory, Module, Store};
 
 mod attest;
-mod coordinate;
 mod craft;
 mod gov;
 mod invoke;
 mod registry;
-pub use attest::{
-    attest_run, attest_transition, committee_hash, endorse_checkpoint, epoch_of, pda,
-    select_committee, verify, verify_chain, verify_commit, verify_quorum, Attestation,
-    AttestedCommit, AttestedRuntime, Committee, CommitteeChain, CommitteeCheckpoint, Endorsement,
-    PdaAdvance,
-};
-pub use coordinate::{
-    collect_commit, request_attestation, request_endorsement, serve_attestations, AttestRequest,
-    AttestService, EndorseRequest, NativeProgram, ATTEST_ALPN, ENDORSE_ALPN,
-};
+pub use attest::{pda, AttestedRuntime};
 pub use craft::CraftBackend;
 pub use gov::{
     GovAction, GovSignature, GovernanceApproval, GovernanceChain, GovernanceProposal, GovernanceSet,
 };
 pub use invoke::{invoke_remote, serve_invocations, InvokeRequest, InvokeService, INVOKE_ALPN};
 pub use registry::{
-    registry_program_cid, HeadEntry, HeadSubmission, ProgramRegistryState, RegistryProgram,
-    RegistryState, REGISTRY_SEED,
+    registry_program_cid, HeadEntry, HeadSubmission, NativeProgram, ProgramRegistryState,
+    RegistryProgram, RegistryState, REGISTRY_SEED,
 };
 
 /// Default fuel budget per invocation — roughly proportional to executed WASM
