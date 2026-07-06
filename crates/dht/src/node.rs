@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use zeph_core::NodeId;
 use zeph_crypto::NodeIdentity;
-use zeph_transport::{Connection, PeerAddr, Transport};
+use zeph_transport::{Connection, Transport};
 
 use crate::proto::{DhtMessage, WireContact};
 use crate::record::{RecordStore, StoredRecord};
@@ -25,6 +25,10 @@ pub struct DhtNode {
     table: Mutex<RoutingTable>,
     store: RecordStore,
     transport: Arc<Transport>,
+    /// Cached outbound DHT connections keyed by peer NodeId. Reused across requests (a fresh
+    /// stream per request) instead of connect+close per op — the per-op teardown re-ran the
+    /// QUIC/multipath handshake every time and stormed the network during the cutover.
+    conns: Mutex<HashMap<[u8; 32], Connection>>,
 }
 
 impl DhtNode {
@@ -43,6 +47,7 @@ impl DhtNode {
             identity,
             me,
             transport,
+            conns: Mutex::new(HashMap::new()),
         })
     }
 
@@ -173,8 +178,39 @@ impl DhtNode {
 
     /// One request → one reply over the DHT ALPN. `None` on any failure (dead peer, bad
     /// reply) — callers treat that as "no answer", never an error to propagate.
-    async fn request(&self, addr: &PeerAddr, msg: &DhtMessage) -> Option<DhtMessage> {
-        let conn = self.transport.connect(addr, ALPN).await.ok()?;
+    async fn request(&self, peer: &Contact, msg: &DhtMessage) -> Option<DhtMessage> {
+        // Reuse a cached connection (a fresh stream per request); if the cached one is dead,
+        // drop it and reconnect once. No per-request close → no handshake/multipath churn.
+        for attempt in 0..2 {
+            let conn = self.conn_for(peer, attempt == 1).await?;
+            if let Some(reply) = Self::request_on(&conn, msg).await {
+                return Some(reply);
+            }
+            self.conns.lock().expect("conns").remove(&peer.id.0);
+        }
+        None
+    }
+
+    /// A live connection to `peer` — cached, or freshly dialed and cached. `force_new` bypasses
+    /// the cache to recover from a connection that just failed a request.
+    async fn conn_for(&self, peer: &Contact, force_new: bool) -> Option<Connection> {
+        if !force_new {
+            let cached = self.conns.lock().expect("conns").get(&peer.id.0).cloned();
+            if let Some(c) = cached {
+                return Some(c);
+            }
+        }
+        let conn = self.transport.connect(&peer.addr, ALPN).await.ok()?;
+        self.conns
+            .lock()
+            .expect("conns")
+            .insert(peer.id.0, conn.clone());
+        Some(conn)
+    }
+
+    /// One request/response over an existing connection (opens a fresh bi-stream; the
+    /// connection itself is left open for reuse).
+    async fn request_on(conn: &Connection, msg: &DhtMessage) -> Option<DhtMessage> {
         let (mut send, mut recv) = conn.open_bi().await.ok()?;
         send.write_all(&msg.encode()).await.ok()?;
         send.finish().ok()?;
@@ -182,7 +218,6 @@ impl DhtNode {
             .await
             .ok()?
             .ok()?;
-        conn.close(0u32.into(), b"done");
         DhtMessage::decode(&bytes)
     }
 
@@ -192,7 +227,7 @@ impl DhtNode {
             from: self.self_wire(),
             target: *target,
         };
-        match self.request(&peer.addr, &msg).await {
+        match self.request(peer, &msg).await {
             Some(DhtMessage::Nodes { contacts }) => contacts
                 .into_iter()
                 .filter_map(|w| w.into_contact())
@@ -256,7 +291,7 @@ impl DhtNode {
         self.store.put(record.clone(), self.now_millis());
         let targets = self.lookup(key).await;
         let msg = DhtMessage::Store { record };
-        futures::future::join_all(targets.iter().map(|c| self.request(&c.addr, &msg))).await;
+        futures::future::join_all(targets.iter().map(|c| self.request(c, &msg))).await;
     }
 
     /// Fetch all records under `key` from the overlay: iterative FIND_VALUE, verifying every
@@ -293,7 +328,7 @@ impl DhtNode {
                     from: self.self_wire(),
                     key,
                 };
-                async move { self.request(&c.addr, &msg).await }
+                async move { self.request(c, &msg).await }
             }))
             .await;
             for reply in replies.into_iter().flatten() {
