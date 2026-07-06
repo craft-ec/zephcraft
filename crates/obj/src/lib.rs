@@ -226,6 +226,10 @@ pub struct CidHealth {
     pub floor: u32,
     /// Distinct LIVE peer providers seen.
     pub live_providers: u32,
+    /// What the scan CONCLUDED about this cid (e.g. "below floor — under-replicated").
+    pub decision: String,
+    /// What the scan DID as a result (e.g. "repaired — minted + pushed 1 piece", "none — healthy").
+    pub action: String,
 }
 
 pub struct ObjEngine {
@@ -1402,6 +1406,14 @@ impl ObjEngine {
             {
                 let _ = self.store.forget(&cid);
                 report.offloaded += 1;
+                self.record_health(
+                    &cid,
+                    have,
+                    floor,
+                    live.len(),
+                    "durable on peers — full erasure set present",
+                    "offloaded — dropped our retained copy",
+                );
                 continue;
             }
 
@@ -1409,23 +1421,14 @@ impl ObjEngine {
             // not a substitute for spread): `have` is the coded-piece count, and
             // a pinner participates in repair as a mint source below.
             let effective = have;
-            self.cid_health.lock().expect("cid_health").insert(
-                cid.0,
-                CidHealth {
-                    last_scan_ms: self.transport.clock().now().millis(),
-                    effective: effective as u32,
-                    floor: floor as u32,
-                    live_providers: live.len() as u32,
-                },
-            );
             if effective > floor {
                 // Surplus above the floor. If download demand has faded, DEGRADE:
-                // shed one piece toward the floor. Rendezvous-elected (one
-                // shedder per cycle) — the deliberately slow, conservative
-                // direction, in contrast to parallel un-elected Scaling.
+                // shed one piece toward the floor (rendezvous-elected, one per cycle).
+                let mut decision = "surplus above floor — demand warm";
+                let mut action = "none — kept for serving bandwidth";
                 if self.served_pulls(&cid) < self.config.degrade_threshold {
-                    // Pinners NEVER degrade — they only create + distribute to
-                    // prevent loss. Shedders are non-pinner holders with surplus.
+                    decision = "surplus above floor — demand cold";
+                    action = "none — not the elected shedder";
                     let mut shedders: Vec<NodeId> = live
                         .iter()
                         .filter(|(_, _, c, pinned)| *c > 2 && !*pinned)
@@ -1439,11 +1442,21 @@ impl ObjEngine {
                         .max_by_key(|id| rendezvous_score(id, &cid, epoch));
                     if winner == Some(&me) && self.shed_one(&cid) {
                         report.degraded += 1;
+                        action = "degraded — shed 1 piece toward the floor";
                     }
                 }
+                self.record_health(&cid, have, floor, live.len(), decision, action);
                 continue;
             }
             if effective >= floor {
+                self.record_health(
+                    &cid,
+                    have,
+                    floor,
+                    live.len(),
+                    "at the durability floor",
+                    "none — healthy",
+                );
                 continue; // exactly at the floor — nothing to do
             }
 
@@ -1457,6 +1470,14 @@ impl ObjEngine {
             if !alive {
                 chunk_fading.insert(cid.0);
                 report.fading += 1;
+                self.record_health(
+                    &cid,
+                    have,
+                    floor,
+                    live.len(),
+                    "below floor but unwanted & undemanded",
+                    "none — left to fade",
+                );
                 continue;
             }
             chunk_at_risk.insert(cid.0);
@@ -1472,12 +1493,28 @@ impl ObjEngine {
             let can_i = self.store.piece_count(&cid) >= 2
                 || (self.store.has_content(&cid) && self.store.is_pinned(&cid));
             if !can_i {
+                self.record_health(
+                    &cid,
+                    have,
+                    floor,
+                    live.len(),
+                    "below floor — under-replicated",
+                    "none — we can't repair (retained/passive copy)",
+                );
                 continue;
             }
             let winner = capable
                 .iter()
                 .max_by_key(|id| rendezvous_score(id, &cid, epoch));
             if winner != Some(&me) {
+                self.record_health(
+                    &cid,
+                    have,
+                    floor,
+                    live.len(),
+                    "below floor — under-replicated",
+                    "none — another holder is the elected repairer",
+                );
                 continue;
             }
             // Repair: mint one fresh piece and push it to the live holder that
@@ -1486,6 +1523,23 @@ impl ObjEngine {
             self.emit(zeph_events::Event::RepairNeeded(cid));
             if self.repair_one(&cid, &gen, &live).await {
                 report.repaired += 1;
+                self.record_health(
+                    &cid,
+                    have,
+                    floor,
+                    live.len(),
+                    "below floor — under-replicated",
+                    "repaired — minted + pushed 1 piece",
+                );
+            } else {
+                self.record_health(
+                    &cid,
+                    have,
+                    floor,
+                    live.len(),
+                    "below floor — under-replicated",
+                    "repair failed — no reachable target",
+                );
             }
         }
         // Roll this chunk's verdicts into the persistent GLOBAL sets — add cids that came out
@@ -1541,6 +1595,29 @@ impl ObjEngine {
             .expect("cid_health")
             .get(&cid.0)
             .cloned()
+    }
+
+    /// Record the scan's decision + action for a cid (dashboard diagnostics).
+    fn record_health(
+        &self,
+        cid: &Cid,
+        eff: usize,
+        floor: usize,
+        live: usize,
+        decision: &str,
+        action: &str,
+    ) {
+        self.cid_health.lock().expect("cid_health").insert(
+            cid.0,
+            CidHealth {
+                last_scan_ms: self.transport.clock().now().millis(),
+                effective: eff as u32,
+                floor: floor as u32,
+                live_providers: live as u32,
+                decision: decision.to_string(),
+                action: action.to_string(),
+            },
+        );
     }
 
     /// Recompute the "pending distribution" snapshot CHEAPLY — from provider RECORDS

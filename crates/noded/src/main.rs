@@ -1810,10 +1810,19 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
             let mut rows = Vec::new();
             for cid in store.cids() {
                 let h = hv_engine.cid_health(&cid);
-                let (eff, floor, lprov, last_ms) = h
+                let (eff, floor, lprov, last_ms, decision, action) = h
                     .as_ref()
-                    .map(|h| (h.effective, h.floor, h.live_providers, h.last_scan_ms))
-                    .unwrap_or((0, 0, 0, 0));
+                    .map(|h| {
+                        (
+                            h.effective,
+                            h.floor,
+                            h.live_providers,
+                            h.last_scan_ms,
+                            h.decision.clone(),
+                            h.action.clone(),
+                        )
+                    })
+                    .unwrap_or((0, 0, 0, 0, String::new(), String::new()));
                 let verdict = if hv_engine.is_at_risk(&cid) {
                     "at-risk"
                 } else if hv_engine.is_fading(&cid) {
@@ -1840,6 +1849,8 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                     "wanted": store.is_wanted(&cid),
                     "scanned_ago_s": scanned_ago,
                     "next_scan_s": next_secs,
+                    "decision": decision,
+                    "action": action,
                 }));
             }
             hv_state.set_cid_health(rows).await;
