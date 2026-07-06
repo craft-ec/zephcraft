@@ -1574,12 +1574,25 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
             mem_peers.clone(),
         );
         tokio::spawn(async move {
-            // Wait for membership to discover peers before the FIRST scan. On a fresh restart the
-            // peer view is empty, so a scan would see every provider as not-alive, flag healthy
-            // content at-risk, and kick off a spurious repair storm. Bounded by a max grace so a
-            // genuinely-alone node still proceeds (and maintains its own pinned content).
+            // Wait for the peer view to SETTLE before the FIRST scan — the alive-peer count
+            // unchanged for a short window, not merely non-empty — so the first pass runs against
+            // a (near-)complete membership rather than a half-discovered one. Scanning too early
+            // sees providers as not-yet-alive, flags healthy content at-risk, and kicks off a
+            // spurious repair storm. Bounded by a max grace so a genuinely-alone or slow-to-form
+            // node still proceeds (and maintains its own pinned content).
             let start = std::time::Instant::now();
-            while live.peers().await.is_empty() && start.elapsed() < Duration::from_secs(60) {
+            let mut last = usize::MAX;
+            let mut stable_since = start;
+            loop {
+                let count = live.peers().await.len();
+                if count != last {
+                    last = count;
+                    stable_since = std::time::Instant::now();
+                }
+                let settled = count > 0 && stable_since.elapsed() >= Duration::from_secs(10);
+                if settled || start.elapsed() >= Duration::from_secs(90) {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
             loop {
