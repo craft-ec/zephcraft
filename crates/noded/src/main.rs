@@ -9,6 +9,7 @@ mod control;
 mod governance;
 mod peers;
 mod programreg;
+mod registry_net;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -954,6 +955,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         zeph_obj::ALPN.to_vec(),
         zeph_sql::PAGE_ALPN.to_vec(),
         zeph_com::INVOKE_ALPN.to_vec(),
+        registry_net::REGISTRY_ALPN.to_vec(),
     ];
     if cfg.routing_dht {
         alpns.push(zeph_dht::ALPN.to_vec());
@@ -1142,9 +1144,13 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let account_store =
         std::sync::Arc::new(account::ProgramAccountStore::open(engine.clone(), data_dir));
     // Phase 4c: the durable program-name registry — a THIN consumer of the account store.
+    // The writer for each epoch is ELECTED deterministically from the membership view + HLC
+    // clock (a rotating writer); non-writers forward to the current epoch's writer.
     let programreg_store = std::sync::Arc::new(programreg::ProgramRegistry::open(
         identity.clone(),
         account_store.clone(),
+        transport.clock(),
+        transport.clone(),
     ));
     // Governance: one durable, self-verifying chain that derives BOTH the governor set
     // and the program registry, published + resolved cross-node (seeded 1-of-1 with this
@@ -1198,7 +1204,6 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         event_counts: tokio::sync::RwLock::new(std::collections::BTreeMap::new()),
         hosting_cids: std::sync::atomic::AtomicU64::new(0),
         com: com_service.clone(),
-        routing: routing.clone(),
         programreg: programreg_store.clone(),
         gov: governance_store.clone(),
         accounts: account_store.clone(),
@@ -1268,6 +1273,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let (piece_tx, piece_rx) = tokio::sync::mpsc::channel(32);
     let (sqlpage_tx, sqlpage_rx) = tokio::sync::mpsc::channel(32);
     let (invoke_tx, invoke_rx) = tokio::sync::mpsc::channel(32);
+    let (registry_tx, registry_rx) = tokio::sync::mpsc::channel(32);
     let (dht_tx, dht_rx) = tokio::sync::mpsc::channel(32);
     let mut handlers = vec![
         (alpn::PING.to_vec(), ping_tx),
@@ -1275,6 +1281,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         (zeph_obj::ALPN.to_vec(), piece_tx),
         (zeph_sql::PAGE_ALPN.to_vec(), sqlpage_tx),
         (zeph_com::INVOKE_ALPN.to_vec(), invoke_tx),
+        (registry_net::REGISTRY_ALPN.to_vec(), registry_tx),
     ];
     if let Some(dht) = &dht_node {
         handlers.push((zeph_dht::ALPN.to_vec(), dht_tx));
@@ -1285,6 +1292,8 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     tokio::spawn(engine.clone().serve(piece_rx));
     tokio::spawn(zeph_sql::serve_pages(sql_dir.clone(), sqlpage_rx));
     tokio::spawn(zeph_com::serve_invocations(invoke_rx, com_service.clone()));
+    // Serve cross-node registry requests (writer path advances; queries resolve).
+    tokio::spawn(programreg_store.clone().serve(registry_rx));
     // Cheap "pending distribution" refresh (provider records, no probing) — independent
     // of the verified health scan so the dashboard stays fresh.
     let pending_engine = engine.clone();
@@ -1362,6 +1371,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     );
     membership.start(peers, member_rx);
     governance_store.set_membership(membership.clone()).await;
+    programreg_store.set_membership(membership.clone()).await;
     programreg_store
         .set_programs(governance_store.clone())
         .await;

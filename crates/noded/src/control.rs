@@ -189,8 +189,6 @@ pub struct State {
     pub settings: NodeSettings,
     /// CraftCOM invocation service — run user-level app WASM (local invoke).
     pub com: std::sync::Arc<zeph_com::InvokeService>,
-    /// Content routing — for resolving/announcing signed app-name heads (KIND_APP).
-    pub routing: std::sync::Arc<dyn zeph_routing::ContentRouting>,
     /// Phase 4c: durable program-name registry (open owner-signed CRDT), a thin
     /// consumer of the program-account store.
     pub programreg: std::sync::Arc<crate::programreg::ProgramRegistry>,
@@ -1313,15 +1311,12 @@ async fn rpc_invoke(
         let Some(publisher) = publisher else {
             return rpc_err(id, "name: bad publisher (expected <hex>/<app>)".into());
         };
-        // Registry resolution: the program-name registry first, then KIND_APP (legacy)
-        // fallback.
-        if let Some(cid) = state.programreg.resolve(publisher.0, app_name).await {
-            (cid, app_name.to_string())
-        } else {
-            match state.routing.resolve_app(publisher, app_name).await {
-                Ok(Some(rec)) => (rec.wasm_cid.0, app_name.to_string()),
-                _ => return rpc_err(id, format!("app '{nm}' not found (deploy it first?)")),
-            }
+        // Registry resolution: the program-name registry itself now handles cross-node
+        // resolution (a non-writer queries the designated writer over REGISTRY_ALPN), so
+        // there is no DHT/KIND_APP fallback — a `None` here is a genuine not-found.
+        match state.programreg.resolve(publisher.0, app_name).await {
+            Some(cid) => (cid, app_name.to_string()),
+            None => return rpc_err(id, format!("app '{nm}' not found (deploy it first?)")),
         }
     } else {
         let wasm_hex = p.get("wasm_cid").and_then(|v| v.as_str()).unwrap_or("");

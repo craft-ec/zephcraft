@@ -107,4 +107,21 @@ impl ProgramAccountStore {
     pub async fn resolve(&self, program_cid: [u8; 32], seed: &[u8]) -> Vec<u8> {
         self.load_state(pda(&program_cid, seed).0)
     }
+
+    /// Adopt `bytes` DIRECTLY as the state of `pda(program_id, seed)` — write it as the
+    /// account's state file and publish it as durable content WITHOUT running a program.
+    /// Used to adopt a registry state handed off from the previous epoch's writer (the state
+    /// was already validated by the program when it was originally advanced). Mirrors
+    /// `advance`'s persist+publish tail.
+    pub async fn put_state(
+        &self,
+        program_id: [u8; 32],
+        seed: &[u8],
+        bytes: &[u8],
+    ) -> anyhow::Result<()> {
+        let account = pda(&program_id, seed).0;
+        std::fs::write(self.state_path(account), bytes)?;
+        let _ = self.obj.publish_system(bytes).await; // durable content (survives node loss)
+        Ok(())
+    }
 }
