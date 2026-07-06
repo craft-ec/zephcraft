@@ -191,29 +191,12 @@ pub struct PublishReport {
 }
 
 /// Source of live candidate peers to place pieces on. Production backs this with SWIM
-/// membership (real-time, in-network liveness); the tracker-backed `RoutingPeerSource` below
-/// is a transition/testing adapter. Replaces the old `ContentRouting::nodes()` census lookup.
+/// membership (real-time, in-network liveness); tests back it with an in-memory double.
+/// Replaces the old `ContentRouting::nodes()` census lookup.
 #[async_trait::async_trait]
 pub trait PeerSource: Send + Sync {
     /// Live peers (id + dialable addr). May include self; callers filter it out.
     async fn peers(&self) -> Vec<(NodeId, PeerAddr)>;
-}
-
-/// A `PeerSource` backed by the `ContentRouting` node registry (tracker) — for tests and
-/// while the tracker still serves census. Production uses a membership-backed source.
-pub struct RoutingPeerSource(pub Arc<dyn ContentRouting>);
-
-#[async_trait::async_trait]
-impl PeerSource for RoutingPeerSource {
-    async fn peers(&self) -> Vec<(NodeId, PeerAddr)> {
-        self.0
-            .nodes()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|(id, np)| np.addr.parse::<PeerAddr>().ok().map(|a| (id, a)))
-            .collect()
-    }
 }
 
 /// Per-cid diagnostic snapshot from the last health scan (for the dashboard). The verdict is
@@ -285,18 +268,6 @@ pub struct ObjEngine {
 }
 
 impl ObjEngine {
-    pub fn new(
-        transport: Arc<Transport>,
-        store: Arc<Store>,
-        routing: Arc<dyn ContentRouting>,
-        config: ObjConfig,
-    ) -> Arc<Self> {
-        // Default peer source: the tracker node registry (transition + tests). Production
-        // wires a membership-backed source via `with_peer_source`.
-        let peer_source = Arc::new(RoutingPeerSource(routing.clone()));
-        Self::with_peer_source(transport, store, routing, peer_source, config)
-    }
-
     /// Construct with an explicit [`PeerSource`] — production passes a membership-backed one
     /// so candidate peers come from live SWIM state, not the tracker.
     pub fn with_peer_source(
@@ -2017,25 +1988,6 @@ impl ObjEngine {
             }
         }
         false
-    }
-
-    /// Announce a relay this node operates into the relay registry (§26). (Tracker-era
-    /// self-registration; removed when census moves to membership in P4c.)
-    pub async fn announce_relay(&self, relay_url: String) -> anyhow::Result<()> {
-        self.routing
-            .announce_relay_registry(relay_url)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))
-    }
-
-    /// Announce this node into the tracker's node registry (map/census), reporting real
-    /// bytes stored + offered capacity. (Removed when census moves to membership in P4c.)
-    pub async fn announce_node(&self) -> anyhow::Result<()> {
-        let used = self.store.stats().bytes;
-        self.routing
-            .announce_node_registry(used, self.config.capacity_bytes)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
     /// Serve the piece ALPN: ingest pushes (vtag-verify → store → announce)

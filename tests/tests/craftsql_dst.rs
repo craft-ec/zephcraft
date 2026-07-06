@@ -87,7 +87,7 @@ async fn sql_node(tracker: &MemNet, dir: &Path) -> SqlNode {
         .unwrap()
         .with_source(Arc::new(TransportPageSource::new(
             t.clone(),
-            routing_dyn.clone(),
+            Arc::new(tracker.peers()),
         )))
         .with_durable(Arc::new(ObjDurable::new(engine.clone())))
         .with_manifests(Arc::new(RoutingManifestStore::new(routing_dyn.clone()))),

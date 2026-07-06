@@ -21,7 +21,6 @@ use zeph_core::Cid;
 use zeph_crypto::Keystore;
 use zeph_membership::Membership;
 use zeph_obj::{ObjConfig, ObjEngine, PeerSource};
-use zeph_routing::TrackerRouting;
 use zeph_store::Store;
 
 /// Delay-queue of CIDs due for a health check, ordered by next-due time (min-heap via Reverse).
@@ -993,25 +992,15 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         .await?,
     );
 
-    // Storage engine: persistent store + tracker routing + obj.
+    // Storage engine: persistent store + DHT routing + obj.
     let store = Arc::new(Store::open(data_dir.join("store"))?);
-    let tracker_addrs: Vec<PeerAddr> = cfg.trackers.iter().filter_map(|t| t.parse().ok()).collect();
-    let tracker = Arc::new(TrackerRouting::new(
-        transport.clone(),
+    // Content-routing backend: the Kademlia DHT is the sole production router (the tracker is
+    // retired). Kept as `Option` (always `Some`) so the persistence/serve sites below read cleanly.
+    let dht_node = Some(zeph_dht::DhtNode::new(
         identity.clone(),
-        tracker_addrs,
-        env!("CARGO_PKG_VERSION").to_string(),
+        transport.clone(),
+        48 * 3600 * 1000, // 48h record TTL (foundation §3)
     ));
-    // Content-routing backend: the Kademlia DHT (experimental, flag-gated) or the tracker.
-    let dht_node = if cfg.routing_dht {
-        Some(zeph_dht::DhtNode::new(
-            identity.clone(),
-            transport.clone(),
-            48 * 3600 * 1000, // 48h record TTL (foundation §3)
-        ))
-    } else {
-        None
-    };
     // Persist the DHT record store under the data dir. A content-routing DHT on fixed-identity
     // infra nodes should survive restart with its records intact (like IPFS) — an in-memory-only
     // store loses everything on restart and forces a false-at-risk repair storm until re-announce
@@ -1035,18 +1024,16 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
             }
         });
     }
-    let routing: Arc<dyn zeph_routing::ContentRouting> = match &dht_node {
-        Some(dht) => Arc::new(zeph_routing::DhtRouting::new(dht.clone())),
-        None => tracker.clone(),
-    };
-    // Candidate-peer source: SWIM membership when on the DHT (census is in-network), else the
-    // tracker node registry. The membership handle is injected after membership is built.
+    let routing: Arc<dyn zeph_routing::ContentRouting> = Arc::new(zeph_routing::DhtRouting::new(
+        dht_node
+            .as_ref()
+            .expect("dht_node is always constructed")
+            .clone(),
+    ));
+    // Candidate-peer source: SWIM membership (census is in-network on the DHT). The membership
+    // handle is injected after membership is built.
     let mem_peers = peers::MembershipPeers::new();
-    let peer_source: Arc<dyn zeph_obj::PeerSource> = if dht_node.is_some() {
-        mem_peers.clone()
-    } else {
-        Arc::new(zeph_obj::RoutingPeerSource(routing.clone()))
-    };
+    let peer_source: Arc<dyn zeph_obj::PeerSource> = mem_peers.clone();
     let engine = ObjEngine::with_peer_source(
         transport.clone(),
         store.clone(),
@@ -1077,7 +1064,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let sql_heads = Arc::new(zeph_sql::RoutingRootStore::new(routing_dyn.clone()));
     let sql_source = Arc::new(zeph_sql::TransportPageSource::new(
         transport.clone(),
-        routing_dyn,
+        mem_peers.clone(),
     ));
     let sql_manifests = Arc::new(zeph_sql::RoutingManifestStore::new(routing.clone()));
     let craftsql = Arc::new(
@@ -1386,15 +1373,11 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         }
     });
 
-    // Announce this node into the tracker's node registry (map/census),
-    // immediately and periodically.
-    // Announce the node into the registry AND re-announce provider records
-    // for everything we hold (pins + pieces), immediately (first tick) and
-    // periodically — so held content stays discoverable across restart,
-    // churn, and tracker restart. Interval well inside the provider TTL and
-    // short enough to recover quickly from a tracker restart.
+    // Re-announce provider records for everything we hold (pins + pieces),
+    // immediately (first tick) and periodically — so held content stays
+    // discoverable across restart and churn. Interval well inside the provider
+    // TTL and short enough to recover quickly.
     let announce_engine = engine.clone();
-    let announce_relays = cfg.relay_operator_urls.clone();
     let announce_sql = craftsql.clone();
     let announce_jobs = jobs.clone();
     let announce_appreg = appreg_store.clone();
@@ -1406,7 +1389,6 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         loop {
             interval.tick().await;
             let e = announce_engine.clone();
-            let relays = announce_relays.clone();
             let sql = announce_sql.clone();
             let appreg = announce_appreg.clone();
             let accounts = announce_accounts.clone();
@@ -1419,16 +1401,11 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                 1,
                 move || {
                     let e = e.clone();
-                    let relays = relays.clone();
                     let sql = sql.clone();
                     let appreg = appreg.clone();
                     let accounts = accounts.clone();
                     let clock = clock.clone();
                     async move {
-                        let _ = e.announce_node().await;
-                        for relay in &relays {
-                            let _ = e.announce_relay(relay.clone()).await;
-                        }
                         let n = e.reannounce_providers().await;
                         if n > 0 {
                             tracing::info!(cids = n, "re-announced provider records");
@@ -1520,14 +1497,9 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         });
     }
 
-    // Discover peers from the tracker's node registry and seed membership —
-    // a node bootstraps from the network without any hardcoded peer.
+    // Seed membership from the configured seed peers — the tracker-free bootstrap: a node
+    // bootstraps from the network without any hardcoded peer. SWIM probing takes over from there.
     let seed_membership = membership.clone();
-    let seed_routing = routing.clone();
-    let me_id = transport.node_id();
-    // Configured seed peers — the tracker-free bootstrap (same list the DHT uses). On the DHT
-    // path routing.nodes() is empty, so these carry membership; on the tracker path both feed
-    // it. SWIM probing takes over from there.
     let config_seeds: Vec<PeerAddr> = cfg
         .dht_seeds
         .iter()
@@ -1539,16 +1511,6 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
             interval.tick().await;
             if !config_seeds.is_empty() {
                 seed_membership.seed(config_seeds.clone()).await;
-            }
-            if let Ok(nodes) = seed_routing.nodes().await {
-                let candidates: Vec<PeerAddr> = nodes
-                    .into_iter()
-                    .filter(|(id, _)| *id != me_id)
-                    .filter_map(|(_, np)| np.addr.parse().ok())
-                    .collect();
-                if !candidates.is_empty() {
-                    seed_membership.seed(candidates).await;
-                }
             }
         }
     });

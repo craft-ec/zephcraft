@@ -8,8 +8,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use zeph_core::{Cid, NodeId};
-use zeph_obj::{ConsumeMode, ObjEngine};
-use zeph_routing::ContentRouting;
+use zeph_obj::{ConsumeMode, ObjEngine, PeerSource};
 use zeph_transport::{Connection, PeerAddr, Transport};
 
 use crate::{DurableStore, ObjectStore, PageSource, Result, SqlError};
@@ -46,25 +45,24 @@ pub async fn serve_pages(store_dir: PathBuf, mut conns: mpsc::Receiver<Connectio
 }
 
 /// Fetches CraftSQL page objects from a DB owner over the transport (resolving
-/// the owner's address from the node registry).
+/// the owner's dial address from the live peer source).
 pub struct TransportPageSource {
     transport: Arc<Transport>,
-    routing: Arc<dyn ContentRouting>,
+    peers: Arc<dyn PeerSource>,
 }
 
 impl TransportPageSource {
-    pub fn new(transport: Arc<Transport>, routing: Arc<dyn ContentRouting>) -> Self {
-        Self { transport, routing }
+    pub fn new(transport: Arc<Transport>, peers: Arc<dyn PeerSource>) -> Self {
+        Self { transport, peers }
     }
 
     async fn owner_addr(&self, owner: NodeId) -> Option<PeerAddr> {
-        self.routing
-            .nodes()
+        self.peers
+            .peers()
             .await
-            .ok()?
             .into_iter()
             .find(|(id, _)| *id == owner)
-            .and_then(|(_, np)| np.addr.parse().ok())
+            .map(|(_, addr)| addr)
     }
 }
 
@@ -72,7 +70,7 @@ impl TransportPageSource {
 impl PageSource for TransportPageSource {
     async fn fetch(&self, owner: NodeId, cid: Cid) -> Result<Option<Vec<u8>>> {
         let addr = self.owner_addr(owner).await.ok_or_else(|| {
-            SqlError::Sqlite(format!("owner {} not in node registry", owner.to_hex()))
+            SqlError::Sqlite(format!("owner {} not among live peers", owner.to_hex()))
         })?;
         let conn = self
             .transport
