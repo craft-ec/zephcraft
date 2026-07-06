@@ -128,7 +128,6 @@
       <dt>erasure</dt><dd id="erasure" class="muted">…</dd>
       <dt>hlc</dt><dd id="hlc" class="muted">…</dd>
       <dt>relays</dt><dd id="relays" class="muted">…</dd>
-      <dt>trackers</dt><dd id="trackers" class="muted">…</dd>
       <dt>store</dt><dd id="store" class="muted">…</dd>
       <dt>health</dt><dd id="health" class="muted">…</dd>
       <dt>jobs</dt><dd id="jobs" class="muted">…</dd>
@@ -300,8 +299,6 @@
 
       <div class="grp">relays</div>
       <div id="set-relays"><div class="muted">none</div></div>
-      <div class="grp">trackers</div>
-      <div id="set-trackers"><div class="muted">none</div></div>
       <div class="grp">operated relays (vouched)</div>
       <div id="set-relayops"><div class="muted">none</div></div>
       <div class="grp">bootstrap peers</div>
@@ -329,13 +326,12 @@ function render(s){
   $("erasure").textContent = s.erasure;
   $("hlc").textContent = new Date(s.hlc_ms).toISOString().slice(11,23) + " · logical " + s.hlc_logical;
   $("relays").textContent = s.relays;
-  $("trackers").textContent = s.trackers;
   $("store").textContent = s.store_cids + " cids · " + s.store_pieces + " pieces · " + s.store_pinned + " pinned · " + (s.store_bytes/1048576).toFixed(1) + " MiB · providing " + s.providing;
   const atrisk = s.health_at_risk || 0;
   $("health").textContent = "scanned " + (s.health_scanned||0) + " · at-risk " + atrisk + " · surplus " + (s.health_surplus||0) + " · fading " + (s.health_fading||0) + " · scan-queue " + (s.scan_queue||0) + " (" + (s.scan_due||0) + " due) · repaired " + (s.health_repaired||0) + " · degraded " + (s.health_degraded||0) + " · offloaded " + (s.health_offloaded||0) + " · distributed " + (s.health_distributed||0) + " · scaled " + (s.health_scaled||0);
   $("health").style.color = atrisk > 0 ? "var(--warn, #d29922)" : "";
   const j = s.jobs || {};
-  $("jobs").textContent = "coordinator (§51 — distribute/scale, re-announce, ticks; health scan runs in its own delay-queue, see health) — submitted " + (j.submitted||0) + " · completed " + (j.completed||0) +
+  $("jobs").textContent = "coordinator (§51 — one bounded job manager: health scan, distribute/scale, re-announce, ticks) — submitted " + (j.submitted||0) + " · completed " + (j.completed||0) +
     " · in-flight " + (j.in_flight||0) + " · deduped " + (j.deduped||0) + " · retried " + (j.retried||0) + " · failed " + (j.failed||0);
   $("listen").textContent = s.listen;
   $("uptime").textContent = fmtUptime(s.uptime_secs);
@@ -815,7 +811,6 @@ function renderSettings(s){
   g("set-datadir", st.data_dir || "—");
   const list = (a) => (a && a.length) ? a.map(x => `<div class="evline mono">${esc(x)}</div>`).join("") : '<div class="muted">none</div>';
   $("set-relays").innerHTML = list(st.relay_urls);
-  $("set-trackers").innerHTML = list(st.trackers);
   $("set-relayops").innerHTML = list(st.relay_operator_urls);
   $("set-peers").innerHTML = list(st.peers);
 }
