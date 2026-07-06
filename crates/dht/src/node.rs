@@ -75,6 +75,17 @@ impl DhtNode {
         self.store.expire(self.now_millis())
     }
 
+    /// Snapshot the record store to `path` (atomic). See [`RecordStore::save`].
+    pub fn save_records(&self, path: &std::path::Path) -> std::io::Result<usize> {
+        self.store.save(path)
+    }
+
+    /// Restore the record store from `path`, dropping expired + re-verifying every signature.
+    /// See [`RecordStore::load_from`].
+    pub fn load_records(&self, path: &std::path::Path) -> usize {
+        self.store.load_from(path, self.now_millis())
+    }
+
     fn self_wire(&self) -> WireContact {
         (&self.me).into()
     }

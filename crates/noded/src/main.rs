@@ -1012,6 +1012,29 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     } else {
         None
     };
+    // Persist the DHT record store under the data dir. A content-routing DHT on fixed-identity
+    // infra nodes should survive restart with its records intact (like IPFS) — an in-memory-only
+    // store loses everything on restart and forces a false-at-risk repair storm until re-announce
+    // repopulates it. Load on boot (expiring + re-verifying), checkpoint every 120s, save on exit.
+    let dht_records_path = data_dir.join("dht_records.bin");
+    if let Some(dht) = &dht_node {
+        let n = dht.load_records(&dht_records_path);
+        if n > 0 {
+            tracing::info!(loaded = n, "dht: restored persisted record store");
+        }
+        let (dht2, path) = (dht.clone(), dht_records_path.clone());
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(120));
+            interval.tick().await; // skip the immediate tick
+            loop {
+                interval.tick().await;
+                match dht2.save_records(&path) {
+                    Ok(n) => tracing::debug!(saved = n, "dht: checkpointed record store"),
+                    Err(e) => tracing::warn!(error = %e, "dht: record store checkpoint failed"),
+                }
+            }
+        });
+    }
     let routing: Arc<dyn zeph_routing::ContentRouting> = match &dht_node {
         Some(dht) => Arc::new(zeph_routing::DhtRouting::new(dht.clone())),
         None => tracker.clone(),
@@ -1941,8 +1964,26 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         }
     });
 
+    // Wait for SIGINT (ctrl-c) or SIGTERM (systemctl stop) — the latter is how deploys restart us.
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = signal(SignalKind::terminate())?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
     tokio::signal::ctrl_c().await?;
     tracing::info!("shutting down");
+    // Persist the DHT record store so the node comes back with it intact, not empty.
+    if let Some(dht) = &dht_node {
+        match dht.save_records(&dht_records_path) {
+            Ok(n) => tracing::info!(saved = n, "dht: persisted record store on shutdown"),
+            Err(e) => tracing::warn!(error = %e, "dht: shutdown save failed"),
+        }
+    }
     events.publish(zeph_events::Event::Shutdown);
     transport.close().await;
     Ok(())
