@@ -86,6 +86,42 @@ impl DhtNode {
         self.store.load_from(path, self.now_millis())
     }
 
+    /// Snapshot the routing table's contacts to `path`, atomically. On restart the overlay
+    /// re-forms instantly from these instead of re-bootstrapping from seeds — stale contacts are
+    /// self-evicted by liveness. Returns how many contacts were written.
+    pub fn save_table(&self, path: &std::path::Path) -> std::io::Result<usize> {
+        let wire: Vec<WireContact> = {
+            let t = self.table.lock().expect("table");
+            t.contacts().iter().map(WireContact::from).collect()
+        };
+        let bytes = postcard::to_allocvec(&wire)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(wire.len())
+    }
+
+    /// Restore routing-table contacts from `path` (malformed addresses skipped, never trusted).
+    /// A missing or corrupt file leaves the table empty. Returns how many contacts were loaded.
+    pub fn load_table(&self, path: &std::path::Path) -> usize {
+        let Ok(bytes) = std::fs::read(path) else {
+            return 0;
+        };
+        let Ok(wire) = postcard::from_bytes::<Vec<WireContact>>(&bytes) else {
+            return 0;
+        };
+        let mut t = self.table.lock().expect("table");
+        let mut loaded = 0;
+        for w in wire {
+            if let Some(c) = w.into_contact() {
+                t.insert(c);
+                loaded += 1;
+            }
+        }
+        loaded
+    }
+
     fn self_wire(&self) -> WireContact {
         (&self.me).into()
     }

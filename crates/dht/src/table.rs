@@ -99,6 +99,11 @@ impl RoutingTable {
         self.buckets.iter().map(|b| b.len()).sum()
     }
 
+    /// All contacts currently held, flattened across buckets — for persistence.
+    pub fn contacts(&self) -> Vec<Contact> {
+        self.buckets.iter().flatten().cloned().collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -133,6 +138,29 @@ mod tests {
             id: NodeId(key(byte0)),
             addr: valid_addr(),
         }
+    }
+
+    #[test]
+    fn contacts_persist_roundtrip_via_wire() {
+        use crate::proto::WireContact;
+        let me = NodeId(key(0));
+        let mut t = RoutingTable::new(me);
+        for b in 1..=5u8 {
+            t.insert(contact(b));
+        }
+        let before = t.len();
+        assert_eq!(t.contacts().len(), before);
+        // Serialize exactly as DhtNode::save_table does, decode + reinsert as load_table does.
+        let wire: Vec<WireContact> = t.contacts().iter().map(WireContact::from).collect();
+        let bytes = postcard::to_allocvec(&wire).expect("encode");
+        let decoded: Vec<WireContact> = postcard::from_bytes(&bytes).expect("decode");
+        let mut t2 = RoutingTable::new(me);
+        for w in decoded {
+            if let Some(c) = w.into_contact() {
+                t2.insert(c);
+            }
+        }
+        assert_eq!(t2.len(), before, "all contacts restored across a save/load");
     }
 
     #[test]

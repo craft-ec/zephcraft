@@ -994,20 +994,35 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // store loses everything on restart and forces a false-at-risk repair storm until re-announce
     // repopulates it. Load on boot (expiring + re-verifying), checkpoint every 120s, save on exit.
     let dht_records_path = data_dir.join("dht_records.bin");
+    let dht_table_path = data_dir.join("dht_table.bin");
     if let Some(dht) = &dht_node {
         let n = dht.load_records(&dht_records_path);
         if n > 0 {
             tracing::info!(loaded = n, "dht: restored persisted record store");
         }
-        let (dht2, path) = (dht.clone(), dht_records_path.clone());
+        // Also restore the routing table so the overlay re-forms INSTANTLY on restart instead of
+        // re-bootstrapping from seeds — the overlay-complete scan gate then clears at once.
+        let t = dht.load_table(&dht_table_path);
+        if t > 0 {
+            tracing::info!(contacts = t, "dht: restored routing table");
+        }
+        let (dht2, rpath, tpath) = (
+            dht.clone(),
+            dht_records_path.clone(),
+            dht_table_path.clone(),
+        );
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(120));
             interval.tick().await; // skip the immediate tick
             loop {
                 interval.tick().await;
-                match dht2.save_records(&path) {
+                match dht2.save_records(&rpath) {
                     Ok(n) => tracing::debug!(saved = n, "dht: checkpointed record store"),
                     Err(e) => tracing::warn!(error = %e, "dht: record store checkpoint failed"),
+                }
+                match dht2.save_table(&tpath) {
+                    Ok(n) => tracing::debug!(saved = n, "dht: checkpointed routing table"),
+                    Err(e) => tracing::warn!(error = %e, "dht: routing table checkpoint failed"),
                 }
             }
         });
@@ -1936,6 +1951,10 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         match dht.save_records(&dht_records_path) {
             Ok(n) => tracing::info!(saved = n, "dht: persisted record store on shutdown"),
             Err(e) => tracing::warn!(error = %e, "dht: shutdown save failed"),
+        }
+        match dht.save_table(&dht_table_path) {
+            Ok(n) => tracing::info!(saved = n, "dht: persisted routing table on shutdown"),
+            Err(e) => tracing::warn!(error = %e, "dht: routing table shutdown save failed"),
         }
     }
     events.publish(zeph_events::Event::Shutdown);
