@@ -36,9 +36,12 @@ pub const ALPN: &[u8] = b"/craftec/piece/1";
 /// Re-announce a provider record this long after its last announce (foundation §462:
 /// 22h re-announce inside a 48h DHT TTL). Per-cid scheduling — NOT every cycle.
 const REPUBLISH_MS: u64 = 22 * 3600 * 1000;
-/// Cids scanned per health-scan pass (rotating). Bounds per-pass DHT gets; the full held set
-/// is covered over ceil(N / HEALTH_BATCH) passes.
-const HEALTH_BATCH: usize = 64;
+/// Health-scan + re-announce process cids in small chunks of PACE_CHUNK, sleeping PACE_DELAY
+/// between chunks — bounds in-flight DHT ops and trickles the load instead of an O(N) burst
+/// (even the startup/restart refresh), so both scale to thousands of cids without storming
+/// the overlay.
+const PACE_CHUNK: usize = 5;
+const PACE_DELAY: Duration = Duration::from_millis(250);
 const MAX_FRAME: usize = wire::MAX_MESSAGE_SIZE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,12 +230,6 @@ pub struct ObjEngine {
     /// Per-cid last-announce time (ms) — drives TTL-aware re-announce scheduling so a record
     /// is refreshed ~every 22h, not every cycle.
     announced_at: Mutex<HashMap<[u8; 32], u64>>,
-    /// Rotating cursor into the held-cid list for the incremental health scan (a bounded
-    /// batch per pass, not all cids every time).
-    scan_cursor: Mutex<usize>,
-    /// Cids currently believed at-risk (rolling — updated as the rotating scan covers each
-    /// batch), so the dashboard reports the full-set estimate, not one batch.
-    at_risk_ids: Mutex<HashSet<[u8; 32]>>,
 }
 
 impl ObjEngine {
@@ -269,8 +266,6 @@ impl ObjEngine {
             enc: std::sync::OnceLock::new(),
             pending: Mutex::new(Vec::new()),
             announced_at: Mutex::new(HashMap::new()),
-            scan_cursor: Mutex::new(0),
-            at_risk_ids: Mutex::new(HashSet::new()),
         })
     }
 
@@ -1158,21 +1153,27 @@ impl ObjEngine {
                 })
                 .collect()
         };
-        let due: Vec<Cid> = records.iter().map(|(c, _, _)| *c).collect();
-        let results =
-            futures::future::join_all(records.into_iter().map(|(cid, count, pinned)| async move {
-                self.routing.announce(cid, count, pinned).await.is_ok()
+        // Trickle the due announces in small chunks of PACE_CHUNK with a delay between — the
+        // startup/restart refresh (when everything is due) is otherwise an O(N) put burst.
+        // Scales to thousands of cids; steady-state is near-zero due each cycle anyway.
+        let mut announced = 0usize;
+        for chunk in records.chunks(PACE_CHUNK) {
+            let results = futures::future::join_all(chunk.iter().map(|(cid, count, pinned)| {
+                let (cid, count, pinned) = (*cid, *count, *pinned);
+                async move { self.routing.announce(cid, count, pinned).await.is_ok() }
             }))
             .await;
-        {
-            let mut sched = self.announced_at.lock().expect("announced_at");
-            for (cid, ok) in due.iter().zip(&results) {
-                if *ok {
-                    sched.insert(cid.0, now);
+            {
+                let mut sched = self.announced_at.lock().expect("announced_at");
+                for ((cid, _, _), ok) in chunk.iter().zip(&results) {
+                    if *ok {
+                        sched.insert(cid.0, now);
+                        announced += 1;
+                    }
                 }
             }
+            tokio::time::sleep(PACE_DELAY).await;
         }
-        let announced = results.iter().filter(|ok| **ok).count();
         // WANT interest (the node's own wants — few); re-announce each cycle (cheap).
         futures::future::join_all(
             self.store
@@ -1217,27 +1218,21 @@ impl ObjEngine {
         // The set of CIDs the network WANTs — content outside it (and unpinned,
         // undemanded) is left to fade (FADE: absence of repair).
 
-        // ROTATING incremental scan: resolve a bounded BATCH of held cids per pass, advancing
-        // a cursor, so each cid is covered over several passes instead of resolving ALL every
-        // time. Per-pass DHT gets are bounded by HEALTH_BATCH (this used to be O(N)/pass).
-        let all = self.store.cids();
-        let all_len = all.len();
-        let batch: Vec<Cid> = if all.is_empty() {
-            Vec::new()
-        } else {
-            let mut cur = self.scan_cursor.lock().expect("scan_cursor");
-            let start = *cur % all.len();
-            let take = HEALTH_BATCH.min(all.len());
-            *cur = start + take;
-            all.iter().cycle().skip(start).take(take).cloned().collect()
-        };
-        let batch_ids: HashSet<[u8; 32]> = batch.iter().map(|c| c.0).collect();
-        let mut batch_at_risk: HashSet<[u8; 32]> = HashSet::new();
-        let resolved =
-            futures::future::join_all(batch.into_iter().map(|cid| async move {
-                (cid, self.routing.resolve(cid).await.unwrap_or_default())
+        // PACED full sweep: resolve every held cid's providers in small chunks of PACE_CHUNK,
+        // sleeping PACE_DELAY between chunks, so in-flight DHT gets stay bounded and the O(N)
+        // read load is trickled rather than bursted — this scales to thousands of cids. (The
+        // coordinator dedupes the job by key, so a sweep that outlasts the scan interval just
+        // re-triggers when it finishes.)
+        let mut resolved = Vec::new();
+        for chunk in self.store.cids().chunks(PACE_CHUNK) {
+            let part = futures::future::join_all(chunk.iter().map(|cid| {
+                let cid = *cid;
+                async move { (cid, self.routing.resolve(cid).await.unwrap_or_default()) }
             }))
             .await;
+            resolved.extend(part);
+            tokio::time::sleep(PACE_DELAY).await;
+        }
 
         for (cid, providers) in resolved {
             if self.store.is_tombstoned(&cid) {
@@ -1354,7 +1349,6 @@ impl ObjEngine {
                 report.fading += 1;
                 continue;
             }
-            batch_at_risk.insert(cid.0);
             report.at_risk += 1;
 
             // Only a capable holder can repair; rendezvous-elect exactly one so
@@ -1383,20 +1377,6 @@ impl ObjEngine {
                 report.repaired += 1;
             }
         }
-        // Roll this batch's verdict into the persistent at-risk set (add newly at-risk, clear
-        // those in the batch that are now healthy); report the full-set estimate + total held.
-        {
-            let mut ids = self.at_risk_ids.lock().expect("at_risk_ids");
-            for cid in &batch_ids {
-                if batch_at_risk.contains(cid) {
-                    ids.insert(*cid);
-                } else {
-                    ids.remove(cid);
-                }
-            }
-            report.at_risk = ids.len();
-        }
-        report.scanned = all_len;
         report
     }
 
