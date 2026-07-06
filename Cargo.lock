@@ -5790,6 +5790,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeph-dht"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures",
+ "hex",
+ "postcard",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "zeph-core",
+ "zeph-crypto",
+ "zeph-transport",
+ "zeph-wire",
+]
+
+[[package]]
 name = "zeph-erasure"
 version = "0.1.0"
 dependencies = [
@@ -5826,6 +5845,7 @@ name = "zeph-noded"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "clap",
  "dirs",
@@ -5845,6 +5865,7 @@ dependencies = [
  "zeph-com",
  "zeph-core",
  "zeph-crypto",
+ "zeph-dht",
  "zeph-erasure",
  "zeph-events",
  "zeph-membership",
@@ -5862,6 +5883,7 @@ name = "zeph-obj"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "futures",
  "hex",
  "postcard",
@@ -5896,6 +5918,7 @@ dependencies = [
  "tracing",
  "zeph-core",
  "zeph-crypto",
+ "zeph-dht",
  "zeph-transport",
  "zeph-wire",
 ]
