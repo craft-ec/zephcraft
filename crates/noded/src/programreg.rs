@@ -265,6 +265,25 @@ impl ProgramRegistry {
         // Adopt the previous epoch's state if we've just become the writer, before advancing.
         self.ensure_current(shard).await;
         let code = self.program_cid().await;
+        // NATIVE DEFAULT (the built-in local registry program). When governance has NOT set a WASM
+        // registry program, run `RegistryState::apply` directly — so a FRESH network self-starts
+        // with no publish/governance bootstrap. A governance `SetProgram` swaps in the WASM (e.g.
+        // the char-limit v2) as the upgrade on top. (MINIMAL_KERNEL: every anchor has a default.)
+        if code == registry_program_cid() {
+            let seed = shard_seed(shard);
+            let prev =
+                RegistryState::decode(&self.store.resolve(registry_program_cid(), &seed).await)
+                    .unwrap_or_default();
+            let sub = HeadSubmission::decode(sub_bytes)
+                .ok_or_else(|| anyhow::anyhow!("bad head submission"))?;
+            let next = prev
+                .apply(&sub)
+                .map_err(|e| anyhow::anyhow!("registry rejected the submission: {e}"))?;
+            self.store
+                .put_state(registry_program_cid(), &seed, &next.encode())
+                .await?;
+            return Ok(next.root());
+        }
         let r = self
             .store
             .advance(registry_program_cid(), code, &shard_seed(shard), sub_bytes)
