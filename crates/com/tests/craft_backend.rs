@@ -14,35 +14,20 @@ use zeph_com::{AppBackend, CraftBackend, HostCtx, Runtime, DEFAULT_FUEL};
 use zeph_core::hlc::Clock;
 use zeph_crypto::NodeIdentity;
 use zeph_obj::{ObjConfig, ObjEngine};
-use zeph_routing::{ContentRouting, Registry, RegistryConfig, TrackerRouting};
+use zeph_routing::ContentRouting;
 use zeph_sql::{CraftSql, ObjDurable, RoutingManifestStore, RoutingRootStore, TransportPageSource};
 use zeph_store::Store;
+use zeph_testkit::MemNet;
 use zeph_transport::{Reach, Transport};
 
-async fn start_tracker() -> Arc<Transport> {
-    let id = NodeIdentity::generate();
-    let t = Arc::new(
-        Transport::bind(
-            id.secret_key_bytes(),
-            Reach::LocalOnly,
-            vec![zeph_routing::ALPN.to_vec()],
-            0,
-        )
-        .await
-        .unwrap(),
-    );
-    let registry = Arc::new(Registry::new(RegistryConfig::default()));
-    let (tx, rx) = tokio::sync::mpsc::channel(64);
-    let st = t.clone();
-    tokio::spawn(async move { st.serve(vec![(zeph_routing::ALPN.to_vec(), tx)]).await });
-    let rt = t.clone();
-    tokio::spawn(async move { zeph_routing::serve(registry, rt, rx).await });
-    t
+/// Replaces the in-process tracker: one shared in-memory network view.
+fn start_tracker() -> MemNet {
+    MemNet::new()
 }
 
 /// A real node: obj engine + CraftSQL serving the piece + page ALPNs. Returns the
 /// CraftSQL + engine so a CraftBackend can be built over them.
-async fn node(tracker: &Transport, dir: &Path) -> (Arc<CraftSql>, Arc<ObjEngine>) {
+async fn node(tracker: &MemNet, dir: &Path) -> (Arc<CraftSql>, Arc<ObjEngine>) {
     let id = Arc::new(NodeIdentity::generate());
     let node_id = id.node_id();
     let t = Arc::new(
@@ -56,13 +41,14 @@ async fn node(tracker: &Transport, dir: &Path) -> (Arc<CraftSql>, Arc<ObjEngine>
         .unwrap(),
     );
     let store = Arc::new(Store::open(dir.join("obj")).unwrap());
-    let routing = Arc::new(TrackerRouting::new(
+    let routing = tracker.routing(id.clone(), t.addr());
+    let engine = ObjEngine::with_peer_source(
         t.clone(),
-        id.clone(),
-        vec![tracker.addr()],
-        "test".into(),
-    ));
-    let engine = ObjEngine::new(t.clone(), store, routing.clone(), ObjConfig::default());
+        store,
+        routing.clone(),
+        Arc::new(tracker.peers()),
+        ObjConfig::default(),
+    );
     let sql_dir = dir.join("sqlpages");
     let routing_dyn: Arc<dyn ContentRouting> = routing.clone();
     let craftsql = Arc::new(
@@ -99,7 +85,7 @@ async fn node(tracker: &Transport, dir: &Path) -> (Arc<CraftSql>, Arc<ObjEngine>
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_writes_persist_to_craftsql_and_reload() {
-    let tracker = start_tracker().await;
+    let tracker = start_tracker();
     let dir = tempfile::tempdir().unwrap();
     let (craftsql, engine) = node(&tracker, dir.path()).await;
     let backend: Arc<dyn AppBackend> =

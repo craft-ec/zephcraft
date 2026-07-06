@@ -25,3 +25,4 @@ zeph-crypto.workspace = true
 zeph-cipher.workspace = true
 zeph-routing.workspace = true
 zeph-store.workspace = true
+zeph-testkit.workspace = true

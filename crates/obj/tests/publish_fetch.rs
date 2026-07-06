@@ -7,34 +7,19 @@ use std::sync::Arc;
 
 use zeph_crypto::NodeIdentity;
 use zeph_obj::{ConsumeMode, ObjConfig, ObjEngine};
-use zeph_routing::{ContentRouting, Registry, RegistryConfig, TrackerRouting};
+use zeph_routing::ContentRouting;
 use zeph_store::Store;
+use zeph_testkit::{MemNet, MemRouting};
 use zeph_transport::{Reach, Transport};
 
-async fn transport(alpns: Vec<Vec<u8>>) -> (Arc<Transport>, Arc<NodeIdentity>) {
-    let id = Arc::new(NodeIdentity::generate());
-    let t = Arc::new(
-        Transport::bind(id.secret_key_bytes(), Reach::LocalOnly, alpns, 0)
-            .await
-            .unwrap(),
-    );
-    (t, id)
+/// Replaces the in-process tracker: one shared in-memory network view.
+fn start_tracker() -> MemNet {
+    MemNet::new()
 }
 
-async fn start_tracker() -> Arc<Transport> {
-    let (t, _) = transport(vec![zeph_routing::ALPN.to_vec()]).await;
-    let registry = Arc::new(Registry::new(RegistryConfig::default()));
-    let (tx, rx) = tokio::sync::mpsc::channel(64);
-    let st = t.clone();
-    tokio::spawn(async move { st.serve(vec![(zeph_routing::ALPN.to_vec(), tx)]).await });
-    let rt = t.clone();
-    tokio::spawn(async move { zeph_routing::serve(registry, rt, rx).await });
-    t
-}
-
-/// A full node: transport (serving the piece ALPN), store, tracker routing,
+/// A full node: transport (serving the piece ALPN), store, in-memory routing,
 /// obj engine. Returns the engine + its routing handle.
-async fn node(tracker: &Transport, dir: &std::path::Path) -> (Arc<ObjEngine>, Arc<TrackerRouting>) {
+async fn node(tracker: &MemNet, dir: &std::path::Path) -> (Arc<ObjEngine>, Arc<MemRouting>) {
     let id = Arc::new(NodeIdentity::generate());
     let (engine, routing, _addr) = node_with(tracker, dir, id).await;
     (engine, routing)
@@ -43,10 +28,10 @@ async fn node(tracker: &Transport, dir: &std::path::Path) -> (Arc<ObjEngine>, Ar
 /// Like `node`, but reuses a given identity (to simulate restart) and returns
 /// the node's dialable address.
 async fn node_with(
-    tracker: &Transport,
+    tracker: &MemNet,
     dir: &std::path::Path,
     id: Arc<NodeIdentity>,
-) -> (Arc<ObjEngine>, Arc<TrackerRouting>, String) {
+) -> (Arc<ObjEngine>, Arc<MemRouting>, String) {
     let t = Arc::new(
         Transport::bind(
             id.secret_key_bytes(),
@@ -59,13 +44,14 @@ async fn node_with(
     );
     let addr = t.addr().to_string();
     let store = Arc::new(Store::open(dir).unwrap());
-    let routing = Arc::new(TrackerRouting::new(
+    let routing = tracker.routing(id, t.addr());
+    let engine = ObjEngine::with_peer_source(
         t.clone(),
-        id,
-        vec![tracker.addr()],
-        "test".into(),
-    ));
-    let engine = ObjEngine::new(t.clone(), store, routing.clone(), ObjConfig::default());
+        store,
+        routing.clone(),
+        Arc::new(tracker.peers()),
+        ObjConfig::default(),
+    );
 
     let (tx, rx) = tokio::sync::mpsc::channel(64);
     let st = t.clone();
@@ -77,7 +63,7 @@ async fn node_with(
 
 #[tokio::test]
 async fn publish_spreads_then_fetch_by_cid_alone() {
-    let tracker = start_tracker().await;
+    let tracker = start_tracker();
     let dirs: Vec<tempfile::TempDir> = (0..10).map(|_| tempfile::tempdir().unwrap()).collect();
 
     // 8 storage nodes — each announces itself so the publisher can find them.
@@ -114,7 +100,7 @@ async fn publish_spreads_then_fetch_by_cid_alone() {
 
 #[tokio::test]
 async fn ingest_rejects_polluted_pieces() {
-    let tracker = start_tracker().await;
+    let tracker = start_tracker();
     let dirs: Vec<tempfile::TempDir> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
     let (storage, srouting) = node(&tracker, dirs[0].path()).await;
     srouting.announce_node(0, 0).await.unwrap();
@@ -139,7 +125,7 @@ async fn ingest_rejects_polluted_pieces() {
 /// reannounce_providers, the content is fetchable again.
 #[tokio::test]
 async fn reannounce_restores_piece_provider_after_restart() {
-    let tracker = start_tracker().await;
+    let tracker = start_tracker();
     let dir = tempfile::tempdir().unwrap();
     let storage_id = Arc::new(NodeIdentity::generate());
 
@@ -194,7 +180,7 @@ async fn reannounce_restores_piece_provider_after_restart() {
 /// objects; the manifest links forward to the content, and the cascade follows it.
 #[tokio::test]
 async fn pin_unpin_forget_cascade_the_whole_file_chain() {
-    let tracker = start_tracker().await;
+    let tracker = start_tracker();
     let dirs: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
     // Two storage nodes so publish spreads normally.
     for dir in dirs.iter().take(2) {

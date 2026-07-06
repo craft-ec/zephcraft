@@ -14,9 +14,10 @@ use zeph_com::{
 use zeph_core::{hlc::Clock, NodeId};
 use zeph_crypto::NodeIdentity;
 use zeph_obj::{ObjConfig, ObjEngine};
-use zeph_routing::{ContentRouting, Registry, RegistryConfig, TrackerRouting};
+use zeph_routing::ContentRouting;
 use zeph_sql::{CraftSql, ObjDurable, RoutingManifestStore, RoutingRootStore, TransportPageSource};
 use zeph_store::Store;
+use zeph_testkit::MemNet;
 use zeph_transport::{Connection, Reach, Transport};
 
 // The feed app: `post` writes a row to the caller's OWN feed; `aggregate` reads a
@@ -45,25 +46,9 @@ const FEED_WAT: &[u8] = br#"(module
         (i32.gt_s (local.get $a) (i32.const 2))
         (i32.gt_s (local.get $b) (i32.const 2))))))"#;
 
-async fn start_tracker() -> Arc<Transport> {
-    let id = NodeIdentity::generate();
-    let t = Arc::new(
-        Transport::bind(
-            id.secret_key_bytes(),
-            Reach::LocalOnly,
-            vec![zeph_routing::ALPN.to_vec()],
-            0,
-        )
-        .await
-        .unwrap(),
-    );
-    let registry = Arc::new(Registry::new(RegistryConfig::default()));
-    let (tx, rx) = mpsc::channel(64);
-    let st = t.clone();
-    tokio::spawn(async move { st.serve(vec![(zeph_routing::ALPN.to_vec(), tx)]).await });
-    let rt = t.clone();
-    tokio::spawn(async move { zeph_routing::serve(registry, rt, rx).await });
-    t
+/// Replaces the in-process tracker: one shared in-memory network view.
+fn start_tracker() -> MemNet {
+    MemNet::new()
 }
 
 /// A node with a live CraftCOM invocation service over its own CraftBackend.
@@ -73,7 +58,7 @@ struct Node {
     service: Arc<InvokeService>,
 }
 
-async fn node(tracker: &Transport, dir: &Path) -> Node {
+async fn node(tracker: &MemNet, dir: &Path) -> Node {
     let id = Arc::new(NodeIdentity::generate());
     let node_id = id.node_id();
     let t = Arc::new(
@@ -91,13 +76,14 @@ async fn node(tracker: &Transport, dir: &Path) -> Node {
         .unwrap(),
     );
     let store = Arc::new(Store::open(dir.join("obj")).unwrap());
-    let routing = Arc::new(TrackerRouting::new(
+    let routing = tracker.routing(id.clone(), t.addr());
+    let engine = ObjEngine::with_peer_source(
         t.clone(),
-        id.clone(),
-        vec![tracker.addr()],
-        "test".into(),
-    ));
-    let engine = ObjEngine::new(t.clone(), store, routing.clone(), ObjConfig::default());
+        store,
+        routing.clone(),
+        Arc::new(tracker.peers()),
+        ObjConfig::default(),
+    );
     let sql_dir = dir.join("sqlpages");
     let routing_dyn: Arc<dyn ContentRouting> = routing.clone();
     let craftsql = Arc::new(
@@ -151,7 +137,7 @@ async fn node(tracker: &Transport, dir: &Path) -> Node {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn federated_feed_aggregates_across_sovereign_participants() {
-    let tracker = start_tracker().await;
+    let tracker = start_tracker();
     let dirs: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
     let a = node(&tracker, dirs[0].path()).await;
     let b = node(&tracker, dirs[1].path()).await;

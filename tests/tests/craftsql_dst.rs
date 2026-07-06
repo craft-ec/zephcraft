@@ -19,30 +19,15 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use zeph_core::NodeId;
 use zeph_crypto::NodeIdentity;
 use zeph_obj::{ObjConfig, ObjEngine};
-use zeph_routing::{ContentRouting, Registry, RegistryConfig, TrackerRouting};
+use zeph_routing::ContentRouting;
 use zeph_sql::{CraftSql, ObjDurable, RoutingManifestStore, RoutingRootStore, TransportPageSource};
 use zeph_store::Store;
+use zeph_testkit::{MemNet, MemRouting};
 use zeph_transport::{Reach, Transport};
 
-async fn start_tracker() -> Arc<Transport> {
-    let id = NodeIdentity::generate();
-    let t = Arc::new(
-        Transport::bind(
-            id.secret_key_bytes(),
-            Reach::LocalOnly,
-            vec![zeph_routing::ALPN.to_vec()],
-            0,
-        )
-        .await
-        .unwrap(),
-    );
-    let registry = Arc::new(Registry::new(RegistryConfig::default()));
-    let (tx, rx) = tokio::sync::mpsc::channel(64);
-    let st = t.clone();
-    tokio::spawn(async move { st.serve(vec![(zeph_routing::ALPN.to_vec(), tx)]).await });
-    let rt = t.clone();
-    tokio::spawn(async move { zeph_routing::serve(registry, rt, rx).await });
-    t
+/// Replaces the in-process tracker: one shared in-memory network view.
+fn start_tracker() -> MemNet {
+    MemNet::new()
 }
 
 /// A full node: obj engine (erasure/repair) + CraftSQL, serving both the piece
@@ -50,7 +35,7 @@ async fn start_tracker() -> Arc<Transport> {
 struct SqlNode {
     id: NodeId,
     engine: Arc<ObjEngine>,
-    routing: Arc<TrackerRouting>,
+    routing: Arc<MemRouting>,
     transport: Arc<Transport>,
     craftsql: Arc<CraftSql>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -65,7 +50,7 @@ impl SqlNode {
     }
 }
 
-async fn sql_node(tracker: &Transport, dir: &Path) -> SqlNode {
+async fn sql_node(tracker: &MemNet, dir: &Path) -> SqlNode {
     let id = Arc::new(NodeIdentity::generate());
     let node_id = id.node_id();
     let t = Arc::new(
@@ -79,16 +64,12 @@ async fn sql_node(tracker: &Transport, dir: &Path) -> SqlNode {
         .unwrap(),
     );
     let store = Arc::new(Store::open(dir.join("obj")).unwrap());
-    let routing = Arc::new(TrackerRouting::new(
-        t.clone(),
-        id.clone(),
-        vec![tracker.addr()],
-        "test".into(),
-    ));
-    let engine = ObjEngine::new(
+    let routing = tracker.routing(id.clone(), t.addr());
+    let engine = ObjEngine::with_peer_source(
         t.clone(),
         store,
         routing.clone(),
+        Arc::new(tracker.peers()),
         ObjConfig {
             probe_timeout: std::time::Duration::from_millis(200),
             scale_threshold: 3,
@@ -139,7 +120,7 @@ async fn sql_node(tracker: &Transport, dir: &Path) -> SqlNode {
 #[ignore]
 async fn dst_craftsql_survives_churn() {
     let mut rng = StdRng::seed_from_u64(0x5EED_5EE7);
-    let tracker = start_tracker().await;
+    let tracker = start_tracker();
     let mut dirs: Vec<tempfile::TempDir> = Vec::new();
     let mut mk = || {
         let d = tempfile::tempdir().unwrap();

@@ -5763,6 +5763,7 @@ dependencies = [
  "zeph-routing",
  "zeph-sql",
  "zeph-store",
+ "zeph-testkit",
  "zeph-transport",
 ]
 
@@ -5899,6 +5900,7 @@ dependencies = [
  "zeph-events",
  "zeph-routing",
  "zeph-store",
+ "zeph-testkit",
  "zeph-transport",
  "zeph-wire",
 ]
@@ -5970,6 +5972,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeph-testkit"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "zeph-core",
+ "zeph-crypto",
+ "zeph-obj",
+ "zeph-routing",
+ "zeph-transport",
+]
+
+[[package]]
 name = "zeph-tests"
 version = "0.1.0"
 dependencies = [
@@ -5982,6 +5996,7 @@ dependencies = [
  "zeph-routing",
  "zeph-sql",
  "zeph-store",
+ "zeph-testkit",
  "zeph-transport",
 ]
 

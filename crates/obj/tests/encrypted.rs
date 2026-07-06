@@ -7,31 +7,16 @@ use std::sync::Arc;
 use zeph_cipher::EncKeypair;
 use zeph_crypto::NodeIdentity;
 use zeph_obj::{ConsumeMode, ObjConfig, ObjEngine};
-use zeph_routing::{Registry, RegistryConfig, TrackerRouting};
 use zeph_store::Store;
+use zeph_testkit::{MemNet, MemRouting};
 use zeph_transport::{Reach, Transport};
 
-async fn transport(alpns: Vec<Vec<u8>>) -> Arc<Transport> {
-    let id = NodeIdentity::generate();
-    Arc::new(
-        Transport::bind(id.secret_key_bytes(), Reach::LocalOnly, alpns, 0)
-            .await
-            .unwrap(),
-    )
+/// Replaces the in-process tracker: one shared in-memory network view.
+fn start_tracker() -> MemNet {
+    MemNet::new()
 }
 
-async fn start_tracker() -> Arc<Transport> {
-    let t = transport(vec![zeph_routing::ALPN.to_vec()]).await;
-    let registry = Arc::new(Registry::new(RegistryConfig::default()));
-    let (tx, rx) = tokio::sync::mpsc::channel(64);
-    let st = t.clone();
-    tokio::spawn(async move { st.serve(vec![(zeph_routing::ALPN.to_vec(), tx)]).await });
-    let rt = t.clone();
-    tokio::spawn(async move { zeph_routing::serve(registry, rt, rx).await });
-    t
-}
-
-async fn node(tracker: &Transport, dir: &std::path::Path) -> (Arc<ObjEngine>, Arc<TrackerRouting>) {
+async fn node(tracker: &MemNet, dir: &std::path::Path) -> (Arc<ObjEngine>, Arc<MemRouting>) {
     let id = Arc::new(NodeIdentity::generate());
     let t = Arc::new(
         Transport::bind(
@@ -44,13 +29,14 @@ async fn node(tracker: &Transport, dir: &std::path::Path) -> (Arc<ObjEngine>, Ar
         .unwrap(),
     );
     let store = Arc::new(Store::open(dir).unwrap());
-    let routing = Arc::new(TrackerRouting::new(
+    let routing = tracker.routing(id, t.addr());
+    let engine = ObjEngine::with_peer_source(
         t.clone(),
-        id,
-        vec![tracker.addr()],
-        "test".into(),
-    ));
-    let engine = ObjEngine::new(t.clone(), store, routing.clone(), ObjConfig::default());
+        store,
+        routing.clone(),
+        Arc::new(tracker.peers()),
+        ObjConfig::default(),
+    );
     let (tx, rx) = tokio::sync::mpsc::channel(64);
     let st = t.clone();
     tokio::spawn(async move { st.serve(vec![(zeph_obj::ALPN.to_vec(), tx)]).await });
@@ -61,7 +47,7 @@ async fn node(tracker: &Transport, dir: &std::path::Path) -> (Arc<ObjEngine>, Ar
 
 #[tokio::test]
 async fn private_object_hides_content_and_only_owner_reads() {
-    let tracker = start_tracker().await;
+    let tracker = start_tracker();
     let dirs: Vec<tempfile::TempDir> = (0..6).map(|_| tempfile::tempdir().unwrap()).collect();
 
     // Storage nodes to hold distributed pieces.

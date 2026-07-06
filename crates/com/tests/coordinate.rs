@@ -15,8 +15,8 @@ use zeph_com::{
 use zeph_core::{Cid, NodeId};
 use zeph_crypto::NodeIdentity;
 use zeph_obj::{ObjConfig, ObjEngine};
-use zeph_routing::{Registry, RegistryConfig, TrackerRouting};
 use zeph_store::Store;
+use zeph_testkit::MemNet;
 use zeph_transport::{Connection, PeerAddr, Reach, Transport};
 
 // Deterministic program: read the first input byte `b`, commit `[b, b*2]`.
@@ -30,25 +30,9 @@ const DOUBLE_WAT: &[u8] = br#"(module
     (i32.store8 (i32.const 101) (i32.mul (i32.load8_u (i32.const 0)) (i32.const 2)))
     (drop (call $commit (i32.const 100) (i32.const 2)))))"#;
 
-async fn start_tracker() -> Arc<Transport> {
-    let id = NodeIdentity::generate();
-    let t = Arc::new(
-        Transport::bind(
-            id.secret_key_bytes(),
-            Reach::LocalOnly,
-            vec![zeph_routing::ALPN.to_vec()],
-            0,
-        )
-        .await
-        .unwrap(),
-    );
-    let registry = Arc::new(Registry::new(RegistryConfig::default()));
-    let (tx, rx) = mpsc::channel(64);
-    let st = t.clone();
-    tokio::spawn(async move { st.serve(vec![(zeph_routing::ALPN.to_vec(), tx)]).await });
-    let rt = t.clone();
-    tokio::spawn(async move { zeph_routing::serve(registry, rt, rx).await });
-    t
+/// Replaces the in-process tracker: one shared in-memory network view.
+fn start_tracker() -> MemNet {
+    MemNet::new()
 }
 
 struct Member {
@@ -58,7 +42,7 @@ struct Member {
     engine: Arc<ObjEngine>,
 }
 
-async fn member(tracker: &Transport, dir: &Path) -> Member {
+async fn member(tracker: &MemNet, dir: &Path) -> Member {
     let id = Arc::new(NodeIdentity::generate());
     let node_id = id.node_id();
     let t = Arc::new(
@@ -72,13 +56,14 @@ async fn member(tracker: &Transport, dir: &Path) -> Member {
         .unwrap(),
     );
     let store = Arc::new(Store::open(dir.join("obj")).unwrap());
-    let routing = Arc::new(TrackerRouting::new(
+    let routing = tracker.routing(id.clone(), t.addr());
+    let engine = ObjEngine::with_peer_source(
         t.clone(),
-        id.clone(),
-        vec![tracker.addr()],
-        "test".into(),
-    ));
-    let engine = ObjEngine::new(t.clone(), store, routing.clone(), ObjConfig::default());
+        store,
+        routing.clone(),
+        Arc::new(tracker.peers()),
+        ObjConfig::default(),
+    );
     let (obj_tx, obj_rx) = mpsc::channel(64);
     let (att_tx, att_rx) = mpsc::channel::<Connection>(64);
     let st = t.clone();
@@ -108,7 +93,7 @@ async fn member(tracker: &Transport, dir: &Path) -> Member {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn committee_attests_a_commit_over_the_wire() {
-    let tracker = start_tracker().await;
+    let tracker = start_tracker();
     let dirs: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
     let mut members = Vec::new();
     for d in &dirs {

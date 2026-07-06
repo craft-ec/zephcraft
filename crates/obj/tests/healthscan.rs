@@ -10,36 +10,21 @@ use std::sync::Arc;
 
 use zeph_crypto::NodeIdentity;
 use zeph_obj::{ConsumeMode, ObjConfig, ObjEngine};
-use zeph_routing::{ContentRouting, Registry, RegistryConfig, TrackerRouting};
+use zeph_routing::ContentRouting;
 use zeph_store::Store;
+use zeph_testkit::{MemNet, MemRouting};
 use zeph_transport::{Reach, Transport};
 
-async fn transport(alpns: Vec<Vec<u8>>) -> (Arc<Transport>, Arc<NodeIdentity>) {
-    let id = Arc::new(NodeIdentity::generate());
-    let t = Arc::new(
-        Transport::bind(id.secret_key_bytes(), Reach::LocalOnly, alpns, 0)
-            .await
-            .unwrap(),
-    );
-    (t, id)
-}
-
-async fn start_tracker() -> Arc<Transport> {
-    let (t, _) = transport(vec![zeph_routing::ALPN.to_vec()]).await;
-    let registry = Arc::new(Registry::new(RegistryConfig::default()));
-    let (tx, rx) = tokio::sync::mpsc::channel(64);
-    let st = t.clone();
-    tokio::spawn(async move { st.serve(vec![(zeph_routing::ALPN.to_vec(), tx)]).await });
-    let rt = t.clone();
-    tokio::spawn(async move { zeph_routing::serve(registry, rt, rx).await });
-    t
+/// Replaces the in-process tracker: one shared in-memory network view.
+fn start_tracker() -> MemNet {
+    MemNet::new()
 }
 
 /// A full storage node kept alive by its returned handles. Dropping the tuple
 /// kills the node (transport closes) — that is how we simulate death.
 struct Node {
     engine: Arc<ObjEngine>,
-    routing: Arc<TrackerRouting>,
+    routing: Arc<MemRouting>,
     transport: Arc<Transport>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -55,7 +40,7 @@ impl Node {
     }
 }
 
-async fn node(tracker: &Transport, dir: &std::path::Path) -> Node {
+async fn node(tracker: &MemNet, dir: &std::path::Path) -> Node {
     let id = Arc::new(NodeIdentity::generate());
     let t = Arc::new(
         Transport::bind(
@@ -68,16 +53,12 @@ async fn node(tracker: &Transport, dir: &std::path::Path) -> Node {
         .unwrap(),
     );
     let store = Arc::new(Store::open(dir).unwrap());
-    let routing = Arc::new(TrackerRouting::new(
-        t.clone(),
-        id,
-        vec![tracker.addr()],
-        "test".into(),
-    ));
-    let engine = ObjEngine::new(
+    let routing = tracker.routing(id, t.addr());
+    let engine = ObjEngine::with_peer_source(
         t.clone(),
         store,
         routing.clone(),
+        Arc::new(tracker.peers()),
         ObjConfig {
             probe_timeout: std::time::Duration::from_millis(200),
             scale_threshold: 3,
@@ -101,7 +82,7 @@ async fn node(tracker: &Transport, dir: &std::path::Path) -> Node {
 
 #[tokio::test]
 async fn content_self_heals_after_holder_death() {
-    let tracker = start_tracker().await;
+    let tracker = start_tracker();
     let dirs: Vec<tempfile::TempDir> = (0..8).map(|_| tempfile::tempdir().unwrap()).collect();
 
     // 5 storage holders announce themselves; publish spreads across them.
@@ -172,7 +153,7 @@ async fn content_self_heals_after_holder_death() {
 /// the contrast to unwanted_content_fades (same setup, minus the fetch).
 #[tokio::test]
 async fn recently_fetched_content_is_repaired() {
-    let tracker = start_tracker().await;
+    let tracker = start_tracker();
     let dirs: Vec<tempfile::TempDir> = (0..7).map(|_| tempfile::tempdir().unwrap()).collect();
     let floor = 32usize;
 
@@ -224,7 +205,7 @@ async fn recently_fetched_content_is_repaired() {
 /// resumes. This is what makes "replicate only what matters" real.
 #[tokio::test]
 async fn unwanted_content_fades_then_want_resumes_repair() {
-    let tracker = start_tracker().await;
+    let tracker = start_tracker();
     let dirs: Vec<tempfile::TempDir> = (0..7).map(|_| tempfile::tempdir().unwrap()).collect();
     let floor = 32usize;
 
@@ -284,7 +265,7 @@ async fn unwanted_content_fades_then_want_resumes_repair() {
 /// for spread.
 #[tokio::test]
 async fn pinned_content_still_repairs_to_floor() {
-    let tracker = start_tracker().await;
+    let tracker = start_tracker();
     let dirs: Vec<tempfile::TempDir> = (0..7).map(|_| tempfile::tempdir().unwrap()).collect();
     let floor = 32usize;
 
@@ -333,7 +314,7 @@ async fn pinned_content_still_repairs_to_floor() {
 /// property that makes Scaling self-regulating.
 #[tokio::test]
 async fn fetch_reads_spread_across_providers() {
-    let tracker = start_tracker().await;
+    let tracker = start_tracker();
     let dirs: Vec<tempfile::TempDir> = (0..7).map(|_| tempfile::tempdir().unwrap()).collect();
 
     // 4 holders; publish spreads the generation across them (~8 pieces each).
@@ -372,7 +353,7 @@ async fn fetch_reads_spread_across_providers() {
 /// recruit nobody.
 #[tokio::test]
 async fn content_scales_under_download_demand() {
-    let tracker = start_tracker().await;
+    let tracker = start_tracker();
     let dirs: Vec<tempfile::TempDir> = (0..6).map(|_| tempfile::tempdir().unwrap()).collect();
 
     // One provider holds the whole generation.
@@ -439,7 +420,7 @@ async fn content_scales_under_download_demand() {
 /// never below (Repair defends the floor).
 #[tokio::test]
 async fn content_degrades_to_floor_when_demand_fades() {
-    let tracker = start_tracker().await;
+    let tracker = start_tracker();
     let dirs: Vec<tempfile::TempDir> = (0..12).map(|_| tempfile::tempdir().unwrap()).collect();
     let floor = 32usize;
 
@@ -511,7 +492,7 @@ async fn content_degrades_to_floor_when_demand_fades() {
 /// depleted network (the earlier pin-failure cause).
 #[tokio::test]
 async fn get_reconstructs_from_local_pieces() {
-    let tracker = start_tracker().await;
+    let tracker = start_tracker();
     let dirs: Vec<tempfile::TempDir> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
 
     let s0 = node(&tracker, dirs[0].path()).await;
@@ -528,7 +509,6 @@ async fn get_reconstructs_from_local_pieces() {
 
     // Kill the publisher AND the tracker: no network to fetch from at all.
     publisher.kill().await;
-    tracker.close().await;
 
     // s0 still reconstructs — purely from its own pieces.
     let got = s0.engine.get(cid, ConsumeMode::Drop).await.unwrap();
@@ -540,7 +520,7 @@ async fn get_reconstructs_from_local_pieces() {
 /// the cooldown and re-acquisition is allowed again.
 #[tokio::test]
 async fn eviction_cooldown_blocks_refill_until_wanted() {
-    let tracker = start_tracker().await;
+    let tracker = start_tracker();
     let dirs: Vec<tempfile::TempDir> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
 
     let s = node(&tracker, dirs[0].path()).await;
@@ -588,7 +568,7 @@ async fn eviction_cooldown_blocks_refill_until_wanted() {
 /// back by the manifest CID alone and recover its name, mime, and bytes.
 #[tokio::test]
 async fn file_manifest_publish_and_fetch_by_name() {
-    let tracker = start_tracker().await;
+    let tracker = start_tracker();
     let dirs: Vec<tempfile::TempDir> = (0..6).map(|_| tempfile::tempdir().unwrap()).collect();
 
     let mut holders = Vec::new();
@@ -626,7 +606,7 @@ async fn file_manifest_publish_and_fetch_by_name() {
 /// back byte-identical.
 #[tokio::test]
 async fn folder_manifest_lists_and_fetches_children() {
-    let tracker = start_tracker().await;
+    let tracker = start_tracker();
     let dirs: Vec<tempfile::TempDir> = (0..6).map(|_| tempfile::tempdir().unwrap()).collect();
     let mut holders = Vec::new();
     for dir in dirs.iter().take(4) {
@@ -695,7 +675,7 @@ async fn folder_manifest_lists_and_fetches_children() {
 #[tokio::test]
 async fn metadata_envelope_publish_edit_multiwriter_withdraw() {
     use zeph_routing::ContentRouting;
-    let tracker = start_tracker().await;
+    let tracker = start_tracker();
     let dirs: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
     let a = node(&tracker, dirs[0].path()).await;
     a.routing.announce_node(0, 0).await.unwrap();
@@ -747,7 +727,7 @@ async fn metadata_envelope_publish_edit_multiwriter_withdraw() {
 #[tokio::test]
 async fn root_pointer_compare_and_swap() {
     use zeph_routing::{ContentRouting, RoutingError};
-    let tracker = start_tracker().await;
+    let tracker = start_tracker();
     let dirs: Vec<tempfile::TempDir> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
     let owner = node(&tracker, dirs[0].path()).await;
     let reader = node(&tracker, dirs[1].path()).await;
@@ -843,7 +823,7 @@ async fn root_pointer_compare_and_swap() {
 /// clears the count.
 #[tokio::test]
 async fn want_signal_propagates_and_withdraws() {
-    let tracker = start_tracker().await;
+    let tracker = start_tracker();
     let dirs: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
 
     let publisher = node(&tracker, dirs[0].path()).await;
@@ -886,7 +866,7 @@ async fn dst_churn_wanted_content_survives() {
     use rand::{rngs::StdRng, Rng, SeedableRng};
     let mut rng = StdRng::seed_from_u64(0xD57_C0FFEE);
     let k = 8usize;
-    let tracker = start_tracker().await;
+    let tracker = start_tracker();
     let mut dirs: Vec<tempfile::TempDir> = Vec::new();
     let mut mk = || {
         let d = tempfile::tempdir().unwrap();
@@ -964,7 +944,7 @@ async fn verified_have(holders: &[Node], cid: zeph_core::Cid) -> usize {
 /// redundancy — while the content ends up across many distinct holders.
 #[tokio::test]
 async fn content_spreads_to_newly_joined_nodes() {
-    let tracker = start_tracker().await;
+    let tracker = start_tracker();
     let dirs: Vec<tempfile::TempDir> = (0..6).map(|_| tempfile::tempdir().unwrap()).collect();
 
     // A single storage node holds everything: publish spreads to it alone.
