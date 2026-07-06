@@ -1104,6 +1104,15 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let events = zeph_events::EventBus::default();
     engine.set_events(events.clone());
 
+    // Background job coordinator (foundation §51): the periodic lifecycle, re-announce, and
+    // future per-item reactive jobs run THROUGH it — prioritized, deduped (a slow pass can't
+    // stack), retried, and metered. It is a BOUNDED-CONCURRENCY scheduler, so it runs as a
+    // small worker pool: priority ORDERS contended work without starving a class. At
+    // concurrency 1 it degenerated into a serial queue where a long, frequent Distribution
+    // job (re-announce, which grows with held content) perpetually starved the lowest
+    // priority — HealthScan, the durability-maintenance pass — so it never ran (scanned=0).
+    let jobs = zeph_sched::JobCoordinator::new(8);
+
     // Demand-driven scaling: the serve path fires a CID here the instant its served-pull count
     // crosses scale_threshold; a bounded worker recruits one more provider right then. Scaling
     // reacts to ACCESS, not to any scan/distribute cadence — so a healthy CID that's backing off
@@ -1112,27 +1121,26 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         let (scale_tx, mut scale_rx) = tokio::sync::mpsc::unbounded_channel::<Cid>();
         engine.set_scale_trigger(scale_tx);
         let scale_engine = engine.clone();
+        let scale_jobs = jobs.clone();
         tokio::spawn(async move {
-            let sem = Arc::new(tokio::sync::Semaphore::new(4));
             while let Some(cid) = scale_rx.recv().await {
-                let permit = sem.clone().acquire_owned().await.expect("scale sem");
                 let eng = scale_engine.clone();
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    eng.scale_one(cid).await;
-                });
+                // Recruit through the coordinator too — one job manager for all reactive work.
+                scale_jobs.submit(
+                    format!("scale:{}", cid.to_hex()),
+                    zeph_sched::Priority::Distribution,
+                    1,
+                    move || {
+                        let eng = eng.clone();
+                        async move {
+                            eng.scale_one(cid).await;
+                            Ok(())
+                        }
+                    },
+                );
             }
         });
     }
-
-    // Background job coordinator (foundation §51): the periodic lifecycle, re-announce, and
-    // future per-item reactive jobs run THROUGH it — prioritized, deduped (a slow pass can't
-    // stack), retried, and metered. It is a BOUNDED-CONCURRENCY scheduler, so it runs as a
-    // small worker pool: priority ORDERS contended work without starving a class. At
-    // concurrency 1 it degenerated into a serial queue where a long, frequent Distribution
-    // job (re-announce, which grows with held content) perpetually starved the lowest
-    // priority — HealthScan, the durability-maintenance pass — so it never ran (scanned=0).
-    let jobs = zeph_sched::JobCoordinator::new(4);
 
     // Control state, shared by the heartbeat loop and the control servers.
     // Phase 4c: the durable app-name registry backing (self-attested v1 ramp).
@@ -1203,7 +1211,9 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         providing: std::sync::atomic::AtomicU64::new(0),
         content: tokio::sync::RwLock::new(Vec::new()),
         cid_health: tokio::sync::RwLock::new(Vec::new()),
-        health: tokio::sync::RwLock::new((0, 0, 0, 0, 0, 0, 0)),
+        health: tokio::sync::RwLock::new((0, 0, 0, 0, 0, 0, 0, 0, 0)),
+        scan_queue: std::sync::atomic::AtomicUsize::new(0),
+        scan_due: std::sync::atomic::AtomicUsize::new(0),
         craftsql: craftsql.clone(),
         events: events.clone(),
         recent_events: tokio::sync::RwLock::new(std::collections::VecDeque::new()),
@@ -1565,13 +1575,13 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // Workers: pull the earliest-due CID, scan it under a concurrency cap (a permit frees only
     // when a scan completes — "submit as they are completed"), then re-enqueue it.
     {
-        let sem = Arc::new(tokio::sync::Semaphore::new(8));
-        let (eng, st, q, seen, live) = (
+        let (eng, st, q, seen, live, coord) = (
             engine.clone(),
             state.clone(),
             hs_queue.clone(),
             hs_seen.clone(),
             mem_peers.clone(),
+            jobs.clone(),
         );
         tokio::spawn(async move {
             // Wait for the peer view to SETTLE before the FIRST scan — the alive-peer count
@@ -1611,49 +1621,68 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                     Some(item) => (item.0 .1, item.0 .2),
                     None => continue,
                 };
-                let permit = sem.clone().acquire_owned().await.expect("sem");
-                let (eng, st, q, seen) = (eng.clone(), st.clone(), q.clone(), seen.clone());
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    let r = eng.health_scan_chunk(&[cid]).await;
-                    st.set_scan(
-                        r.scanned,
-                        r.at_risk,
-                        r.repaired as u64,
-                        r.degraded as u64,
-                        r.fading,
-                    )
-                    .await;
-                    if r.repaired > 0 || r.degraded > 0 || r.offloaded > 0 {
-                        tracing::info!(
-                            at_risk = r.at_risk,
-                            repaired = r.repaired,
-                            degraded = r.degraded,
-                            offloaded = r.offloaded,
-                            "health scan: repair / degrade / offload"
-                        );
-                    }
-                    // Re-enqueue for the next check if still held; else stop tracking it.
-                    if eng.store().piece_count(&cid) > 0 || eng.store().has_content(&cid) {
-                        // Adaptive backoff: an at-risk cid stays HOT (recheck_min); a healthy cid
-                        // backs OFF — double its interval up to recheck_max — so the bounded scan
-                        // throughput concentrates on content that actually needs attention.
-                        // Stay HOT while actively CONVERGING (repairing below the floor, or
-                        // shedding cold surplus above it); back off once stable.
-                        let next = if eng.converging(&cid) {
-                            recheck_min
-                        } else {
-                            (delay * 2).min(recheck_max)
-                        };
-                        q.lock().expect("q").push(std::cmp::Reverse((
-                            std::time::Instant::now() + next,
-                            cid,
-                            next,
-                        )));
-                    } else {
-                        seen.lock().expect("seen").remove(&cid);
-                    }
-                });
+                // Hand the WORK to the coordinator — the single job manager (bounded concurrency,
+                // dedup, retries, stats). The delay-queue only SCHEDULES *when* each cid is due;
+                // the scan itself is now a coordinator job, visible in job stats like distribute
+                // and re-announce. Deduped by cid so a slow scan can't stack.
+                let (e2, s2, q2, seen2) = (eng.clone(), st.clone(), q.clone(), seen.clone());
+                let submitted = coord.submit(
+                    format!("scan:{}", cid.to_hex()),
+                    zeph_sched::Priority::HealthScan,
+                    1,
+                    move || {
+                        let (eng, st, q, seen) =
+                            (e2.clone(), s2.clone(), q2.clone(), seen2.clone());
+                        async move {
+                            let r = eng.health_scan_chunk(&[cid]).await;
+                            st.set_scan(
+                                r.scanned,
+                                r.at_risk,
+                                r.repaired as u64,
+                                r.degraded as u64,
+                                r.fading,
+                                r.offloaded as u64,
+                                r.surplus,
+                            )
+                            .await;
+                            if r.repaired > 0 || r.degraded > 0 || r.offloaded > 0 {
+                                tracing::info!(
+                                    at_risk = r.at_risk,
+                                    repaired = r.repaired,
+                                    degraded = r.degraded,
+                                    offloaded = r.offloaded,
+                                    "health scan: repair / degrade / offload"
+                                );
+                            }
+                            // Re-enqueue for the next check if still held; else stop tracking it.
+                            if eng.store().piece_count(&cid) > 0 || eng.store().has_content(&cid) {
+                                // Adaptive backoff: an at-risk/converging cid stays HOT
+                                // (recheck_min); a stable cid backs OFF up to recheck_max.
+                                let next = if eng.converging(&cid) {
+                                    recheck_min
+                                } else {
+                                    (delay * 2).min(recheck_max)
+                                };
+                                q.lock().expect("q").push(std::cmp::Reverse((
+                                    std::time::Instant::now() + next,
+                                    cid,
+                                    next,
+                                )));
+                            } else {
+                                seen.lock().expect("seen").remove(&cid);
+                            }
+                            Ok(())
+                        }
+                    },
+                );
+                // Already in-flight (deduped) — reschedule so the cid is never dropped.
+                if !submitted {
+                    q.lock().expect("q").push(std::cmp::Reverse((
+                        std::time::Instant::now() + delay,
+                        cid,
+                        delay,
+                    )));
+                }
             }
         });
     }
@@ -1829,6 +1858,8 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                     .map(|std::cmp::Reverse((d, c, _))| (c.0, *d))
                     .collect()
             };
+            let due_now_count = due_map.values().filter(|d| **d <= due_now).count();
+            hv_state.set_scan_queue(due_map.len(), due_now_count);
             let now_ms = hv_clock.now().millis();
             let store = hv_engine.store();
             let mut rows = Vec::new();

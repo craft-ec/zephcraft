@@ -133,6 +133,10 @@ pub struct Status {
     pub health_scaled: u64,
     pub health_degraded: u64,
     pub health_fading: u64,
+    pub health_offloaded: u64,
+    pub health_surplus: usize,
+    pub scan_queue: usize,
+    pub scan_due: usize,
     pub peers: Vec<PeerStatus>,
     /// Recent node events (activity feed), newest first.
     pub recent_events: Vec<String>,
@@ -145,6 +149,9 @@ pub struct Status {
     /// Node configuration (read-only Settings view).
     pub settings: NodeSettings,
 }
+
+/// Health counters: scanned, at_risk, repaired, moved, scaled, degraded, fading, offloaded, surplus.
+type HealthCounters = (usize, usize, u64, u64, u64, u64, u64, u64, usize);
 
 pub struct State {
     pub clock: std::sync::Arc<zeph_core::hlc::Clock>,
@@ -162,7 +169,11 @@ pub struct State {
     pub content: RwLock<Vec<ContentInfo>>,
     /// Per-cid health rows (all held cids) for the dashboard health view, pre-built by noded.
     pub cid_health: RwLock<Vec<serde_json::Value>>,
-    pub health: RwLock<(usize, usize, u64, u64, u64, u64, u64)>, // scanned, at_risk, repaired, moved, scaled, degraded, fading
+    pub health: RwLock<HealthCounters>,
+    /// Health-scan delay-queue depth (cids scheduled) + due-now backlog — the scanner is its own
+    /// queue now, NOT a coordinator job, so it is surfaced separately.
+    pub scan_queue: std::sync::atomic::AtomicUsize,
+    pub scan_due: std::sync::atomic::AtomicUsize,
     pub craftsql: std::sync::Arc<zeph_sql::CraftSql>,
     /// The node event bus (foundation §52) — producers publish, apps subscribe.
     pub events: zeph_events::EventBus,
@@ -228,6 +239,10 @@ impl State {
             health_scaled: self.health.read().await.4,
             health_degraded: self.health.read().await.5,
             health_fading: self.health.read().await.6,
+            health_offloaded: self.health.read().await.7,
+            health_surplus: self.health.read().await.8,
+            scan_queue: self.scan_queue.load(std::sync::atomic::Ordering::Relaxed),
+            scan_due: self.scan_due.load(std::sync::atomic::Ordering::Relaxed),
             peers: self.peers.read().await.clone(),
             recent_events: self
                 .recent_events
@@ -293,6 +308,7 @@ impl State {
 
     #[allow(clippy::too_many_arguments)]
     /// Health-scan results (its own coordinator job).
+    #[allow(clippy::too_many_arguments)]
     pub async fn set_scan(
         &self,
         scanned: usize,
@@ -300,6 +316,8 @@ impl State {
         repaired_delta: u64,
         degraded_delta: u64,
         fading: usize,
+        offloaded_delta: u64,
+        surplus: usize,
     ) {
         let mut h = self.health.write().await;
         h.0 = scanned;
@@ -307,6 +325,16 @@ impl State {
         h.2 += repaired_delta;
         h.5 += degraded_delta;
         h.6 = fading as u64;
+        h.7 += offloaded_delta;
+        h.8 = surplus;
+    }
+
+    /// Health-scan delay-queue depth (total scheduled) + due-now backlog.
+    pub fn set_scan_queue(&self, total: usize, due: usize) {
+        self.scan_queue
+            .store(total, std::sync::atomic::Ordering::Relaxed);
+        self.scan_due
+            .store(due, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Distribute/scale results (the separate Distribution job).

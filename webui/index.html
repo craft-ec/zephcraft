@@ -332,10 +332,10 @@ function render(s){
   $("trackers").textContent = s.trackers;
   $("store").textContent = s.store_cids + " cids · " + s.store_pieces + " pieces · " + s.store_pinned + " pinned · " + (s.store_bytes/1048576).toFixed(1) + " MiB · providing " + s.providing;
   const atrisk = s.health_at_risk || 0;
-  $("health").textContent = "scanned " + (s.health_scanned||0) + " · at-risk " + atrisk + " · repaired " + (s.health_repaired||0) + " · distributed " + (s.health_distributed||0) + " · scaled " + (s.health_scaled||0) + " · degraded " + (s.health_degraded||0) + " · fading " + (s.health_fading||0);
+  $("health").textContent = "scanned " + (s.health_scanned||0) + " · at-risk " + atrisk + " · surplus " + (s.health_surplus||0) + " · fading " + (s.health_fading||0) + " · scan-queue " + (s.scan_queue||0) + " (" + (s.scan_due||0) + " due) · repaired " + (s.health_repaired||0) + " · degraded " + (s.health_degraded||0) + " · offloaded " + (s.health_offloaded||0) + " · distributed " + (s.health_distributed||0) + " · scaled " + (s.health_scaled||0);
   $("health").style.color = atrisk > 0 ? "var(--warn, #d29922)" : "";
   const j = s.jobs || {};
-  $("jobs").textContent = "coordinator (§51) — submitted " + (j.submitted||0) + " · completed " + (j.completed||0) +
+  $("jobs").textContent = "coordinator (§51 — distribute/scale, re-announce, ticks; health scan runs in its own delay-queue, see health) — submitted " + (j.submitted||0) + " · completed " + (j.completed||0) +
     " · in-flight " + (j.in_flight||0) + " · deduped " + (j.deduped||0) + " · retried " + (j.retried||0) + " · failed " + (j.failed||0);
   $("listen").textContent = s.listen;
   $("uptime").textContent = fmtUptime(s.uptime_secs);

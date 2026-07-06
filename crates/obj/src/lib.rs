@@ -124,6 +124,8 @@ pub struct HealthReport {
     pub fading: usize,
     /// Retained copies dropped this pass because they are now durable on >= k peers.
     pub offloaded: usize,
+    /// CIDs currently ABOVE the durability band (shedding cold surplus toward the floor).
+    pub surplus: usize,
 }
 
 /// One Distribution pass' outcome.
@@ -1601,6 +1603,7 @@ impl ObjEngine {
             }
             report.at_risk = ar.len();
             report.fading = fd.len();
+            report.surplus = su.len();
         }
         report.scanned = self.store.cids().len();
         report
