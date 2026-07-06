@@ -17,11 +17,16 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use zeph_core::Cid;
 use zeph_crypto::Keystore;
 use zeph_membership::Membership;
 use zeph_obj::{ObjConfig, ObjEngine};
 use zeph_routing::TrackerRouting;
 use zeph_store::Store;
+
+/// Delay-queue of CIDs due for a health check, ordered by next-due time (min-heap via Reverse).
+type DueQueue =
+    std::sync::Mutex<std::collections::BinaryHeap<std::cmp::Reverse<(std::time::Instant, Cid)>>>;
 use zeph_transport::{alpn, PeerAddr, Reach, Transport};
 
 #[derive(Parser)]
@@ -1494,56 +1499,99 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let health_state = state.clone();
     let health_jobs = jobs.clone();
     let health_scan_secs = cfg.health_scan_secs.max(1);
-    let health_chunk_pace = Duration::from_secs(cfg.pace_delay_secs.max(1));
+    // HealthScan scheduler: a per-CID work QUEUE, not a sweep. Every held CID is an INDIVIDUAL
+    // item on a delay-queue keyed by when it is next due. Bounded-concurrency workers pull the
+    // earliest-due item, scan just that one CID, then re-enqueue it for its next check — so
+    // coverage is a continuous cycle whose interval EMERGES from throughput (~ N / scan-rate),
+    // floored at health_scan_secs for small sets. A cheap discovery pass feeds new CIDs in as
+    // items; gone CIDs drop out on completion. Scales to 100k+ CIDs: bounded memory (<= N items
+    // + a few in flight), no O(N) sweep, and no job that holds a slot while it sleeps.
+    let recheck = Duration::from_secs(health_scan_secs);
+    let hs_queue: Arc<DueQueue> =
+        Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new()));
+    let hs_seen: Arc<std::sync::Mutex<std::collections::HashSet<Cid>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
 
-    // HealthScan enqueue: a plain task that continuously sweeps the held set, submitting ONE
-    // small per-chunk scan job to the coordinator at a time and pacing between submits. The
-    // coordinator manages bounded units — no single job sweeps the whole set or holds a slot
-    // while it sleeps. Each chunk's verdicts aggregate into the engine's GLOBAL at-risk/fading
-    // sets, so set_scan still reports accurate network-wide totals. This scales to thousands of
-    // cids: a sweep is just more (still-tiny) jobs spaced over time.
-    let hs_engine = health_engine.clone();
-    let hs_state = health_state.clone();
-    let hs_jobs = health_jobs.clone();
-    tokio::spawn(async move {
-        loop {
-            let cids = hs_engine.store().cids();
-            if cids.is_empty() {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                continue;
+    // Discovery: push any held CID we aren't already tracking (published OR hosted-for-others),
+    // due immediately. A cheap set-diff (no DHT) — it just FEEDS individual items into the queue.
+    {
+        let (eng, q, seen) = (engine.clone(), hs_queue.clone(), hs_seen.clone());
+        tokio::spawn(async move {
+            loop {
+                let now = std::time::Instant::now();
+                for cid in eng.store().cids() {
+                    let is_new = seen.lock().expect("seen").insert(cid);
+                    if is_new {
+                        q.lock().expect("q").push(std::cmp::Reverse((now, cid)));
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(10)).await;
             }
-            for chunk in cids.chunks(5) {
-                let chunk = chunk.to_vec();
-                let (e, st) = (hs_engine.clone(), hs_state.clone());
-                let key = format!("health-scan:{}", chunk[0].to_hex());
-                hs_jobs.submit(&key, zeph_sched::Priority::HealthScan, 1, move || {
-                    let (e, st, chunk) = (e.clone(), st.clone(), chunk.clone());
-                    async move {
-                        let r = e.health_scan_chunk(&chunk).await;
-                        st.set_scan(
-                            r.scanned,
-                            r.at_risk,
-                            r.repaired as u64,
-                            r.degraded as u64,
-                            r.fading,
-                        )
-                        .await;
-                        if r.repaired > 0 || r.degraded > 0 || r.offloaded > 0 {
-                            tracing::info!(
-                                at_risk = r.at_risk,
-                                repaired = r.repaired,
-                                degraded = r.degraded,
-                                offloaded = r.offloaded,
-                                "health scan: repair / degrade / offload"
-                            );
-                        }
-                        Ok(())
+        });
+    }
+
+    // Workers: pull the earliest-due CID, scan it under a concurrency cap (a permit frees only
+    // when a scan completes — "submit as they are completed"), then re-enqueue it.
+    {
+        let sem = Arc::new(tokio::sync::Semaphore::new(8));
+        let (eng, st, q, seen) = (
+            engine.clone(),
+            state.clone(),
+            hs_queue.clone(),
+            hs_seen.clone(),
+        );
+        tokio::spawn(async move {
+            loop {
+                let next = q.lock().expect("q").peek().map(|r| r.0 .0);
+                let Some(due) = next else {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                };
+                let now = std::time::Instant::now();
+                if due > now {
+                    // Wait until due, but wake at least once a second to notice newly-fed items.
+                    tokio::time::sleep((due - now).min(Duration::from_secs(1))).await;
+                    continue;
+                }
+                let cid = match q.lock().expect("q").pop() {
+                    Some(item) => item.0 .1,
+                    None => continue,
+                };
+                let permit = sem.clone().acquire_owned().await.expect("sem");
+                let (eng, st, q, seen) = (eng.clone(), st.clone(), q.clone(), seen.clone());
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let r = eng.health_scan_chunk(&[cid]).await;
+                    st.set_scan(
+                        r.scanned,
+                        r.at_risk,
+                        r.repaired as u64,
+                        r.degraded as u64,
+                        r.fading,
+                    )
+                    .await;
+                    if r.repaired > 0 || r.degraded > 0 || r.offloaded > 0 {
+                        tracing::info!(
+                            at_risk = r.at_risk,
+                            repaired = r.repaired,
+                            degraded = r.degraded,
+                            offloaded = r.offloaded,
+                            "health scan: repair / degrade / offload"
+                        );
+                    }
+                    // Re-enqueue for the next check if still held; else stop tracking it.
+                    if eng.store().piece_count(&cid) > 0 || eng.store().has_content(&cid) {
+                        q.lock().expect("q").push(std::cmp::Reverse((
+                            std::time::Instant::now() + recheck,
+                            cid,
+                        )));
+                    } else {
+                        seen.lock().expect("seen").remove(&cid);
                     }
                 });
-                tokio::time::sleep(health_chunk_pace).await;
             }
-        }
-    });
+        });
+    }
 
     // Distribute / scale: the heavier per-cid piece movement, on its own periodic cadence as a
     // separate coordinator job (deduped by key), so it never stalls the health scan.
