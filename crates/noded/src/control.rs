@@ -74,7 +74,6 @@ pub struct NodeSettings {
     pub fallback_relays: bool,
     pub probe_timeout_secs: u64,
     pub relay_urls: Vec<String>,
-    pub trackers: Vec<String>,
     pub relay_operator_urls: Vec<String>,
     pub peers: Vec<String>,
     // ── storage & erasure ──
@@ -123,7 +122,6 @@ pub struct Status {
     pub providing: u64,
     /// CIDs hosted for the network (provided; not user-curated).
     pub hosting_cids: u64,
-    pub trackers: String,
     pub content: Vec<ContentInfo>,
     /// HealthScan: last-pass scanned + at-risk CIDs, cumulative pieces repaired.
     pub health_scanned: usize,
@@ -158,7 +156,6 @@ pub struct State {
     pub node_id: String,
     pub reach: String,
     pub relays: String,
-    pub trackers: String,
     pub listen: String,
     pub started: Instant,
     pub engine: Arc<zeph_obj::ObjEngine>,
@@ -230,7 +227,6 @@ impl State {
             store_bytes: self.storage.read().await.3,
             providing: self.providing.load(std::sync::atomic::Ordering::Relaxed),
             hosting_cids: self.hosting_cids.load(std::sync::atomic::Ordering::Relaxed),
-            trackers: self.trackers.clone(),
             content: self.content.read().await.clone(),
             health_scanned: self.health.read().await.0,
             health_at_risk: self.health.read().await.1,

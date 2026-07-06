@@ -223,11 +223,6 @@ struct RunArgs {
     /// Do not append n0's public relays as fallback (our mesh only).
     #[arg(long, global = true)]
     no_fallback_relays: bool,
-
-    /// Tracker to announce to / resolve from: <node_id_hex>@<addr>.
-    /// Repeatable; REPLACES config.toml trackers when given.
-    #[arg(long = "tracker", global = true)]
-    trackers: Vec<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -244,10 +239,8 @@ struct Config {
     /// fallback unless fallback_relays = false.
     relay_urls: Vec<String>,
     fallback_relays: bool,
-    /// Trackers to announce to / resolve from: <node_id_hex>@<addr>.
-    trackers: Vec<String>,
-    /// Relays this node OPERATES and vouches for — announced into the
-    /// tracker's relay registry (foundation §26). Empty = not a relay op.
+    /// Relays this node OPERATES and vouches for (foundation §26).
+    /// Empty = not a relay op.
     relay_operator_urls: Vec<String>,
     /// Storage this node offers to the network, in GiB.
     storage_quota_gib: f64,
@@ -298,7 +291,6 @@ impl Default for Config {
             dashboard_port: 9945,
             relay_urls: vec!["https://relay1.zeph.craft.ec".to_string()],
             fallback_relays: true,
-            trackers: Vec::new(),
             relay_operator_urls: Vec::new(),
             storage_quota_gib: 10.0,
             peers: Vec::new(),
@@ -855,7 +847,6 @@ async fn cmd_status(data_dir: &Path) -> anyhow::Result<()> {
     println!("erasure {}", status.erasure);
     println!("hlc    {}.{}", status.hlc_ms, status.hlc_logical);
     println!("relays {}", status.relays);
-    println!("trackers {}", status.trackers);
     println!(
         "store  {} cids · {} pieces · {} pinned · {:.1} MiB · providing {}",
         status.store_cids,
@@ -939,9 +930,6 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     }
     if args.no_fallback_relays {
         cfg.fallback_relays = false;
-    }
-    if !args.trackers.is_empty() {
-        cfg.trackers = args.trackers.clone();
     }
     cfg.peers.extend(args.peers);
 
@@ -1207,11 +1195,6 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                 }
             )
         },
-        trackers: if cfg.trackers.is_empty() {
-            "none configured".to_string()
-        } else {
-            format!("{} configured", cfg.trackers.len())
-        },
         listen: transport.addr().to_string(),
         started: std::time::Instant::now(),
         engine: engine.clone(),
@@ -1246,7 +1229,6 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                 fallback_relays: cfg.fallback_relays,
                 probe_timeout_secs: oc.probe_timeout.as_secs(),
                 relay_urls: cfg.relay_urls.clone(),
-                trackers: cfg.trackers.clone(),
                 relay_operator_urls: cfg.relay_operator_urls.clone(),
                 peers: cfg.peers.clone(),
                 storage_quota_gib: cfg.storage_quota_gib,

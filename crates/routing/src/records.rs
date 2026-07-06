@@ -1,9 +1,8 @@
-//! Signed registry records: content provider, node, relay.
+//! Signed routing records (provider, want, meta, root, app, manifest).
 //!
-//! The tracker holds three registries; all records share one shape — a
-//! typed payload wrapped in a wire `SignedRecord` (Ed25519 over
-//! `kind ‖ node_id ‖ payload ‖ hlc_ts`). Records are re-verified by whoever
-//! consumes them, never trusted because a tracker relayed them.
+//! All records share one shape — a typed payload wrapped in a wire
+//! `SignedRecord` (Ed25519 over `kind ‖ node_id ‖ payload ‖ hlc_ts`). Records
+//! are re-verified by whoever consumes them, never trusted on relay.
 
 use serde::{Deserialize, Serialize};
 use zeph_core::NodeId;
@@ -11,8 +10,6 @@ use zeph_crypto::NodeIdentity;
 use zeph_wire::SignedRecord;
 
 pub const KIND_PROVIDER: u8 = 1;
-pub const KIND_NODE: u8 = 2;
-pub const KIND_RELAY: u8 = 3;
 pub const KIND_WANT: u8 = 4;
 pub const KIND_META: u8 = 5;
 pub const KIND_ROOT: u8 = 6;
@@ -45,23 +42,6 @@ pub struct ProviderPayload {
     pub addr: String,
     /// This provider serves the whole CID from a pin (repair/fetch prefer it).
     pub pinned: bool,
-}
-
-/// "I exist" — for the node registry / live map (MU.4).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NodePayload {
-    pub addr: String,
-    pub version: String,
-    /// Bytes this node is actually storing.
-    pub used_bytes: u64,
-    /// Storage this node offers to the network (its quota).
-    pub capacity_bytes: u64,
-}
-
-/// "I run a relay" — for dynamic relay discovery (foundation §26).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RelayPayload {
-    pub relay_url: String,
 }
 
 /// "I want `cid` kept alive" — the WANT interest signal (no holding implied).
@@ -124,18 +104,6 @@ pub fn verify(record: &SignedRecord) -> bool {
 /// Decode a provider payload from a verified record.
 pub fn provider(record: &SignedRecord) -> Option<ProviderPayload> {
     (record.kind == KIND_PROVIDER)
-        .then(|| postcard::from_bytes(&record.payload).ok())
-        .flatten()
-}
-
-pub fn node(record: &SignedRecord) -> Option<NodePayload> {
-    (record.kind == KIND_NODE)
-        .then(|| postcard::from_bytes(&record.payload).ok())
-        .flatten()
-}
-
-pub fn relay(record: &SignedRecord) -> Option<RelayPayload> {
-    (record.kind == KIND_RELAY)
         .then(|| postcard::from_bytes(&record.payload).ok())
         .flatten()
 }

@@ -9,9 +9,8 @@
 //!   CAS; a DHT has no single authority — foundation §62). The key embeds the owner and reads
 //!   filter to the owner's own signature, so only the owner can advance their head.
 //!
-//! Census + enumeration (`nodes`/`relays`/`content`/`wanted_cids`) are NOT DHT-native: a DHT
-//! can't list all keys or all nodes. Those stay on the tracker (composed in P4); here they
-//! return empty. Fade moves to per-CID want lookups (P5).
+//! Census + enumeration are NOT DHT-native: a DHT can't list all keys or all nodes, so the
+//! trait carries no such methods. Fade uses per-CID want lookups (`is_wanted`) instead.
 
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,10 +22,7 @@ use crate::records::{
     AppPayload, ManifestPayload, MetaPayload, ProviderPayload, RootPayload, WantPayload, KIND_APP,
     KIND_MANIFEST, KIND_META, KIND_PROVIDER, KIND_ROOT, KIND_WANT,
 };
-use crate::{
-    AppRecord, ContentRouting, ManifestRecord, MetaRecord, NodePayload, RelayPayload, Result,
-    RootRecord,
-};
+use crate::{AppRecord, ContentRouting, ManifestRecord, MetaRecord, Result, RootRecord};
 
 /// Content routing over the DHT.
 pub struct DhtRouting {
@@ -151,11 +147,6 @@ impl ContentRouting for DhtRouting {
         self.put(Self::cid_key(KIND_WANT, &cid), Vec::new(), self.next_seq())
             .await;
         Ok(())
-    }
-
-    /// A DHT cannot enumerate all wanted CIDs — Fade uses the per-cid `is_wanted` instead.
-    async fn wanted_cids(&self) -> Result<Vec<Cid>> {
-        Ok(Vec::new())
     }
 
     async fn is_wanted(&self, cid: Cid) -> Result<bool> {
@@ -333,21 +324,6 @@ impl ContentRouting for DhtRouting {
                 manifest_cid: Cid(p.manifest_cid),
                 seq: p.seq,
             }))
-    }
-
-    // ---- census + enumeration: NOT DHT-native (served by the tracker in the composite) --
-
-    async fn nodes(&self) -> Result<Vec<(NodeId, NodePayload)>> {
-        Ok(Vec::new())
-    }
-    async fn relays(&self) -> Result<Vec<RelayPayload>> {
-        Ok(Vec::new())
-    }
-    async fn announce_node_registry(&self, _used_bytes: u64, _capacity_bytes: u64) -> Result<()> {
-        Ok(())
-    }
-    async fn announce_relay_registry(&self, _relay_url: String) -> Result<()> {
-        Ok(())
     }
 }
 

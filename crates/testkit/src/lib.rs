@@ -1,26 +1,23 @@
 //! Test doubles for content routing — a lightweight, in-memory `ContentRouting`
 //! (`MemRouting`) and `PeerSource` (`MemPeers`) that let multi-node tests run
-//! without standing up an in-process tracker (`Registry` + `zeph_routing::serve`).
+//! without standing up a real DHT.
 //!
 //! All state lives in one shared `MemNet` (an `Arc<Mutex<..>>`), so every test
 //! node's `MemRouting` clone reads and writes the SAME network view — announces
-//! by one node are resolvable by another, exactly like a real tracker/DHT.
+//! by one node are resolvable by another, exactly like a real DHT.
 //!
-//! Fidelity notes (semantics mirrored from `zeph_routing::TrackerRouting` +
-//! `zeph_routing::registry::Registry`, cross-checked against `DhtRouting`):
+//! Fidelity notes (semantics cross-checked against `zeph_routing::DhtRouting`):
 //!  - **providers / wants / metas** — per-CID, keyed by the announcing NodeId;
 //!    many coexist; re-announce replaces, withdraw removes this node's record.
 //!  - **root** — compare-and-swap: `prev_cid` must match the current root
 //!    (None ⇒ expect no prior), `seq` must strictly advance; idempotent
-//!    re-announce of the current head is accepted (registry §KIND_ROOT).
-//!  - **manifest** — owner-keyed, seq must strictly advance (registry §KIND_MANIFEST).
+//!    re-announce of the current head is accepted.
+//!  - **manifest** — owner-keyed, seq must strictly advance.
 //!  - **app** — publisher+name-keyed head, monotonic version (equal accepted;
-//!    lower rejected — registry §KIND_APP).
-//!  - **census (`nodes`)** — populated by `announce_node` / `announce_node_registry`;
-//!    NOT an empty stub, because `zeph_sql::TransportPageSource` resolves an owner's
-//!    dial address via `routing.nodes()`. `MemPeers` is a VIEW over the same census,
-//!    so "who is a candidate peer" == "who called announce_node" — mirroring the
-//!    tracker, where `RoutingPeerSource` read the node registry.
+//!    lower rejected).
+//!  - **census** — populated by the inherent `MemRouting::announce_node`; `MemPeers`
+//!    is a VIEW over the same census, so "who is a candidate peer" == "who called
+//!    announce_node". (`ContentRouting` no longer exposes a `nodes()` enumeration.)
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -30,8 +27,8 @@ use zeph_core::{Cid, NodeId};
 use zeph_crypto::NodeIdentity;
 use zeph_obj::PeerSource;
 use zeph_routing::{
-    AppRecord, ContentRouting, ManifestRecord, MetaRecord, NodePayload, ProviderRecord,
-    RelayPayload, Result, RootRecord, RoutingError,
+    AppRecord, ContentRouting, ManifestRecord, MetaRecord, ProviderRecord, Result, RootRecord,
+    RoutingError,
 };
 use zeph_transport::PeerAddr;
 
@@ -65,7 +62,6 @@ struct AppEntry {
 
 struct CensusEntry {
     addr: PeerAddr,
-    payload: NodePayload,
 }
 
 #[derive(Default)]
@@ -97,9 +93,9 @@ impl MemNet {
         Self::default()
     }
 
-    /// A per-node routing client bound to this shared network. Mirrors
-    /// `TrackerRouting::new`'s (identity, self-addr) capture — the identity keys
-    /// this node's records, `addr` is what resolvers dial.
+    /// A per-node routing client bound to this shared network. Captures the
+    /// node's (identity, self-addr): the identity keys this node's records,
+    /// `addr` is what resolvers dial.
     pub fn routing(&self, identity: Arc<NodeIdentity>, addr: PeerAddr) -> Arc<MemRouting> {
         Arc::new(MemRouting {
             inner: self.inner.clone(),
@@ -121,7 +117,7 @@ impl MemNet {
 
 /// In-memory [`PeerSource`] backed by the shared census. Registration mirrors
 /// the tracker's node registry: a node becomes a candidate peer when it
-/// announces itself (`MemRouting::announce_node` / `announce_node_registry`),
+/// announces itself (`MemRouting::announce_node`),
 /// or explicitly via [`MemPeers::register`].
 #[derive(Clone)]
 pub struct MemPeers {
@@ -132,13 +128,7 @@ impl MemPeers {
     /// Register (or refresh the address of) `node_id` as a live candidate peer.
     pub fn register(&self, node_id: NodeId, addr: PeerAddr) {
         let mut g = self.inner.lock().expect("memnet lock");
-        let payload = NodePayload {
-            addr: addr.to_string(),
-            version: "test".into(),
-            used_bytes: 0,
-            capacity_bytes: 0,
-        };
-        g.census.insert(node_id.0, CensusEntry { addr, payload });
+        g.census.insert(node_id.0, CensusEntry { addr });
     }
 
     /// The registered candidate peers (id + dial addr).
@@ -173,22 +163,16 @@ impl MemRouting {
         self.identity.node_id().0
     }
 
-    /// Announce this node into the census (map / candidate-peer registry) with
-    /// its storage usage + offered capacity. Inherent method mirroring
-    /// `TrackerRouting::announce_node`, which tests call directly.
-    pub async fn announce_node(&self, used_bytes: u64, capacity_bytes: u64) -> Result<()> {
-        let payload = NodePayload {
-            addr: self.addr.to_string(),
-            version: "test".into(),
-            used_bytes,
-            capacity_bytes,
-        };
+    /// Announce this node into the census (candidate-peer registry). The
+    /// storage-usage / capacity args are accepted for call-site compatibility
+    /// but unused — the census only tracks the dialable address. Inherent
+    /// method that tests call directly to register a node as a candidate peer.
+    pub async fn announce_node(&self, _used_bytes: u64, _capacity_bytes: u64) -> Result<()> {
         let mut g = self.inner.lock().expect("memnet lock");
         g.census.insert(
             self.me(),
             CensusEntry {
                 addr: self.addr.clone(),
-                payload,
             },
         );
         Ok(())
@@ -241,28 +225,6 @@ impl ContentRouting for MemRouting {
         Ok(())
     }
 
-    // ---- census (map / peer registry) ---------------------------------------
-
-    async fn nodes(&self) -> Result<Vec<(NodeId, NodePayload)>> {
-        let g = self.inner.lock().expect("memnet lock");
-        Ok(g.census
-            .iter()
-            .map(|(id, e)| (NodeId(*id), e.payload.clone()))
-            .collect())
-    }
-
-    async fn relays(&self) -> Result<Vec<RelayPayload>> {
-        Ok(Vec::new())
-    }
-
-    async fn announce_node_registry(&self, used_bytes: u64, capacity_bytes: u64) -> Result<()> {
-        self.announce_node(used_bytes, capacity_bytes).await
-    }
-
-    async fn announce_relay_registry(&self, _relay_url: String) -> Result<()> {
-        Ok(())
-    }
-
     // ---- want signals --------------------------------------------------------
 
     async fn announce_want(&self, cid: Cid) -> Result<()> {
@@ -280,15 +242,6 @@ impl ContentRouting for MemRouting {
             }
         }
         Ok(())
-    }
-
-    async fn wanted_cids(&self) -> Result<Vec<Cid>> {
-        let g = self.inner.lock().expect("memnet lock");
-        Ok(g.wants
-            .iter()
-            .filter(|(_, s)| !s.is_empty())
-            .map(|(cid, _)| Cid(*cid))
-            .collect())
     }
 
     async fn is_wanted(&self, cid: Cid) -> Result<bool> {
