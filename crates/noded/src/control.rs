@@ -1795,6 +1795,27 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         axum::Json(gov_set_json(&set, ig)).into_response()
     }
 
+    // Program-registry status: the open, owner-signed, sharded registry's live view from
+    // THIS node — current writer-election epoch, eligible node count, how many of the 256
+    // shards this node currently writes, and the entry count across those shards.
+    async fn api_registry(
+        AxumState(ctx): AxumState<HttpCtx>,
+        Query(params): Query<TokenParam>,
+    ) -> axum::response::Response {
+        if params.token != *ctx.token {
+            return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
+        }
+        let (epoch, eligible, writer_shards, entries) = ctx.state.programreg.status().await;
+        axum::Json(serde_json::json!({
+            "epoch": epoch,
+            "eligible": eligible,
+            "writer_shards": writer_shards,
+            "shard_count": 256,
+            "entries": entries,
+        }))
+        .into_response()
+    }
+
     let ctx = HttpCtx {
         state,
         token: Arc::new(token),
@@ -1811,6 +1832,7 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         .route("/api/sql", get(api_sql))
         .route("/api/deploy", axum::routing::post(api_deploy))
         .route("/api/governance", get(api_governance))
+        .route("/api/registry", get(api_registry))
         .route("/api/programs", get(api_programs))
         .route("/api/pending", get(api_pending))
         .route("/api/cids", get(api_cids))

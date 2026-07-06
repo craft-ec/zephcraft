@@ -484,4 +484,27 @@ impl ProgramRegistry {
         }
         (count, hex::encode(Cid::of(&combined).0))
     }
+
+    /// Registry status for the dashboard: `(current_epoch, eligible_count, writer_shard_count,
+    /// entries)`. `writer_shard_count` = the shards THIS node currently writes; `entries` = the
+    /// total `(owner, name)` rows across exactly those shards (a per-node partial view — the
+    /// registry is sharded, so no single node sees every shard).
+    pub async fn status(&self) -> (u64, usize, usize, usize) {
+        let epoch = self.effective_epoch();
+        let eligible = self.eligible().await.len();
+        let mut writer_shards = 0usize;
+        let mut entries = 0usize;
+        for shard in 0..SHARD_COUNT {
+            if !self.is_writer(shard).await {
+                continue;
+            }
+            writer_shards += 1;
+            let raw = self
+                .store
+                .resolve(registry_program_cid(), &shard_seed(shard))
+                .await;
+            entries += RegistryState::decode(&raw).map(|s| s.len()).unwrap_or(0);
+        }
+        (epoch, eligible, writer_shards, entries)
+    }
 }
