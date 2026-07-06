@@ -1542,32 +1542,42 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // Workers: pull the earliest-due CID, scan it under a concurrency cap (a permit frees only
     // when a scan completes — "submit as they are completed"), then re-enqueue it.
     {
-        let (eng, st, q, seen, live, coord) = (
+        let (eng, st, q, seen, live, coord, dht) = (
             engine.clone(),
             state.clone(),
             hs_queue.clone(),
             hs_seen.clone(),
             mem_peers.clone(),
             jobs.clone(),
+            dht_node
+                .as_ref()
+                .expect("dht_node is always constructed")
+                .clone(),
         );
         tokio::spawn(async move {
-            // Wait for the peer view to SETTLE before the FIRST scan — the alive-peer count
-            // unchanged for a short window, not merely non-empty — so the first pass runs against
-            // a (near-)complete membership rather than a half-discovered one. Scanning too early
-            // sees providers as not-yet-alive, flags healthy content at-risk, and kicks off a
-            // spurious repair storm. Bounded by a max grace so a genuinely-alone or slow-to-form
-            // node still proceeds (and maintains its own pinned content).
+            // Wait for the peer view AND the DHT overlay to SETTLE before the FIRST scan — two
+            // distinct readiness states. (1) membership converged: the alive-peer count is stable,
+            // not merely non-empty. (2) the Kademlia overlay is formed: the routing table has
+            // contacts and has stopped growing, so `resolve` can actually reach the nodes holding
+            // provider records. Scanning against a half-formed overlay returns thin provider lists
+            // and manufactures false at-risk repair work — the node is still INITIALIZING until the
+            // overlay is complete. Bounded by a max grace so a genuinely-alone or slow-to-form node
+            // still proceeds (and maintains its own pinned content).
             let start = std::time::Instant::now();
-            let mut last = usize::MAX;
+            let mut last_peers = usize::MAX;
+            let mut last_table = usize::MAX;
             let mut stable_since = start;
             loop {
-                let count = live.peers().await.len();
-                if count != last {
-                    last = count;
+                let peers = live.peers().await.len();
+                let table = dht.table_len();
+                if peers != last_peers || table != last_table {
+                    last_peers = peers;
+                    last_table = table;
                     stable_since = std::time::Instant::now();
                 }
-                let settled = count > 0 && stable_since.elapsed() >= Duration::from_secs(10);
-                if settled || start.elapsed() >= Duration::from_secs(90) {
+                let ready =
+                    peers > 0 && table > 0 && stable_since.elapsed() >= Duration::from_secs(10);
+                if ready || start.elapsed() >= Duration::from_secs(90) {
                     break;
                 }
                 tokio::time::sleep(Duration::from_secs(2)).await;
