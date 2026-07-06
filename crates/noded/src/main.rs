@@ -1202,6 +1202,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         storage: tokio::sync::RwLock::new((0, 0, 0, 0)),
         providing: std::sync::atomic::AtomicU64::new(0),
         content: tokio::sync::RwLock::new(Vec::new()),
+        cid_health: tokio::sync::RwLock::new(Vec::new()),
         health: tokio::sync::RwLock::new((0, 0, 0, 0, 0, 0, 0)),
         craftsql: craftsql.clone(),
         events: events.clone(),
@@ -1783,6 +1784,65 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                 out.push(e);
             }
             content_state.set_content(out).await;
+        }
+    });
+
+    // Dashboard health view: per-cid diagnostics (verdict, held vs effective pieces, floor, last
+    // scan, next scan from the scheduler queue) for ALL held cids, so any durability issue is
+    // visible at a glance and grouped by condition in the UI.
+    let hv_engine = engine.clone();
+    let hv_state = state.clone();
+    let hv_queue = hs_queue.clone();
+    let hv_clock = transport.clock();
+    tokio::spawn(async move {
+        let mut iv = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            iv.tick().await;
+            let due_now = std::time::Instant::now();
+            let due_map: std::collections::HashMap<[u8; 32], std::time::Instant> = {
+                let q = hv_queue.lock().expect("q");
+                q.iter()
+                    .map(|std::cmp::Reverse((d, c, _))| (c.0, *d))
+                    .collect()
+            };
+            let now_ms = hv_clock.now().millis();
+            let store = hv_engine.store();
+            let mut rows = Vec::new();
+            for cid in store.cids() {
+                let h = hv_engine.cid_health(&cid);
+                let (eff, floor, lprov, last_ms) = h
+                    .as_ref()
+                    .map(|h| (h.effective, h.floor, h.live_providers, h.last_scan_ms))
+                    .unwrap_or((0, 0, 0, 0));
+                let verdict = if hv_engine.is_at_risk(&cid) {
+                    "at-risk"
+                } else if hv_engine.is_fading(&cid) {
+                    "fading"
+                } else if last_ms == 0 {
+                    "pending"
+                } else if floor > 0 && eff > floor {
+                    "surplus"
+                } else {
+                    "durable"
+                };
+                let scanned_ago = (last_ms != 0).then(|| now_ms.saturating_sub(last_ms) / 1000);
+                let next_secs = due_map
+                    .get(&cid.0)
+                    .map(|d| d.saturating_duration_since(due_now).as_secs());
+                rows.push(serde_json::json!({
+                    "cid": cid.to_hex(),
+                    "verdict": verdict,
+                    "held": store.piece_count(&cid),
+                    "effective": eff,
+                    "floor": floor,
+                    "live_providers": lprov,
+                    "pinned": store.is_pinned(&cid),
+                    "wanted": store.is_wanted(&cid),
+                    "scanned_ago_s": scanned_ago,
+                    "next_scan_s": next_secs,
+                }));
+            }
+            hv_state.set_cid_health(rows).await;
         }
     });
 

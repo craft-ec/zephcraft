@@ -160,6 +160,8 @@ pub struct State {
     pub storage: RwLock<(u64, u64, u64, u64)>, // (cids, pieces, pinned, bytes)
     pub providing: std::sync::atomic::AtomicU64,
     pub content: RwLock<Vec<ContentInfo>>,
+    /// Per-cid health rows (all held cids) for the dashboard health view, pre-built by noded.
+    pub cid_health: RwLock<Vec<serde_json::Value>>,
     pub health: RwLock<(usize, usize, u64, u64, u64, u64, u64)>, // scanned, at_risk, repaired, moved, scaled, degraded, fading
     pub craftsql: std::sync::Arc<zeph_sql::CraftSql>,
     /// The node event bus (foundation §52) — producers publish, apps subscribe.
@@ -283,6 +285,10 @@ impl State {
 
     pub async fn set_content(&self, content: Vec<ContentInfo>) {
         *self.content.write().await = content;
+    }
+
+    pub async fn set_cid_health(&self, rows: Vec<serde_json::Value>) {
+        *self.cid_health.write().await = rows;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1734,6 +1740,17 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         axum::Json(serde_json::json!({ "pending": rows })).into_response()
     }
 
+    async fn api_cids(
+        AxumState(ctx): AxumState<HttpCtx>,
+        Query(params): Query<TokenParam>,
+    ) -> axum::response::Response {
+        if params.token != *ctx.token {
+            return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
+        }
+        axum::Json(serde_json::json!({ "cids": ctx.state.cid_health.read().await.clone() }))
+            .into_response()
+    }
+
     async fn api_programs(
         AxumState(ctx): AxumState<HttpCtx>,
         Query(params): Query<TokenParam>,
@@ -1845,6 +1862,7 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         .route("/api/governance", get(api_governance))
         .route("/api/programs", get(api_programs))
         .route("/api/pending", get(api_pending))
+        .route("/api/cids", get(api_cids))
         .with_state(ctx);
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;

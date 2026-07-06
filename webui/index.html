@@ -141,6 +141,10 @@
     <div id="pending-body"><div class="muted">loading…</div></div>
   </div>
   <div class="card">
+    <div class="cardhead">cid health <span class="muted">— every held cid grouped by condition · held vs effective pieces, floor, last &amp; next scan (spot issues at a glance)</span></div>
+    <div id="cidhealth-body"><div class="muted">loading…</div></div>
+  </div>
+  <div class="card">
     <div class="cardhead">activity <span class="muted">(node event bus §52 — the reactive stream apps subscribe to)</span></div>
     <div id="activity"><div class="muted">no events yet</div></div>
   </div>
@@ -383,7 +387,7 @@ async function tick(){
     if (ra.ok) renderApps(await ra.json());
   } catch (_) {}
   if($("tab-status") && !$("tab-status").hidden) loadStatus();
-  if($("tab-overview") && !$("tab-overview").hidden) loadPending();
+  if($("tab-overview") && !$("tab-overview").hidden){ loadPending(); loadCidHealth(); }
 }
 // My Drive: this identity's CraftSQL file index (name · size · type · age · cid).
 function renderApps(v){
@@ -585,6 +589,34 @@ async function loadPending(){
       return `<div class="kv" style="border-bottom:none;padding-bottom:.05rem"><span class="mono muted cidcell" onclick="copyCid('${p.cid}')" title="copy cid">${String(p.cid).slice(0,18)}\u2026</span><b>${p.have} / ${p.floor} pieces on peers</b></div>`
         + `<div class="pbar"><div class="pbar-fill${pct>=100?' done':''}" style="width:${pct}%"></div></div>`;
     }).join("");
+  }catch(e){ el.textContent="error: "+e; }
+}
+async function loadCidHealth(){
+  const el=$("cidhealth-body"); if(!el) return;
+  try{
+    const r=await fetch("/api/cids?token="+TOKEN);
+    if(!r.ok){ el.textContent="unavailable"; return; }
+    const rows=((await r.json()).cids)||[];
+    if(!rows.length){ el.innerHTML='<div class="muted" style="font-size:.78rem">no held content</div>'; return; }
+    const order=["at-risk","fading","pending","surplus","durable"];
+    const cls={"at-risk":"warn","fading":"net","pending":"net","surplus":"scaled","durable":"ok"};
+    const groups={}; for(const c of rows){ (groups[c.verdict]=groups[c.verdict]||[]).push(c); }
+    let html="";
+    for(const v of order){
+      const g=groups[v]; if(!g||!g.length) continue;
+      html+=`<div style="margin:.5rem 0 .2rem"><span class="badge ${cls[v]||'net'}">${v} · ${g.length}</span></div>`;
+      html+=`<div style="overflow-x:auto"><table style="width:100%;font-size:.73rem;border-collapse:collapse"><thead><tr style="color:var(--dim);text-align:left"><th>cid</th><th>held</th><th>effective/floor</th><th>live prov</th><th>last scan</th><th>next scan</th></tr></thead><tbody>`;
+      for(const c of g.slice(0,50)){
+        const eff = c.floor>0 ? `${c.effective}/${c.floor}` : `${c.effective}`;
+        const ls = (c.scanned_ago_s==null) ? "—" : c.scanned_ago_s+"s ago";
+        const ns = (c.next_scan_s==null) ? "—" : "in "+c.next_scan_s+"s";
+        const flags = (c.pinned?" 📌":"")+(c.wanted?" ★":"");
+        html+=`<tr><td class="mono muted cidcell" onclick="copyCid('${c.cid}')" title="copy cid">${String(c.cid).slice(0,14)}…${flags}</td><td>${c.held}</td><td>${eff}</td><td>${c.live_providers}</td><td>${ls}</td><td>${ns}</td></tr>`;
+      }
+      html+=`</tbody></table></div>`;
+      if(g.length>50) html+=`<div class="muted" style="font-size:.72rem">+${g.length-50} more</div>`;
+    }
+    el.innerHTML=html;
   }catch(e){ el.textContent="error: "+e; }
 }
 function showTab(name){

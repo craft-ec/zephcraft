@@ -214,6 +214,20 @@ impl PeerSource for RoutingPeerSource {
     }
 }
 
+/// Per-cid diagnostic snapshot from the last health scan (for the dashboard). The verdict is
+/// derived separately from the at-risk / fading sets; this carries the raw numbers.
+#[derive(Clone, Debug)]
+pub struct CidHealth {
+    /// Wall-clock ms of the last scan (HLC), 0 if never scanned.
+    pub last_scan_ms: u64,
+    /// Effective coded pieces on the network the scan counted (sum over LIVE providers incl self).
+    pub effective: u32,
+    /// Durability floor n = target_pieces(k).
+    pub floor: u32,
+    /// Distinct LIVE peer providers seen.
+    pub live_providers: u32,
+}
+
 pub struct ObjEngine {
     transport: Arc<Transport>,
     store: Arc<Store>,
@@ -258,6 +272,8 @@ pub struct ObjEngine {
     alive_cache: Mutex<Option<(Instant, HashSet<NodeId>)>>,
     /// Per-node liveness probe cache (used only when no membership source is wired — e.g. tests).
     node_liveness: Mutex<HashMap<NodeId, (Instant, bool)>>,
+    /// Per-cid health snapshot from the last scan (dashboard diagnostics).
+    cid_health: Mutex<HashMap<[u8; 32], CidHealth>>,
 }
 
 impl ObjEngine {
@@ -300,6 +316,7 @@ impl ObjEngine {
             liveness: Mutex::new(None),
             alive_cache: Mutex::new(None),
             node_liveness: Mutex::new(HashMap::new()),
+            cid_health: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1392,6 +1409,15 @@ impl ObjEngine {
             // not a substitute for spread): `have` is the coded-piece count, and
             // a pinner participates in repair as a mint source below.
             let effective = have;
+            self.cid_health.lock().expect("cid_health").insert(
+                cid.0,
+                CidHealth {
+                    last_scan_ms: self.transport.clock().now().millis(),
+                    effective: effective as u32,
+                    floor: floor as u32,
+                    live_providers: live.len() as u32,
+                },
+            );
             if effective > floor {
                 // Surplus above the floor. If download demand has faded, DEGRADE:
                 // shed one piece toward the floor. Rendezvous-elected (one
@@ -1501,6 +1527,20 @@ impl ObjEngine {
             .lock()
             .expect("at_risk_ids")
             .contains(&cid.0)
+    }
+
+    /// Is this cid currently being left to fade (unwanted, not repaired)?
+    pub fn is_fading(&self, cid: &Cid) -> bool {
+        self.fading_ids.lock().expect("fading_ids").contains(&cid.0)
+    }
+
+    /// The last-scan health snapshot for a cid, if scanned.
+    pub fn cid_health(&self, cid: &Cid) -> Option<CidHealth> {
+        self.cid_health
+            .lock()
+            .expect("cid_health")
+            .get(&cid.0)
+            .cloned()
     }
 
     /// Recompute the "pending distribution" snapshot CHEAPLY — from provider RECORDS
