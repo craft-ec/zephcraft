@@ -36,12 +36,10 @@ pub const ALPN: &[u8] = b"/craftec/piece/1";
 /// Re-announce a provider record this long after its last announce (foundation §462:
 /// 22h re-announce inside a 48h DHT TTL). Per-cid scheduling — NOT every cycle.
 const REPUBLISH_MS: u64 = 22 * 3600 * 1000;
-/// Health-scan + re-announce process cids in small chunks of PACE_CHUNK, sleeping PACE_DELAY
-/// between chunks — bounds in-flight DHT ops and trickles the load instead of an O(N) burst
-/// (even the startup/restart refresh), so both scale to thousands of cids without storming
-/// the overlay.
+/// Cids processed per chunk in the health-scan sweep + re-announce refresh. Between chunks the
+/// loop sleeps `ObjConfig::pace_delay`, bounding in-flight DHT ops and trickling the load
+/// instead of an O(N) burst — so both scale to thousands of cids without storming the overlay.
 const PACE_CHUNK: usize = 5;
-const PACE_DELAY: Duration = Duration::from_millis(250);
 const MAX_FRAME: usize = wire::MAX_MESSAGE_SIZE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +79,10 @@ pub struct ObjConfig {
     /// Eviction cooldown: an evicted CID won't be refilled for this long
     /// (anti-thrash), then the record is purged. Default 30 days.
     pub eviction_cooldown: Duration,
+    /// Pacing delay between chunks of PACE_CHUNK cids in the health-scan sweep and the
+    /// re-announce refresh — spaces DHT ops out so reaching steady state is a slow crawl,
+    /// not a burst. Default 1s; tests set it ~0. See PACE_CHUNK.
+    pub pace_delay: Duration,
 }
 
 impl Default for ObjConfig {
@@ -94,6 +96,7 @@ impl Default for ObjConfig {
             degrade_threshold: 5,
             fade_grace: Duration::from_secs(24 * 60 * 60),
             eviction_cooldown: Duration::from_secs(30 * 24 * 60 * 60),
+            pace_delay: Duration::from_secs(1),
         }
     }
 }
@@ -230,6 +233,11 @@ pub struct ObjEngine {
     /// Per-cid last-announce time (ms) — drives TTL-aware re-announce scheduling so a record
     /// is refreshed ~every 22h, not every cycle.
     announced_at: Mutex<HashMap<[u8; 32], u64>>,
+    /// Persistent GLOBAL durability sets, aggregated across per-chunk scans: cids currently
+    /// at-risk / left-to-fade. Each health_scan_chunk updates the chunk's cids in place, so the
+    /// dashboard reads accurate global counts without any one job scanning the whole set.
+    at_risk_ids: Mutex<HashSet<[u8; 32]>>,
+    fading_ids: Mutex<HashSet<[u8; 32]>>,
 }
 
 impl ObjEngine {
@@ -266,6 +274,8 @@ impl ObjEngine {
             enc: std::sync::OnceLock::new(),
             pending: Mutex::new(Vec::new()),
             announced_at: Mutex::new(HashMap::new()),
+            at_risk_ids: Mutex::new(HashSet::new()),
+            fading_ids: Mutex::new(HashSet::new()),
         })
     }
 
@@ -1172,7 +1182,7 @@ impl ObjEngine {
                     }
                 }
             }
-            tokio::time::sleep(PACE_DELAY).await;
+            tokio::time::sleep(self.config.pace_delay).await;
         }
         // WANT interest (the node's own wants — few); re-announce each cycle (cheap).
         futures::future::join_all(
@@ -1211,28 +1221,21 @@ impl ObjEngine {
     /// live capable holders, it mints one fresh piece and pushes it to a peer
     /// that isn't yet a holder (HAVE ↑ toward the floor). Degradation (HAVE ↓)
     /// and WANT-gated fade are the loop's later halves.
-    pub async fn health_scan(&self) -> HealthReport {
+    /// Scan ONE small chunk of cids — a coordinator-managed unit. Callers submit many of these,
+    /// paced, so no single job sweeps the whole set or holds a slot while it sleeps. Verdicts
+    /// roll into the engine's persistent at-risk / fading sets, so `report.at_risk`/`fading` are
+    /// the accurate GLOBAL counts aggregated across every chunk, and `scanned` is the total held.
+    pub async fn health_scan_chunk(&self, cids: &[Cid]) -> HealthReport {
         let mut report = HealthReport::default();
         let epoch = self.transport.clock().now().0 / HEALTH_EPOCH_MS;
         let me = self.transport.node_id();
-        // The set of CIDs the network WANTs — content outside it (and unpinned,
-        // undemanded) is left to fade (FADE: absence of repair).
-
-        // PACED full sweep: resolve every held cid's providers in small chunks of PACE_CHUNK,
-        // sleeping PACE_DELAY between chunks, so in-flight DHT gets stay bounded and the O(N)
-        // read load is trickled rather than bursted — this scales to thousands of cids. (The
-        // coordinator dedupes the job by key, so a sweep that outlasts the scan interval just
-        // re-triggers when it finishes.)
-        let mut resolved = Vec::new();
-        for chunk in self.store.cids().chunks(PACE_CHUNK) {
-            let part = futures::future::join_all(chunk.iter().map(|cid| {
-                let cid = *cid;
-                async move { (cid, self.routing.resolve(cid).await.unwrap_or_default()) }
-            }))
-            .await;
-            resolved.extend(part);
-            tokio::time::sleep(PACE_DELAY).await;
-        }
+        let mut chunk_at_risk: HashSet<[u8; 32]> = HashSet::new();
+        let mut chunk_fading: HashSet<[u8; 32]> = HashSet::new();
+        let resolved = futures::future::join_all(cids.iter().map(|cid| {
+            let cid = *cid;
+            async move { (cid, self.routing.resolve(cid).await.unwrap_or_default()) }
+        }))
+        .await;
 
         for (cid, providers) in resolved {
             if self.store.is_tombstoned(&cid) {
@@ -1346,9 +1349,11 @@ impl ObjEngine {
                 .is_alive(&cid, providers.iter().any(|p| p.pinned))
                 .await;
             if !alive {
+                chunk_fading.insert(cid.0);
                 report.fading += 1;
                 continue;
             }
+            chunk_at_risk.insert(cid.0);
             report.at_risk += 1;
 
             // Only a capable holder can repair; rendezvous-elect exactly one so
@@ -1377,7 +1382,36 @@ impl ObjEngine {
                 report.repaired += 1;
             }
         }
+        // Roll this chunk's verdicts into the persistent GLOBAL sets — add cids that came out
+        // at-risk / fading, clear chunk cids that are now healthy — then report the global
+        // counts + the total held set, so the dashboard aggregates correctly across chunks.
+        {
+            let mut ar = self.at_risk_ids.lock().expect("at_risk_ids");
+            let mut fd = self.fading_ids.lock().expect("fading_ids");
+            for cid in cids {
+                if chunk_at_risk.contains(&cid.0) {
+                    ar.insert(cid.0);
+                } else {
+                    ar.remove(&cid.0);
+                }
+                if chunk_fading.contains(&cid.0) {
+                    fd.insert(cid.0);
+                } else {
+                    fd.remove(&cid.0);
+                }
+            }
+            report.at_risk = ar.len();
+            report.fading = fd.len();
+        }
+        report.scanned = self.store.cids().len();
         report
+    }
+
+    /// Scan the ENTIRE held set as a single chunk. Convenience for tests + one-shot callers; the
+    /// node's periodic path submits per-chunk `health_scan_chunk` jobs (see noded) instead, so no
+    /// job ever sweeps the whole set at once.
+    pub async fn health_scan(&self) -> HealthReport {
+        self.health_scan_chunk(&self.store.cids()).await
     }
 
     /// Recompute the "pending distribution" snapshot CHEAPLY — from provider RECORDS

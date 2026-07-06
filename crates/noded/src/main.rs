@@ -260,6 +260,8 @@ struct Config {
     degrade_threshold: u32,
     /// Fade grace: content fetched within this stays demand-alive (seconds). Default 1 day.
     fade_grace_secs: u64,
+    /// Health-scan/re-announce pacing delay between chunks of cids (seconds). Default 1.
+    pace_delay_secs: u64,
     /// Eviction cooldown: an evicted CID is not refilled for this (seconds). Default 30 days.
     eviction_cooldown_secs: u64,
     /// Health-scan / lifecycle loop interval (seconds). Default 30.
@@ -301,6 +303,7 @@ impl Default for Config {
             scale_threshold: 20,
             degrade_threshold: 5,
             fade_grace_secs: 24 * 60 * 60,
+            pace_delay_secs: 1,
             eviction_cooldown_secs: 30 * 24 * 60 * 60,
             health_scan_secs: 30,
             reannounce_secs: 120,
@@ -1029,6 +1032,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
             degrade_threshold: cfg.degrade_threshold,
             fade_grace: Duration::from_secs(cfg.fade_grace_secs),
             eviction_cooldown: Duration::from_secs(cfg.eviction_cooldown_secs),
+            pace_delay: Duration::from_secs(cfg.pace_delay_secs),
         },
     );
     // The owner's encryption keypair (PRE), derived from the identity seed —
@@ -1490,28 +1494,32 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let health_state = state.clone();
     let health_jobs = jobs.clone();
     let health_scan_secs = cfg.health_scan_secs.max(1);
+    let health_chunk_pace = Duration::from_secs(cfg.pace_delay_secs.max(1));
+
+    // HealthScan enqueue: a plain task that continuously sweeps the held set, submitting ONE
+    // small per-chunk scan job to the coordinator at a time and pacing between submits. The
+    // coordinator manages bounded units — no single job sweeps the whole set or holds a slot
+    // while it sleeps. Each chunk's verdicts aggregate into the engine's GLOBAL at-risk/fading
+    // sets, so set_scan still reports accurate network-wide totals. This scales to thousands of
+    // cids: a sweep is just more (still-tiny) jobs spaced over time.
+    let hs_engine = health_engine.clone();
+    let hs_state = health_state.clone();
+    let hs_jobs = health_jobs.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(health_scan_secs));
-        interval.tick().await; // skip immediate tick at startup
         loop {
-            interval.tick().await;
-            let e = health_engine.clone();
-            let st = health_state.clone();
-            // PROPER coordinator use: two INDEPENDENT jobs, not one monolith. The fast,
-            // record-based health scan (durability assessment + repair) runs on its own
-            // HealthScan cadence and updates promptly; the heavier distribute/scale passes
-            // (which push pieces per cid) run as a separate Distribution job. Each is deduped
-            // by its own key and they run concurrently (worker pool), so a slow distribute
-            // can NEVER stall the health scan again.
-            let (eh, sth) = (e.clone(), st.clone());
-            health_jobs.submit(
-                "health-scan",
-                zeph_sched::Priority::HealthScan,
-                1,
-                move || {
-                    let (e, st) = (eh.clone(), sth.clone());
+            let cids = hs_engine.store().cids();
+            if cids.is_empty() {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+            for chunk in cids.chunks(5) {
+                let chunk = chunk.to_vec();
+                let (e, st) = (hs_engine.clone(), hs_state.clone());
+                let key = format!("health-scan:{}", chunk[0].to_hex());
+                hs_jobs.submit(&key, zeph_sched::Priority::HealthScan, 1, move || {
+                    let (e, st, chunk) = (e.clone(), st.clone(), chunk.clone());
                     async move {
-                        let r = e.health_scan().await;
+                        let r = e.health_scan_chunk(&chunk).await;
                         st.set_scan(
                             r.scanned,
                             r.at_risk,
@@ -1531,8 +1539,20 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                         }
                         Ok(())
                     }
-                },
-            );
+                });
+                tokio::time::sleep(health_chunk_pace).await;
+            }
+        }
+    });
+
+    // Distribute / scale: the heavier per-cid piece movement, on its own periodic cadence as a
+    // separate coordinator job (deduped by key), so it never stalls the health scan.
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(health_scan_secs));
+        interval.tick().await; // skip immediate tick at startup
+        loop {
+            interval.tick().await;
+            let (e, st) = (health_engine.clone(), health_state.clone());
             health_jobs.submit(
                 "distribute",
                 zeph_sched::Priority::Distribution,

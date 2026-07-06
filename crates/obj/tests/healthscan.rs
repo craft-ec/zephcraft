@@ -81,6 +81,7 @@ async fn node(tracker: &Transport, dir: &std::path::Path) -> Node {
         ObjConfig {
             probe_timeout: std::time::Duration::from_millis(200),
             scale_threshold: 3,
+            pace_delay: std::time::Duration::from_millis(0),
             ..ObjConfig::default()
         },
     );
