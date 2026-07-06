@@ -25,8 +25,9 @@ use zeph_routing::TrackerRouting;
 use zeph_store::Store;
 
 /// Delay-queue of CIDs due for a health check, ordered by next-due time (min-heap via Reverse).
-type DueQueue =
-    std::sync::Mutex<std::collections::BinaryHeap<std::cmp::Reverse<(std::time::Instant, Cid)>>>;
+type DueQueue = std::sync::Mutex<
+    std::collections::BinaryHeap<std::cmp::Reverse<(std::time::Instant, Cid, std::time::Duration)>>,
+>;
 use zeph_transport::{alpn, PeerAddr, Reach, Transport};
 
 #[derive(Parser)]
@@ -1506,7 +1507,10 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // floored at health_scan_secs for small sets. A cheap discovery pass feeds new CIDs in as
     // items; gone CIDs drop out on completion. Scales to 100k+ CIDs: bounded memory (<= N items
     // + a few in flight), no O(N) sweep, and no job that holds a slot while it sleeps.
-    let recheck = Duration::from_secs(health_scan_secs);
+    // Adaptive re-check bounds: at-risk (and freshly discovered) cids re-check at recheck_min;
+    // healthy cids back off geometrically up to recheck_max (min * 64).
+    let recheck_min = Duration::from_secs(health_scan_secs);
+    let recheck_max = Duration::from_secs(health_scan_secs.saturating_mul(64));
     let hs_queue: Arc<DueQueue> =
         Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new()));
     let hs_seen: Arc<std::sync::Mutex<std::collections::HashSet<Cid>>> =
@@ -1522,7 +1526,9 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                 for cid in eng.store().cids() {
                     let is_new = seen.lock().expect("seen").insert(cid);
                     if is_new {
-                        q.lock().expect("q").push(std::cmp::Reverse((now, cid)));
+                        q.lock()
+                            .expect("q")
+                            .push(std::cmp::Reverse((now, cid, recheck_min)));
                     }
                 }
                 tokio::time::sleep(Duration::from_secs(10)).await;
@@ -1553,8 +1559,8 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                     tokio::time::sleep((due - now).min(Duration::from_secs(1))).await;
                     continue;
                 }
-                let cid = match q.lock().expect("q").pop() {
-                    Some(item) => item.0 .1,
+                let (cid, delay) = match q.lock().expect("q").pop() {
+                    Some(item) => (item.0 .1, item.0 .2),
                     None => continue,
                 };
                 let permit = sem.clone().acquire_owned().await.expect("sem");
@@ -1581,9 +1587,18 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                     }
                     // Re-enqueue for the next check if still held; else stop tracking it.
                     if eng.store().piece_count(&cid) > 0 || eng.store().has_content(&cid) {
+                        // Adaptive backoff: an at-risk cid stays HOT (recheck_min); a healthy cid
+                        // backs OFF — double its interval up to recheck_max — so the bounded scan
+                        // throughput concentrates on content that actually needs attention.
+                        let next = if eng.is_at_risk(&cid) {
+                            recheck_min
+                        } else {
+                            (delay * 2).min(recheck_max)
+                        };
                         q.lock().expect("q").push(std::cmp::Reverse((
-                            std::time::Instant::now() + recheck,
+                            std::time::Instant::now() + next,
                             cid,
+                            next,
                         )));
                     } else {
                         seen.lock().expect("seen").remove(&cid);

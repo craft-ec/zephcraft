@@ -1414,6 +1414,15 @@ impl ObjEngine {
         self.health_scan_chunk(&self.store.cids()).await
     }
 
+    /// Is this cid currently believed at-risk (per its last scan)? Drives the scheduler's
+    /// adaptive re-check backoff — at-risk cids stay hot, healthy cids back off.
+    pub fn is_at_risk(&self, cid: &Cid) -> bool {
+        self.at_risk_ids
+            .lock()
+            .expect("at_risk_ids")
+            .contains(&cid.0)
+    }
+
     /// Recompute the "pending distribution" snapshot CHEAPLY — from provider RECORDS
     /// (their claimed piece_count via `resolve`, no per-peer probe), so it stays fresh even
     /// when the verified health scan is slow. For each copy we retain (whole content, not
