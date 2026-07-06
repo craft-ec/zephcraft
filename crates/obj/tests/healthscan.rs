@@ -440,7 +440,7 @@ async fn content_scales_under_download_demand() {
 #[tokio::test]
 async fn content_degrades_to_floor_when_demand_fades() {
     let tracker = start_tracker().await;
-    let dirs: Vec<tempfile::TempDir> = (0..6).map(|_| tempfile::tempdir().unwrap()).collect();
+    let dirs: Vec<tempfile::TempDir> = (0..12).map(|_| tempfile::tempdir().unwrap()).collect();
     let floor = 32usize;
 
     // One provider holds the whole generation.
@@ -452,9 +452,9 @@ async fn content_degrades_to_floor_when_demand_fades() {
         .collect();
     let cid = publisher.engine.publish(&payload, false).await.unwrap().cid;
 
-    // Two empty nodes join.
+    // Several empty nodes join — targets for Scaling to build surplus beyond the band.
     let mut nodes = vec![s0];
-    for dir in dirs.iter().skip(2).take(2) {
+    for dir in dirs.iter().skip(2).take(8) {
         let n = node(&tracker, dir.path()).await;
         n.routing.announce_node(0, 0).await.unwrap();
         nodes.push(n);
@@ -466,23 +466,28 @@ async fn content_degrades_to_floor_when_demand_fades() {
             .sum()
     };
 
-    // Drive Scaling with real downloads to create surplus above the floor.
-    let fetcher = node(&tracker, dirs[4].path()).await;
-    for _ in 0..2 {
-        for _ in 0..2 {
+    // Drive Scaling with real downloads to create surplus ABOVE the durability band (so the
+    // degrade path actually has something to shed — content inside the band is deliberately kept).
+    let high = floor + (floor / 8).max(2);
+    let fetcher = node(&tracker, dirs[10].path()).await;
+    for _ in 0..8 {
+        for _ in 0..3 {
             let _ = fetcher.engine.get(cid, ConsumeMode::Drop).await.unwrap();
         }
-        nodes[0].engine.scale().await;
+        for n in &nodes {
+            n.engine.scale().await;
+        }
     }
     let surplus = total(&nodes);
     assert!(
-        surplus > floor,
-        "scaling created surplus {surplus} > floor {floor}"
+        surplus > high,
+        "scaling created surplus {surplus} above the band top {high}"
     );
 
-    // Demand fades (no more fetches). Degradation sheds back to the floor.
+    // Demand fades (no more fetches). Degradation sheds cold surplus back down to the floor
+    // (the Schmitt shed centres it, symmetric with repair).
     let mut settled = 0;
-    for _ in 0..40 {
+    for _ in 0..60 {
         for n in &nodes {
             n.engine.health_scan().await;
         }

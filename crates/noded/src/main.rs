@@ -1831,7 +1831,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                     "fading"
                 } else if last_ms == 0 {
                     "pending"
-                } else if floor > 0 && eff > floor {
+                } else if floor > 0 && eff > floor + (floor / 8).max(2) {
                     "surplus"
                 } else {
                     "durable"

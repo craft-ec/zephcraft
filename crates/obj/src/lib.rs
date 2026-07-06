@@ -226,7 +226,7 @@ pub struct CidHealth {
     pub floor: u32,
     /// Distinct LIVE peer providers seen.
     pub live_providers: u32,
-    /// What the scan CONCLUDED about this cid (e.g. "below floor — under-replicated").
+    /// What the scan CONCLUDED about this cid (e.g. "below band — under-replicated").
     pub decision: String,
     /// What the scan DID as a result (e.g. "repaired — minted + pushed 1 piece", "none — healthy").
     pub action: String,
@@ -265,6 +265,8 @@ pub struct ObjEngine {
     /// dashboard reads accurate global counts without any one job scanning the whole set.
     at_risk_ids: Mutex<HashSet<[u8; 32]>>,
     fading_ids: Mutex<HashSet<[u8; 32]>>,
+    /// Cids currently SHEDDING cold surplus back toward the floor (Schmitt state, mirrors at_risk_ids).
+    surplus_ids: Mutex<HashSet<[u8; 32]>>,
     /// Set by the node: a channel to fire demand-driven scaling. When a served pull crosses
     /// scale_threshold the serve path sends the cid here, and a worker recruits another provider
     /// immediately — scaling reacts to access, not to any scan/distribute cadence.
@@ -316,6 +318,7 @@ impl ObjEngine {
             announced_at: Mutex::new(HashMap::new()),
             at_risk_ids: Mutex::new(HashSet::new()),
             fading_ids: Mutex::new(HashSet::new()),
+            surplus_ids: Mutex::new(HashSet::new()),
             scale_trigger: std::sync::OnceLock::new(),
             liveness: Mutex::new(None),
             alive_cache: Mutex::new(None),
@@ -1321,6 +1324,7 @@ impl ObjEngine {
         let me = self.transport.node_id();
         let mut chunk_at_risk: HashSet<[u8; 32]> = HashSet::new();
         let mut chunk_fading: HashSet<[u8; 32]> = HashSet::new();
+        let mut chunk_surplus: HashSet<[u8; 32]> = HashSet::new();
         let resolved = futures::future::join_all(cids.iter().map(|cid| {
             let cid = *cid;
             async move { (cid, self.routing.resolve(cid).await.unwrap_or_default()) }
@@ -1421,43 +1425,72 @@ impl ObjEngine {
             // not a substitute for spread): `have` is the coded-piece count, and
             // a pinner participates in repair as a mint source below.
             let effective = have;
-            if effective > floor {
-                // Surplus above the floor. If download demand has faded, DEGRADE:
-                // shed one piece toward the floor (rendezvous-elected, one per cycle).
-                let mut decision = "surplus above floor — demand warm";
-                let mut action = "none — kept for serving bandwidth";
-                if self.served_pulls(&cid) < self.config.degrade_threshold {
-                    decision = "surplus above floor — demand cold";
-                    action = "none — not the elected shedder";
-                    let mut shedders: Vec<NodeId> = live
-                        .iter()
-                        .filter(|(_, _, c, pinned)| *c > 2 && !*pinned)
-                        .map(|(id, _, _, _)| *id)
-                        .collect();
-                    if self.store.piece_count(&cid) > 2 && !self.store.is_pinned(&cid) {
-                        shedders.push(me);
-                    }
-                    let winner = shedders
-                        .iter()
-                        .max_by_key(|id| rendezvous_score(id, &cid, epoch));
-                    if winner == Some(&me) && self.shed_one(&cid) {
-                        report.degraded += 1;
-                        action = "degraded — shed 1 piece toward the floor";
-                    }
+            // Hysteresis deadband around the floor so measurement wobble (repair's 1-piece step,
+            // ~2s record lag, liveness jitter) doesn't make repair and shed fight at the exact
+            // floor. Repair below the band, shed above it, hold steady inside it.
+            let delta = (floor / 8).max(2);
+            let high = floor + delta;
+            let low = floor.saturating_sub(delta);
+            // SURPLUS side (Schmitt): once COLD surplus rises above the band it sheds all the
+            // way back to the FLOOR (band centre) — not just to the band top — symmetric with
+            // repair, so it rests with ±Δ of margin. Warm surplus is kept for serving bandwidth.
+            let cold = self.served_pulls(&cid) < self.config.degrade_threshold;
+            let shedding =
+                cold && (effective > high || (self.is_surplus(&cid) && effective > floor));
+            if shedding {
+                chunk_surplus.insert(cid.0);
+                let mut action = "none — not the elected shedder";
+                let mut shedders: Vec<NodeId> = live
+                    .iter()
+                    .filter(|(_, _, c, pinned)| *c > 2 && !*pinned)
+                    .map(|(id, _, _, _)| *id)
+                    .collect();
+                if self.store.piece_count(&cid) > 2 && !self.store.is_pinned(&cid) {
+                    shedders.push(me);
                 }
-                self.record_health(&cid, have, floor, live.len(), decision, action);
-                continue;
-            }
-            if effective >= floor {
+                let winner = shedders
+                    .iter()
+                    .max_by_key(|id| rendezvous_score(id, &cid, epoch));
+                if winner == Some(&me) && self.shed_one(&cid) {
+                    report.degraded += 1;
+                    action = "degraded — shed 1 piece toward the floor";
+                }
                 self.record_health(
                     &cid,
                     have,
                     floor,
                     live.len(),
-                    "at the durability floor",
-                    "none — healthy",
+                    "surplus — shedding toward floor (cold)",
+                    action,
                 );
-                continue; // exactly at the floor — nothing to do
+                continue;
+            }
+            if effective > high {
+                self.record_health(
+                    &cid,
+                    have,
+                    floor,
+                    live.len(),
+                    "surplus above band — demand warm",
+                    "none — kept for serving bandwidth",
+                );
+                continue;
+            }
+            // Schmitt hysteresis: a cid that WENT at-risk keeps repairing until it climbs back
+            // to the floor (band CENTRE), so it rests with ±Δ of margin on each side; a cid not
+            // under repair is left alone anywhere in the band. This is what stops the ±1
+            // repair/shed flap — small wobble around the floor no longer flips the decision.
+            let recovering = self.is_at_risk(&cid) && effective < floor;
+            if effective >= low && !recovering {
+                self.record_health(
+                    &cid,
+                    have,
+                    floor,
+                    live.len(),
+                    "within durability band (floor ± Δ)",
+                    "none — stable",
+                );
+                continue; // inside the deadband — nothing to do
             }
 
             // FADE: content nothing wants — no pin, no want, no live demand — is
@@ -1475,7 +1508,7 @@ impl ObjEngine {
                     have,
                     floor,
                     live.len(),
-                    "below floor but unwanted & undemanded",
+                    "below band but unwanted & undemanded",
                     "none — left to fade",
                 );
                 continue;
@@ -1498,7 +1531,7 @@ impl ObjEngine {
                     have,
                     floor,
                     live.len(),
-                    "below floor — under-replicated",
+                    "below band — under-replicated",
                     "none — we can't repair (retained/passive copy)",
                 );
                 continue;
@@ -1512,7 +1545,7 @@ impl ObjEngine {
                     have,
                     floor,
                     live.len(),
-                    "below floor — under-replicated",
+                    "below band — under-replicated",
                     "none — another holder is the elected repairer",
                 );
                 continue;
@@ -1528,7 +1561,7 @@ impl ObjEngine {
                     have,
                     floor,
                     live.len(),
-                    "below floor — under-replicated",
+                    "below band — under-replicated",
                     "repaired — minted + pushed 1 piece",
                 );
             } else {
@@ -1537,7 +1570,7 @@ impl ObjEngine {
                     have,
                     floor,
                     live.len(),
-                    "below floor — under-replicated",
+                    "below band — under-replicated",
                     "repair failed — no reachable target",
                 );
             }
@@ -1548,6 +1581,7 @@ impl ObjEngine {
         {
             let mut ar = self.at_risk_ids.lock().expect("at_risk_ids");
             let mut fd = self.fading_ids.lock().expect("fading_ids");
+            let mut su = self.surplus_ids.lock().expect("surplus_ids");
             for cid in cids {
                 if chunk_at_risk.contains(&cid.0) {
                     ar.insert(cid.0);
@@ -1558,6 +1592,11 @@ impl ObjEngine {
                     fd.insert(cid.0);
                 } else {
                     fd.remove(&cid.0);
+                }
+                if chunk_surplus.contains(&cid.0) {
+                    su.insert(cid.0);
+                } else {
+                    su.remove(&cid.0);
                 }
             }
             report.at_risk = ar.len();
@@ -1588,19 +1627,28 @@ impl ObjEngine {
         self.fading_ids.lock().expect("fading_ids").contains(&cid.0)
     }
 
+    /// Is this cid currently shedding cold surplus back toward the floor?
+    pub fn is_surplus(&self, cid: &Cid) -> bool {
+        self.surplus_ids
+            .lock()
+            .expect("surplus_ids")
+            .contains(&cid.0)
+    }
+
     /// Is this cid actively CONVERGING toward the floor and so worth re-scanning frequently?
     /// True while REPAIRING (below floor) or SHEDDING cold surplus (above floor + demand cold);
     /// false once stable (at the floor, warm surplus kept for bandwidth, or fading). Drives the
     /// scheduler's backoff so shedding keeps pace with repair instead of drifting out to the cap.
     pub fn converging(&self, cid: &Cid) -> bool {
+        // Repairing back up toward the floor, or shedding cold surplus back down to it (Schmitt).
+        if self.is_at_risk(cid) || self.is_surplus(cid) {
+            return true;
+        }
         match self.cid_health(cid) {
-            None => true, // not yet scanned — check it soon
-            Some(h) if h.floor == 0 => false,
-            Some(h) if h.effective < h.floor => true, // below floor — repairing
-            Some(h) if h.effective > h.floor => {
-                self.served_pulls(cid) < self.config.degrade_threshold // surplus — shed only if cold
+            Some(h) if h.floor > 0 && h.effective > h.floor + (h.floor / 8).max(2) => {
+                self.served_pulls(cid) < self.config.degrade_threshold // above band — shed if cold
             }
-            Some(_) => false, // exactly at the floor — durable
+            _ => false,
         }
     }
 
