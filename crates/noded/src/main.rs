@@ -1104,6 +1104,27 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let events = zeph_events::EventBus::default();
     engine.set_events(events.clone());
 
+    // Demand-driven scaling: the serve path fires a CID here the instant its served-pull count
+    // crosses scale_threshold; a bounded worker recruits one more provider right then. Scaling
+    // reacts to ACCESS, not to any scan/distribute cadence — so a healthy CID that's backing off
+    // its durability re-check (up to ~32min) still gets an extra replica the moment it goes hot.
+    {
+        let (scale_tx, mut scale_rx) = tokio::sync::mpsc::unbounded_channel::<Cid>();
+        engine.set_scale_trigger(scale_tx);
+        let scale_engine = engine.clone();
+        tokio::spawn(async move {
+            let sem = Arc::new(tokio::sync::Semaphore::new(4));
+            while let Some(cid) = scale_rx.recv().await {
+                let permit = sem.clone().acquire_owned().await.expect("scale sem");
+                let eng = scale_engine.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    eng.scale_one(cid).await;
+                });
+            }
+        });
+    }
+
     // Background job coordinator (foundation §51): the periodic lifecycle, re-announce, and
     // future per-item reactive jobs run THROUGH it — prioritized, deduped (a slow pass can't
     // stack), retried, and metered. It is a BOUNDED-CONCURRENCY scheduler, so it runs as a

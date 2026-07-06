@@ -238,6 +238,10 @@ pub struct ObjEngine {
     /// dashboard reads accurate global counts without any one job scanning the whole set.
     at_risk_ids: Mutex<HashSet<[u8; 32]>>,
     fading_ids: Mutex<HashSet<[u8; 32]>>,
+    /// Set by the node: a channel to fire demand-driven scaling. When a served pull crosses
+    /// scale_threshold the serve path sends the cid here, and a worker recruits another provider
+    /// immediately — scaling reacts to access, not to any scan/distribute cadence.
+    scale_trigger: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<Cid>>,
 }
 
 impl ObjEngine {
@@ -276,6 +280,7 @@ impl ObjEngine {
             announced_at: Mutex::new(HashMap::new()),
             at_risk_ids: Mutex::new(HashSet::new()),
             fading_ids: Mutex::new(HashSet::new()),
+            scale_trigger: std::sync::OnceLock::new(),
         })
     }
 
@@ -1621,10 +1626,17 @@ impl ObjEngine {
     /// downloads have another source — bandwidth headroom above the durability
     /// floor. Bounded to one recruit per hot CID per cycle (periodic principle);
     /// when demand fades, Degradation sheds the extra providers.
+    /// Wire the demand-driven scale trigger (the node passes the sender; a worker drains it).
+    pub fn set_scale_trigger(&self, tx: tokio::sync::mpsc::UnboundedSender<Cid>) {
+        let _ = self.scale_trigger.set(tx);
+    }
+
+    /// Periodic backstop + demand-window reset: snapshot & clear the pull window, recruit for
+    /// anything still hot. The INSTANT path is demand-driven (scale_one, fired on the serve path
+    /// the moment a pull crosses scale_threshold) — this just resets the window and mops up any
+    /// residue, so it is no longer the primary scaling trigger and never gates on a scan.
     pub async fn scale(&self) -> ScaleReport {
         let mut report = ScaleReport::default();
-        let me = self.transport.node_id();
-        // Snapshot + reset the demand window.
         let demand: HashMap<[u8; 32], u32> = {
             let mut d = self.demand.lock().expect("demand");
             std::mem::take(&mut *d)
@@ -1633,44 +1645,49 @@ impl ObjEngine {
             if pulls < self.config.scale_threshold {
                 continue;
             }
-            let cid = Cid(cid_bytes);
-            if self.store.is_tombstoned(&cid) {
-                continue;
-            }
-            // Must be able to mint a fresh piece to hand out.
-            if !(self.store.piece_count(&cid) >= 2 || self.store.has_content(&cid)) {
-                continue;
-            }
-            let Some(gen) = self.store.generation(&cid) else {
-                continue;
-            };
             report.hot += 1;
-
-            let providers = self.routing.resolve(cid).await.unwrap_or_default();
-            // Intrinsic ceiling (self-correcting, no network-size input): each
-            // provider holds ≥2 pieces (the repair-recode minimum), so a CID of
-            // n pieces spreads across at most n/2 providers. Bigger content has
-            // more pieces → naturally more providers (bandwidth).
-            let max_providers = (target_pieces(gen.k as usize) / 2).max(1);
-            if providers.len() >= max_providers {
-                continue;
-            }
-            let provider_ids: HashSet<NodeId> = providers.iter().map(|p| p.node_id).collect();
-            let Some(piece) = self.mint_piece(&cid, &gen) else {
-                continue;
-            };
-            // Recruit one new provider: a live peer not already holding the CID.
-            for (id, addr) in self.peer_source.peers().await {
-                if id == me || provider_ids.contains(&id) {
-                    continue;
-                }
-                if self.push_piece(&addr, cid, &gen, &piece).await.is_ok() {
-                    report.scaled += 1;
-                    break;
-                }
+            if self.scale_one(Cid(cid_bytes)).await {
+                report.scaled += 1;
             }
         }
         report
+    }
+
+    /// Recruit ONE additional provider for a hot CID (more replicas → more serving bandwidth), up
+    /// to the intrinsic ceiling: a CID of n pieces spreads across at most n/2 providers (each
+    /// holds ≥2), so bigger content naturally gets more providers. Demand-driven — fired the
+    /// instant a pull crosses scale_threshold, with no scan/distribute cadence gating it.
+    pub async fn scale_one(&self, cid: Cid) -> bool {
+        let me = self.transport.node_id();
+        if self.store.is_tombstoned(&cid) {
+            return false;
+        }
+        // Must be able to mint a fresh piece to hand out.
+        if !(self.store.piece_count(&cid) >= 2 || self.store.has_content(&cid)) {
+            return false;
+        }
+        let Some(gen) = self.store.generation(&cid) else {
+            return false;
+        };
+        let providers = self.routing.resolve(cid).await.unwrap_or_default();
+        let max_providers = (target_pieces(gen.k as usize) / 2).max(1);
+        if providers.len() >= max_providers {
+            return false;
+        }
+        let provider_ids: HashSet<NodeId> = providers.iter().map(|p| p.node_id).collect();
+        let Some(piece) = self.mint_piece(&cid, &gen) else {
+            return false;
+        };
+        // Recruit one new provider: a live peer not already holding the CID.
+        for (id, addr) in self.peer_source.peers().await {
+            if id == me || provider_ids.contains(&id) {
+                continue;
+            }
+            if self.push_piece(&addr, cid, &gen, &piece).await.is_ok() {
+                return true;
+            }
+        }
+        false
     }
 
     /// Drop one stored coded piece (Degradation MOVE-less shed — reduces
@@ -1808,12 +1825,27 @@ impl ObjEngine {
                 // Record a real fetch: demand (drives Scaling) + last-served
                 // recency (drives Fade — serve-only, not lifecycle writes).
                 if !pieces.is_empty() {
-                    *self
-                        .demand
-                        .lock()
-                        .expect("demand")
-                        .entry(cid.0)
-                        .or_insert(0) += 1;
+                    // Count the pull; the MOMENT it crosses scale_threshold, fire a demand-driven
+                    // scale for this cid (and reset its window) — replication reacts to access
+                    // instantly, independent of any scan/distribute cadence.
+                    // Consume the count for an INSTANT trigger only when a trigger is wired;
+                    // otherwise let it accumulate for the periodic scale() backstop (tests).
+                    let fire = {
+                        let mut d = self.demand.lock().expect("demand");
+                        let n = d.entry(cid.0).or_insert(0);
+                        *n += 1;
+                        if self.scale_trigger.get().is_some() && *n >= self.config.scale_threshold {
+                            *n = 0;
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if fire {
+                        if let Some(tx) = self.scale_trigger.get() {
+                            let _ = tx.send(cid);
+                        }
+                    }
                     self.last_served
                         .lock()
                         .expect("last_served")
