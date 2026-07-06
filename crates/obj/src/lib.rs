@@ -36,6 +36,15 @@ pub const ALPN: &[u8] = b"/craftec/piece/1";
 /// Re-announce a provider record this long after its last announce (foundation §462:
 /// 22h re-announce inside a 48h DHT TTL). Per-cid scheduling — NOT every cycle.
 const REPUBLISH_MS: u64 = 22 * 3600 * 1000;
+/// On ingest, re-announce our (growing) piece count at most this often per cid — keeps provider
+/// records tracking real holdings so the health scan's summed `effective` doesn't undercount and
+/// churn repairs, without an announce-per-piece flood.
+const INGEST_ANNOUNCE_DEBOUNCE_MS: u64 = 2000;
+/// How long the health scan caches the alive-peer set used to exclude DEAD holders (whose
+/// provider records linger until TTL). Bounds liveness lookups to one per this window.
+const ALIVE_CACHE: Duration = Duration::from_secs(10);
+/// Timeout for a liveness probe (a connect attempt) when no membership source is wired.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Cids processed per chunk in the health-scan sweep + re-announce refresh. Between chunks the
 /// loop sleeps `ObjConfig::pace_delay`, bounding in-flight DHT ops and trickling the load
 /// instead of an O(N) burst — so both scale to thousands of cids without storming the overlay.
@@ -242,6 +251,13 @@ pub struct ObjEngine {
     /// scale_threshold the serve path sends the cid here, and a worker recruits another provider
     /// immediately — scaling reacts to access, not to any scan/distribute cadence.
     scale_trigger: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<Cid>>,
+    /// Liveness source (set by the node = membership; a test source in tests). The health scan
+    /// filters provider records by this so a DIED holder — whose record lingers until TTL — stops
+    /// inflating a cid's effective count, and repair fires. None → no filtering (legacy).
+    liveness: Mutex<Option<Arc<dyn PeerSource>>>,
+    alive_cache: Mutex<Option<(Instant, HashSet<NodeId>)>>,
+    /// Per-node liveness probe cache (used only when no membership source is wired — e.g. tests).
+    node_liveness: Mutex<HashMap<NodeId, (Instant, bool)>>,
 }
 
 impl ObjEngine {
@@ -281,6 +297,9 @@ impl ObjEngine {
             at_risk_ids: Mutex::new(HashSet::new()),
             fading_ids: Mutex::new(HashSet::new()),
             scale_trigger: std::sync::OnceLock::new(),
+            liveness: Mutex::new(None),
+            alive_cache: Mutex::new(None),
+            node_liveness: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1226,6 +1245,51 @@ impl ObjEngine {
     /// live capable holders, it mints one fresh piece and pushes it to a peer
     /// that isn't yet a holder (HAVE ↑ toward the floor). Degradation (HAVE ↓)
     /// and WANT-gated fade are the loop's later halves.
+    /// Wire the liveness source (membership in production; a test source in tests). Providers
+    /// not in this set are treated as gone by the health scan.
+    pub fn set_liveness(&self, src: Arc<dyn PeerSource>) {
+        *self.liveness.lock().expect("liveness") = Some(src);
+    }
+
+    /// Currently-alive peer node-ids (cached ~10s). None if no liveness source is wired (then the
+    /// health scan does not filter — legacy behaviour).
+    async fn alive_peers(&self) -> Option<HashSet<NodeId>> {
+        let src = self.liveness.lock().expect("liveness").clone()?;
+        {
+            let c = self.alive_cache.lock().expect("alive_cache");
+            if let Some((t, set)) = c.as_ref() {
+                if t.elapsed() < ALIVE_CACHE {
+                    return Some(set.clone());
+                }
+            }
+        }
+        let set: HashSet<NodeId> = src.peers().await.into_iter().map(|(id, _)| id).collect();
+        *self.alive_cache.lock().expect("alive_cache") = Some((Instant::now(), set.clone()));
+        Some(set)
+    }
+
+    /// Liveness fallback when no membership source is wired: probe the holder with a short
+    /// connect (cached ~10s). A killed node whose transport is closed fails to connect → dead.
+    async fn probe_alive(&self, id: NodeId, addr: &PeerAddr) -> bool {
+        {
+            let c = self.node_liveness.lock().expect("node_liveness");
+            if let Some((t, alive)) = c.get(&id) {
+                if t.elapsed() < ALIVE_CACHE {
+                    return *alive;
+                }
+            }
+        }
+        let alive = tokio::time::timeout(PROBE_TIMEOUT, self.transport.connect(addr, ALPN))
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false);
+        self.node_liveness
+            .lock()
+            .expect("node_liveness")
+            .insert(id, (Instant::now(), alive));
+        alive
+    }
+
     /// Scan ONE small chunk of cids — a coordinator-managed unit. Callers submit many of these,
     /// paced, so no single job sweeps the whole set or holds a slot while it sleeps. Verdicts
     /// roll into the engine's persistent at-risk / fading sets, so `report.at_risk`/`fading` are
@@ -1241,6 +1305,7 @@ impl ObjEngine {
             async move { (cid, self.routing.resolve(cid).await.unwrap_or_default()) }
         }))
         .await;
+        let alive_set = self.alive_peers().await;
 
         for (cid, providers) in resolved {
             if self.store.is_tombstoned(&cid) {
@@ -1275,6 +1340,16 @@ impl ObjEngine {
             // the right, fast signal for a periodic maintenance scan.
             for p in &providers {
                 if p.node_id == me {
+                    continue;
+                }
+                // Skip holders no longer alive: a dead holder's record lingers until TTL but its
+                // pieces are gone, so counting it would suppress a needed repair. Use the wired
+                // liveness source (membership) if present, else fall back to a cached probe.
+                let is_alive = match &alive_set {
+                    Some(set) => set.contains(&p.node_id),
+                    None => self.probe_alive(p.node_id, &p.addr).await,
+                };
+                if !is_alive {
                     continue;
                 }
                 have += p.piece_count as usize;
@@ -1930,12 +2005,28 @@ impl ObjEngine {
         if push.system {
             let _ = self.store.mark_system(&cid);
         }
-        // Announce as provider on first piece for this CID. (Distribution no longer relies on
-        // this record being fresh — it balances within a pass via a local belief — so a single
-        // first-piece announce suffices and we avoid an announce-per-ingest flood.)
-        if was_empty {
+        // Announce our provider record with the CURRENT piece count — immediately on the first
+        // piece (become a provider) and thereafter DEBOUNCED per-cid. The health scan's
+        // `effective` is the SUM of providers' record counts vs the floor; a holder that only ever
+        // announced count=1 undercounts its real holdings, so `effective` stays below the floor
+        // forever → perpetual repair that keeps MINTING pieces. Announcing the real count as it
+        // grows lets `effective` reach the floor and repair converge; debounce avoids a flood.
+        let now = self.now_millis();
+        let due = was_empty || {
+            let sched = self.announced_at.lock().expect("announced_at");
+            sched
+                .get(&cid.0)
+                .is_none_or(|t| now.saturating_sub(*t) >= INGEST_ANNOUNCE_DEBOUNCE_MS)
+        };
+        if due {
             let count = self.store.piece_count(&cid) as u32;
-            let _ = self.routing.announce(cid, count, false).await;
+            let pinned = self.store.is_pinned(&cid);
+            if self.routing.announce(cid, count, pinned).await.is_ok() {
+                self.announced_at
+                    .lock()
+                    .expect("announced_at")
+                    .insert(cid.0, now);
+            }
         }
         wire::PiecePushAck {
             ok: true,

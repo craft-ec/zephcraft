@@ -1444,6 +1444,10 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         .set_coordinator(transport.clone(), membership.clone())
         .await;
     mem_peers.set(membership.clone()).await;
+    // Membership is the health scan's LIVENESS source (on both routing paths): a holder that
+    // SWIM marks dead is excluded from durability counts so repair fires, instead of its stale
+    // provider record lingering until TTL.
+    engine.set_liveness(mem_peers.clone());
     // DHT overlay (flag-gated): bootstrap from seed peers, then expire stale records hourly.
     // Provider republish rides on the existing re-announce loop (routing.announce → DHT put).
     if let Some(dht) = &dht_node {
