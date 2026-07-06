@@ -20,7 +20,7 @@ use clap::{Parser, Subcommand};
 use zeph_core::Cid;
 use zeph_crypto::Keystore;
 use zeph_membership::Membership;
-use zeph_obj::{ObjConfig, ObjEngine};
+use zeph_obj::{ObjConfig, ObjEngine, PeerSource};
 use zeph_routing::TrackerRouting;
 use zeph_store::Store;
 
@@ -1566,13 +1566,22 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // when a scan completes — "submit as they are completed"), then re-enqueue it.
     {
         let sem = Arc::new(tokio::sync::Semaphore::new(8));
-        let (eng, st, q, seen) = (
+        let (eng, st, q, seen, live) = (
             engine.clone(),
             state.clone(),
             hs_queue.clone(),
             hs_seen.clone(),
+            mem_peers.clone(),
         );
         tokio::spawn(async move {
+            // Wait for membership to discover peers before the FIRST scan. On a fresh restart the
+            // peer view is empty, so a scan would see every provider as not-alive, flag healthy
+            // content at-risk, and kick off a spurious repair storm. Bounded by a max grace so a
+            // genuinely-alone node still proceeds (and maintains its own pinned content).
+            let start = std::time::Instant::now();
+            while live.peers().await.is_empty() && start.elapsed() < Duration::from_secs(60) {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
             loop {
                 let next = q.lock().expect("q").peek().map(|r| r.0 .0);
                 let Some(due) = next else {
