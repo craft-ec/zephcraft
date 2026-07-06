@@ -195,6 +195,8 @@ pub struct State {
     pub appreg: std::sync::Arc<crate::appreg::AppRegistry>,
     /// Governance: one durable chain deriving both the governor set and program registry.
     pub gov: std::sync::Arc<crate::governance::GovernanceChainStore>,
+    /// Generic program accounts — any program's single-writer state (the program is the writer).
+    pub accounts: std::sync::Arc<crate::account::ProgramAccountStore>,
 }
 
 impl State {
@@ -424,6 +426,8 @@ async fn handle_rpc(state: &State, line: &str) -> serde_json::Value {
         Some("invoke") => rpc_invoke(state, &request, id).await,
         Some("deploy") => rpc_deploy(state, &request, id).await,
         Some("publish_program") => rpc_publish_program(state, &request, id).await,
+        Some("program_advance") => rpc_program_advance(state, &request, id).await,
+        Some("program_resolve") => rpc_program_resolve(state, &request, id).await,
         Some("gov") => rpc_gov(state, id).await,
         Some("gov_propose") => rpc_gov_propose(state, &request, id).await,
         Some("gov_sign") => rpc_gov_sign(state, &request, id).await,
@@ -1028,6 +1032,67 @@ async fn rpc_publish_program(
             {"cid": content_cid, "size": bytes.len()}}),
         Err(e) => rpc_err(id, format!("publish failed: {e}")),
     }
+}
+
+/// Parse a required 32-byte hex field (e.g. a program cid) from the params.
+fn parse_hex32(v: Option<&serde_json::Value>) -> Result<[u8; 32], String> {
+    let h = v.and_then(|x| x.as_str()).ok_or("missing hex field")?;
+    <[u8; 32]>::try_from(hex::decode(h.trim()).map_err(|_| "bad hex")?.as_slice())
+        .map_err(|_| "expected 32 bytes".to_string())
+}
+
+/// Parse an optional hex-bytes field (empty/absent → empty vec).
+fn parse_hex_bytes(v: Option<&serde_json::Value>) -> Result<Vec<u8>, String> {
+    match v.and_then(|x| x.as_str()) {
+        Some(h) if !h.trim().is_empty() => hex::decode(h.trim()).map_err(|_| "bad hex".into()),
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// Advance a generic program account: run <program> on `(state, request)` — the program IS the
+/// writer. Returns {account, root}.
+async fn rpc_program_advance(
+    state: &State,
+    req: &serde_json::Value,
+    id: serde_json::Value,
+) -> serde_json::Value {
+    let program = match parse_hex32(req["params"].get("program")) {
+        Ok(p) => p,
+        Err(e) => return rpc_err(id, e),
+    };
+    let seed = match parse_hex_bytes(req["params"].get("seed")) {
+        Ok(s) => s,
+        Err(_) => return rpc_err(id, "bad seed hex".into()),
+    };
+    let request = match parse_hex_bytes(req["params"].get("request")) {
+        Ok(r) => r,
+        Err(_) => return rpc_err(id, "bad request hex".into()),
+    };
+    match state.accounts.advance(program, &seed, &request).await {
+        Ok(r) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":
+            {"account": hex::encode(r.account), "root": hex::encode(r.new_root)}}),
+        Err(e) => rpc_err(id, e.to_string()),
+    }
+}
+
+/// Read a generic program account's current (local) state. Returns {account, state, size}.
+async fn rpc_program_resolve(
+    state: &State,
+    req: &serde_json::Value,
+    id: serde_json::Value,
+) -> serde_json::Value {
+    let program = match parse_hex32(req["params"].get("program")) {
+        Ok(p) => p,
+        Err(e) => return rpc_err(id, e),
+    };
+    let seed = match parse_hex_bytes(req["params"].get("seed")) {
+        Ok(s) => s,
+        Err(_) => return rpc_err(id, "bad seed hex".into()),
+    };
+    let st = state.accounts.resolve(program, &seed).await;
+    let account = hex::encode(zeph_com::pda(&program, &seed).0);
+    serde_json::json!({"jsonrpc":"2.0","id":id,"result":
+        {"account": account, "state": hex::encode(&st), "size": st.len()}})
 }
 
 async fn rpc_deploy(

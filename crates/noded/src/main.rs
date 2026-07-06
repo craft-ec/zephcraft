@@ -4,6 +4,7 @@
 //! Boot order (foundation §12, skeleton subset): identity → transport →
 //! control servers → serve loop → heartbeat.
 
+mod account;
 mod appreg;
 mod control;
 mod governance;
@@ -118,6 +119,22 @@ enum Command {
     Apps,
     /// Publish a WASM program to the grid (returns its content cid).
     PublishProgram { file: String },
+    /// Advance a generic program account: run <program> on its state (the program is the writer).
+    ProgramAdvance {
+        #[arg(long)]
+        program: String,
+        #[arg(long)]
+        seed: String,
+        #[arg(long, default_value = "")]
+        request: String,
+    },
+    /// Read a generic program account's state.
+    ProgramResolve {
+        #[arg(long)]
+        program: String,
+        #[arg(long)]
+        seed: String,
+    },
     /// List network-owned programs and their canonical cids.
     Programs,
     /// Show the governance set (governors, threshold, seq).
@@ -357,6 +374,14 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Deploy { file, name }) => cmd_deploy(&data_dir, &file, name.as_deref()).await,
         Some(Command::Apps) => cmd_apps(&data_dir).await,
         Some(Command::PublishProgram { file }) => cmd_publish_program(&data_dir, &file).await,
+        Some(Command::ProgramAdvance {
+            program,
+            seed,
+            request,
+        }) => cmd_program_advance(&data_dir, &program, &seed, &request).await,
+        Some(Command::ProgramResolve { program, seed }) => {
+            cmd_program_resolve(&data_dir, &program, &seed).await
+        }
         Some(Command::Programs) => cmd_programs(&data_dir).await,
         Some(Command::Gov) => cmd_gov(&data_dir).await,
         Some(Command::GovPropose {
@@ -496,6 +521,42 @@ async fn cmd_publish_program(data_dir: &Path, file: &str) -> anyhow::Result<()> 
     println!("published {} ({} bytes)", file, bytes.len());
     println!("cid: {cid}");
     println!("activate: zeph gov-propose --set-program <name>={cid}");
+    Ok(())
+}
+
+async fn cmd_program_advance(
+    data_dir: &Path,
+    program: &str,
+    seed: &str,
+    request: &str,
+) -> anyhow::Result<()> {
+    let params = serde_json::json!({"program": program, "seed": seed, "request": request});
+    let res =
+        control::query_unix_params(&data_dir.join("zeph.sock"), "program_advance", params).await?;
+    println!(
+        "account {}",
+        res.get("account").and_then(|v| v.as_str()).unwrap_or("")
+    );
+    println!(
+        "root {}",
+        res.get("root").and_then(|v| v.as_str()).unwrap_or("")
+    );
+    Ok(())
+}
+
+async fn cmd_program_resolve(data_dir: &Path, program: &str, seed: &str) -> anyhow::Result<()> {
+    let params = serde_json::json!({"program": program, "seed": seed});
+    let res =
+        control::query_unix_params(&data_dir.join("zeph.sock"), "program_resolve", params).await?;
+    println!(
+        "account {}",
+        res.get("account").and_then(|v| v.as_str()).unwrap_or("")
+    );
+    println!(
+        "state ({} bytes): {}",
+        res.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
+        res.get("state").and_then(|v| v.as_str()).unwrap_or("")
+    );
     Ok(())
 }
 
@@ -1099,6 +1160,9 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         engine.clone(),
         routing.clone(),
     ));
+    // Generic program accounts — any program's single-writer state (the program IS the writer).
+    let account_store =
+        std::sync::Arc::new(account::ProgramAccountStore::open(engine.clone(), data_dir));
     let state = Arc::new(control::State {
         clock: transport.clock(),
         node_id: identity.node_id().to_hex(),
@@ -1138,6 +1202,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         routing: routing.clone(),
         appreg: appreg_store.clone(),
         gov: governance_store.clone(),
+        accounts: account_store.clone(),
         settings: {
             let oc = engine.config();
             control::NodeSettings {
