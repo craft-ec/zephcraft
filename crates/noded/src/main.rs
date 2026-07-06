@@ -1616,7 +1616,9 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                         // Adaptive backoff: an at-risk cid stays HOT (recheck_min); a healthy cid
                         // backs OFF — double its interval up to recheck_max — so the bounded scan
                         // throughput concentrates on content that actually needs attention.
-                        let next = if eng.is_at_risk(&cid) {
+                        // Stay HOT while actively CONVERGING (repairing below the floor, or
+                        // shedding cold surplus above it); back off once stable.
+                        let next = if eng.converging(&cid) {
                             recheck_min
                         } else {
                             (delay * 2).min(recheck_max)

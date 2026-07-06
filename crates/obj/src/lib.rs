@@ -1588,6 +1588,22 @@ impl ObjEngine {
         self.fading_ids.lock().expect("fading_ids").contains(&cid.0)
     }
 
+    /// Is this cid actively CONVERGING toward the floor and so worth re-scanning frequently?
+    /// True while REPAIRING (below floor) or SHEDDING cold surplus (above floor + demand cold);
+    /// false once stable (at the floor, warm surplus kept for bandwidth, or fading). Drives the
+    /// scheduler's backoff so shedding keeps pace with repair instead of drifting out to the cap.
+    pub fn converging(&self, cid: &Cid) -> bool {
+        match self.cid_health(cid) {
+            None => true, // not yet scanned — check it soon
+            Some(h) if h.floor == 0 => false,
+            Some(h) if h.effective < h.floor => true, // below floor — repairing
+            Some(h) if h.effective > h.floor => {
+                self.served_pulls(cid) < self.config.degrade_threshold // surplus — shed only if cold
+            }
+            Some(_) => false, // exactly at the floor — durable
+        }
+    }
+
     /// The last-scan health snapshot for a cid, if scanned.
     pub fn cid_health(&self, cid: &Cid) -> Option<CidHealth> {
         self.cid_health
