@@ -77,19 +77,22 @@ impl ProgramAccountStore {
         (!out.is_empty()).then_some(out)
     }
 
-    /// Advance `account = pda(program_cid, seed)` by running its program — the program's
-    /// execution IS the write. Persists the new state locally + publishes it as durable
-    /// content. Single-writer: one advance at a time per account.
+    /// Advance an account by running its program — the program's execution IS the write.
+    /// The account ADDRESS is `pda(program_id, seed)` (a STABLE namespace that survives
+    /// code upgrades), while the EXECUTING WASM is `code_cid` — so governance can swap the
+    /// program behind an account without moving it. Persists the new state locally +
+    /// publishes it as durable content. Single-writer: one advance at a time per account.
     pub async fn advance(
         &self,
-        program_cid: [u8; 32],
+        program_id: [u8; 32],
+        code_cid: [u8; 32],
         seed: &[u8],
         request: &[u8],
     ) -> anyhow::Result<AdvanceResult> {
-        let account = pda(&program_cid, seed).0;
+        let account = pda(&program_id, seed).0;
         let prev = self.load_state(account);
         let new_state = self
-            .run(program_cid, &prev, request)
+            .run(code_cid, &prev, request)
             .await
             .ok_or_else(|| anyhow::anyhow!("program rejected the request"))?;
         std::fs::write(self.state_path(account), &new_state)?;

@@ -5,10 +5,10 @@
 //! control servers → serve loop → heartbeat.
 
 mod account;
-mod appreg;
 mod control;
 mod governance;
 mod peers;
+mod programreg;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1137,12 +1137,14 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     }
 
     // Control state, shared by the heartbeat loop and the control servers.
-    // Phase 4c: the durable app-name registry backing (self-attested v1 ramp).
-    let appreg_store = std::sync::Arc::new(appreg::AppRegistry::open(
+    // Generic program accounts — any program's single-writer state (the program IS the writer).
+    // Built FIRST so the program registry can share this same store Arc.
+    let account_store =
+        std::sync::Arc::new(account::ProgramAccountStore::open(engine.clone(), data_dir));
+    // Phase 4c: the durable program-name registry — a THIN consumer of the account store.
+    let programreg_store = std::sync::Arc::new(programreg::ProgramRegistry::open(
         identity.clone(),
-        engine.clone(),
-        routing.clone(),
-        data_dir,
+        account_store.clone(),
     ));
     // Governance: one durable, self-verifying chain that derives BOTH the governor set
     // and the program registry, published + resolved cross-node (seeded 1-of-1 with this
@@ -1160,9 +1162,6 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         engine.clone(),
         routing.clone(),
     ));
-    // Generic program accounts — any program's single-writer state (the program IS the writer).
-    let account_store =
-        std::sync::Arc::new(account::ProgramAccountStore::open(engine.clone(), data_dir));
     let state = Arc::new(control::State {
         clock: transport.clock(),
         node_id: identity.node_id().to_hex(),
@@ -1200,7 +1199,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         hosting_cids: std::sync::atomic::AtomicU64::new(0),
         com: com_service.clone(),
         routing: routing.clone(),
-        appreg: appreg_store.clone(),
+        programreg: programreg_store.clone(),
         gov: governance_store.clone(),
         accounts: account_store.clone(),
         settings: {
@@ -1312,8 +1311,6 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let announce_engine = engine.clone();
     let announce_sql = craftsql.clone();
     let announce_jobs = jobs.clone();
-    let announce_appreg = appreg_store.clone();
-    let announce_clock = transport.clock();
     let reannounce_secs = cfg.reannounce_secs.max(1);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(reannounce_secs));
@@ -1321,8 +1318,6 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
             interval.tick().await;
             let e = announce_engine.clone();
             let sql = announce_sql.clone();
-            let appreg = announce_appreg.clone();
-            let clock = announce_clock.clone();
             // Distribution priority: getting records to peers matters, but yields
             // to Repair. Deduped so a slow re-announce can't stack.
             announce_jobs.submit(
@@ -1332,8 +1327,6 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                 move || {
                     let e = e.clone();
                     let sql = sql.clone();
-                    let appreg = appreg.clone();
-                    let clock = clock.clone();
                     async move {
                         let n = e.reannounce_providers().await;
                         if n > 0 {
@@ -1346,10 +1339,6 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                         if h > 0 {
                             tracing::info!(dbs = h, "re-announced CraftSQL heads/manifests");
                         }
-                        // App-registry head (no other periodic re-publish) — TTL
-                        // keep-alive + backend migration (tracker→DHT).
-                        let now = clock.now().millis();
-                        appreg.republish(now).await;
                         Ok(())
                     }
                 },
@@ -1373,7 +1362,9 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     );
     membership.start(peers, member_rx);
     governance_store.set_membership(membership.clone()).await;
-    appreg_store.set_programs(governance_store.clone()).await;
+    programreg_store
+        .set_programs(governance_store.clone())
+        .await;
     mem_peers.set(membership.clone()).await;
     // Membership is the health scan's LIVENESS source (on both routing paths): a holder that
     // SWIM marks dead is excluded from durability counts so repair fires, instead of its stale

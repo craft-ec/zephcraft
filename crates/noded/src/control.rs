@@ -191,8 +191,9 @@ pub struct State {
     pub com: std::sync::Arc<zeph_com::InvokeService>,
     /// Content routing — for resolving/announcing signed app-name heads (KIND_APP).
     pub routing: std::sync::Arc<dyn zeph_routing::ContentRouting>,
-    /// Phase 4c: durable app-name registry backing (open owner-signed CRDT).
-    pub appreg: std::sync::Arc<crate::appreg::AppRegistry>,
+    /// Phase 4c: durable program-name registry (open owner-signed CRDT), a thin
+    /// consumer of the program-account store.
+    pub programreg: std::sync::Arc<crate::programreg::ProgramRegistry>,
     /// Governance: one durable chain deriving both the governor set and program registry.
     pub gov: std::sync::Arc<crate::governance::GovernanceChainStore>,
     /// Generic program accounts — any program's single-writer state (the program is the writer).
@@ -1068,7 +1069,11 @@ async fn rpc_program_advance(
         Ok(r) => r,
         Err(_) => return rpc_err(id, "bad request hex".into()),
     };
-    match state.accounts.advance(program, &seed, &request).await {
+    match state
+        .accounts
+        .advance(program, program, &seed, &request)
+        .await
+    {
         Ok(r) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":
             {"account": hex::encode(r.account), "root": hex::encode(r.new_root)}}),
         Err(e) => rpc_err(id, e.to_string()),
@@ -1267,21 +1272,17 @@ async fn deploy_bytes(
         .await
         .map_err(|e| format!("deploy failed: {e}"))?;
     let version = match parse_node_id(&state.node_id) {
-        Some(own) => match state.routing.resolve_app(own, name).await {
-            Ok(Some(rec)) => rec.version + 1,
-            _ => 1,
-        },
+        Some(own) => state.programreg.current_version(own.0, name).await + 1,
         None => 1,
     };
-    // Register into the authoritative committee-attested registry FIRST — if the current
-    // registry program rejects the submission (e.g. an invalid name under v2), fail the
-    // deploy before announcing anything.
+    // Register into the program registry — the registry program validates the submission
+    // (e.g. rejects an invalid name), failing the deploy if so. The program-account store
+    // persists + publishes it durably; no DHT announce.
     state
-        .appreg
+        .programreg
         .register(name, cid.0, version, state.clock.now().millis())
         .await
         .map_err(|e| e.to_string())?;
-    let _ = state.routing.announce_app(name, cid, version).await;
     apps_add(state, name, &cid.to_hex(), version).await;
     Ok(serde_json::json!({
         "name": name, "cid": cid.to_hex(), "size": bytes.len(), "version": version
@@ -1312,11 +1313,9 @@ async fn rpc_invoke(
         let Some(publisher) = publisher else {
             return rpc_err(id, "name: bad publisher (expected <hex>/<app>)".into());
         };
-        // Registry resolution: local first (own names), then cross-node (fetch the
-        // owner's committee-attested registry head), then KIND_APP (legacy) fallback.
-        if let Some(cid) = state.appreg.resolve(publisher.0, app_name).await {
-            (cid, app_name.to_string())
-        } else if let Some(cid) = state.appreg.resolve_cross(publisher.0, app_name).await {
+        // Registry resolution: the program-name registry first, then KIND_APP (legacy)
+        // fallback.
+        if let Some(cid) = state.programreg.resolve(publisher.0, app_name).await {
             (cid, app_name.to_string())
         } else {
             match state.routing.resolve_app(publisher, app_name).await {
