@@ -22,10 +22,13 @@ pub enum RegistryReq {
     Submit(Vec<u8>),
     /// Ask the writer to resolve `(owner, name)` to its current head cid.
     Resolve { owner: [u8; 32], name: String },
-    /// Ask a writer for the FULL current registry-account state bytes. Used for the
-    /// per-epoch state handoff: a node becoming the new epoch's writer fetches the
-    /// previous writer's state before serving so registrations survive rotation.
-    GetState,
+    /// Ask a writer for the FULL current registry-account state bytes of a SHARD. Used for
+    /// the per-epoch state handoff: a node becoming the new epoch's writer for `shard` fetches
+    /// the previous writer's state before serving so registrations survive rotation.
+    GetState { shard: u64 },
+    /// Ask the writer for the current version of `(owner, name)` (0 if unregistered) — so a
+    /// non-writer node can compute `prev + 1` for its next deploy without holding the shard.
+    CurrentVersion { owner: [u8; 32], name: String },
 }
 
 /// The writer's response.
@@ -38,6 +41,9 @@ pub enum RegistryResp {
     /// The full registry-account state bytes (empty = no state yet) — reply to `GetState`,
     /// used for the per-epoch state handoff.
     State(Vec<u8>),
+    /// The current version of a `(owner, name)` key (0 if unregistered) — reply to
+    /// `CurrentVersion`.
+    Version(u64),
     /// The writer rejected/failed the request.
     Err(String),
 }
