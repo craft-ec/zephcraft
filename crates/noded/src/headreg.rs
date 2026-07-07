@@ -125,6 +125,36 @@ pub struct HeadRegistry {
     last_epoch: RwLock<std::collections::HashMap<ShardKey, u64>>,
 }
 
+/// One head row for the dashboard — hex-encoded `(owner, cid)` + `name` + `version`.
+pub struct HeadRow {
+    pub owner: String,
+    pub name: String,
+    pub cid: String,
+    pub version: u64,
+}
+
+/// Every head this node holds, grouped by registry type (program heads / DB roots /
+/// manifests) — a per-node partial view (the registry is sharded, so a node holds only its
+/// own shards).
+#[derive(Default)]
+pub struct RegistryEntries {
+    pub programs: Vec<HeadRow>,
+    pub dbroots: Vec<HeadRow>,
+    pub manifests: Vec<HeadRow>,
+}
+
+/// Registry status for the dashboard. `writer_shards` = how many RT_PROGRAM shards this node
+/// currently writes (of [`SHARD_COUNT`]); the per-type counts are the `(owner, name)` rows
+/// across exactly the shards this node writes for each type — a per-node partial view.
+pub struct RegistryStatus {
+    pub epoch: u64,
+    pub eligible: usize,
+    pub writer_shards: usize,
+    pub program_heads: usize,
+    pub dbroots: usize,
+    pub manifests: usize,
+}
+
 impl HeadRegistry {
     /// Open the registry over a shared program-account store. The `clock` drives the per-epoch
     /// per-shard writer election — the writer is computed, not configured.
@@ -745,30 +775,77 @@ impl HeadRegistry {
         (count, hex::encode(Cid::of(&combined).0))
     }
 
-    /// Registry status for the dashboard: `(current_epoch, eligible_count, writer_shard_count,
-    /// entries)`. `writer_shard_count` = the shards THIS node currently writes; `entries` = the
-    /// total `(owner, name)` rows across exactly those shards (a per-node partial view — the
-    /// registry is sharded, so no single node sees every shard).
-    pub async fn status(&self) -> (u64, usize, usize, usize) {
+    /// Registry status for the dashboard. `writer_shards` = the RT_PROGRAM shards THIS node
+    /// currently writes; `program_heads` / `dbroots` / `manifests` = the total `(owner, name)`
+    /// rows across exactly the shards this node writes for each registry type (a per-node
+    /// partial view — the registry is sharded, so no single node sees every shard).
+    pub async fn status(&self) -> RegistryStatus {
         let epoch = self.effective_epoch();
         let eligible = self.eligible().await.len();
         let mut writer_shards = 0usize;
-        let mut entries = 0usize;
-        for shard in 0..SHARD_COUNT {
-            let sk = ShardKey {
-                rtype: RT_PROGRAM,
-                shard,
-            };
-            if !self.is_writer(sk).await {
-                continue;
+        let (mut program_heads, mut dbroots, mut manifests) = (0usize, 0usize, 0usize);
+        for &rtype in &[RT_PROGRAM, RT_DBROOT, RT_MANIFEST] {
+            for shard in 0..SHARD_COUNT {
+                let sk = ShardKey { rtype, shard };
+                if !self.is_writer(sk).await {
+                    continue;
+                }
+                if rtype == RT_PROGRAM {
+                    writer_shards += 1;
+                }
+                let raw = self
+                    .store
+                    .resolve(registry_program_cid(), &shard_seed(sk))
+                    .await;
+                let n = RegistryState::decode(&raw).map(|s| s.len()).unwrap_or(0);
+                match rtype {
+                    RT_PROGRAM => program_heads += n,
+                    RT_DBROOT => dbroots += n,
+                    _ => manifests += n,
+                }
             }
-            writer_shards += 1;
-            let raw = self
-                .store
-                .resolve(registry_program_cid(), &shard_seed(sk))
-                .await;
-            entries += RegistryState::decode(&raw).map(|s| s.len()).unwrap_or(0);
         }
-        (epoch, eligible, writer_shards, entries)
+        RegistryStatus {
+            epoch,
+            eligible,
+            writer_shards,
+            program_heads,
+            dbroots,
+            manifests,
+        }
+    }
+
+    /// Snapshot every head this node holds, grouped by registry type, for the dashboard.
+    /// A per-node partial view (sharded): for each of RT_PROGRAM / RT_DBROOT / RT_MANIFEST it
+    /// iterates the shards THIS node currently writes (same shard-iteration as [`Self::status`])
+    /// and collects each account's heads as hex-encoded rows.
+    pub async fn entries(&self) -> RegistryEntries {
+        let mut out = RegistryEntries::default();
+        for &rtype in &[RT_PROGRAM, RT_DBROOT, RT_MANIFEST] {
+            let bucket = match rtype {
+                RT_PROGRAM => &mut out.programs,
+                RT_DBROOT => &mut out.dbroots,
+                _ => &mut out.manifests,
+            };
+            for shard in 0..SHARD_COUNT {
+                let sk = ShardKey { rtype, shard };
+                if !self.is_writer(sk).await {
+                    continue;
+                }
+                let raw = self
+                    .store
+                    .resolve(registry_program_cid(), &shard_seed(sk))
+                    .await;
+                for e in RegistryState::decode(&raw).unwrap_or_default().entries() {
+                    bucket.push(HeadRow {
+                        owner: hex::encode(e.owner),
+                        name: e.name.clone(),
+                        cid: hex::encode(e.cid),
+                        version: e.version,
+                    });
+                }
+            }
+        }
+        out
     }
 }

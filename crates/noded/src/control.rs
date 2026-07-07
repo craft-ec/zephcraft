@@ -1858,9 +1858,10 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         axum::Json(gov_set_json(&set, ig)).into_response()
     }
 
-    // Program-registry status: the open, owner-signed, sharded registry's live view from
-    // THIS node — current writer-election epoch, eligible node count, how many of the 256
-    // shards this node currently writes, and the entry count across those shards.
+    // Head-registry status: the open, owner-signed, sharded registry's live view from THIS
+    // node — current writer-election epoch, eligible node count, how many of the 256 shards
+    // this node currently writes, and the per-type head counts (program heads, DB roots,
+    // manifests) across the shards it writes.
     async fn api_registry(
         AxumState(ctx): AxumState<HttpCtx>,
         Query(params): Query<TokenParam>,
@@ -1868,13 +1869,45 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         if params.token != *ctx.token {
             return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
         }
-        let (epoch, eligible, writer_shards, entries) = ctx.state.registry.status().await;
+        let st = ctx.state.registry.status().await;
         axum::Json(serde_json::json!({
-            "epoch": epoch,
-            "eligible": eligible,
-            "writer_shards": writer_shards,
+            "epoch": st.epoch,
+            "eligible": st.eligible,
+            "writer_shards": st.writer_shards,
             "shard_count": 256,
-            "entries": entries,
+            "program_heads": st.program_heads,
+            "dbroots": st.dbroots,
+            "manifests": st.manifests,
+        }))
+        .into_response()
+    }
+
+    // Browsable head-registry entries — every head on THIS node's shards, grouped by type
+    // (program heads / DB roots / manifests). A per-node partial view (sharded registry).
+    async fn api_registry_entries(
+        AxumState(ctx): AxumState<HttpCtx>,
+        Query(params): Query<TokenParam>,
+    ) -> axum::response::Response {
+        if params.token != *ctx.token {
+            return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
+        }
+        let e = ctx.state.registry.entries().await;
+        let rows = |v: Vec<crate::headreg::HeadRow>| -> Vec<serde_json::Value> {
+            v.into_iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "owner": r.owner,
+                        "name": r.name,
+                        "cid": r.cid,
+                        "version": r.version,
+                    })
+                })
+                .collect()
+        };
+        axum::Json(serde_json::json!({
+            "programs": rows(e.programs),
+            "dbroots": rows(e.dbroots),
+            "manifests": rows(e.manifests),
         }))
         .into_response()
     }
@@ -1896,6 +1929,7 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         .route("/api/deploy", axum::routing::post(api_deploy))
         .route("/api/governance", get(api_governance))
         .route("/api/registry", get(api_registry))
+        .route("/api/registry/entries", get(api_registry_entries))
         .route("/api/programs", get(api_programs))
         .route("/api/pending", get(api_pending))
         .route("/api/cids", get(api_cids))

@@ -272,7 +272,7 @@ struct Config {
     eviction_cooldown_secs: u64,
     /// Health-scan / lifecycle loop interval (seconds). Default 30.
     health_scan_secs: u64,
-    /// Provider + CraftSQL-head re-announce interval (seconds). Default 120.
+    /// Provider re-announce interval (seconds). Default 120.
     reannounce_secs: u64,
     /// Governance genesis: governor node-id hexes. Empty = seed 1-of-1 with this node.
     #[serde(default)]

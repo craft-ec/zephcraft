@@ -113,7 +113,8 @@
   <nav class="tabnav">
     <button class="tab-btn on" data-tab="overview" onclick="showTab('overview')">overview</button>
     <button class="tab-btn" data-tab="data" onclick="showTab('data')">data</button>
-    <button class="tab-btn" data-tab="programs" onclick="showTab('programs')">programs</button>
+    <button class="tab-btn" data-tab="registry" onclick="showTab('registry')">registry</button>
+    <button class="tab-btn" data-tab="governance" onclick="showTab('governance')">governance</button>
     <button class="tab-btn" data-tab="status" onclick="showTab('status')">status</button>
     <button class="tab-btn" data-tab="settings" onclick="showTab('settings')">settings</button>
   </nav>
@@ -190,56 +191,55 @@
     </div>
   </section>
 
-  <section id="tab-programs" class="tab" hidden>
-    <div class="muted" style="font-size:.76rem;line-height:1.55;margin-bottom:1rem">Everything the network runs is a <b style="color:var(--fg)">WASM program</b>. A small set are <b style="color:var(--fg)">protocol programs</b> the network owns and governs; everything else is a <b style="color:var(--fg)">user program</b>, listed by the <b style="color:var(--fg)">program registry</b> (itself a protocol program). Governance sets the protocol programs; the program registry is open and owner-signed — sharded, with a rotating writer per shard, no committee (its stats live in <b style="color:var(--fg)">Status</b>).</div>
-    <div class="subtabnav">
-      <button class="subtab on" data-group="programs" data-panel="protocol" onclick="showPanel('programs','protocol')">protocol</button>
-      <button class="subtab" data-group="programs" data-panel="apps" onclick="showPanel('programs','apps')">user programs</button>
+  <section id="tab-registry" class="tab" hidden>
+    <div class="muted" style="font-size:.76rem;line-height:1.55;margin-bottom:1rem">Everything the network runs is a <b style="color:var(--fg)">WASM program</b>. The <b style="color:var(--fg)">head registry</b> is the open, owner-signed map of heads — it holds <b style="color:var(--fg)">program heads, DB roots, and manifests</b> — sharded, with a rotating writer per shard and no committee. A small set of <b style="color:var(--fg)">protocol programs</b> the network owns and governs live under <b style="color:var(--fg)">Governance</b>; everything else is a <b style="color:var(--fg)">user program</b>, listed here by the head registry.</div>
+    <div class="card">
+      <div class="cardhead">head registry <span class="muted">— open, owner-signed · sharded, rotating writer per shard · no committee · holds program heads, DB roots &amp; manifests</span></div>
+      <div id="reg-status"><div class="muted">…</div></div>
     </div>
-    <div class="subpanel" data-group="programs" data-panel="protocol">
-      <div class="card">
-        <div class="cardhead">protocol programs <span class="muted">— network-owned · canonical WASM set by governance</span></div>
-        <div id="prog-protocol"><div class="muted">loading…</div></div>
-      </div>
+    <div class="card">
+      <div class="cardhead">registry entries <span class="muted">— heads on this node's shards (sharded registry — a node holds its own shards, most but not guaranteed all)</span></div>
+      <div id="reg-entries"><div class="muted">loading…</div></div>
     </div>
-    <div class="subpanel" data-group="programs" data-panel="apps" hidden>
-      <div class="card">
-        <div class="cardhead">user programs <span class="muted">— published freely by owners · listed by the program registry</span></div>
-        <div id="prog-user"><div class="muted">loading…</div></div>
+    <div class="card">
+      <div class="cardhead">user programs <span class="muted">— published freely by owners · listed by the head registry</span></div>
+      <div id="prog-user"><div class="muted">loading…</div></div>
+    </div>
+    <div class="card">
+      <div class="cardhead">craftcom <span class="muted">(deploy + run sovereign apps — sandboxed WASM against your <span class="mono">app.&lt;ns&gt;</span> namespace)</span></div>
+      <div id="apps-list" class="muted" style="font-size:.78rem;margin-bottom:.7rem">no apps deployed — <span class="mono">zeph deploy &lt;app.wasm&gt; --name &lt;name&gt;</span></div>
+      <div class="cidbar">
+        <input id="dep-name" class="cidin" style="flex:0 0 9rem" placeholder="new app name" spellcheck="false">
+        <input id="dep-file" type="file" accept=".wasm,.wat" class="cidin" style="padding:.25rem">
+        <button class="btn" title="publish a .wasm as a durable system app + signed name" onclick="doDeploy()">deploy</button>
       </div>
-      <div class="card">
-        <div class="cardhead">craftcom <span class="muted">(deploy + run sovereign apps — sandboxed WASM against your <span class="mono">app.&lt;ns&gt;</span> namespace)</span></div>
-        <div id="apps-list" class="muted" style="font-size:.78rem;margin-bottom:.7rem">no apps deployed — <span class="mono">zeph deploy &lt;app.wasm&gt; --name &lt;name&gt;</span></div>
-        <div class="cidbar">
-          <input id="dep-name" class="cidin" style="flex:0 0 9rem" placeholder="new app name" spellcheck="false">
-          <input id="dep-file" type="file" accept=".wasm,.wat" class="cidin" style="padding:.25rem">
-          <button class="btn" title="publish a .wasm as a durable system app + signed name" onclick="doDeploy()">deploy</button>
-        </div>
-        <div id="dep-result" class="muted" style="font-size:.76rem;margin-bottom:.4rem"></div>
-        <div class="cidbar">
-          <input id="inv-app" class="cidin" style="flex:0 0 9rem" placeholder="app (e.g. feed)" spellcheck="false">
-          <input id="inv-wasm" class="cidin" placeholder="app wasm cid (64 hex)" spellcheck="false">
-          <input id="inv-func" class="cidin" style="flex:0 0 6rem" placeholder="func" value="run" spellcheck="false">
-        </div>
-        <div class="cidbar">
-          <input id="inv-input" class="cidin" placeholder="input — optional text for invoke, or SQL for view state" spellcheck="false">
-          <button class="btn" onclick="doInvoke()">invoke</button>
-          <button class="btn" title="query this app's own state (app.&lt;ns&gt;)" onclick="viewApp()">view state</button>
-        </div>
-        <div id="inv-result" class="muted" style="font-size:.8rem;margin-top:.5rem;word-break:break-all"></div>
+      <div id="dep-result" class="muted" style="font-size:.76rem;margin-bottom:.4rem"></div>
+      <div class="cidbar">
+        <input id="inv-app" class="cidin" style="flex:0 0 9rem" placeholder="app (e.g. feed)" spellcheck="false">
+        <input id="inv-wasm" class="cidin" placeholder="app wasm cid (64 hex)" spellcheck="false">
+        <input id="inv-func" class="cidin" style="flex:0 0 6rem" placeholder="func" value="run" spellcheck="false">
       </div>
+      <div class="cidbar">
+        <input id="inv-input" class="cidin" placeholder="input — optional text for invoke, or SQL for view state" spellcheck="false">
+        <button class="btn" onclick="doInvoke()">invoke</button>
+        <button class="btn" title="query this app's own state (app.&lt;ns&gt;)" onclick="viewApp()">view state</button>
+      </div>
+      <div id="inv-result" class="muted" style="font-size:.8rem;margin-top:.5rem;word-break:break-all"></div>
     </div>
   </section>
 
-  <section id="tab-status" class="tab" hidden>
+  <section id="tab-governance" class="tab" hidden>
     <div class="card">
       <div class="cardhead">governance <span class="muted">— k-of-n governor multisig · approves protocol program listings</span></div>
       <div id="st-gov"><div class="muted">…</div></div>
     </div>
     <div class="card">
-      <div class="cardhead">program registry <span class="muted">— open, owner-signed · sharded, rotating writer per shard · no committee</span></div>
-      <div id="st-reg"><div class="muted">…</div></div>
+      <div class="cardhead">protocol programs <span class="muted">— network-owned · governed anchors · canonical WASM set by governance</span></div>
+      <div id="prog-protocol"><div class="muted">loading…</div></div>
     </div>
+  </section>
+
+  <section id="tab-status" class="tab" hidden>
     <div class="card">
       <div class="cardhead">event bus <span class="muted">(foundation §52 — the reactive nervous system)</span></div>
       <div class="kv"><span>total events</span><b id="eb-total">…</b></div>
@@ -295,7 +295,7 @@
 
       <div class="grp">background intervals</div>
       <div class="kv"><span>health scan / lifecycle</span><b id="set-hscan">…</b></div>
-      <div class="kv"><span>re-announce (providers + heads)</span><b id="set-reann">…</b></div>
+      <div class="kv"><span>re-announce (providers)</span><b id="set-reann">…</b></div>
 
       <div class="grp">relays</div>
       <div id="set-relays"><div class="muted">none</div></div>
@@ -382,7 +382,8 @@ async function tick(){
     const ra = await fetch("/api/apps?token=" + TOKEN);
     if (ra.ok) renderApps(await ra.json());
   } catch (_) {}
-  if($("tab-status") && !$("tab-status").hidden) loadStatus();
+  if($("tab-registry") && !$("tab-registry").hidden) loadRegistry();
+  if($("tab-governance") && !$("tab-governance").hidden) loadGovernance();
   if($("tab-overview") && !$("tab-overview").hidden){ loadPending(); loadCidHealth(); }
 }
 // My Drive: this identity's CraftSQL file index (name · size · type · age · cid).
@@ -622,8 +623,8 @@ function showTab(name){
   document.querySelectorAll('.tab').forEach(t => { t.hidden = (t.id !== 'tab-'+name); });
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('on', b.dataset.tab === name));
   try { localStorage.setItem('zeph-tab', name); } catch(e){}
-  if(name==="programs") loadPrograms();
-  if(name==="status") loadStatus();
+  if(name==="registry") loadRegistry();
+  if(name==="governance") loadGovernance();
 }
 async function doDeploy(){
   const name=$("dep-name").value.trim(); const f=$("dep-file").files[0]; const out=$("dep-result");
@@ -657,53 +658,89 @@ function sqlTable(j){
   return '<table><thead><tr>'+cols.map(c=>`<th style="text-align:left;border-bottom:1px solid var(--line)">${esc(c)}</th>`).join("")
     +'</tr></thead><tbody>'+rows.map(r=>'<tr>'+r.map(x=>`<td style="padding:.15rem .5rem .15rem 0">${esc(String(x))}</td>`).join("")+'</tr>').join("")+'</tbody></table>';
 }
-async function loadPrograms(){
-  const host=$("prog-protocol"); if(!host) return;
+// Registry tab: the head-registry status + per-type counts, the browsable entries list,
+// and the user-programs listing.
+async function loadRegistry(){
+  const rs=$("reg-status");
+  if(rs){
+    try{
+      const rr=await fetch("/api/registry?token="+TOKEN);
+      const r=rr.ok?await rr.json():{};
+      const sc=r.shard_count||256;
+      rs.innerHTML=`
+        <div class="kv"><span>epoch</span><b>${r.epoch||0}</b></div>
+        <div class="kv"><span>writer for</span><b>${r.writer_shards||0} of ${sc} shards</b></div>
+        <div class="kv"><span>eligible nodes</span><b>${r.eligible||0}</b></div>
+        <div class="kv"><span>program heads</span><b>${r.program_heads||0}</b></div>
+        <div class="kv"><span>db roots</span><b>${r.dbroots||0}</b></div>
+        <div class="kv"><span>manifests</span><b>${r.manifests||0}</b></div>`;
+    }catch(e){ rs.textContent="error: "+e; }
+  }
+  loadRegistryEntries();
+  loadUserPrograms();
+}
+// The browsable head list from /api/registry/entries — grouped Programs / DB roots /
+// Manifests, each row: owner · name · cid · version (hex truncated the same as elsewhere).
+async function loadRegistryEntries(){
+  const el=$("reg-entries"); if(!el) return;
   try{
-    const [ar,pr]=await Promise.all([
-      fetch("/api/apps?token="+TOKEN),
-      fetch("/api/programs?token="+TOKEN)
-    ]);
+    const r=await fetch("/api/registry/entries?token="+TOKEN);
+    const j=r.ok?await r.json():{};
+    const groups=[["Programs",j.programs],["DB roots",j.dbroots],["Manifests",j.manifests]];
+    let html="";
+    for(const [label,rows] of groups){
+      const list=rows||[];
+      html+=`<div class="grp">${label} · ${list.length}</div>`;
+      html+= list.length
+        ? list.map(e=>`<div class="kv"><span class="mono"><span class="cidcell" onclick="copyCid('${e.owner}')" title="owner — click to copy">${String(e.owner).slice(0,10)}…</span> · <b>${esc(e.name)}</b></span><span class="mono muted"><span class="cidcell" onclick="copyCid('${e.cid}')" title="cid — click to copy">${String(e.cid).slice(0,12)}…</span> · v${e.version}</span></div>`).join("")
+        : '<div class="muted" style="font-size:.76rem">none on this node’s shards</div>';
+    }
+    el.innerHTML=html;
+  }catch(e){ el.textContent="error: "+e; }
+}
+async function loadUserPrograms(){
+  const host=$("prog-user"); if(!host) return;
+  try{
+    const ar=await fetch("/api/apps?token="+TOKEN);
     const j=ar.ok?await ar.json():{};
-    const p=pr.ok?await pr.json():{};
-    const prg=(p.programs||[]);
-    const ptable = prg.length
-      ? '<table><thead><tr><th style="text-align:left">program</th><th style="text-align:left">ver</th><th style="text-align:left">canonical wasm cid</th></tr></thead><tbody>'
-        + prg.map(x=>`<tr><td style="padding:.15rem .8rem .15rem 0"><b>${esc(x[0])}</b></td><td style="padding:.15rem .8rem .15rem 0">v${x[2]}</td><td class="mono muted cidcell" style="padding:.15rem 0" onclick="copyCid('${x[1]}')">${String(x[1]).slice(0,22)}…</td></tr>`).join("")
-        + '</tbody></table>'
-      : '<div class="muted">none</div>';
-    $("prog-protocol").innerHTML=`${ptable}
-      <div class="note">The programs the network itself runs. <b>Governance</b> approves which WASM cid is canonical for each, so they upgrade with no binary release (the governor set is in <b>Status</b>). The <b>program registry</b> is the protocol program that lists the user programs below.</div>`;
     const rows=(j.rows||[]);
     const utable = rows.length
       ? '<table><thead><tr><th style="text-align:left">program</th><th style="text-align:left">ver</th><th style="text-align:left">cid</th></tr></thead><tbody>'
         + rows.map(x=>`<tr><td style="padding:.15rem .8rem .15rem 0"><b>${esc(x[0])}</b></td><td style="padding:.15rem .8rem .15rem 0">v${x[2]!=null?x[2]:1}</td><td class="mono muted cidcell" style="padding:.15rem 0" onclick="copyCid('${x[1]}')">${String(x[1]).slice(0,14)}…</td></tr>`).join("")
         + '</tbody></table>'
       : '<div class="muted">no programs yet — deploy one</div>';
-    $("prog-user").innerHTML=`${utable}
-      <div class="note">Anyone publishes a program by signing a head (name→cid); the <b>program registry</b> records it. The registry is open and owner-signed — sharded, with a rotating writer per shard; no committee, no attestation.</div>`;
-  }catch(e){ if($("prog-protocol")) $("prog-protocol").textContent="error: "+e; }
+    host.innerHTML=`${utable}
+      <div class="note">Anyone publishes a program by signing a head (name→cid); the <b>head registry</b> records it. The registry is open and owner-signed — sharded, with a rotating writer per shard; no committee, no attestation.</div>`;
+  }catch(e){ host.textContent="error: "+e; }
 }
-async function loadStatus(){
-  const gh=$("st-gov"); if(!gh) return;
-  try{
-    const [gr,rr]=await Promise.all([
-      fetch("/api/governance?token="+TOKEN),
-      fetch("/api/registry?token="+TOKEN)
-    ]);
-    const g=gr.ok?await gr.json():{};
-    const r=rr.ok?await rr.json():{};
-    const govs=(g.governors||[]);
-    gh.innerHTML=`
-      <div class="kv"><span>governor set</span><b>${g.threshold||0}-of-${govs.length} · seq ${g.seq||0}${g.is_governor?' · <span class="chip providing">you are a governor</span>':''}</b></div>
-      ${govs.map(h=>`<div class="kv"><span>governor</span><span class="mono muted cidcell" onclick="copyCid('${h}')">${h.slice(0,20)}…</span></div>`).join("")}`;
-    const sc=r.shard_count||256;
-    $("st-reg").innerHTML=`
-      <div class="kv"><span>epoch</span><b>${r.epoch||0}</b></div>
-      <div class="kv"><span>writer for</span><b>${r.writer_shards||0} of ${sc} shards</b></div>
-      <div class="kv"><span>eligible nodes</span><b>${r.eligible||0}</b></div>
-      <div class="kv"><span>registry entries</span><b>${r.entries||0}</b></div>`;
-  }catch(e){ if($("st-gov")) $("st-gov").textContent="error: "+e; }
+// Governance tab: the governor multisig + the governed protocol programs (canonical anchors).
+async function loadGovernance(){
+  const gh=$("st-gov");
+  if(gh){
+    try{
+      const gr=await fetch("/api/governance?token="+TOKEN);
+      const g=gr.ok?await gr.json():{};
+      const govs=(g.governors||[]);
+      gh.innerHTML=`
+        <div class="kv"><span>governor set</span><b>${g.threshold||0}-of-${govs.length} · seq ${g.seq||0}${g.is_governor?' · <span class="chip providing">you are a governor</span>':''}</b></div>
+        ${govs.map(h=>`<div class="kv"><span>governor</span><span class="mono muted cidcell" onclick="copyCid('${h}')">${h.slice(0,20)}…</span></div>`).join("")}`;
+    }catch(e){ gh.textContent="error: "+e; }
+  }
+  const host=$("prog-protocol");
+  if(host){
+    try{
+      const pr=await fetch("/api/programs?token="+TOKEN);
+      const p=pr.ok?await pr.json():{};
+      const prg=(p.programs||[]);
+      const ptable = prg.length
+        ? '<table><thead><tr><th style="text-align:left">program</th><th style="text-align:left">ver</th><th style="text-align:left">canonical wasm cid</th></tr></thead><tbody>'
+          + prg.map(x=>`<tr><td style="padding:.15rem .8rem .15rem 0"><b>${esc(x[0])}</b></td><td style="padding:.15rem .8rem .15rem 0">v${x[2]}</td><td class="mono muted cidcell" style="padding:.15rem 0" onclick="copyCid('${x[1]}')">${String(x[1]).slice(0,22)}…</td></tr>`).join("")
+          + '</tbody></table>'
+        : '<div class="muted">none</div>';
+      host.innerHTML=`${ptable}
+        <div class="note">The programs the network itself runs. <b>Governance</b> approves which WASM cid is canonical for each, so they upgrade with no binary release. The <b>head registry</b> (see <b>Registry</b>) is the protocol program that lists the user programs.</div>`;
+    }catch(e){ host.textContent="error: "+e; }
+  }
 }
 async function doInvoke(){
   const app=$("inv-app").value.trim(), wasm=$("inv-wasm").value.trim();
@@ -799,9 +836,14 @@ function renderSettings(s){
   $("set-relayops").innerHTML = list(st.relay_operator_urls);
   $("set-peers").innerHTML = list(st.peers);
 }
-// Restore the last-selected tab (persists across reloads).
-showTab((() => { try { return localStorage.getItem('zeph-tab'); } catch(e){ return null; } })() || 'overview');
-['data','programs'].forEach(g=>{ try{ const pn=localStorage.getItem('zeph-panel-'+g); if(pn) showPanel(g,pn); }catch(e){} });
+// Restore the last-selected tab (persists across reloads). Fall back to overview if the
+// stored tab no longer exists (e.g. the old "programs" tab was renamed to "registry").
+(() => {
+  let t = null; try { t = localStorage.getItem('zeph-tab'); } catch(e){}
+  if(!t || !$("tab-"+t)) t = 'overview';
+  showTab(t);
+})();
+['data'].forEach(g=>{ try{ const pn=localStorage.getItem('zeph-panel-'+g); if(pn) showPanel(g,pn); }catch(e){} });
 window.curSub = (() => { try { return localStorage.getItem('zeph-sub'); } catch(e){ return null; } })() || 'drive';
 document.querySelectorAll('.subtab[data-sub]').forEach(b=>b.classList.toggle('on', b.dataset.sub===window.curSub));
 tick(); setInterval(tick, 1000);
