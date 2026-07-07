@@ -1,0 +1,19 @@
+[package]
+name = "zeph-guestbook-wasm"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+# Dependency-free: no_std, no alloc, fixed stack buffers only. Nothing beyond core.
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"
+strip = true
+
+# Excluded from the zephcraft workspace (own workspace root), like registry-wasm.
+[workspace]
