@@ -103,8 +103,18 @@ async fn content_self_heals_after_holder_death() {
     // Content must be WANTED to be repaired — holding is not implicit want (Fade).
     holders[0].engine.want(cid).await.unwrap();
     let floor = 32usize; // n = target_pieces(K=8)
-    assert_eq!(report.distinct_peers, 5, "spread across all 5 holders");
-    assert!(report.pieces_pushed >= floor, "pushed the full generation");
+                         // Fire-and-forget distribution: poll until the full generation lands on the holders
+                         // (was read off the publish report; now it happens in the background after return).
+    let spread = wait_have(&holders, cid, floor).await;
+    assert!(spread >= floor, "pushed the full generation across holders");
+    assert_eq!(
+        holders
+            .iter()
+            .filter(|h| h.engine.store().piece_count(&cid) > 0)
+            .count(),
+        5,
+        "spread across all 5 holders"
+    );
 
     // Sanity: fetchable now.
     let got = publisher.engine.get(cid, ConsumeMode::Drop).await.unwrap();
@@ -169,6 +179,9 @@ async fn recently_fetched_content_is_repaired() {
         .collect();
     // No pin, no want.
     let cid = publisher.engine.publish(&payload, false).await.unwrap().cid;
+    // Fire-and-forget distribution: wait for the pieces to reach the holders before a
+    // cross-node fetch can resolve providers.
+    wait_have(&holders, cid, floor).await;
 
     // A real FETCH — the serving holders record recent access (last_served).
     let fetcher = node(&tracker, dirs[6].path()).await;
@@ -221,6 +234,8 @@ async fn unwanted_content_fades_then_want_resumes_repair() {
         .collect();
     // Published WITHOUT pin, and nobody wants it.
     let cid = publisher.engine.publish(&payload, false).await.unwrap().cid;
+    // Fire-and-forget distribution: wait for the generation to land before churn.
+    wait_have(&holders, cid, floor).await;
 
     // Kill a holder → below the floor.
     for dead in holders.split_off(4) {
@@ -280,6 +295,8 @@ async fn pinned_content_still_repairs_to_floor() {
         .map(|i| (i.wrapping_mul(2654435761) >> 4) as u8)
         .collect();
     let cid = publisher.engine.publish(&payload, false).await.unwrap().cid;
+    // Fire-and-forget distribution: wait for the generation to land, then a survivor pins.
+    wait_have(&holders, cid, floor).await;
 
     // One survivor PINS the content (now holds the whole file).
     holders[0].engine.pin(cid).await.unwrap();
@@ -330,7 +347,16 @@ async fn fetch_reads_spread_across_providers() {
         .collect();
     let report = publisher.engine.publish(&payload, false).await.unwrap();
     let cid = report.cid;
-    assert_eq!(report.distinct_peers, 4, "spread across 4 holders");
+    // Fire-and-forget distribution: wait for the spread to land across the 4 holders.
+    wait_have(&holders, cid, 32).await;
+    assert_eq!(
+        holders
+            .iter()
+            .filter(|h| h.engine.store().piece_count(&cid) > 0)
+            .count(),
+        4,
+        "spread across 4 holders"
+    );
 
     // One download.
     let fetcher = node(&tracker, dirs[5].path()).await;
@@ -365,7 +391,13 @@ async fn content_scales_under_download_demand() {
         .collect();
     let report = publisher.engine.publish(&payload, false).await.unwrap();
     let cid = report.cid;
-    assert_eq!(report.distinct_peers, 1, "all pieces on the one provider");
+    // Fire-and-forget distribution: wait for the whole generation to land on s0.
+    wait_have(std::slice::from_ref(&s0), cid, 32).await;
+    assert_eq!(
+        s0.engine.store().piece_count(&cid),
+        32,
+        "all pieces on the one provider"
+    );
 
     // Two empty nodes join (candidate providers).
     let mut spares = Vec::new();
@@ -432,6 +464,8 @@ async fn content_degrades_to_floor_when_demand_fades() {
         .map(|i| (i.wrapping_mul(2654435761) >> 3) as u8)
         .collect();
     let cid = publisher.engine.publish(&payload, false).await.unwrap().cid;
+    // Fire-and-forget distribution: wait for the whole generation to land on s0.
+    wait_have(std::slice::from_ref(&s0), cid, floor).await;
 
     // Several empty nodes join — targets for Scaling to build surplus beyond the band.
     let mut nodes = vec![s0];
@@ -502,6 +536,8 @@ async fn get_reconstructs_from_local_pieces() {
         .map(|i| (i.wrapping_mul(40503) >> 6) as u8)
         .collect();
     let cid = publisher.engine.publish(&payload, false).await.unwrap().cid;
+    // Fire-and-forget distribution: wait for s0 to receive >=k pieces.
+    wait_have(std::slice::from_ref(&s0), cid, 8).await;
     assert!(
         s0.engine.store().piece_count(&cid) >= 8,
         "s0 holds >=k pieces"
@@ -528,6 +564,8 @@ async fn eviction_cooldown_blocks_refill_until_wanted() {
     let publisher = node(&tracker, dirs[1].path()).await;
     let payload = vec![7u8; 40_000];
     let cid = publisher.engine.publish(&payload, false).await.unwrap().cid;
+    // Fire-and-forget distribution: wait for the pieces to land on s.
+    wait_have(std::slice::from_ref(&s), cid, 1).await;
     assert!(
         s.engine.store().piece_count(&cid) > 0,
         "s holds the content"
@@ -592,6 +630,9 @@ async fn file_manifest_publish_and_fetch_by_name() {
         "manifest and content are distinct objects"
     );
     assert_eq!(fp.size, data.len() as u64);
+    // Fire-and-forget distribution: wait for both generations to land before a cross-node fetch.
+    wait_have(&holders, fp.manifest_cid, 32).await;
+    wait_have(&holders, fp.content_cid, 32).await;
 
     // A fresh node fetches by the manifest CID alone → name/mime/bytes.
     let fetcher = node(&tracker, dirs[5].path()).await;
@@ -648,6 +689,16 @@ async fn folder_manifest_lists_and_fetches_children() {
         .publish_dir("album", entries, false)
         .await
         .unwrap();
+    // Fire-and-forget distribution: wait for every generation to land before a cross-node fetch.
+    for c in [
+        fa.manifest_cid,
+        fa.content_cid,
+        fb.manifest_cid,
+        fb.content_cid,
+        dir_cid,
+    ] {
+        wait_have(&holders, c, 32).await;
+    }
 
     // A fresh node fetches the folder tree by the dir CID alone.
     let fetcher = node(&tracker, dirs[5].path()).await;
@@ -892,6 +943,8 @@ async fn dst_churn_wanted_content_survives() {
         .collect();
     let cid = publisher.engine.publish(&payload, false).await.unwrap().cid;
     nodes[0].engine.want(cid).await.unwrap();
+    // Fire-and-forget distribution: wait for the initial spread before churning.
+    wait_have(&nodes, cid, k).await;
 
     for round in 0..4 {
         // Churn: kill a random live node (keep ≥4), spawn a fresh empty one.
@@ -929,13 +982,27 @@ async fn dst_churn_wanted_content_survives() {
     }
 }
 
-/// Sum the pieces the LIVE holders actually hold for `cid` (ground truth,/// Sum the pieces the LIVE holders actually hold for `cid` (ground truth,
+/// Sum the pieces the LIVE holders actually hold for `cid` (ground truth,
 /// bypassing the tracker's advisory counts).
 async fn verified_have(holders: &[Node], cid: zeph_core::Cid) -> usize {
     holders
         .iter()
         .map(|h| h.engine.store().piece_count(&cid))
         .sum()
+}
+
+/// Distribution is fire-and-forget: `publish` returns immediately and pushes pieces to peers
+/// in the BACKGROUND. Poll (bounded ~2s, every 20ms) until the summed pieces across `holders`
+/// reach `want` — replaces reading the spread off the (now immediate) publish report.
+async fn wait_have(holders: &[Node], cid: zeph_core::Cid, want: usize) -> usize {
+    for _ in 0..100 {
+        let have = verified_have(holders, cid).await;
+        if have >= want {
+            return have;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    verified_have(holders, cid).await
 }
 
 /// Distribution (spin-up): a node that holds ALL of a CID's pieces spreads
@@ -958,14 +1025,12 @@ async fn content_spreads_to_newly_joined_nodes() {
     let cid = report.cid;
     // Wanted, so the lifecycle maintains + spreads it (Distribution is fade-gated).
     s0.engine.want(cid).await.unwrap();
-    assert_eq!(
-        report.distinct_peers, 1,
-        "all pieces landed on the one node"
-    );
+    // Fire-and-forget distribution: wait for the whole generation to land on the one node.
+    wait_have(std::slice::from_ref(&s0), cid, 32).await;
     let total = s0.engine.store().piece_count(&cid);
     assert!(
         total >= 32,
-        "s0 over-concentrated with the whole generation"
+        "s0 over-concentrated with the whole generation (all pieces on one node)"
     );
 
     // Now 3 empty nodes join.

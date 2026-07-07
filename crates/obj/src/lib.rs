@@ -505,87 +505,91 @@ impl ObjEngine {
             });
         }
 
-        // Candidate storage peers from the node registry (exclude self).
-        let me = self.transport.node_id();
-        let candidates: Vec<PeerAddr> = self
-            .peer_source
-            .peers()
-            .await
-            .into_iter()
-            .filter(|(id, _)| *id != me)
-            .map(|(_, addr)| addr)
-            .collect();
-
-        let n = target_pieces(k);
-        let mut distinct: HashSet<_> = HashSet::new();
-        let mut pushed = 0usize;
-        if !candidates.is_empty() {
-            // Encode all pieces up front (encode needs &mut rng), then push them
-            // CONCURRENTLY with a per-push timeout. Sequential pushes turned
-            // publish into n round-trips — crippling over a relay link and
-            // ruinous for folders (many objects). One round-trip now, and a
-            // stalled peer times out instead of hanging the whole publish.
-            let jobs: Vec<(PeerAddr, CodedPiece)> = (0..n)
-                .map(|i| {
-                    Ok((
-                        candidates[i % candidates.len()].clone(),
-                        encode(&sources, &mut rng)?,
-                    ))
-                })
-                .collect::<anyhow::Result<_>>()?;
-            let gen_ref = &gen;
-            let results = futures::future::join_all(jobs.iter().map(|(peer, piece)| async move {
-                match tokio::time::timeout(PUSH_TIMEOUT, self.push_piece(peer, cid, gen_ref, piece))
-                    .await
-                {
-                    Ok(Ok(())) => Some(peer.node_id()),
-                    _ => None,
-                }
-            }))
-            .await;
-            for id in results.into_iter().flatten() {
-                distinct.insert(id);
-                pushed += 1;
-            }
-        }
-
-        if pin {
-            let _ = self.routing.announce(cid, 0, true).await;
-        }
-
-        // DURABILITY GATE + COMPLETION. The publisher RETAINS its own copy of everything
-        // it publishes (kept alive by its class — system marker / pin / want), so the first
-        // distribution is never left with zero copies even into a no-peer window. When the
-        // erasure set has REACHED the network — all n coded pieces pushed, or as many
-        // distinct peers as this cluster can offer — mark it DISTRIBUTED so re-publishes
-        // stop re-pushing (no unbounded piece growth). From there the health scan maintains
-        // it as stable content, and the publisher offloads its own copy once the full
-        // erasure set is durable on peers.
+        // RETAIN synchronously — the publisher holds its own copy (kept alive by its
+        // class: system marker / pin / want) BEFORE returning. The cid is BLAKE3(data),
+        // known now, and the bytes are local, so the content is immediately available
+        // and the first distribution is never left with zero copies. Distribution to
+        // peers is fire-and-forget below (durability, reached asynchronously).
         if !self.store.has_content(&cid) {
             self.store.put_content(cid, data, false)?;
         }
         if !system && !pin {
             self.store.set_want(cid)?;
         }
-        let target = self.config.durability_threshold.min(candidates.len());
-        if !candidates.is_empty() && (pushed >= n || distinct.len() >= target) {
-            let _ = self.store.set_distributed(cid);
-        }
-        let durable = distinct.len() >= self.config.durability_threshold;
-        if !durable {
-            tracing::warn!(
-                cid = %cid.to_hex(),
-                distinct_peers = distinct.len(),
-                threshold = self.config.durability_threshold,
-                "publish not yet durable — retained locally; health scan will redistribute"
-            );
-        }
 
+        // DISTRIBUTION — fire-and-forget. A publish must NOT block on spreading pieces to
+        // peers: spread is only for durability, reached asynchronously (these direct pushes
+        // now — NOT deferred to the health scan — plus the health scan later). Clone the
+        // Arc handles and move the owned data into the task: resolve candidates, encode the
+        // n pieces, push them CONCURRENTLY under PUSH_TIMEOUT (a stalled peer times out
+        // instead of hanging distribution), then mark DISTRIBUTED once the erasure set has
+        // reached the network so re-publishes stop re-pushing (no unbounded piece growth).
+        let me = self.transport.node_id();
+        let transport = self.transport.clone();
+        let store = self.store.clone();
+        let peer_source = self.peer_source.clone();
+        let routing = self.routing.clone();
+        let threshold = self.config.durability_threshold;
+        let n = target_pieces(k);
+        tokio::spawn(async move {
+            let candidates: Vec<PeerAddr> = peer_source
+                .peers()
+                .await
+                .into_iter()
+                .filter(|(id, _)| *id != me)
+                .map(|(_, addr)| addr)
+                .collect();
+            if !candidates.is_empty() {
+                let mut rng = OsRng;
+                let is_system = store.is_system(&cid);
+                let jobs: anyhow::Result<Vec<(PeerAddr, CodedPiece)>> = (0..n)
+                    .map(|i| {
+                        Ok((
+                            candidates[i % candidates.len()].clone(),
+                            encode(&sources, &mut rng)?,
+                        ))
+                    })
+                    .collect();
+                if let Ok(jobs) = jobs {
+                    let gen_ref = &gen;
+                    let transport_ref = &transport;
+                    let results =
+                        futures::future::join_all(jobs.iter().map(|(peer, piece)| async move {
+                            match tokio::time::timeout(
+                                PUSH_TIMEOUT,
+                                push_piece(transport_ref, is_system, peer, cid, gen_ref, piece),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => Some(peer.node_id()),
+                                _ => None,
+                            }
+                        }))
+                        .await;
+                    let mut distinct: HashSet<_> = HashSet::new();
+                    let mut pushed = 0usize;
+                    for id in results.into_iter().flatten() {
+                        distinct.insert(id);
+                        pushed += 1;
+                    }
+                    let target = threshold.min(candidates.len());
+                    if pushed >= n || distinct.len() >= target {
+                        let _ = store.set_distributed(cid);
+                    }
+                }
+            }
+            if pin {
+                let _ = routing.announce(cid, 0, true).await;
+            }
+        });
+
+        // Return the cid IMMEDIATELY: distribution is pending in the background and the
+        // publisher holds its copy, so durability metrics are 0/false at return.
         Ok(PublishReport {
             cid,
-            pieces_pushed: pushed,
-            distinct_peers: distinct.len(),
-            durable,
+            pieces_pushed: 0,
+            distinct_peers: 0,
+            durable: false,
             pinned: pin,
         })
     }
@@ -693,6 +697,8 @@ impl ObjEngine {
         Ok(())
     }
 
+    /// Thin `&self` wrapper over the free [`push_piece`] — propagates the system
+    /// class (from the store) so each holder treats it as DB data locally.
     async fn push_piece(
         &self,
         peer: &PeerAddr,
@@ -700,38 +706,19 @@ impl ObjEngine {
         gen: &Generation,
         piece: &CodedPiece,
     ) -> anyhow::Result<()> {
-        let msg = wire::Message::PiecePush(wire::PiecePush {
-            cid: cid.0,
-            k: gen.k,
-            piece_len: gen.piece_len,
-            total_len: gen.total_len,
-            vtags: gen.vtags.clone(),
-            piece: wire::WirePiece {
-                coding_vector: piece.coding_vector.clone(),
-                data: piece.data.clone(),
-            },
-            // Propagate the system class with every push (publish, repair,
-            // distribute) so each holder treats it as DB data locally.
-            system: self.store.is_system(&cid),
-        });
-        match self.request(peer, &msg).await? {
-            wire::Message::PiecePushAck(ack) if ack.ok => Ok(()),
-            wire::Message::PiecePushAck(ack) => anyhow::bail!("push rejected: {}", ack.reason),
-            _ => anyhow::bail!("unexpected push reply"),
-        }
+        push_piece(
+            &self.transport,
+            self.store.is_system(&cid),
+            peer,
+            cid,
+            gen,
+            piece,
+        )
+        .await
     }
 
     async fn request(&self, peer: &PeerAddr, msg: &wire::Message) -> anyhow::Result<wire::Message> {
-        let conn = self.transport.connect(peer, ALPN).await?;
-        let (mut send, mut recv) = conn.open_bi().await?;
-        send.write_all(&wire::encode(msg, self.transport.clock().now().0))
-            .await?;
-        send.finish()?;
-        let bytes =
-            tokio::time::timeout(Duration::from_secs(30), recv.read_to_end(MAX_FRAME)).await??;
-        let frame = wire::decode(&bytes)?;
-        conn.close(0u32.into(), b"done");
-        Ok(frame.message)
+        request(&self.transport, peer, msg).await
     }
 
     /// Fetch content by CID alone: resolve providers, fetch + verify + decode.
@@ -2173,6 +2160,57 @@ impl ObjEngine {
             reason: String::new(),
         }
     }
+}
+
+/// Push one coded piece to a peer and await its ack. A free fn (over `&Arc<Transport>` +
+/// the precomputed `is_system` flag) so the fire-and-forget distribution task can call it
+/// without `&self`. Wire messages, timeout, and behaviour are identical to the old method.
+async fn push_piece(
+    transport: &Arc<Transport>,
+    is_system: bool,
+    peer: &PeerAddr,
+    cid: Cid,
+    gen: &Generation,
+    piece: &CodedPiece,
+) -> anyhow::Result<()> {
+    let msg = wire::Message::PiecePush(wire::PiecePush {
+        cid: cid.0,
+        k: gen.k,
+        piece_len: gen.piece_len,
+        total_len: gen.total_len,
+        vtags: gen.vtags.clone(),
+        piece: wire::WirePiece {
+            coding_vector: piece.coding_vector.clone(),
+            data: piece.data.clone(),
+        },
+        // Propagate the system class with every push (publish, repair, distribute)
+        // so each holder treats it as DB data locally.
+        system: is_system,
+    });
+    match request(transport, peer, &msg).await? {
+        wire::Message::PiecePushAck(ack) if ack.ok => Ok(()),
+        wire::Message::PiecePushAck(ack) => anyhow::bail!("push rejected: {}", ack.reason),
+        _ => anyhow::bail!("unexpected push reply"),
+    }
+}
+
+/// Open a bi-stream to a peer, send `msg`, and return the reply. A free fn over
+/// `&Arc<Transport>` so the spawned distribution task can call it without `&self`.
+async fn request(
+    transport: &Arc<Transport>,
+    peer: &PeerAddr,
+    msg: &wire::Message,
+) -> anyhow::Result<wire::Message> {
+    let conn = transport.connect(peer, ALPN).await?;
+    let (mut send, mut recv) = conn.open_bi().await?;
+    send.write_all(&wire::encode(msg, transport.clock().now().0))
+        .await?;
+    send.finish()?;
+    let bytes =
+        tokio::time::timeout(Duration::from_secs(30), recv.read_to_end(MAX_FRAME)).await??;
+    let frame = wire::decode(&bytes)?;
+    conn.close(0u32.into(), b"done");
+    Ok(frame.message)
 }
 
 /// Refuse a user lifecycle operation on a CraftSQL system object (DB generation).

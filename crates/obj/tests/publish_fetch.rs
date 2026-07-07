@@ -61,6 +61,29 @@ async fn node_with(
     (engine, routing, addr)
 }
 
+/// Distribution is fire-and-forget: `publish` returns immediately (0/false) and pushes the
+/// pieces to peers in the BACKGROUND. Tests that used to read the spread off the publish
+/// report now POLL the receiving stores until the pushes actually land (bounded ~2s, checked
+/// every 20ms) — the assertion becomes "distribution eventually happened," the real intent.
+async fn wait_pieces(engines: &[Arc<ObjEngine>], cid: zeph_core::Cid, want: usize) -> usize {
+    for _ in 0..100 {
+        let have: usize = engines.iter().map(|e| e.store().piece_count(&cid)).sum();
+        if have >= want {
+            return have;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    engines.iter().map(|e| e.store().piece_count(&cid)).sum()
+}
+
+/// Distinct engines holding at least one piece of `cid`.
+fn distinct_holders(engines: &[Arc<ObjEngine>], cid: zeph_core::Cid) -> usize {
+    engines
+        .iter()
+        .filter(|e| e.store().piece_count(&cid) > 0)
+        .count()
+}
+
 #[tokio::test]
 async fn publish_spreads_then_fetch_by_cid_alone() {
     let tracker = start_tracker();
@@ -82,12 +105,16 @@ async fn publish_spreads_then_fetch_by_cid_alone() {
 
     let report = publisher.publish(&payload, true).await.unwrap();
     assert!(report.pinned, "uploader pins by default");
+    // Distribution is fire-and-forget: the report is immediate (0/false). Poll the storage
+    // nodes until the background pushes LAND — the full generation (n=32) reaching all 8
+    // distinct nodes IS the "spread across ≥K distinct peers ⇒ durable" intent.
+    let total = wait_pieces(&storage, report.cid, 32).await;
+    assert!(total >= 8, "pushed the full generation across the network");
     assert_eq!(
-        report.distinct_peers, 8,
-        "spread across all 8 storage nodes"
+        distinct_holders(&storage, report.cid),
+        8,
+        "spread across all 8 storage nodes (≥K distinct ⇒ durable)"
     );
-    assert!(report.durable, "≥K distinct peers ⇒ durable");
-    assert!(report.pieces_pushed >= 8);
 
     // Fetcher — fresh node, knows ONLY the CID (no peer address).
     let (fetcher, _) = node(&tracker, dirs[9].path()).await;
@@ -109,7 +136,9 @@ async fn ingest_rejects_polluted_pieces() {
     // Publish so the storage node holds a generation, then a fetch works.
     let payload = vec![42u8; 50_000];
     let report = publisher.publish(&payload, false).await.unwrap();
-    assert!(report.distinct_peers >= 1);
+    // Fire-and-forget distribution: wait for a piece to land on the storage node.
+    let landed = wait_pieces(std::slice::from_ref(&storage), report.cid, 1).await;
+    assert!(landed >= 1);
 
     // The storage node's ingest verified vtags — a polluted piece never made
     // it in, so what it holds decodes cleanly.
@@ -136,8 +165,12 @@ async fn reannounce_restores_piece_provider_after_restart() {
     let (publisher, _) = node(&tracker, tempfile::tempdir().unwrap().path()).await;
     let payload = vec![7u8; 60_000];
     let report = publisher.publish(&payload, false).await.unwrap();
-    assert!(report.distinct_peers >= 1, "pushed to storage A");
     let cid = report.cid;
+    // Fire-and-forget distribution: A is the sole candidate, so the whole generation
+    // (n=32) lands on it. Wait for it BEFORE restarting — the post-restart fetch decodes
+    // from A alone, so it needs >=k pieces, not just one.
+    let landed = wait_pieces(std::slice::from_ref(&_a), cid, 32).await;
+    assert!(landed >= 8, "pushed the full generation to storage A");
 
     // Drop A (its address dies). Restart as A2: SAME identity + store, NEW addr.
     drop(_a);
