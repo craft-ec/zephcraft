@@ -27,7 +27,7 @@ use zeph_membership::Membership;
 use zeph_transport::{Connection, PeerAddr, Transport};
 
 use crate::account::ProgramAccountStore;
-use crate::registry_net::{request_registry, RegistryReq, RegistryResp};
+use crate::registry_net::{request_registry, HeadRowWire, RegistryReq, RegistryResp};
 
 /// Max size of a registry request/response frame served over `REGISTRY_ALPN`.
 const MAX_FRAME: usize = 256 * 1024;
@@ -133,14 +133,17 @@ pub struct HeadRow {
     pub version: u64,
 }
 
-/// Every head this node holds, grouped by registry type (program heads / DB roots /
-/// manifests) — a per-node partial view (the registry is sharded, so a node holds only its
-/// own shards).
+/// Registry heads grouped by registry type (program heads / DB roots / manifests). From
+/// [`HeadRegistry::entries`] this is a per-node partial view (only this node's shards); from
+/// [`HeadRegistry::entries_global`] it is the network-wide union gathered across members.
 #[derive(Default)]
 pub struct RegistryEntries {
     pub programs: Vec<HeadRow>,
     pub dbroots: Vec<HeadRow>,
     pub manifests: Vec<HeadRow>,
+    /// How many nodes contributed to this view (1 = node-local; N = self + peers that answered
+    /// the global gather in time). Surfaced to the UI as "gathered across N nodes".
+    pub contributors: usize,
 }
 
 /// Registry status for the dashboard. `writer_shards` = how many RT_PROGRAM shards this node
@@ -674,6 +677,10 @@ impl HeadRegistry {
                                 .await;
                             RegistryResp::Ack
                         }
+                        // Return ALL of this node's local heads for the global dashboard union.
+                        Ok(RegistryReq::ListEntries) => {
+                            RegistryResp::Entries(this.local_head_rows().await)
+                        }
                         Err(e) => RegistryResp::Err(format!("bad registry request: {e}")),
                     };
                     let out = postcard::to_allocvec(&resp).unwrap_or_default();
@@ -815,18 +822,13 @@ impl HeadRegistry {
         }
     }
 
-    /// Snapshot every head this node holds, grouped by registry type, for the dashboard.
-    /// A per-node partial view (sharded): for each of RT_PROGRAM / RT_DBROOT / RT_MANIFEST it
-    /// iterates the shards THIS node currently writes (same shard-iteration as [`Self::status`])
-    /// and collects each account's heads as hex-encoded rows.
-    pub async fn entries(&self) -> RegistryEntries {
-        let mut out = RegistryEntries::default();
+    /// Enumerate THIS node's local registry heads — every rtype, every shard it currently
+    /// writes (the same all-rtypes/held-shards iteration [`Self::entries`] uses) — as raw-byte
+    /// wire rows. Shared by the node-local [`Self::entries`], the `ListEntries` serve handler,
+    /// and the global gather in [`Self::entries_global`].
+    async fn local_head_rows(&self) -> Vec<HeadRowWire> {
+        let mut out = Vec::new();
         for &rtype in &[RT_PROGRAM, RT_DBROOT, RT_MANIFEST] {
-            let bucket = match rtype {
-                RT_PROGRAM => &mut out.programs,
-                RT_DBROOT => &mut out.dbroots,
-                _ => &mut out.manifests,
-            };
             for shard in 0..SHARD_COUNT {
                 let sk = ShardKey { rtype, shard };
                 if !self.is_writer(sk).await {
@@ -837,14 +839,123 @@ impl HeadRegistry {
                     .resolve(registry_program_cid(), &shard_seed(sk))
                     .await;
                 for e in RegistryState::decode(&raw).unwrap_or_default().entries() {
-                    bucket.push(HeadRow {
-                        owner: hex::encode(e.owner),
+                    out.push(HeadRowWire {
+                        rtype,
+                        owner: e.owner,
                         name: e.name.clone(),
-                        cid: hex::encode(e.cid),
+                        cid: e.cid,
                         version: e.version,
                     });
                 }
             }
+        }
+        out
+    }
+
+    /// Snapshot every head this node holds, grouped by registry type, for the dashboard.
+    /// A per-node partial view (sharded): for each of RT_PROGRAM / RT_DBROOT / RT_MANIFEST it
+    /// iterates the shards THIS node currently writes (same shard-iteration as [`Self::status`])
+    /// and collects each account's heads as hex-encoded rows. Retained for callers that want a
+    /// cheap node-local view; the dashboard uses [`Self::entries_global`].
+    #[allow(dead_code)]
+    pub async fn entries(&self) -> RegistryEntries {
+        Self::group_rows(self.local_head_rows().await, 1)
+    }
+
+    /// GLOBAL registry view: gather every member's local heads and merge them, so the dashboard
+    /// shows the COMPLETE registry rather than only this node's shards. Since each shard is
+    /// K-replicated across the members, the UNION of all members' local views is the whole
+    /// registry.
+    ///
+    /// - Starts with this node's own local heads.
+    /// - Dials every OTHER active member and asks for its local heads (`ListEntries`) over
+    ///   `REGISTRY_ALPN`. All peer queries run CONCURRENTLY; each tolerates failure (a dead or
+    ///   slow peer contributes nothing — its error is swallowed, never propagated).
+    /// - The whole gather is bounded by a short deadline (~3s): results are absorbed as they
+    ///   arrive, and whatever responded in time is used. A single laggard (e.g. a relay-only
+    ///   peer) can't stall the UI — K-replication means its shards are still covered by other
+    ///   replicas that did answer.
+    /// - Rows are MERGED into a map keyed by `(rtype, owner, name)` keeping the MAX version
+    ///   (last-writer-wins), which dedups the replica overlap.
+    pub async fn entries_global(&self) -> RegistryEntries {
+        use futures::stream::{FuturesUnordered, StreamExt};
+        use std::collections::HashMap;
+
+        // (rtype, owner, name) -> row at its highest version (LWW dedup of replica overlap).
+        let mut merged: HashMap<(u8, [u8; 32], String), HeadRowWire> = HashMap::new();
+        fn absorb(
+            merged: &mut HashMap<(u8, [u8; 32], String), HeadRowWire>,
+            rows: Vec<HeadRowWire>,
+        ) {
+            for r in rows {
+                let key = (r.rtype, r.owner, r.name.clone());
+                match merged.get(&key) {
+                    Some(ex) if ex.version >= r.version => {}
+                    _ => {
+                        merged.insert(key, r);
+                    }
+                }
+            }
+        }
+
+        // Own local heads first (always a contributor).
+        absorb(&mut merged, self.local_head_rows().await);
+        let mut contributors = 1usize;
+
+        // Other active members' dialable addresses.
+        let mut peers: Vec<PeerAddr> = Vec::new();
+        if let Some(m) = self.membership.read().await.as_ref() {
+            for (n, ps) in m.snapshot().await.active {
+                if n.0 == self.self_id {
+                    continue;
+                }
+                peers.push(ps.addr.clone());
+            }
+        }
+
+        // Query every peer CONCURRENTLY. Each future returns `Some(rows)` on a successful
+        // ListEntries reply (a peer with no heads still yields `Some(vec![])` and counts as a
+        // contributor) or `None` on any failure. Drained against a single overall deadline so
+        // partial results already in hand survive a laggard.
+        let mut futs = FuturesUnordered::new();
+        for addr in peers {
+            let transport = self.transport.clone();
+            futs.push(async move {
+                match request_registry(&transport, &addr, &RegistryReq::ListEntries).await {
+                    Ok(RegistryResp::Entries(rows)) => Some(rows),
+                    _ => None,
+                }
+            });
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while let Ok(Some(res)) = tokio::time::timeout_at(deadline, futs.next()).await {
+            if let Some(rows) = res {
+                contributors += 1;
+                absorb(&mut merged, rows);
+            }
+        }
+
+        Self::group_rows(merged.into_values().collect(), contributors)
+    }
+
+    /// Group raw wire rows into a hex-encoded [`RegistryEntries`] by registry type.
+    fn group_rows(rows: Vec<HeadRowWire>, contributors: usize) -> RegistryEntries {
+        let mut out = RegistryEntries {
+            contributors,
+            ..Default::default()
+        };
+        for r in rows {
+            let bucket = match r.rtype {
+                RT_PROGRAM => &mut out.programs,
+                RT_DBROOT => &mut out.dbroots,
+                _ => &mut out.manifests,
+            };
+            bucket.push(HeadRow {
+                owner: hex::encode(r.owner),
+                name: r.name,
+                cid: hex::encode(r.cid),
+                version: r.version,
+            });
         }
         out
     }

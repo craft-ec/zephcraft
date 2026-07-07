@@ -198,12 +198,12 @@
       <div id="reg-status"><div class="muted">…</div></div>
     </div>
     <div class="card">
-      <div class="cardhead">registry entries <span class="muted">— heads on this node's shards (sharded registry — a node holds its own shards, most but not guaranteed all)</span></div>
+      <div class="cardhead">registry entries <span class="muted">— owner-signed heads: programs, DB roots &amp; manifests</span></div>
+      <div style="display:flex;gap:.4rem;margin:.15rem 0 .7rem">
+        <button id="reg-seg-global" onclick="setRegScope('global')" style="font:inherit;font-size:.74rem;background:var(--accent);color:#0d1117;border:1px solid var(--line);border-radius:.3rem;padding:.2rem .75rem;cursor:pointer">global</button>
+        <button id="reg-seg-node" onclick="setRegScope('node')" style="font:inherit;font-size:.74rem;background:transparent;color:var(--dim);border:1px solid var(--line);border-radius:.3rem;padding:.2rem .75rem;cursor:pointer">this node</button>
+      </div>
       <div id="reg-entries"><div class="muted">loading…</div></div>
-    </div>
-    <div class="card">
-      <div class="cardhead">user programs <span class="muted">— published freely by owners · listed by the head registry</span></div>
-      <div id="prog-user"><div class="muted">loading…</div></div>
     </div>
     <div class="card">
       <div class="cardhead">craftcom <span class="muted">(deploy + run sovereign apps — sandboxed WASM against your <span class="mono">app.&lt;ns&gt;</span> namespace)</span></div>
@@ -313,13 +313,14 @@
 </main>
 <script>
 const TOKEN = "__TOKEN__";
+let REG_SCOPE='global', REG_DATA=null, SELF_ID='';
 const $ = (id) => document.getElementById(id);
 function fmtUptime(s){ const h=Math.floor(s/3600), m=Math.floor(s%3600/60), x=s%60;
   return (h? h+"h ":"") + (m? m+"m ":"") + x + "s"; }
 function fmtAgo(unix){ if(!unix) return "—";
   const d = Math.max(0, Math.floor(Date.now()/1000) - unix); return d + "s ago"; }
 function render(s){
-  $("node-id").textContent = s.node_id;
+  $("node-id").textContent = s.node_id; SELF_ID = s.node_id;
   $("reach").textContent = s.reach;
   $("wire").textContent = "v" + s.wire_version + " (framed, postcard)";
   $("views").textContent = "active " + s.peers.filter(p=>p.alive).length + " · passive " + s.passive_peers;
@@ -623,7 +624,9 @@ function showTab(name){
   document.querySelectorAll('.tab').forEach(t => { t.hidden = (t.id !== 'tab-'+name); });
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('on', b.dataset.tab === name));
   try { localStorage.setItem('zeph-tab', name); } catch(e){}
-  if(name==="registry") loadRegistry();
+  // The global entries gather is heavier than a local read, so run it ONCE on tab open (here),
+  // not on every poll tick. loadRegistry() (also called each tick) only refreshes cheap status.
+  if(name==="registry"){ loadRegistry(); loadRegistryEntries(); }
   if(name==="governance") loadGovernance();
 }
 async function doDeploy(){
@@ -658,8 +661,8 @@ function sqlTable(j){
   return '<table><thead><tr>'+cols.map(c=>`<th style="text-align:left;border-bottom:1px solid var(--line)">${esc(c)}</th>`).join("")
     +'</tr></thead><tbody>'+rows.map(r=>'<tr>'+r.map(x=>`<td style="padding:.15rem .5rem .15rem 0">${esc(String(x))}</td>`).join("")+'</tr>').join("")+'</tbody></table>';
 }
-// Registry tab: the head-registry status + per-type counts, the browsable entries list,
-// and the user-programs listing.
+// Registry tab: the head-registry status (cheap, polled) + the browsable entries list
+// (a global gather across members, toggled global / this-node client-side).
 async function loadRegistry(){
   const rs=$("reg-status");
   if(rs){
@@ -667,17 +670,15 @@ async function loadRegistry(){
       const rr=await fetch("/api/registry?token="+TOKEN);
       const r=rr.ok?await rr.json():{};
       const sc=r.shard_count||256;
+      // Cheap, node-local status (polled): epoch / writer-shard count / eligible nodes. The
+      // per-type head COUNTS now come from the GLOBAL entries union (see loadRegistryEntries),
+      // so they are NOT shown here — this endpoint must stay cheap and not trigger a gather.
       rs.innerHTML=`
         <div class="kv"><span>epoch</span><b>${r.epoch||0}</b></div>
         <div class="kv"><span>writer for</span><b>${r.writer_shards||0} of ${sc} shards</b></div>
-        <div class="kv"><span>eligible nodes</span><b>${r.eligible||0}</b></div>
-        <div class="kv"><span>program heads</span><b>${r.program_heads||0}</b></div>
-        <div class="kv"><span>db roots</span><b>${r.dbroots||0}</b></div>
-        <div class="kv"><span>manifests</span><b>${r.manifests||0}</b></div>`;
+        <div class="kv"><span>eligible nodes</span><b>${r.eligible||0}</b></div>`;
     }catch(e){ rs.textContent="error: "+e; }
   }
-  loadRegistryEntries();
-  loadUserPrograms();
 }
 // The browsable head list from /api/registry/entries — grouped Programs / DB roots /
 // Manifests, each row: owner · name · cid · version (hex truncated the same as elsewhere).
@@ -685,33 +686,37 @@ async function loadRegistryEntries(){
   const el=$("reg-entries"); if(!el) return;
   try{
     const r=await fetch("/api/registry/entries?token="+TOKEN);
-    const j=r.ok?await r.json():{};
-    const groups=[["Programs",j.programs],["DB roots",j.dbroots],["Manifests",j.manifests]];
-    let html="";
-    for(const [label,rows] of groups){
-      const list=rows||[];
-      html+=`<div class="grp">${label} · ${list.length}</div>`;
-      html+= list.length
-        ? list.map(e=>`<div class="kv"><span class="mono"><span class="cidcell" onclick="copyCid('${e.owner}')" title="owner — click to copy">${String(e.owner).slice(0,10)}…</span> · <b>${esc(e.name)}</b></span><span class="mono muted"><span class="cidcell" onclick="copyCid('${e.cid}')" title="cid — click to copy">${String(e.cid).slice(0,12)}…</span> · v${e.version}</span></div>`).join("")
-        : '<div class="muted" style="font-size:.76rem">none on this node’s shards</div>';
-    }
-    el.innerHTML=html;
+    REG_DATA=r.ok?await r.json():{programs:[],dbroots:[],manifests:[]};
+    renderReg();
   }catch(e){ el.textContent="error: "+e; }
 }
-async function loadUserPrograms(){
-  const host=$("prog-user"); if(!host) return;
-  try{
-    const ar=await fetch("/api/apps?token="+TOKEN);
-    const j=ar.ok?await ar.json():{};
-    const rows=(j.rows||[]);
-    const utable = rows.length
-      ? '<table><thead><tr><th style="text-align:left">program</th><th style="text-align:left">ver</th><th style="text-align:left">cid</th></tr></thead><tbody>'
-        + rows.map(x=>`<tr><td style="padding:.15rem .8rem .15rem 0"><b>${esc(x[0])}</b></td><td style="padding:.15rem .8rem .15rem 0">v${x[2]!=null?x[2]:1}</td><td class="mono muted cidcell" style="padding:.15rem 0" onclick="copyCid('${x[1]}')">${String(x[1]).slice(0,14)}…</td></tr>`).join("")
-        + '</tbody></table>'
-      : '<div class="muted">no programs yet — deploy one</div>';
-    host.innerHTML=`${utable}
-      <div class="note">Anyone publishes a program by signing a head (name→cid); the <b>head registry</b> records it. The registry is open and owner-signed — sharded, with a rotating writer per shard; no committee, no attestation.</div>`;
-  }catch(e){ host.textContent="error: "+e; }
+// Render the cached registry union under the current scope. 'global' = every owner's heads;
+// 'node' = only heads OWNED by this node (owner === SELF_ID) — filtered client-side.
+function renderReg(){
+  const el=$("reg-entries"); if(!el||!REG_DATA) return;
+  const mine = REG_SCOPE==='node';
+  const filt = rows => (rows||[]).filter(e=> !mine || e.owner===SELF_ID);
+  const groups=[["Programs",filt(REG_DATA.programs)],["DB roots",filt(REG_DATA.dbroots)],["Manifests",filt(REG_DATA.manifests)]];
+  const n=REG_DATA.contributors||1;
+  const hdr = mine
+    ? "owner-signed heads owned by this node"
+    : `all registry heads across the network · gathered across ${n} node${n===1?'':'s'}`;
+  let html=`<div class="muted" style="font-size:.72rem;margin-bottom:.4rem">${hdr}</div>`;
+  for(const [label,list] of groups){
+    html+=`<div class="grp">${label} · ${list.length}</div>`;
+    html+= list.length
+      ? list.map(e=>`<div class="kv"><span class="mono"><span class="cidcell" onclick="copyCid('${e.owner}')" title="owner — click to copy">${String(e.owner).slice(0,10)}…</span> · <b>${esc(e.name)}</b></span><span class="mono muted"><span class="cidcell" onclick="copyCid('${e.cid}')" title="cid — click to copy">${String(e.cid).slice(0,12)}…</span> · v${e.version}</span></div>`).join("")
+      : '<div class="muted" style="font-size:.76rem">none</div>';
+  }
+  el.innerHTML=html;
+}
+// Global | This node toggle — client-side filter of the already-gathered union.
+function setRegScope(s){
+  REG_SCOPE=s;
+  const g=$("reg-seg-global"), nb=$("reg-seg-node");
+  if(g){ g.style.background=s==='global'?'var(--accent)':'transparent'; g.style.color=s==='global'?'#0d1117':'var(--dim)'; }
+  if(nb){ nb.style.background=s==='node'?'var(--accent)':'transparent'; nb.style.color=s==='node'?'#0d1117':'var(--dim)'; }
+  renderReg();
 }
 // Governance tab: the governor multisig + the governed protocol programs (canonical anchors).
 async function loadGovernance(){

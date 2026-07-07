@@ -1882,8 +1882,11 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         .into_response()
     }
 
-    // Browsable head-registry entries — every head on THIS node's shards, grouped by type
-    // (program heads / DB roots / manifests). A per-node partial view (sharded registry).
+    // Browsable head-registry entries — the GLOBAL union of every member's local heads, grouped
+    // by type (program heads / DB roots / manifests). Each shard is K-replicated across the
+    // members, so the union of all members' local views is the complete registry. The gather is
+    // concurrent, per-peer-failure-tolerant, and bounded (~3s) so a dead/slow member can't hang
+    // the UI. Heavier than a local read — invoked on tab load, NOT per status poll.
     async fn api_registry_entries(
         AxumState(ctx): AxumState<HttpCtx>,
         Query(params): Query<TokenParam>,
@@ -1891,7 +1894,10 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         if params.token != *ctx.token {
             return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
         }
-        let e = ctx.state.registry.entries().await;
+        let e = ctx.state.registry.entries_global().await;
+        let (nprograms, ndbroots, nmanifests) =
+            (e.programs.len(), e.dbroots.len(), e.manifests.len());
+        let contributors = e.contributors;
         let rows = |v: Vec<crate::headreg::HeadRow>| -> Vec<serde_json::Value> {
             v.into_iter()
                 .map(|r| {
@@ -1908,6 +1914,11 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
             "programs": rows(e.programs),
             "dbroots": rows(e.dbroots),
             "manifests": rows(e.manifests),
+            // Global union counts (reflect the merged view) + how many nodes contributed.
+            "program_heads": nprograms,
+            "dbroot_count": ndbroots,
+            "manifest_count": nmanifests,
+            "contributors": contributors,
         }))
         .into_response()
     }

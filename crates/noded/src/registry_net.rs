@@ -46,6 +46,21 @@ pub enum RegistryReq {
         shard: u64,
         state: Vec<u8>,
     },
+    /// Return ALL of this node's local registry heads — every rtype, every shard it holds. Used
+    /// to build the GLOBAL dashboard view: since each shard is K-replicated across the members,
+    /// the union of every member's local heads is the complete registry. No fields.
+    ListEntries,
+}
+
+/// One local head row on the wire — raw bytes (hex-encoded later, in control.rs). Carries its
+/// `rtype` so the receiver can group it into programs / DB roots / manifests.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct HeadRowWire {
+    pub rtype: u8,
+    pub owner: [u8; 32],
+    pub name: String,
+    pub cid: [u8; 32],
+    pub version: u64,
 }
 
 /// The writer's response.
@@ -64,6 +79,8 @@ pub enum RegistryResp {
     Version(u64),
     /// A `PushState` was merged.
     Ack,
+    /// Every local registry head this node holds (reply to `ListEntries`) — raw-byte rows.
+    Entries(Vec<HeadRowWire>),
     /// The writer rejected/failed the request.
     Err(String),
 }
