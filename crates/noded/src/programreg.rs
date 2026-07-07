@@ -39,6 +39,30 @@ const EPOCH_MILLIS: u64 = 30_000;
 /// each shard is an independent account with its own rotating-writer election.
 const SHARD_COUNT: u64 = 256;
 
+/// Registry KIND tags — each kind is a SEPARATE account per shard (the tag is folded into
+/// [`shard_seed`], so `(rtype, shard)` addresses distinct state). Lets program heads, database
+/// roots, and manifests share one substrate without colliding.
+pub const RT_PROGRAM: u8 = 0;
+/// Reserved kinds — the substrate already routes them (type-in-seed); the DB-root and manifest
+/// registries that will use them are not wired yet, so tolerate the unused tags for now.
+#[allow(dead_code)]
+pub const RT_DBROOT: u8 = 1;
+#[allow(dead_code)]
+pub const RT_MANIFEST: u8 = 2;
+
+/// How many replicas hold each shard's state. The writer ROTATES among this stable set and
+/// pushes every write to the others, so if the writer dies a warm successor already holds the
+/// state (the offline-writer fault the single-writer model could not survive).
+const REPLICATION_FACTOR: usize = 3;
+
+/// Identifies one registry account = one `(kind, shard)`. Threaded everywhere a shard used to
+/// be, so each kind gets its own independent per-shard account + writer set.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct ShardKey {
+    rtype: u8,
+    shard: u64,
+}
+
 /// Boundary-race grace window, in milliseconds. During the first `GRACE_MILLIS` of a new epoch
 /// the PREVIOUS epoch's writer stays authoritative (see [`ProgramRegistry::effective_epoch`]),
 /// so a bounded clock skew (< grace) can't produce two live writers at a boundary.
@@ -51,10 +75,17 @@ fn shard_of(owner: &[u8; 32], name: &str) -> u64 {
     u64::from_le_bytes(h[..8].try_into().unwrap()) % SHARD_COUNT
 }
 
-/// The per-shard account seed — replaces the bare `REGISTRY_SEED` in every account op so each
-/// shard gets a distinct `pda(registry_program_cid(), shard_seed(shard))`.
-fn shard_seed(shard: u64) -> Vec<u8> {
-    [REGISTRY_SEED, shard.to_le_bytes().as_slice()].concat()
+/// The per-account seed — replaces the bare `REGISTRY_SEED` in every account op so each
+/// `(rtype, shard)` gets a distinct `pda(registry_program_cid(), shard_seed(sk))`. The KIND
+/// tag is folded in FIRST, so a program head and a database root at the same shard live in
+/// separate accounts (type-in-seed).
+fn shard_seed(sk: ShardKey) -> Vec<u8> {
+    [
+        REGISTRY_SEED,
+        &[sk.rtype],
+        sk.shard.to_le_bytes().as_slice(),
+    ]
+    .concat()
 }
 
 /// The node's durable program-name registry — a thin consumer of [`ProgramAccountStore`].
@@ -83,10 +114,10 @@ pub struct ProgramRegistry {
     membership: RwLock<Option<Arc<Membership>>>,
     /// This node's own id.
     self_id: [u8; 32],
-    /// Per-shard: the last effective epoch for which this node (as that shard's writer) has
-    /// performed the state handoff. Guards [`Self::ensure_current`] so the previous-writer
-    /// fetch runs once per epoch per shard.
-    last_epoch: RwLock<std::collections::HashMap<u64, u64>>,
+    /// Per `(rtype, shard)`: the last effective epoch for which this node (as that account's
+    /// writer) has performed the takeover merge. Guards [`Self::ensure_current`] so the
+    /// merge-from-replicas runs once per epoch per account.
+    last_epoch: RwLock<std::collections::HashMap<ShardKey, u64>>,
 }
 
 impl ProgramRegistry {
@@ -151,37 +182,53 @@ impl ProgramRegistry {
         ids
     }
 
-    /// Deterministic per-shard per-epoch election: the eligible id with the SMALLEST
-    /// `blake3(shard_le ‖ epoch_le ‖ node_id)`. Because every node computes this over the same
-    /// shard + epoch + membership view, the write duty rotates without any coordination, and
-    /// different shards can elect different nodes at the same moment.
-    fn elect(shard: u64, epoch: u64, eligible: &[[u8; 32]]) -> Option<[u8; 32]> {
-        eligible.iter().copied().min_by_key(|id| {
+    /// The STABLE replica set for `sk`: the eligible ids sorted ASC by
+    /// `blake3(rtype ‖ shard_le ‖ node_id)`, truncated to [`REPLICATION_FACTOR`]. The hash has
+    /// NO epoch term on purpose — this set shifts ONLY on membership change, so a fixed group
+    /// of nodes holds each account's state. The writer rotates AMONG these; the others are warm
+    /// followers that already carry the state, so a writer failure has a ready successor.
+    fn replicas(sk: ShardKey, eligible: &[[u8; 32]]) -> Vec<[u8; 32]> {
+        let mut ids: Vec<[u8; 32]> = eligible.to_vec();
+        ids.sort_by_key(|id| {
             Cid::of(
                 &[
-                    shard.to_le_bytes().as_slice(),
-                    epoch.to_le_bytes().as_slice(),
+                    &[sk.rtype][..],
+                    sk.shard.to_le_bytes().as_slice(),
                     id.as_slice(),
                 ]
                 .concat(),
             )
             .0
-        })
+        });
+        ids.truncate(REPLICATION_FACTOR.min(ids.len()));
+        ids
     }
 
-    /// The writer for `shard` in the CURRENT (effective) epoch. Empty eligibility (membership
-    /// not yet wired) → self, so a fresh/single node still writes every shard.
-    async fn current_writer(&self, shard: u64) -> Option<[u8; 32]> {
+    /// The writer for `sk` in the CURRENT (effective) epoch. The writer is ALWAYS a replica:
+    /// the role rotates through the stable replica set by epoch, so every node computes the
+    /// same winner and the others stay warm followers. Empty eligibility (membership not yet
+    /// wired) → self, so a fresh/single node still writes every account.
+    async fn current_writer(&self, sk: ShardKey) -> Option<[u8; 32]> {
         let elig = self.eligible().await;
-        if elig.is_empty() {
-            return Some(self.self_id);
+        let reps = Self::replicas(sk, &elig);
+        if reps.is_empty() {
+            Some(self.self_id)
+        } else {
+            Some(reps[(self.effective_epoch() as usize) % reps.len()])
         }
-        Self::elect(shard, self.effective_epoch(), &elig)
     }
 
-    /// True if THIS node is `shard`'s current (effective-epoch) elected writer.
-    async fn is_writer(&self, shard: u64) -> bool {
-        self.current_writer(shard).await == Some(self.self_id)
+    /// True if THIS node is `sk`'s current (effective-epoch) writer.
+    async fn is_writer(&self, sk: ShardKey) -> bool {
+        self.current_writer(sk).await == Some(self.self_id)
+    }
+
+    /// True if THIS node is in `sk`'s stable replica set (holds its state as a warm follower
+    /// even when it is not the current writer).
+    #[allow(dead_code)]
+    async fn is_replica(&self, sk: ShardKey) -> bool {
+        let elig = self.eligible().await;
+        Self::replicas(sk, &elig).contains(&self.self_id)
     }
 
     /// Look up `id`'s dialable address from the membership view (active or dead).
@@ -195,11 +242,11 @@ impl ProgramRegistry {
             .map(|(_, ps)| ps.addr.clone())
     }
 
-    /// `shard`'s current writer's dialable address. Errors if this node IS the writer (caller
+    /// `sk`'s current writer's dialable address. Errors if this node IS the writer (caller
     /// should act locally) or the writer is not in the membership view.
-    async fn writer_addr(&self, shard: u64) -> anyhow::Result<PeerAddr> {
+    async fn writer_addr(&self, sk: ShardKey) -> anyhow::Result<PeerAddr> {
         let writer = self
-            .current_writer(shard)
+            .current_writer(sk)
             .await
             .ok_or_else(|| anyhow::anyhow!("no registry writer for current epoch"))?;
         if writer == self.self_id {
@@ -210,67 +257,78 @@ impl ProgramRegistry {
             .ok_or_else(|| anyhow::anyhow!("registry writer not in membership view"))
     }
 
-    /// STATE HANDOFF: when this node becomes `shard`'s writer for a NEW effective epoch, adopt
-    /// the PREVIOUS epoch's writer's shard state before serving, so registrations survive
-    /// rotation. Best-effort and idempotent per epoch per shard (guarded by `last_epoch`).
+    /// TAKEOVER MERGE: when this node becomes `sk`'s writer for a NEW effective epoch, MERGE
+    /// the OTHER live replicas' state into its own before serving, so a freshly-promoted
+    /// replica catches up on anything it missed while a peer was writing. Merge (LWW), not
+    /// overwrite — so no replica's newer entries are lost. Best-effort and idempotent per epoch
+    /// per account (guarded by `last_epoch`).
     ///
     /// Edge cases (see also `.claude/feature-progress.md`):
     /// (a) the grace window ([`Self::effective_epoch`]) removes the clock-skew dual-writer race
     ///     at epoch boundaries while skew < grace;
-    /// (b) if the previous writer is unreachable at handoff, we keep local/last-known state;
-    /// (c) the FULL shard state is transferred each rotation — fine while a shard is small;
-    ///     later hand off the cid and fetch the content lazily.
-    async fn ensure_current(&self, shard: u64) {
-        if !self.is_writer(shard).await {
+    /// (b) if a replica is unreachable, we merge whoever answered + keep local state;
+    /// (c) the FULL account state is transferred — fine while an account is small; later
+    ///     exchange the cid and fetch content lazily.
+    async fn ensure_current(&self, sk: ShardKey) {
+        if !self.is_writer(sk).await {
             return;
         }
         let eff = self.effective_epoch();
-        if eff
-            <= self
-                .last_epoch
-                .read()
-                .await
-                .get(&shard)
-                .copied()
-                .unwrap_or(0)
-        {
+        if eff <= self.last_epoch.read().await.get(&sk).copied().unwrap_or(0) {
             return;
         }
         let elig = self.eligible().await;
-        if let Some(prev) = Self::elect(shard, eff - 1, &elig) {
-            if prev != self.self_id {
-                if let Some(addr) = self.addr_of(prev).await {
-                    if let Ok(RegistryResp::State(bytes)) =
-                        request_registry(&self.transport, &addr, &RegistryReq::GetState { shard })
-                            .await
-                    {
-                        if !bytes.is_empty() {
-                            let _ = self
-                                .store
-                                .put_state(registry_program_cid(), &shard_seed(shard), &bytes)
-                                .await;
-                        }
+        let mut local = RegistryState::decode(
+            &self
+                .store
+                .resolve(registry_program_cid(), &shard_seed(sk))
+                .await,
+        )
+        .unwrap_or_default();
+        for id in Self::replicas(sk, &elig) {
+            if id == self.self_id {
+                continue;
+            }
+            if let Some(addr) = self.addr_of(id).await {
+                if let Ok(RegistryResp::State(bytes)) = request_registry(
+                    &self.transport,
+                    &addr,
+                    &RegistryReq::GetState {
+                        rtype: sk.rtype,
+                        shard: sk.shard,
+                    },
+                )
+                .await
+                {
+                    if let Some(other) = RegistryState::decode(&bytes) {
+                        local.merge(&other);
                     }
                 }
             }
         }
+        let _ = self
+            .store
+            .put_state(registry_program_cid(), &shard_seed(sk), &local.encode())
+            .await;
         // Best-effort: mark this epoch handled regardless — on failure we keep local state.
-        self.last_epoch.write().await.insert(shard, eff);
+        self.last_epoch.write().await.insert(sk, eff);
     }
 
-    /// Advance `shard`'s registry account from an owner-signed submission's raw bytes.
+    /// Advance `sk`'s registry account from an owner-signed submission's raw bytes.
     /// Runs the governance-resolved registry program on the writer's own store — the same
     /// advance logic as the local writer path, but on already-signed bytes (no re-sign).
-    async fn advance_local(&self, shard: u64, sub_bytes: &[u8]) -> anyhow::Result<[u8; 32]> {
-        // Adopt the previous epoch's state if we've just become the writer, before advancing.
-        self.ensure_current(shard).await;
+    /// After persisting, PUSHES the new state to the other replicas so the K-replica set stays
+    /// warm (best-effort — a push failure never fails the write).
+    async fn advance_local(&self, sk: ShardKey, sub_bytes: &[u8]) -> anyhow::Result<[u8; 32]> {
+        // Merge the other replicas' state if we've just become the writer, before advancing.
+        self.ensure_current(sk).await;
         let code = self.program_cid().await;
+        let seed = shard_seed(sk);
         // NATIVE DEFAULT (the built-in local registry program). When governance has NOT set a WASM
         // registry program, run `RegistryState::apply` directly — so a FRESH network self-starts
         // with no publish/governance bootstrap. A governance `SetProgram` swaps in the WASM (e.g.
         // the char-limit v2) as the upgrade on top. (MINIMAL_KERNEL: every anchor has a default.)
-        if code == registry_program_cid() {
-            let seed = shard_seed(shard);
+        let (new_state_bytes, root) = if code == registry_program_cid() {
             let prev =
                 RegistryState::decode(&self.store.resolve(registry_program_cid(), &seed).await)
                     .unwrap_or_default();
@@ -279,25 +337,55 @@ impl ProgramRegistry {
             let next = prev
                 .apply(&sub)
                 .map_err(|e| anyhow::anyhow!("registry rejected the submission: {e}"))?;
+            let bytes = next.encode();
             self.store
-                .put_state(registry_program_cid(), &seed, &next.encode())
+                .put_state(registry_program_cid(), &seed, &bytes)
                 .await?;
-            return Ok(next.root());
-        }
-        let r = self
-            .store
-            .advance(registry_program_cid(), code, &shard_seed(shard), sub_bytes)
-            .await?;
-        Ok(r.new_root)
+            (bytes, next.root())
+        } else {
+            let r = self
+                .store
+                .advance(registry_program_cid(), code, &seed, sub_bytes)
+                .await?;
+            let bytes = self.store.resolve(registry_program_cid(), &seed).await;
+            (bytes, r.new_root)
+        };
+        // Push-on-write: keep the replica set warm. Best-effort; never fails the write.
+        self.replicate(sk, &new_state_bytes).await;
+        Ok(root)
     }
 
-    /// Local resolve against this node's own copy of `shard`'s registry account.
-    async fn resolve_local(&self, shard: u64, owner: [u8; 32], name: &str) -> Option<[u8; 32]> {
-        // Adopt the previous epoch's state if we've just become the writer, before resolving.
-        self.ensure_current(shard).await;
+    /// Push `sk`'s freshly-written state to every OTHER replica present in the eligible set,
+    /// each of which MERGES it (LWW). Best-effort: the ≤ `REPLICATION_FACTOR - 1` sends are
+    /// awaited sequentially, and any error is swallowed — a push failure NEVER fails the write.
+    async fn replicate(&self, sk: ShardKey, state: &[u8]) {
+        let elig = self.eligible().await;
+        for id in Self::replicas(sk, &elig) {
+            if id == self.self_id {
+                continue;
+            }
+            if let Some(addr) = self.addr_of(id).await {
+                let _ = request_registry(
+                    &self.transport,
+                    &addr,
+                    &RegistryReq::PushState {
+                        rtype: sk.rtype,
+                        shard: sk.shard,
+                        state: state.to_vec(),
+                    },
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Local resolve against this node's own copy of `sk`'s registry account.
+    async fn resolve_local(&self, sk: ShardKey, owner: [u8; 32], name: &str) -> Option<[u8; 32]> {
+        // Merge the other replicas' state if we've just become the writer, before resolving.
+        self.ensure_current(sk).await;
         let raw = self
             .store
-            .resolve(registry_program_cid(), &shard_seed(shard))
+            .resolve(registry_program_cid(), &shard_seed(sk))
             .await;
         RegistryState::decode(&raw)?
             .resolve(&owner, name)
@@ -331,14 +419,26 @@ impl ProgramRegistry {
     ) -> anyhow::Result<[u8; 32]> {
         // The OWNER (this node's identity) signs the submission either way.
         let sub = HeadSubmission::sign(&self.identity, name, cid, version);
-        let shard = shard_of(&self.self_id, name);
-        if self.is_writer(shard).await {
-            return self.advance_local(shard, &sub.encode()).await;
+        let sk = ShardKey {
+            rtype: RT_PROGRAM,
+            shard: shard_of(&self.self_id, name),
+        };
+        if self.is_writer(sk).await {
+            return self.advance_local(sk, &sub.encode()).await;
         }
         // Non-writer: forward the signed submission to the shard's writer, which advances the
         // shard account and returns the new root.
-        let addr = self.writer_addr(shard).await?;
-        match request_registry(&self.transport, &addr, &RegistryReq::Submit(sub.encode())).await? {
+        let addr = self.writer_addr(sk).await?;
+        match request_registry(
+            &self.transport,
+            &addr,
+            &RegistryReq::Submit {
+                rtype: RT_PROGRAM,
+                sub: sub.encode(),
+            },
+        )
+        .await?
+        {
             RegistryResp::SubmitAck(root) => Ok(root),
             RegistryResp::Err(e) => Err(anyhow::anyhow!("registry writer rejected submit: {e}")),
             other => Err(anyhow::anyhow!("unexpected registry response: {other:?}")),
@@ -349,15 +449,19 @@ impl ProgramRegistry {
     /// the shard's writer resolves locally, a non-writer queries that writer over
     /// `REGISTRY_ALPN` (no caching yet — see follow-up).
     pub async fn resolve(&self, owner: [u8; 32], name: &str) -> Option<[u8; 32]> {
-        let shard = shard_of(&owner, name);
-        if self.is_writer(shard).await {
-            return self.resolve_local(shard, owner, name).await;
+        let sk = ShardKey {
+            rtype: RT_PROGRAM,
+            shard: shard_of(&owner, name),
+        };
+        if self.is_writer(sk).await {
+            return self.resolve_local(sk, owner, name).await;
         }
-        let addr = self.writer_addr(shard).await.ok()?;
+        let addr = self.writer_addr(sk).await.ok()?;
         match request_registry(
             &self.transport,
             &addr,
             &RegistryReq::Resolve {
+                rtype: RT_PROGRAM,
                 owner,
                 name: name.to_string(),
             },
@@ -383,37 +487,71 @@ impl ProgramRegistry {
                         break;
                     };
                     let resp = match postcard::from_bytes::<RegistryReq>(&bytes) {
-                        Ok(RegistryReq::Submit(sub)) => match HeadSubmission::decode(&sub) {
-                            Some(s) => {
-                                let shard = shard_of(&s.owner, &s.name);
-                                match this.advance_local(shard, &sub).await {
-                                    Ok(root) => RegistryResp::SubmitAck(root),
-                                    Err(e) => RegistryResp::Err(e.to_string()),
+                        Ok(RegistryReq::Submit { rtype, sub }) => {
+                            match HeadSubmission::decode(&sub) {
+                                Some(s) => {
+                                    let sk = ShardKey {
+                                        rtype,
+                                        shard: shard_of(&s.owner, &s.name),
+                                    };
+                                    match this.advance_local(sk, &sub).await {
+                                        Ok(root) => RegistryResp::SubmitAck(root),
+                                        Err(e) => RegistryResp::Err(e.to_string()),
+                                    }
                                 }
+                                None => RegistryResp::Err("bad submission".into()),
                             }
-                            None => RegistryResp::Err("bad submission".into()),
-                        },
-                        Ok(RegistryReq::Resolve { owner, name }) => {
-                            let shard = shard_of(&owner, &name);
-                            RegistryResp::Resolved(this.resolve_local(shard, owner, &name).await)
                         }
-                        // Serve the full current shard state for the epoch handoff.
-                        Ok(RegistryReq::GetState { shard }) => RegistryResp::State(
+                        Ok(RegistryReq::Resolve { rtype, owner, name }) => {
+                            let sk = ShardKey {
+                                rtype,
+                                shard: shard_of(&owner, &name),
+                            };
+                            RegistryResp::Resolved(this.resolve_local(sk, owner, &name).await)
+                        }
+                        // Serve the full current account state for the takeover merge.
+                        Ok(RegistryReq::GetState { rtype, shard }) => RegistryResp::State(
                             this.store
-                                .resolve(registry_program_cid(), &shard_seed(shard))
+                                .resolve(
+                                    registry_program_cid(),
+                                    &shard_seed(ShardKey { rtype, shard }),
+                                )
                                 .await,
                         ),
-                        // Report the current version of a key from its shard (0 if none).
-                        Ok(RegistryReq::CurrentVersion { owner, name }) => {
-                            let shard = shard_of(&owner, &name);
+                        // Report the current version of a key from its account (0 if none).
+                        Ok(RegistryReq::CurrentVersion { rtype, owner, name }) => {
+                            let sk = ShardKey {
+                                rtype,
+                                shard: shard_of(&owner, &name),
+                            };
                             let raw = this
                                 .store
-                                .resolve(registry_program_cid(), &shard_seed(shard))
+                                .resolve(registry_program_cid(), &shard_seed(sk))
                                 .await;
                             let v = RegistryState::decode(&raw)
                                 .and_then(|s| s.resolve(&owner, &name).map(|e| e.version))
                                 .unwrap_or(0);
                             RegistryResp::Version(v)
+                        }
+                        // A pushed replica state — MERGE (LWW) into our own copy, don't overwrite.
+                        Ok(RegistryReq::PushState {
+                            rtype,
+                            shard,
+                            state,
+                        }) => {
+                            let seed = shard_seed(ShardKey { rtype, shard });
+                            let mut local = RegistryState::decode(
+                                &this.store.resolve(registry_program_cid(), &seed).await,
+                            )
+                            .unwrap_or_default();
+                            if let Some(pushed) = RegistryState::decode(&state) {
+                                local.merge(&pushed);
+                            }
+                            let _ = this
+                                .store
+                                .put_state(registry_program_cid(), &seed, &local.encode())
+                                .await;
+                            RegistryResp::Ack
                         }
                         Err(e) => RegistryResp::Err(format!("bad registry request: {e}")),
                     };
@@ -429,23 +567,27 @@ impl ProgramRegistry {
     /// `prev + 1` from the registry itself — no DHT lookup. Routes the key to its shard: the
     /// shard's writer reads it locally, a non-writer queries the writer over `REGISTRY_ALPN`.
     pub async fn current_version(&self, owner: [u8; 32], name: &str) -> u64 {
-        let shard = shard_of(&owner, name);
-        if self.is_writer(shard).await {
+        let sk = ShardKey {
+            rtype: RT_PROGRAM,
+            shard: shard_of(&owner, name),
+        };
+        if self.is_writer(sk).await {
             let raw = self
                 .store
-                .resolve(registry_program_cid(), &shard_seed(shard))
+                .resolve(registry_program_cid(), &shard_seed(sk))
                 .await;
             return RegistryState::decode(&raw)
                 .and_then(|s| s.resolve(&owner, name).map(|e| e.version))
                 .unwrap_or(0);
         }
-        let Ok(addr) = self.writer_addr(shard).await else {
+        let Ok(addr) = self.writer_addr(sk).await else {
             return 0;
         };
         match request_registry(
             &self.transport,
             &addr,
             &RegistryReq::CurrentVersion {
+                rtype: RT_PROGRAM,
                 owner,
                 name: name.to_string(),
             },
@@ -464,12 +606,16 @@ impl ProgramRegistry {
     pub async fn rows(&self) -> Vec<(String, String, String, u64)> {
         let mut out = Vec::new();
         for shard in 0..SHARD_COUNT {
-            if !self.is_writer(shard).await {
+            let sk = ShardKey {
+                rtype: RT_PROGRAM,
+                shard,
+            };
+            if !self.is_writer(sk).await {
                 continue;
             }
             let raw = self
                 .store
-                .resolve(registry_program_cid(), &shard_seed(shard))
+                .resolve(registry_program_cid(), &shard_seed(sk))
                 .await;
             for e in RegistryState::decode(&raw).unwrap_or_default().entries() {
                 out.push((
@@ -490,12 +636,16 @@ impl ProgramRegistry {
         let mut count = 0;
         let mut combined: Vec<u8> = Vec::new();
         for shard in 0..SHARD_COUNT {
-            if !self.is_writer(shard).await {
+            let sk = ShardKey {
+                rtype: RT_PROGRAM,
+                shard,
+            };
+            if !self.is_writer(sk).await {
                 continue;
             }
             let raw = self
                 .store
-                .resolve(registry_program_cid(), &shard_seed(shard))
+                .resolve(registry_program_cid(), &shard_seed(sk))
                 .await;
             let s = RegistryState::decode(&raw).unwrap_or_default();
             count += s.len();
@@ -514,13 +664,17 @@ impl ProgramRegistry {
         let mut writer_shards = 0usize;
         let mut entries = 0usize;
         for shard in 0..SHARD_COUNT {
-            if !self.is_writer(shard).await {
+            let sk = ShardKey {
+                rtype: RT_PROGRAM,
+                shard,
+            };
+            if !self.is_writer(sk).await {
                 continue;
             }
             writer_shards += 1;
             let raw = self
                 .store
-                .resolve(registry_program_cid(), &shard_seed(shard))
+                .resolve(registry_program_cid(), &shard_seed(sk))
                 .await;
             entries += RegistryState::decode(&raw).map(|s| s.len()).unwrap_or(0);
         }

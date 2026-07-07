@@ -165,6 +165,25 @@ impl RegistryState {
         }
         Ok(next)
     }
+
+    /// Merge `other` into self — last-writer-wins per `(owner, name)`: for each entry in
+    /// `other`, if self lacks that key OR `other`'s version is strictly greater, take
+    /// `other`'s entry. The result is the union of keys, each held at its highest version.
+    /// Order-independent (a CRDT join), so replicas converge no matter the merge order —
+    /// this is what lets K replicas hold the same shard state and a promoted replica catch
+    /// up on takeover.
+    pub fn merge(&mut self, other: &RegistryState) {
+        for e in &other.entries {
+            match self.find(&e.owner, &e.name) {
+                Ok(i) => {
+                    if e.version > self.entries[i].version {
+                        self.entries[i] = e.clone();
+                    }
+                }
+                Err(i) => self.entries.insert(i, e.clone()),
+            }
+        }
+    }
 }
 
 /// The well-known program CID of the app-name registry — a NATIVE network-owned
@@ -369,6 +388,51 @@ mod tests {
         assert_eq!(ab.len(), 2);
         assert_eq!(ab.resolve(&a.node_id().0, "feed").unwrap().cid, [1u8; 32]);
         assert_eq!(ab.resolve(&b.node_id().0, "feed").unwrap().cid, [2u8; 32]);
+    }
+
+    #[test]
+    fn merge_keeps_higher_version_and_unions_keys() {
+        let a = id();
+        let b = id();
+        // self holds `a/feed@1` and `a/blog@2`.
+        let mut lhs = RegistryState::default()
+            .apply(&HeadSubmission::sign(&a, "feed", [1u8; 32], 1))
+            .unwrap()
+            .apply(&HeadSubmission::sign(&a, "blog", [3u8; 32], 2))
+            .unwrap();
+        // other holds a NEWER `a/feed@5`, an OLDER `a/blog@1`, and a key self lacks `b/feed@1`.
+        let rhs = RegistryState::default()
+            .apply(&HeadSubmission::sign(&a, "feed", [9u8; 32], 5))
+            .unwrap()
+            .apply(&HeadSubmission::sign(&a, "blog", [8u8; 32], 1))
+            .unwrap()
+            .apply(&HeadSubmission::sign(&b, "feed", [2u8; 32], 1))
+            .unwrap();
+        lhs.merge(&rhs);
+        // higher version wins per key
+        let feed = lhs.resolve(&a.node_id().0, "feed").unwrap();
+        assert_eq!((feed.cid, feed.version), ([9u8; 32], 5), "newer feed wins");
+        // older push does NOT clobber the higher local version
+        let blog = lhs.resolve(&a.node_id().0, "blog").unwrap();
+        assert_eq!((blog.cid, blog.version), ([3u8; 32], 2), "higher blog kept");
+        // union of keys: the key only other had is now present
+        assert_eq!(lhs.resolve(&b.node_id().0, "feed").unwrap().cid, [2u8; 32]);
+        assert_eq!(lhs.len(), 3, "union of keys");
+
+        // merge is order-independent → both replicas converge to the same root
+        let mut rhs2 = rhs.clone();
+        rhs2.merge(
+            &RegistryState::default()
+                .apply(&HeadSubmission::sign(&a, "feed", [1u8; 32], 1))
+                .unwrap()
+                .apply(&HeadSubmission::sign(&a, "blog", [3u8; 32], 2))
+                .unwrap(),
+        );
+        assert_eq!(
+            lhs.root(),
+            rhs2.root(),
+            "merge converges regardless of order"
+        );
     }
 
     #[test]

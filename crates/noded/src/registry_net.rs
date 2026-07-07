@@ -14,21 +14,38 @@ pub const REGISTRY_ALPN: &[u8] = b"/craftec/registry/1";
 /// Max size of a registry request/response frame.
 const MAX_FRAME: usize = 256 * 1024;
 
-/// A registry request forwarded to the writer.
+/// A registry request forwarded to the writer. Every variant carries an `rtype` (the
+/// registry KIND — [`zeph_com`]-style `RT_PROGRAM`/`RT_DBROOT`/`RT_MANIFEST`) so a request
+/// routes to the account for that type: each `(rtype, shard)` is a distinct account.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum RegistryReq {
     /// Forward an owner-signed [`zeph_com::HeadSubmission`] (its `encode()` bytes) to the
-    /// writer, which advances the global registry account and returns the new root.
-    Submit(Vec<u8>),
-    /// Ask the writer to resolve `(owner, name)` to its current head cid.
-    Resolve { owner: [u8; 32], name: String },
-    /// Ask a writer for the FULL current registry-account state bytes of a SHARD. Used for
-    /// the per-epoch state handoff: a node becoming the new epoch's writer for `shard` fetches
-    /// the previous writer's state before serving so registrations survive rotation.
-    GetState { shard: u64 },
-    /// Ask the writer for the current version of `(owner, name)` (0 if unregistered) — so a
-    /// non-writer node can compute `prev + 1` for its next deploy without holding the shard.
-    CurrentVersion { owner: [u8; 32], name: String },
+    /// writer, which advances the `(rtype, shard)` registry account and returns the new root.
+    Submit { rtype: u8, sub: Vec<u8> },
+    /// Ask the writer to resolve `(owner, name)` to its current head cid, under `rtype`.
+    Resolve {
+        rtype: u8,
+        owner: [u8; 32],
+        name: String,
+    },
+    /// Ask a replica for the FULL current registry-account state bytes of `(rtype, shard)`.
+    /// Used for the takeover MERGE: a node becoming the new epoch's writer fetches the other
+    /// replicas' state and merges it before serving so registrations survive rotation.
+    GetState { rtype: u8, shard: u64 },
+    /// Ask the writer for the current version of `(owner, name)` under `rtype` (0 if
+    /// unregistered) — so a non-writer can compute `prev + 1` without holding the shard.
+    CurrentVersion {
+        rtype: u8,
+        owner: [u8; 32],
+        name: String,
+    },
+    /// Push the writer's FULL `(rtype, shard)` state to a replica, which MERGES it (LWW) into
+    /// its own copy. Sent on every write so the K-replica set stays warm.
+    PushState {
+        rtype: u8,
+        shard: u64,
+        state: Vec<u8>,
+    },
 }
 
 /// The writer's response.
@@ -39,11 +56,13 @@ pub enum RegistryResp {
     /// A `Resolve` result (`None` = not registered).
     Resolved(Option<[u8; 32]>),
     /// The full registry-account state bytes (empty = no state yet) — reply to `GetState`,
-    /// used for the per-epoch state handoff.
+    /// used for the takeover merge.
     State(Vec<u8>),
     /// The current version of a `(owner, name)` key (0 if unregistered) — reply to
     /// `CurrentVersion`.
     Version(u64),
+    /// A `PushState` was merged.
+    Ack,
     /// The writer rejected/failed the request.
     Err(String),
 }
