@@ -45,7 +45,7 @@ pub use registry::{
     registry_program_cid, HeadEntry, HeadSubmission, NativeProgram, ProgramRegistryState,
     RegistryProgram, RegistryState, REGISTRY_SEED,
 };
-pub use transition::{pda, TransitionRuntime};
+pub use transition::{pda, TransitionCtx, TransitionRuntime};
 
 /// Default fuel budget per invocation — roughly proportional to executed WASM
 /// instructions (foundation §38). A runaway loop exhausts this and traps.

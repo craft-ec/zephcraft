@@ -33,23 +33,52 @@ pub struct TransitionRuntime {
     engine: Engine,
 }
 
-/// Per-run context: the prior state + request bytes in, the committed output out. The
-/// `caller`/`app_ns`/`backend` fields are plumbing for the unified runtime (Phase 2b adds
-/// sql/obj host functions that read them) — no host function bound today reads them, so
-/// they carry inert defaults and behavior is unchanged.
-struct TransitionCtx {
+/// Per-run context for the unified runtime: the prior state + request bytes in, the
+/// committed output out, plus the `caller`/`app_ns`/`backend` the granted host functions
+/// read. Under the deterministic grant only `prev_state`/`input`/`output` are touched
+/// (`backend` is `None`); under a `full` grant the sql/obj/clock/caller functions read the
+/// remaining fields. Build one with [`TransitionCtx::deterministic`] (backend-less) or
+/// [`TransitionCtx::new`] (backend-backed).
+pub struct TransitionCtx {
     prev_state: Vec<u8>,
     input: Vec<u8>,
     output: Vec<u8>,
-    /// The invoking identity (unused in the deterministic grant; Phase 2b `caller`).
-    #[allow(dead_code)]
+    /// The invoking identity (exposed via the `caller` host fn under `Capability::Caller`).
     caller: [u8; 32],
-    /// The app namespace a future sql/obj grant is confined to (Phase 2b).
-    #[allow(dead_code)]
+    /// The app namespace sql/obj writes are confined to (the structural gate).
     app_ns: String,
-    /// The substrate a future sql/obj grant acts on (`None` under the deterministic grant).
-    #[allow(dead_code)]
+    /// The substrate sql/obj/clock act on. `None` under the deterministic grant (protocol
+    /// programs don't import those functions); a called sql/obj/clock fn with `None`
+    /// returns its failure path rather than panicking.
     backend: Option<Arc<dyn AppBackend>>,
+}
+
+impl TransitionCtx {
+    /// A backend-backed context — for apps/tests supplying a real (or mock) [`AppBackend`],
+    /// the invoking `caller`, and the `app_ns` sql/obj writes are confined to.
+    pub fn new(
+        prev_state: Vec<u8>,
+        input: Vec<u8>,
+        caller: [u8; 32],
+        app_ns: String,
+        backend: Option<Arc<dyn AppBackend>>,
+    ) -> Self {
+        Self {
+            prev_state,
+            input,
+            output: Vec::new(),
+            caller,
+            app_ns,
+            backend,
+        }
+    }
+
+    /// The deterministic context: prior state + request, no backend, default
+    /// caller/app_ns. This is what [`TransitionRuntime::run_transition`] builds, so protocol
+    /// programs run exactly as before.
+    pub fn deterministic(prev_state: Vec<u8>, input: Vec<u8>) -> Self {
+        Self::new(prev_state, input, [0u8; 32], String::new(), None)
+    }
 }
 
 impl TransitionRuntime {
@@ -83,8 +112,11 @@ impl TransitionRuntime {
         .await
     }
 
-    /// Run a state-transition program: the prior state is exposed via the `state` host
-    /// function, the request via `input`. The output is what the program commits.
+    /// Run a state-transition program deterministically: the prior state is exposed via the
+    /// `state` host function, the request via `input`. The output is what the program
+    /// commits. Convenience over [`run_program`](Self::run_program) that builds a
+    /// backend-less [`TransitionCtx::deterministic`] — protocol programs (registry,
+    /// governance, account paths) run through here, unchanged.
     pub async fn run_transition(
         &self,
         wasm: &[u8],
@@ -94,18 +126,25 @@ impl TransitionRuntime {
         fuel: u64,
         grant: &CapabilityGrant,
     ) -> anyhow::Result<Vec<u8>> {
+        let ctx = TransitionCtx::deterministic(prev_state.to_vec(), request.to_vec());
+        self.run_program(wasm, func, ctx, fuel, grant).await
+    }
+
+    /// The unified run path: instantiate `wasm` under `grant` (binding ONLY the granted host
+    /// functions — a non-granted import fails to link) against a full [`TransitionCtx`], run
+    /// `func`, and return the committed output. A `ctx.backend` of `Some` lets the granted
+    /// sql/obj/clock functions reach the substrate; `None` leaves them to return their
+    /// failure path. Fuel-metered.
+    pub async fn run_program(
+        &self,
+        wasm: &[u8],
+        func: &str,
+        ctx: TransitionCtx,
+        fuel: u64,
+        grant: &CapabilityGrant,
+    ) -> anyhow::Result<Vec<u8>> {
         let module = Module::new(&self.engine, wasm)?;
-        let mut store = Store::new(
-            &self.engine,
-            TransitionCtx {
-                prev_state: prev_state.to_vec(),
-                input: request.to_vec(),
-                output: Vec::new(),
-                caller: [0u8; 32],
-                app_ns: String::new(),
-                backend: None,
-            },
-        );
+        let mut store = Store::new(&self.engine, ctx);
         store.set_fuel(fuel)?;
         let mut linker = Linker::new(&self.engine);
         bind_granted(&mut linker, grant)?;
@@ -159,6 +198,15 @@ fn det_read(
     data.get(s..e).map(|b| b.to_vec())
 }
 
+fn det_read_str(
+    caller: &Caller<'_, TransitionCtx>,
+    mem: &Memory,
+    ptr: i32,
+    len: i32,
+) -> Option<String> {
+    det_read(caller, mem, ptr, len).and_then(|b| String::from_utf8(b).ok())
+}
+
 fn det_write(
     caller: &mut Caller<'_, TransitionCtx>,
     mem: &Memory,
@@ -182,10 +230,14 @@ fn det_write(
 
 /// Bind the host ABI per the capability `grant` — a function is bound **only if** its
 /// capability is granted, so a program importing a non-granted capability fails to
-/// instantiate (`unknown import`; `COMPUTE_EXECUTION_DESIGN.md` §5). Phase 1 binds the
-/// four caps a transition needs: `input` (Input), `state` (State), `commit` (Commit), and
-/// `ed25519_verify` (Crypto). The deterministic grant allows all four → today's exact
-/// surface (no behavior change); the remaining §4 caps are bound in later phases.
+/// instantiate (`unknown import`; `COMPUTE_EXECUTION_DESIGN.md` §5). This is the unified
+/// surface: `input` (Input), `state` (State), `commit` (Commit), `ed25519_verify` (Crypto),
+/// `caller` (Caller), `sql_execute`/`sql_query` (Sql), `obj_put`/`obj_get` (Obj), and
+/// `clock` (WallClock — the per-node HLC is host-varying, so it is NOT in the deterministic
+/// profile). Wasm-facing names are identical to the capability `Runtime` in `lib.rs`. The
+/// deterministic grant binds the ✅ subset (backend-less); a `full` grant additionally binds
+/// `clock`. The sql/obj/clock functions read `ctx.backend` and return their failure path
+/// (never panic) when it is `None`.
 fn bind_granted(linker: &mut Linker<TransitionCtx>, grant: &CapabilityGrant) -> anyhow::Result<()> {
     if grant.allows(Capability::Input) {
         linker.func_wrap_async(
@@ -265,6 +317,164 @@ fn bind_granted(linker: &mut Linker<TransitionCtx>, grant: &CapabilityGrant) -> 
                         return 0;
                     };
                     i32::from(NodeIdentity::verify(&NodeId(pk), &m, &s))
+                })
+            },
+        )?;
+    }
+    if grant.allows(Capability::Caller) {
+        // `caller(out, cap) -> i32` — writes the 32-byte invoking NodeId. Reads `ctx.caller`
+        // directly (no backend needed). Mirrors lib.rs `caller`.
+        linker.func_wrap_async(
+            TRANSITION_HOST_MODULE,
+            "caller",
+            |mut caller: Caller<'_, TransitionCtx>, (out, cap): (i32, i32)| {
+                Box::new(async move {
+                    let id = caller.data().caller;
+                    let Some(mem) = det_memory(&mut caller) else {
+                        return -1i32;
+                    };
+                    det_write(&mut caller, &mem, out, cap, &id)
+                })
+            },
+        )?;
+    }
+    if grant.allows(Capability::Sql) {
+        // `sql_execute(ptr, len) -> i64` — write SQL to the app's OWN namespace (the ctx
+        // `app_ns`, never an agent argument → structural gate). Mirrors lib.rs `sql_execute`.
+        // Backend-None → -1 (the failure path), never a panic.
+        linker.func_wrap_async(
+            TRANSITION_HOST_MODULE,
+            "sql_execute",
+            |mut caller: Caller<'_, TransitionCtx>, (ptr, len): (i32, i32)| {
+                Box::new(async move {
+                    let Some(mem) = det_memory(&mut caller) else {
+                        return -1i64;
+                    };
+                    let Some(sql) = det_read_str(&caller, &mem, ptr, len) else {
+                        return -1;
+                    };
+                    let ns = caller.data().app_ns.clone(); // gate: ctx namespace, not agent
+                    let Some(backend) = caller.data().backend.clone() else {
+                        return -1; // no substrate (protocol program) → failure path
+                    };
+                    match backend.sql_execute(&ns, &sql).await {
+                        Ok(n) => n as i64,
+                        Err(_) => -1,
+                    }
+                })
+            },
+        )?;
+        // `sql_query(owner_ptr, owner_len, sql_ptr, sql_len, out, cap) -> i32` — read the app
+        // namespace of `owner` (own if `owner_len==0`); SAME app_ns only. Mirrors lib.rs.
+        linker.func_wrap_async(
+            TRANSITION_HOST_MODULE,
+            "sql_query",
+            |mut caller: Caller<'_, TransitionCtx>,
+             (owner_ptr, owner_len, sql_ptr, sql_len, out, cap): (
+                i32,
+                i32,
+                i32,
+                i32,
+                i32,
+                i32,
+            )| {
+                Box::new(async move {
+                    let Some(mem) = det_memory(&mut caller) else {
+                        return -1i32;
+                    };
+                    let owner = if owner_len == 0 {
+                        None
+                    } else {
+                        match det_read(&caller, &mem, owner_ptr, owner_len) {
+                            Some(b) if b.len() == 32 => {
+                                let mut a = [0u8; 32];
+                                a.copy_from_slice(&b);
+                                Some(a)
+                            }
+                            _ => return -1,
+                        }
+                    };
+                    let Some(sql) = det_read_str(&caller, &mem, sql_ptr, sql_len) else {
+                        return -1;
+                    };
+                    let ns = caller.data().app_ns.clone(); // gate: same app_ns only
+                    let Some(backend) = caller.data().backend.clone() else {
+                        return -1;
+                    };
+                    match backend.sql_query(owner, &ns, &sql).await {
+                        Ok(res) => det_write(&mut caller, &mem, out, cap, res.as_bytes()),
+                        Err(_) => -1,
+                    }
+                })
+            },
+        )?;
+    }
+    if grant.allows(Capability::Obj) {
+        // `obj_put(ptr, len, out, cap) -> i32` — store bytes; writes the 32-byte CID.
+        // Mirrors lib.rs `obj_put`. Backend-None → -1.
+        linker.func_wrap_async(
+            TRANSITION_HOST_MODULE,
+            "obj_put",
+            |mut caller: Caller<'_, TransitionCtx>, (ptr, len, out, cap): (i32, i32, i32, i32)| {
+                Box::new(async move {
+                    let Some(mem) = det_memory(&mut caller) else {
+                        return -1i32;
+                    };
+                    let Some(data) = det_read(&caller, &mem, ptr, len) else {
+                        return -1;
+                    };
+                    let Some(backend) = caller.data().backend.clone() else {
+                        return -1;
+                    };
+                    match backend.obj_put(&data).await {
+                        Ok(cid) => det_write(&mut caller, &mem, out, cap, &cid),
+                        Err(_) => -1,
+                    }
+                })
+            },
+        )?;
+        // `obj_get(cid_ptr, out, cap) -> i32` — fetch by CID; content length written.
+        // Mirrors lib.rs `obj_get`. Backend-None → -1.
+        linker.func_wrap_async(
+            TRANSITION_HOST_MODULE,
+            "obj_get",
+            |mut caller: Caller<'_, TransitionCtx>, (cid_ptr, out, cap): (i32, i32, i32)| {
+                Box::new(async move {
+                    let Some(mem) = det_memory(&mut caller) else {
+                        return -1i32;
+                    };
+                    let cid = match det_read(&caller, &mem, cid_ptr, 32) {
+                        Some(b) if b.len() == 32 => {
+                            let mut a = [0u8; 32];
+                            a.copy_from_slice(&b);
+                            a
+                        }
+                        _ => return -1,
+                    };
+                    let Some(backend) = caller.data().backend.clone() else {
+                        return -1;
+                    };
+                    match backend.obj_get(cid).await {
+                        Ok(data) => det_write(&mut caller, &mem, out, cap, &data),
+                        Err(_) => -1,
+                    }
+                })
+            },
+        )?;
+    }
+    if grant.allows(Capability::WallClock) {
+        // `clock() -> i64` — the per-node HLC (`now_millis`). Host-varying (each node's own
+        // clock), so it binds under WallClock, NOT the deterministic profile (the consensus
+        // clock is Phase 4). Mirrors lib.rs `clock`. Backend-None → -1.
+        linker.func_wrap_async(
+            TRANSITION_HOST_MODULE,
+            "clock",
+            |caller: Caller<'_, TransitionCtx>, (): ()| {
+                Box::new(async move {
+                    match caller.data().backend.as_ref() {
+                        Some(backend) => backend.now_millis() as i64,
+                        None => -1,
+                    }
                 })
             },
         )?;
@@ -388,6 +598,192 @@ mod tests {
         assert!(
             msg.contains("commit") || msg.contains("import") || msg.contains("unknown"),
             "instantiation failed on the missing `commit` import: {msg}"
+        );
+    }
+
+    // ---- phase 2b: grant-gated capability host functions ----
+
+    // A minimal backend for the capability gate tests — records nothing, returns success.
+    struct MockBackend;
+    #[async_trait::async_trait]
+    impl AppBackend for MockBackend {
+        async fn sql_execute(&self, _ns: &str, _sql: &str) -> anyhow::Result<u64> {
+            Ok(0)
+        }
+        async fn sql_query(
+            &self,
+            _o: Option<[u8; 32]>,
+            _ns: &str,
+            _sql: &str,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+        async fn obj_put(&self, _d: &[u8]) -> anyhow::Result<[u8; 32]> {
+            Ok([7u8; 32])
+        }
+        async fn obj_get(&self, _c: [u8; 32]) -> anyhow::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn now_millis(&self) -> u64 {
+            0
+        }
+    }
+
+    // Imports `obj_put` (Obj capability) and stores 4 bytes.
+    const OBJ_PUT_WAT: &[u8] = br#"(module
+      (import "craftcom" "obj_put" (func $put (param i32 i32 i32 i32) (result i32)))
+      (memory (export "memory") 1)
+      (func (export "run")
+        (drop (call $put (i32.const 0) (i32.const 4) (i32.const 64) (i32.const 32)))))"#;
+
+    // THE GATE (new capability): the same `obj_put`-importing program instantiates under a
+    // grant containing Obj (with a backend in the ctx) and FAILS to instantiate under a
+    // grant WITHOUT Obj — proving a newly-ported host fn is bound only when granted.
+    #[tokio::test]
+    async fn obj_capability_gates_obj_put() {
+        let rt = TransitionRuntime::new().unwrap();
+        let backend: Arc<dyn AppBackend> = Arc::new(MockBackend);
+
+        // Obj granted (deterministic profile includes Obj) → binds → runs.
+        let ctx = TransitionCtx::new(
+            Vec::new(),
+            Vec::new(),
+            [0u8; 32],
+            "feed".into(),
+            Some(backend.clone()),
+        );
+        rt.run_program(
+            OBJ_PUT_WAT,
+            "run",
+            ctx,
+            DEFAULT_FUEL,
+            &CapabilityGrant::deterministic(),
+        )
+        .await
+        .expect("Obj granted → obj_put binds and the program runs");
+
+        // Obj removed → `obj_put` is not bound → unresolved import → fails to instantiate.
+        let ctx = TransitionCtx::new(
+            Vec::new(),
+            Vec::new(),
+            [0u8; 32],
+            "feed".into(),
+            Some(backend),
+        );
+        let err = rt
+            .run_program(
+                OBJ_PUT_WAT,
+                "run",
+                ctx,
+                DEFAULT_FUEL,
+                &CapabilityGrant::deterministic().without(Capability::Obj),
+            )
+            .await
+            .expect_err("no Obj grant → obj_put unbound → unknown import");
+        let msg = format!("{err:#}").to_lowercase();
+        assert!(
+            msg.contains("obj_put") || msg.contains("import") || msg.contains("unknown"),
+            "instantiation failed on the missing `obj_put` import: {msg}"
+        );
+    }
+
+    // Backend-None safety: obj_put is granted but the ctx has no backend (a protocol-style
+    // run). The host fn must take its failure path (return -1), NOT panic. The program
+    // returns nothing but completes cleanly.
+    #[tokio::test]
+    async fn obj_put_with_no_backend_does_not_panic() {
+        let rt = TransitionRuntime::new().unwrap();
+        let ctx = TransitionCtx::deterministic(Vec::new(), Vec::new());
+        rt.run_program(
+            OBJ_PUT_WAT,
+            "run",
+            ctx,
+            DEFAULT_FUEL,
+            &CapabilityGrant::deterministic(),
+        )
+        .await
+        .expect("obj_put with backend=None returns its failure path, no panic");
+    }
+
+    // `clock` binds under WallClock (per-node HLC) — NOT the deterministic profile — and
+    // reads the backend's `now_millis`, committed so the value is observable.
+    #[tokio::test]
+    async fn clock_binds_under_wall_clock_and_reads_backend() {
+        // clock() -> i64; store its low byte and commit it.
+        const CLOCK_WAT: &[u8] = br#"(module
+          (import "craftcom" "clock" (func $clock (result i64)))
+          (import "craftcom" "commit" (func $commit (param i32 i32) (result i32)))
+          (memory (export "memory") 1)
+          (func (export "run")
+            (i32.store8 (i32.const 0) (i32.wrap_i64 (call $clock)))
+            (drop (call $commit (i32.const 0) (i32.const 1)))))"#;
+
+        struct ClockBackend;
+        #[async_trait::async_trait]
+        impl AppBackend for ClockBackend {
+            async fn sql_execute(&self, _n: &str, _s: &str) -> anyhow::Result<u64> {
+                Ok(0)
+            }
+            async fn sql_query(
+                &self,
+                _o: Option<[u8; 32]>,
+                _n: &str,
+                _s: &str,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn obj_put(&self, _d: &[u8]) -> anyhow::Result<[u8; 32]> {
+                Ok([0u8; 32])
+            }
+            async fn obj_get(&self, _c: [u8; 32]) -> anyhow::Result<Vec<u8>> {
+                Ok(Vec::new())
+            }
+            fn now_millis(&self) -> u64 {
+                42
+            }
+        }
+        let rt = TransitionRuntime::new().unwrap();
+        let backend: Arc<dyn AppBackend> = Arc::new(ClockBackend);
+
+        // Under `full` (grants WallClock) → clock binds, returns 42.
+        let ctx = TransitionCtx::new(
+            Vec::new(),
+            Vec::new(),
+            [0u8; 32],
+            String::new(),
+            Some(backend.clone()),
+        );
+        let out = rt
+            .run_program(
+                CLOCK_WAT,
+                "run",
+                ctx,
+                DEFAULT_FUEL,
+                &CapabilityGrant::full(),
+            )
+            .await
+            .expect("full grants WallClock → clock binds");
+        assert_eq!(out, vec![42], "clock returned the backend's now_millis");
+
+        // Under the deterministic grant (no WallClock) → clock is unbound → fails to link.
+        let ctx = TransitionCtx::new(
+            Vec::new(),
+            Vec::new(),
+            [0u8; 32],
+            String::new(),
+            Some(backend),
+        );
+        assert!(
+            rt.run_program(
+                CLOCK_WAT,
+                "run",
+                ctx,
+                DEFAULT_FUEL,
+                &CapabilityGrant::deterministic(),
+            )
+            .await
+            .is_err(),
+            "deterministic profile must NOT bind the per-node clock"
         );
     }
 }
