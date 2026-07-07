@@ -499,10 +499,13 @@ async fn cmd_invoke(
         "name": name, "app_ns": app, "wasm_cid": wasm, "func": func, "input": input
     });
     let res = control::query_unix_params(&data_dir.join("zeph.sock"), "invoke", params).await?;
-    let value = res.get("value").and_then(|v| v.as_i64()).unwrap_or(-1);
-    let fuel = res.get("fuel_used").and_then(|v| v.as_u64()).unwrap_or(0);
+    let output = res.get("output").and_then(|v| v.as_str()).unwrap_or("");
     let label = name.or(app).unwrap_or("app");
-    println!("app '{label}' returned {value}  (fuel {fuel})");
+    if output.is_empty() {
+        println!("app '{label}' committed (empty)");
+    } else {
+        println!("app '{label}' committed {output}");
+    }
     Ok(())
 }
 
@@ -1105,7 +1108,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         transport.clock(),
     ));
     let com_service = Arc::new(zeph_com::InvokeService::new(
-        zeph_com::Runtime::new()?,
+        zeph_com::TransitionRuntime::new()?,
         engine.clone(),
         com_backend,
     ));

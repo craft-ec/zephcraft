@@ -7,6 +7,10 @@
 //! The agent always runs against THIS node's identity-bound backend (it writes this
 //! node's `(own, app.ns)`), but it knows WHO called via the `caller` host function —
 //! the federated request pattern.
+//!
+//! Apps run on the unified [`TransitionRuntime`] under [`CapabilityGrant::full`] (they get
+//! sql/obj/clock/caller): the app exports `run()` (no result) and declares its output via
+//! the `commit` host function. The invocation result is those COMMITTED bytes.
 
 use std::sync::Arc;
 
@@ -16,7 +20,7 @@ use zeph_core::Cid;
 use zeph_obj::{ConsumeMode, ObjEngine};
 use zeph_transport::{Connection, PeerAddr, Transport};
 
-use crate::{AppBackend, HostCtx, Outcome, Runtime, DEFAULT_FUEL};
+use crate::{AppBackend, CapabilityGrant, TransitionCtx, TransitionRuntime, DEFAULT_FUEL};
 
 /// ALPN for remote app invocation.
 pub const INVOKE_ALPN: &[u8] = b"/craftec/invoke/1";
@@ -35,13 +39,17 @@ pub struct InvokeRequest {
 /// Runs app invocations on THIS node: loads the WASM by CID from CraftOBJ and runs
 /// it with a caller identity against the node's (identity-bound) backend.
 pub struct InvokeService {
-    runtime: Runtime,
+    runtime: TransitionRuntime,
     obj: Arc<ObjEngine>,
     backend: Arc<dyn AppBackend>,
 }
 
 impl InvokeService {
-    pub fn new(runtime: Runtime, obj: Arc<ObjEngine>, backend: Arc<dyn AppBackend>) -> Self {
+    pub fn new(
+        runtime: TransitionRuntime,
+        obj: Arc<ObjEngine>,
+        backend: Arc<dyn AppBackend>,
+    ) -> Self {
         Self {
             runtime,
             obj,
@@ -49,11 +57,13 @@ impl InvokeService {
         }
     }
 
-    /// Load the app's WASM by CID and run `func` with the given `caller`. The CID
-    /// may be a raw-content CID OR a file manifest CID (what `zeph publish` prints)
-    /// — a File manifest is followed to its content, so publishing an `app.wasm`
-    /// just works.
-    pub async fn invoke(&self, req: &InvokeRequest, caller: [u8; 32]) -> anyhow::Result<Outcome> {
+    /// Load the app's WASM by CID and run `func` with the given `caller`, returning the
+    /// bytes the app COMMITTED. The CID may be a raw-content CID OR a file manifest CID
+    /// (what `zeph publish` prints) — a File manifest is followed to its content, so
+    /// publishing an `app.wasm` just works. Apps run under [`CapabilityGrant::full`]
+    /// (sql/obj/clock/caller) against this node's identity-bound backend; they have no
+    /// account blob, so `prev_state` is empty.
+    pub async fn invoke(&self, req: &InvokeRequest, caller: [u8; 32]) -> anyhow::Result<Vec<u8>> {
         let raw = self.obj.get(Cid(req.wasm_cid), ConsumeMode::Drop).await?;
         let wasm = match zeph_obj::Manifest::decode(&raw) {
             Some(zeph_obj::Manifest::File { content, .. }) => {
@@ -61,14 +71,21 @@ impl InvokeService {
             }
             _ => raw,
         };
-        let ctx = HostCtx {
+        let ctx = TransitionCtx::new(
+            Vec::new(), // apps have no account blob
+            req.input.clone(),
             caller,
-            app_ns: req.app_ns.clone(),
-            backend: self.backend.clone(),
-            input: req.input.clone(),
-        };
+            req.app_ns.clone(),
+            Some(self.backend.clone()),
+        );
         self.runtime
-            .invoke(&wasm, &req.func, ctx, DEFAULT_FUEL)
+            .run_program(
+                &wasm,
+                &req.func,
+                ctx,
+                DEFAULT_FUEL,
+                &CapabilityGrant::full(),
+            )
             .await
     }
 }
@@ -76,6 +93,10 @@ impl InvokeService {
 /// Serve remote invocations. Each connection's caller is its QUIC-authenticated
 /// NodeId — the identity is verified by the transport, so the agent's `caller` host
 /// function is trustworthy with no extra auth layer.
+///
+/// Wire framing (response): a 1-byte status — `0x01` followed by the app's committed
+/// output bytes on success, or a single `0x00` on error. The status byte makes an
+/// empty-output success distinguishable from a failure.
 pub async fn serve_invocations(mut conns: mpsc::Receiver<Connection>, service: Arc<InvokeService>) {
     while let Some(conn) = conns.recv().await {
         // The caller's identity, QUIC-authenticated by the transport (iroh
@@ -87,33 +108,40 @@ pub async fn serve_invocations(mut conns: mpsc::Receiver<Connection>, service: A
                 let Ok(bytes) = recv.read_to_end(64 * 1024).await else {
                     break;
                 };
-                let value = match postcard::from_bytes::<InvokeRequest>(&bytes) {
-                    Ok(req) => service
-                        .invoke(&req, caller)
-                        .await
-                        .map(|o| o.value)
-                        .unwrap_or(-1),
-                    Err(_) => -1,
-                };
-                let _ = send.write_all(&value.to_le_bytes()).await;
+                let mut resp = Vec::new();
+                match postcard::from_bytes::<InvokeRequest>(&bytes) {
+                    Ok(req) => match service.invoke(&req, caller).await {
+                        Ok(out) => {
+                            resp.push(0x01);
+                            resp.extend_from_slice(&out);
+                        }
+                        Err(_) => resp.push(0x00),
+                    },
+                    Err(_) => resp.push(0x00),
+                }
+                let _ = send.write_all(&resp).await;
                 let _ = send.finish();
             }
         });
     }
 }
 
-/// Invoke an app on a remote node; returns the agent's `i64` result.
+/// Invoke an app on a remote node; returns the bytes the app COMMITTED on success. The
+/// response is framed as a 1-byte status (`0x01` = success, else error) followed by the
+/// committed output.
 pub async fn invoke_remote(
     transport: &Transport,
     addr: &PeerAddr,
     req: &InvokeRequest,
-) -> anyhow::Result<i64> {
+) -> anyhow::Result<Vec<u8>> {
     let conn = transport.connect(addr, INVOKE_ALPN).await?;
     let (mut send, mut recv) = conn.open_bi().await?;
     send.write_all(&postcard::to_allocvec(req)?).await?;
     send.finish()?;
-    let resp = recv.read_to_end(64).await?;
+    let resp = recv.read_to_end(64 * 1024).await?;
     conn.close(0u32.into(), b"done");
-    anyhow::ensure!(resp.len() == 8, "malformed invoke response");
-    Ok(i64::from_le_bytes(resp.try_into().unwrap()))
+    match resp.split_first() {
+        Some((0x01, out)) => Ok(out.to_vec()),
+        _ => anyhow::bail!("remote invocation failed"),
+    }
 }

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use zeph_com::{
     invoke_remote, serve_invocations, AppBackend, CraftBackend, InvokeRequest, InvokeService,
-    Runtime, INVOKE_ALPN,
+    TransitionRuntime, INVOKE_ALPN,
 };
 use zeph_core::{hlc::Clock, NodeId};
 use zeph_crypto::NodeIdentity;
@@ -110,18 +110,21 @@ async fn node_b_invokes_an_app_on_node_a_as_a_distinct_identity() {
     let host = node(&tracker, da.path()).await; // A — hosts the app
     let caller = node(&tracker, db.path()).await; // B — invokes it
 
-    // A publishes the app WASM (WAT text; the runtime compiles it) → its CID.
+    // A publishes the app WASM (WAT text; the runtime compiles it) → its CID. The
+    // unified ABI: `run()` takes no result and COMMITs its output — here the first byte
+    // of the caller identity, so the committed bytes prove who A ran it as.
     let guestbook = br#"(module
         (import "craftcom" "sql_execute" (func $exec (param i32 i32) (result i64)))
         (import "craftcom" "caller" (func $who (param i32 i32) (result i32)))
+        (import "craftcom" "commit" (func $commit (param i32 i32) (result i32)))
         (memory (export "memory") 1)
         (data (i32.const 0)  "CREATE TABLE g(x TEXT)")
         (data (i32.const 64) "INSERT INTO g VALUES('hi')")
-        (func (export "run") (result i64)
+        (func (export "run")
             (drop (call $exec (i32.const 0)  (i32.const 22)))
             (drop (call $exec (i32.const 64) (i32.const 26)))
             (drop (call $who (i32.const 200) (i32.const 32)))
-            (i64.load8_u (i32.const 200))))"#;
+            (drop (call $commit (i32.const 200) (i32.const 1)))))"#;
     let wasm_cid = host.engine.publish(guestbook, true).await.unwrap().cid.0;
 
     // A stands up the invocation service (its own CraftBackend) + serves the ALPN.
@@ -131,7 +134,7 @@ async fn node_b_invokes_an_app_on_node_a_as_a_distinct_identity() {
         Arc::new(Clock::new()),
     ));
     let service = Arc::new(InvokeService::new(
-        Runtime::new().unwrap(),
+        TransitionRuntime::new().unwrap(),
         host.engine.clone(),
         backend,
     ));
@@ -150,8 +153,9 @@ async fn node_b_invokes_an_app_on_node_a_as_a_distinct_identity() {
         .await
         .unwrap();
     assert_eq!(
-        result, caller.node_id.0[0] as i64,
-        "A ran the agent with B's identity as the caller"
+        result,
+        vec![caller.node_id.0[0]],
+        "A ran the agent with B's identity as the caller (committed caller[0])"
     );
 
     // …and the write landed in A's OWN app namespace (remote invocation had effect).

@@ -1376,7 +1376,7 @@ async fn rpc_invoke(
     };
     match state.com.invoke(&ireq, caller).await {
         Ok(out) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
-            "value": out.value, "fuel_used": out.fuel_used
+            "output": hex::encode(out)
         }}),
         Err(e) => rpc_err(id, format!("invoke failed: {e}")),
     }
@@ -1657,7 +1657,7 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         };
         match ctx.state.com.invoke(&ireq, caller.0).await {
             Ok(out) => axum::Json(serde_json::json!({
-                "value": out.value, "fuel_used": out.fuel_used
+                "output": hex::encode(out)
             }))
             .into_response(),
             Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),

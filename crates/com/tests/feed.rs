@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use zeph_com::{
-    serve_invocations, AppBackend, CraftBackend, InvokeRequest, InvokeService, Runtime, INVOKE_ALPN,
+    serve_invocations, AppBackend, CraftBackend, InvokeRequest, InvokeService, TransitionRuntime,
+    INVOKE_ALPN,
 };
 use zeph_core::{hlc::Clock, NodeId};
 use zeph_crypto::NodeIdentity;
@@ -27,24 +28,27 @@ const FEED_WAT: &[u8] = br#"(module
   (import "craftcom" "sql_execute" (func $exec (param i32 i32) (result i64)))
   (import "craftcom" "sql_query" (func $query (param i32 i32 i32 i32 i32 i32) (result i32)))
   (import "craftcom" "input" (func $input (param i32 i32) (result i32)))
+  (import "craftcom" "commit" (func $commit (param i32 i32) (result i32)))
   (memory (export "memory") 4)
   (data (i32.const 0)   "CREATE TABLE IF NOT EXISTS posts(body TEXT)")
   (data (i32.const 128) "INSERT INTO posts VALUES('hi')")
   (data (i32.const 256) "SELECT body FROM posts")
-  (func (export "post") (result i64)
+  (func (export "post")
     (drop (call $exec (i32.const 0)   (i32.const 43)))
-    (call $exec (i32.const 128) (i32.const 30)))
-  (func (export "aggregate") (result i64)
+    (drop (call $exec (i32.const 128) (i32.const 30))))
+  (func (export "aggregate")
     (local $a i32) (local $b i32)
     (drop (call $input (i32.const 1024) (i32.const 64)))
     (local.set $a (call $query (i32.const 1024) (i32.const 32) (i32.const 256) (i32.const 22)
                                 (i32.const 2048) (i32.const 1000)))
     (local.set $b (call $query (i32.const 1056) (i32.const 32) (i32.const 256) (i32.const 22)
                                 (i32.const 3072) (i32.const 1000)))
-    (i64.extend_i32_s
+    ;; commit a single byte: how many of the two feeds were non-empty (0/1/2).
+    (i32.store8 (i32.const 5000)
       (i32.add
         (i32.gt_s (local.get $a) (i32.const 2))
-        (i32.gt_s (local.get $b) (i32.const 2))))))"#;
+        (i32.gt_s (local.get $b) (i32.const 2))))
+    (drop (call $commit (i32.const 5000) (i32.const 1)))))"#;
 
 /// Replaces the in-process tracker: one shared in-memory network view.
 fn start_tracker() -> MemNet {
@@ -123,7 +127,7 @@ async fn node(tracker: &MemNet, dir: &Path) -> Node {
         Arc::new(Clock::new()),
     ));
     let service = Arc::new(InvokeService::new(
-        Runtime::new().unwrap(),
+        TransitionRuntime::new().unwrap(),
         engine.clone(),
         backend,
     ));
@@ -172,7 +176,8 @@ async fn federated_feed_aggregates_across_sovereign_participants() {
     };
     let out = c.service.invoke(&agg, c.node_id.0).await.unwrap();
     assert_eq!(
-        out.value, 2,
-        "the aggregation read BOTH sovereign feeds cross-node (each non-empty)"
+        out,
+        vec![2],
+        "the aggregation read BOTH sovereign feeds cross-node (each non-empty), committed as bytes"
     );
 }

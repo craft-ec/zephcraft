@@ -10,7 +10,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use zeph_com::{AppBackend, CraftBackend, HostCtx, Runtime, DEFAULT_FUEL};
+use zeph_com::{
+    AppBackend, CapabilityGrant, CraftBackend, TransitionCtx, TransitionRuntime, DEFAULT_FUEL,
+};
 use zeph_core::hlc::Clock;
 use zeph_crypto::NodeIdentity;
 use zeph_obj::{ObjConfig, ObjEngine};
@@ -92,27 +94,35 @@ async fn agent_writes_persist_to_craftsql_and_reload() {
         Arc::new(CraftBackend::new(craftsql, engine, Arc::new(Clock::new())));
 
     // Agent: CREATE a table, then INSERT a row — both via `sql_execute`, both
-    // confined (structurally) to (own, "app/feed").
-    let rt = Runtime::new().unwrap();
+    // confined (structurally) to (own, "app/feed"). The unified ABI: `run()` takes no
+    // result and declares its output (the INSERT's rows-affected) via `commit`.
+    let rt = TransitionRuntime::new().unwrap();
     let wasm = br#"(module
         (import "craftcom" "sql_execute" (func $exec (param i32 i32) (result i64)))
+        (import "craftcom" "commit" (func $commit (param i32 i32) (result i32)))
         (memory (export "memory") 1)
         (data (i32.const 0)  "CREATE TABLE posts(body TEXT)")
         (data (i32.const 64) "INSERT INTO posts VALUES('x')")
-        (func (export "run") (result i64)
+        (func (export "run")
             (drop (call $exec (i32.const 0)  (i32.const 29)))
-            (call $exec (i32.const 64) (i32.const 29))))"#;
-    let ctx = HostCtx {
-        caller: [0u8; 32],
-        app_ns: "feed".into(),
-        backend: backend.clone(),
-        input: Vec::new(),
-    };
-    let out = rt.invoke(wasm, "run", ctx, DEFAULT_FUEL).await.unwrap();
+            (i64.store (i32.const 200) (call $exec (i32.const 64) (i32.const 29)))
+            (drop (call $commit (i32.const 200) (i32.const 8)))))"#;
+    let ctx = TransitionCtx::new(
+        Vec::new(), // apps have no account blob
+        Vec::new(),
+        [0u8; 32],
+        "feed".into(),
+        Some(backend.clone()),
+    );
+    let out = rt
+        .run_program(wasm, "run", ctx, DEFAULT_FUEL, &CapabilityGrant::full())
+        .await
+        .unwrap();
+    // The committed bytes are the little-endian rows-affected of the INSERT (>= 0).
+    let affected = i64::from_le_bytes(out.as_slice().try_into().unwrap());
     assert!(
-        out.value >= 0,
-        "sql_execute host function did not error (got {})",
-        out.value
+        affected >= 0,
+        "sql_execute host function did not error (got {affected})"
     );
 
     // A FRESH query (new open → re-resolves the committed root) reads the row back.
