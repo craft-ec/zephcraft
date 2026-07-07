@@ -270,13 +270,21 @@ impl CraftSql {
         // Resolve the authoritative head. If the tracker lost it (restart) and
         // this is our own DB, recover it from the local sidecar so the owner is
         // never locked out of its own database by tracker liveness.
-        let head = match self.heads.resolve(owner, namespace).await? {
-            Some(rs) => Some(rs),
-            None if writable => {
-                let m = load_manifest(&self.store_dir, &key);
-                m.last_root.map(|r| (Cid(r), m.seq))
+        let head = if writable {
+            // The owner is the single writer of its own DB, so the LOCAL sidecar is authoritative:
+            // prefer it and SKIP the registry resolve, which would forward to a possibly-rotating
+            // shard writer and stall the open for seconds (the write path publishes the head to the
+            // registry in the background for OTHER nodes to resolve). Fall back to the registry only
+            // when there is no local state yet — a cold start or a recovery onto a fresh store.
+            let m = load_manifest(&self.store_dir, &key);
+            match m.last_root {
+                Some(r) => Some((Cid(r), m.seq)),
+                None => self.heads.resolve(owner, namespace).await?,
             }
-            None => None,
+        } else {
+            // Reader of (possibly another owner's) DB: resolve the authoritative head from the
+            // registry — the local store may be empty or stale.
+            self.heads.resolve(owner, namespace).await?
         };
         let seq = match head {
             Some((root, seq)) => {
@@ -450,8 +458,13 @@ impl CraftDb {
             .map(Cid)
     }
 
-    /// Run write SQL, then publish the new root as the signed head via CAS.
-    /// Returns `Conflict` if another writer moved the head first (retry).
+    /// Run write SQL and commit locally, then publish the new root head to the registry in the
+    /// BACKGROUND (fire-and-forget). Returns as soon as the local commit is durable (pages +
+    /// in-memory root map + the `.gens` sidecar); the head becomes network-resolvable
+    /// asynchronously, where the registry reconciles by LWW-by-seq. Under single-writer-per-
+    /// identity this is safe: `seq` advances monotonically and there is no concurrent writer to
+    /// conflict with — so the caller never blocks on the registry round-trip (which can hit the
+    /// writer-rotation timeout and spike write latency to seconds).
     pub async fn write(&mut self, sql: &str) -> Result<()> {
         let heads = self.heads.clone().ok_or(SqlError::ReadOnly)?;
         let prev = self.roots.lock().expect("roots").get(&self.key).copied();
@@ -461,10 +474,13 @@ impl CraftDb {
         let new = self.roots.lock().expect("roots").get(&self.key).copied();
         if let Some(root) = new {
             if Some(root) != prev {
-                heads
-                    .publish(&self.namespace, Cid(root), prev.map(Cid), self.seq + 1)
-                    .await?;
                 self.seq += 1;
+                let ns = self.namespace.clone();
+                let seq = self.seq;
+                let prev_cid = prev.map(Cid);
+                tokio::spawn(async move {
+                    let _ = heads.publish(&ns, Cid(root), prev_cid, seq).await;
+                });
                 self.sweep_durability(Cid(root)).await?;
             }
         }
@@ -517,9 +533,15 @@ impl CraftDb {
                 let manifest_cid = durable.put_generation(list).await?;
                 manifest.manifest_cid = Some(manifest_cid.0);
                 manifest.manifest_seq += 1;
-                mstore
-                    .publish(&self.namespace, manifest_cid, manifest.manifest_seq)
-                    .await?;
+                // Background-publish the manifest head (same reasoning as the root in `write`):
+                // the `.gens` sidecar holds the authoritative generation list locally; the
+                // registry catches up async, so the commit never blocks on the round-trip.
+                let mstore = mstore.clone();
+                let ns = self.namespace.clone();
+                let mseq = manifest.manifest_seq;
+                tokio::spawn(async move {
+                    let _ = mstore.publish(&ns, manifest_cid, mseq).await;
+                });
             }
         }
         save_manifest(&self.store_dir, &self.key, &manifest)?;
@@ -636,18 +658,25 @@ async fn run_compaction(
         let mc = durable.put_generation(list).await?;
         manifest.manifest_cid = Some(mc.0);
         manifest.manifest_seq += 1;
-        let _ = mstore.publish(namespace, mc, manifest.manifest_seq).await;
+        // Background-publish (see `write`/`sweep_durability`): don't block compaction on the
+        // registry round-trip; the sidecar is authoritative and the registry reconciles by seq.
+        let mstore = mstore.clone();
+        let ns = namespace.to_string();
+        let mseq = manifest.manifest_seq;
+        tokio::spawn(async move {
+            let _ = mstore.publish(&ns, mc, mseq).await;
+        });
     }
-    // Drop superseded generations (base is durable first, so this is safe).
-    // A generation with holders still providing it stays in `releasing` so the
-    // re-announce loop keeps re-sending the release — this is what reaches a
-    // holder that was offline (churned) during the initial release.
+    // Drop superseded generations in the BACKGROUND (the base is durable first, so this is
+    // safe). Each drop is a network unpin, and doing ~COMPACT_THRESHOLD of them inline is what
+    // spiked the triggering write to seconds. They are pure cleanup — the old pieces just fade —
+    // so fire-and-forget them; the write returns without waiting on the unpins.
     for g in old {
         if g != base.0 {
-            let remaining = durable.drop_generation(Cid(g)).await.unwrap_or(0);
-            if remaining > 0 {
-                manifest.releasing.push(g);
-            }
+            let durable = durable.clone();
+            tokio::spawn(async move {
+                let _ = durable.drop_generation(Cid(g)).await;
+            });
         }
     }
     save_manifest(store_dir, key, &manifest)?;
@@ -740,6 +769,7 @@ mod tests {
             db.write("CREATE TABLE s(id INTEGER PRIMARY KEY, secret TEXT); INSERT INTO s VALUES (1,'TOPSECRET');")
                 .await
                 .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await; // let the async head publish land
         }
 
         // Owner reopens (fresh engine, same key) → auto-detects private, reads back.
@@ -784,6 +814,7 @@ mod tests {
         )
         .await
         .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await; // let the async head publish land
         let root_after = db.root().expect("committed a root");
 
         // The head is now in the store (seq 1).
@@ -827,6 +858,7 @@ mod tests {
         db.write("CREATE TABLE msg(id INTEGER PRIMARY KEY, body TEXT); INSERT INTO msg VALUES (1,'hi'),(2,'yo');")
             .await
             .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await; // let the async head publish land
 
         // Reader has an EMPTY store + a page source pointing at the owner's store.
         let source = Arc::new(MockSource {
@@ -857,7 +889,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_write_conflicts() {
+    async fn writes_commit_locally_publish_async() {
         let dir = tempdir().unwrap();
         let owner = NodeId([9u8; 32]);
         let heads = MockHeads::new(owner);
@@ -868,18 +900,19 @@ mod tests {
         let mut w1 = e1.open("db").await.unwrap();
         let mut w2 = e2.open("db").await.unwrap();
 
-        // w1 commits first → head at seq 1.
+        // w1 commits first (locally).
         w1.write("CREATE TABLE a(x); INSERT INTO a VALUES (1);")
             .await
             .unwrap();
-        // w2's write publishes prev=None seq 1 → CAS fails (head already moved).
-        let conflict = w2
+        // Root/manifest publishes are now fire-and-forget: w2 commits LOCALLY and returns Ok —
+        // there is no synchronous `Conflict`. The head publishes to the registry in the
+        // background, where LWW-by-seq reconciles. Under single-writer-per-identity a concurrent
+        // stale writer does not occur; removing the sync CAS from write() is what eliminates the
+        // writer-rotation tail latency (a registry round-trip could hit the 8s timeout).
+        let w2_res = w2
             .write("CREATE TABLE b(y); INSERT INTO b VALUES (2);")
             .await;
-        assert!(
-            matches!(conflict, Err(SqlError::Conflict)),
-            "stale writer is rejected"
-        );
+        assert!(w2_res.is_ok(), "write commits locally + publishes async");
     }
 
     /// In-memory durable store: a generation goes in, comes back by CID —
@@ -929,6 +962,7 @@ mod tests {
         db.write("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t VALUES (1,'durable'),(2,'via erasure');")
             .await
             .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await; // let the async head publish land
         drop(db);
         assert!(
             !durable.gens.lock().unwrap().is_empty(),
@@ -1006,6 +1040,7 @@ mod tests {
         db.write("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t VALUES (1,'resurrected');")
             .await
             .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await; // let the async head + manifest publishes land
         drop(db);
 
         // Node 2 has an EMPTY store and NO local sidecar — it only knows
