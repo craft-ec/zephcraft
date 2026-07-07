@@ -121,6 +121,11 @@ pub struct HeadRegistry {
     /// writer) has performed the takeover merge. Guards [`Self::ensure_current`] so the
     /// merge-from-replicas runs once per epoch per account.
     last_epoch: RwLock<std::collections::HashMap<ShardKey, u64>>,
+    /// Digest of the last census (sorted eligible ids) the migration loop acted on. When the
+    /// census changes (a node joins/leaves) the shard→replica assignment shifts, so the loop
+    /// re-replicates the shards this node holds to their NEW replica set — state follows the
+    /// election. `None` until the first pass. Event-driven: no work while membership is stable.
+    last_census: RwLock<Option<[u8; 32]>>,
 }
 
 /// One head row for the dashboard — hex-encoded `(owner, cid)` + `name` + `version`.
@@ -175,6 +180,40 @@ impl HeadRegistry {
             membership: RwLock::new(None),
             self_id,
             last_epoch: RwLock::new(std::collections::HashMap::new()),
+            last_census: RwLock::new(None),
+        }
+    }
+
+    /// State-migration anti-entropy: when the census changes, the stable replica set of each
+    /// shard shifts, so re-replicate every shard THIS node holds to its CURRENT replica set —
+    /// newly-elected replicas receive the state, and a node that is no longer a replica hands its
+    /// (orphaned) copy off to the current set. This is what makes membership ELASTIC: state
+    /// follows the election on join/leave. EVENT-DRIVEN — it only does work when the census
+    /// digest changes, so it adds NO registry traffic while membership is stable (avoiding the
+    /// per-cycle reannounce storm class of bug). Pushes are fire-and-forget via `replicate`.
+    async fn migrate_round(&self) {
+        let mut ids = self.eligible().await;
+        ids.sort();
+        let digest = Cid::of(&ids.concat()).0;
+        {
+            let mut last = self.last_census.write().await;
+            if *last == Some(digest) {
+                return; // membership unchanged — nothing to migrate
+            }
+            *last = Some(digest);
+        }
+        // Census changed: re-replicate every shard we hold local state for to its new replica set.
+        for &rtype in &[RT_PROGRAM, RT_DBROOT, RT_MANIFEST] {
+            for shard in 0..SHARD_COUNT {
+                let sk = ShardKey { rtype, shard };
+                let state = self
+                    .store
+                    .resolve(registry_program_cid(), &shard_seed(sk))
+                    .await;
+                if !state.is_empty() {
+                    self.replicate(sk, &state).await;
+                }
+            }
         }
     }
 
@@ -607,6 +646,19 @@ impl HeadRegistry {
     /// `CurrentVersion`. The shard is derived from the request's key so a key always lands on
     /// the SAME shard as the registering node computed.
     pub async fn serve(self: Arc<Self>, mut conns: mpsc::Receiver<Connection>) {
+        // State-migration anti-entropy loop — re-replicate held shards to their current replica
+        // set whenever the census changes (see `migrate_round`). Event-driven, so it adds no
+        // registry traffic while membership is stable.
+        {
+            let this = self.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+                loop {
+                    tick.tick().await;
+                    this.migrate_round().await;
+                }
+            });
+        }
         while let Some(conn) = conns.recv().await {
             let this = self.clone();
             tokio::spawn(async move {
