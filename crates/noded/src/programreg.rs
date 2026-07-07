@@ -55,6 +55,11 @@ pub const RT_MANIFEST: u8 = 2;
 /// state (the offline-writer fault the single-writer model could not survive).
 const REPLICATION_FACTOR: usize = 3;
 
+/// Max measured rtt (microseconds) for a peer to be eligible as a registry writer/replica. A
+/// relay-only node on a poor link (hundreds of ms) is excluded so writes/pushes never route to it;
+/// co-located peers are well under 1 ms, legitimate cross-region peers under this cap.
+const WRITER_RTT_CAP_US: u64 = 150_000;
+
 /// Identifies one registry account = one `(kind, shard)`. Threaded everywhere a shard used to
 /// be, so each kind gets its own independent per-shard account + writer set.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -173,10 +178,20 @@ impl ProgramRegistry {
     async fn eligible(&self) -> Vec<[u8; 32]> {
         let mut ids = vec![self.self_id];
         if let Some(m) = self.membership.read().await.as_ref() {
-            for (n, _) in m.snapshot().await.active {
-                if n.0 != self.self_id {
-                    ids.push(n.0);
+            for (n, ps) in m.snapshot().await.active {
+                if n.0 == self.self_id {
+                    continue;
                 }
+                // Exclude PROVEN-slow peers (e.g. a relay-only node on a poor link) from the writer
+                // + replica roles. A slow WRITER stalls every write routed to it — writes have no
+                // fallback (single-writer) — and a slow REPLICA stalls its pushes/merges. A peer
+                // whose measured rtt exceeds the cap is skipped; an unprobed peer (rtt None) gets
+                // the benefit of the doubt. A clearly-slow peer (hundreds of ms) is excluded
+                // consistently by all of its fast peers, so the election stays coherent among them.
+                if matches!(ps.rtt_us, Some(rtt) if rtt >= WRITER_RTT_CAP_US) {
+                    continue;
+                }
+                ids.push(n.0);
             }
         }
         ids
