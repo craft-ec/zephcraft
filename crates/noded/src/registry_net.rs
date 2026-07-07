@@ -68,9 +68,13 @@ pub enum RegistryResp {
 }
 
 /// Overall deadline for a single registry round-trip. Bounds the connect+request+read so an
-/// unreachable peer (e.g. a dead-but-not-yet-dropped writer/replica) fails in ~3s instead of
-/// hanging forever — the caller can then fall back to another replica.
-const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// unreachable peer (e.g. a dead-but-not-yet-dropped writer/replica) fails and lets the caller
+/// fall back to another replica, instead of hanging forever. Must be generous enough for a
+/// SLOW-but-alive writer: a relay-only peer (behind NAT) needs QUIC-over-relay setup + a round
+/// trip, which can exceed a few seconds — too tight a bound spuriously fails writes to it (a
+/// register has no replica fallback). 8s tolerates relay latency while still bounding a dead
+/// peer. (Deeper fix: prefer directly-reachable peers in the writer election — see progress.)
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// Send a registry request to the writer at `addr` and read its response. Mirrors the
 /// removed `request_attestation` client shape. The whole network round-trip is bounded by
