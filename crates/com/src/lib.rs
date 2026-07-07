@@ -29,12 +29,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use wasmtime::{Caller, Config, Engine, Extern, Linker, Memory, Module, Store};
 
-mod attest;
 mod craft;
 mod gov;
 mod invoke;
 mod registry;
-pub use attest::{pda, AttestedRuntime};
+mod transition;
 pub use craft::CraftBackend;
 pub use gov::{
     GovAction, GovSignature, GovernanceApproval, GovernanceChain, GovernanceProposal, GovernanceSet,
@@ -44,6 +43,7 @@ pub use registry::{
     registry_program_cid, HeadEntry, HeadSubmission, NativeProgram, ProgramRegistryState,
     RegistryProgram, RegistryState, REGISTRY_SEED,
 };
+pub use transition::{pda, TransitionRuntime};
 
 /// Default fuel budget per invocation — roughly proportional to executed WASM
 /// instructions (foundation §38). A runaway loop exhausts this and traps.

@@ -1,5 +1,5 @@
 //! The app-name registry, as a governance-upgradeable WASM program. Runs under the
-//! CraftCOM deterministic attested ABI: reads the prior `RegistryState` via `state`, the
+//! CraftCOM deterministic transition ABI: reads the prior `RegistryState` via `state`, the
 //! signed `HeadSubmission` via `input`, verifies the owner signature with the
 //! `ed25519_verify` host function, upserts, and `commit`s the new state. The types +
 //! encodings mirror `zeph-com`'s registry exactly (postcard), so its output decodes as a
@@ -95,10 +95,10 @@ pub extern "C" fn run() {
         Err(_) => return,
     };
 
-    // v2: committee-enforced name validity — non-empty, <= 32 bytes, no control chars
-    // (< 0x20). Enforcing this in the attested program (not just the daemon) makes it
-    // trustless: a modified client can't inject a reserved-namespace or state-bloating
-    // name, because the committee runs THIS check and a bad name can't reach quorum.
+    // Name validity — non-empty, <= 32 bytes, no control chars (< 0x20). Enforcing this
+    // inside the program itself (not just the daemon) makes it trustless: a modified
+    // client can't inject a reserved-namespace or state-bloating name, because this check
+    // runs as part of the deterministic transition and a bad name commits nothing.
     let name = sub.name.as_bytes();
     if name.is_empty() || name.len() > 32 || name.iter().any(|&b| b < 0x20) {
         return; // rejected

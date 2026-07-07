@@ -1,13 +1,15 @@
-//! Deterministic WASM runtime — the "anchor runtime" (foundation §56).
+//! The deterministic state-transition runtime — computes `(prev_state, request) →
+//! new_state` (foundation §56).
 //!
 //! A DETERMINISTIC program runner under a restricted ABI: the program reads `input`,
 //! optionally reads the prior `state`, and declares its `output` via `commit` — and
 //! nothing else (no clock, no rng, no sql/obj side effects), so the output is a pure
-//! function of `(program, prev_state, input)`. Every honest node that runs the same
-//! program on the same input computes the identical output.
+//! function of `(program, prev_state, input)`. Every node that runs the same program on
+//! the same input computes the identical `new_state` — no attestation, no committee; the
+//! determinism itself is what makes the result reproducible.
 //!
 //! Its own sync engine (no async, no threads), fuel-metered, isolated from the
-//! capability [`crate::Runtime`]. Reused as the execution core behind governed anchors.
+//! capability [`crate::Runtime`]. Reused as the execution core behind program accounts.
 //! Also exposes [`pda`] — deriving a program-derived account identity — used by the
 //! registry and generic-account paths.
 
@@ -17,24 +19,24 @@ use zeph_crypto::NodeIdentity;
 
 /// Import module the restricted deterministic ABI is bound under (shares the `craftcom`
 /// namespace with the capability runtime, but exposes only `input` + `commit` + `state`).
-const ATTEST_MODULE: &str = "craftcom";
+const TRANSITION_HOST_MODULE: &str = "craftcom";
 
 /// A deterministic WASM runner. Restricted ABI: the program reads `input` and declares
 /// its `output` via `commit` — and nothing else — so every honest node computes the
 /// identical output. Its own sync engine (no async, no threads), fuel-metered `Engine`,
 /// isolated from the capability [`crate::Runtime`].
-pub struct AttestedRuntime {
+pub struct TransitionRuntime {
     engine: Engine,
 }
 
 /// Per-run context: the prior state + request bytes in, the committed output out.
-struct AttestCtx {
+struct TransitionCtx {
     prev_state: Vec<u8>,
     input: Vec<u8>,
     output: Vec<u8>,
 }
 
-impl AttestedRuntime {
+impl TransitionRuntime {
     pub fn new() -> anyhow::Result<Self> {
         let mut cfg = Config::new();
         cfg.consume_fuel(true); // deterministic bound; sync (no async_support)
@@ -69,7 +71,7 @@ impl AttestedRuntime {
         let module = Module::new(&self.engine, wasm)?;
         let mut store = Store::new(
             &self.engine,
-            AttestCtx {
+            TransitionCtx {
                 prev_state: prev_state.to_vec(),
                 input: request.to_vec(),
                 output: Vec::new(),
@@ -85,9 +87,9 @@ impl AttestedRuntime {
     }
 }
 
-impl Default for AttestedRuntime {
+impl Default for TransitionRuntime {
     fn default() -> Self {
-        Self::new().expect("attested runtime")
+        Self::new().expect("transition runtime")
     }
 }
 
@@ -95,9 +97,9 @@ impl Default for AttestedRuntime {
 const PDA_DOMAIN: &[u8] = b"craftec/pda/v1";
 
 /// Derive a **program-derived account (PDA)** identity from a program (+ seed). No
-/// private key exists for it; its state is authorized by the program's own logic run on
-/// the network (ATTESTATION_DESIGN §3). Deterministic + collision-resistant, so anyone
-/// can compute the account for a program and no one can sign for it directly.
+/// private key exists for it; its state is authorized by the program's own deterministic
+/// logic (the transition validates each request). Deterministic + collision-resistant, so
+/// anyone can compute the account for a program and no one can sign for it directly.
 pub fn pda(program_cid: &[u8; 32], seed: &[u8]) -> NodeId {
     let mut b = Vec::with_capacity(PDA_DOMAIN.len() + 32 + seed.len());
     b.extend_from_slice(PDA_DOMAIN);
@@ -107,14 +109,19 @@ pub fn pda(program_cid: &[u8; 32], seed: &[u8]) -> NodeId {
 }
 
 /// The agent's exported linear memory, if present.
-fn det_memory(caller: &mut Caller<'_, AttestCtx>) -> Option<Memory> {
+fn det_memory(caller: &mut Caller<'_, TransitionCtx>) -> Option<Memory> {
     match caller.get_export("memory") {
         Some(Extern::Memory(m)) => Some(m),
         _ => None,
     }
 }
 
-fn det_read(caller: &Caller<'_, AttestCtx>, mem: &Memory, ptr: i32, len: i32) -> Option<Vec<u8>> {
+fn det_read(
+    caller: &Caller<'_, TransitionCtx>,
+    mem: &Memory,
+    ptr: i32,
+    len: i32,
+) -> Option<Vec<u8>> {
     if ptr < 0 || len < 0 {
         return None;
     }
@@ -124,7 +131,7 @@ fn det_read(caller: &Caller<'_, AttestCtx>, mem: &Memory, ptr: i32, len: i32) ->
 }
 
 fn det_write(
-    caller: &mut Caller<'_, AttestCtx>,
+    caller: &mut Caller<'_, TransitionCtx>,
     mem: &Memory,
     out: i32,
     cap: i32,
@@ -146,11 +153,11 @@ fn det_write(
 
 /// Bind ONLY the deterministic ABI — `input` (read the request) and `commit` (declare
 /// the output). No clock, no rng, no sql/obj: the run is a pure function of its input.
-fn bind_deterministic(linker: &mut Linker<AttestCtx>) -> anyhow::Result<()> {
+fn bind_deterministic(linker: &mut Linker<TransitionCtx>) -> anyhow::Result<()> {
     linker.func_wrap(
-        ATTEST_MODULE,
+        TRANSITION_HOST_MODULE,
         "input",
-        |mut caller: Caller<'_, AttestCtx>, out: i32, cap: i32| -> i32 {
+        |mut caller: Caller<'_, TransitionCtx>, out: i32, cap: i32| -> i32 {
             let input = caller.data().input.clone();
             let Some(mem) = det_memory(&mut caller) else {
                 return -1;
@@ -159,9 +166,9 @@ fn bind_deterministic(linker: &mut Linker<AttestCtx>) -> anyhow::Result<()> {
         },
     )?;
     linker.func_wrap(
-        ATTEST_MODULE,
+        TRANSITION_HOST_MODULE,
         "commit",
-        |mut caller: Caller<'_, AttestCtx>, ptr: i32, len: i32| -> i32 {
+        |mut caller: Caller<'_, TransitionCtx>, ptr: i32, len: i32| -> i32 {
             let Some(mem) = det_memory(&mut caller) else {
                 return -1;
             };
@@ -174,9 +181,9 @@ fn bind_deterministic(linker: &mut Linker<AttestCtx>) -> anyhow::Result<()> {
         },
     )?;
     linker.func_wrap(
-        ATTEST_MODULE,
+        TRANSITION_HOST_MODULE,
         "state",
-        |mut caller: Caller<'_, AttestCtx>, out: i32, cap: i32| -> i32 {
+        |mut caller: Caller<'_, TransitionCtx>, out: i32, cap: i32| -> i32 {
             let ps = caller.data().prev_state.clone();
             let Some(mem) = det_memory(&mut caller) else {
                 return -1;
@@ -184,14 +191,14 @@ fn bind_deterministic(linker: &mut Linker<AttestCtx>) -> anyhow::Result<()> {
             det_write(&mut caller, &mem, out, cap, &ps)
         },
     )?;
-    // Deterministic ed25519 verification — the one crypto primitive an attested program
+    // Deterministic ed25519 verification — the one crypto primitive a transition program
     // needs (e.g. the registry program checking an owner's signed submission). Reads a
     // 32-byte pubkey, `msg_len` message bytes, and a 64-byte signature from guest memory;
     // returns 1 if valid, else 0. Verification is deterministic, so it's safe here.
     linker.func_wrap(
-        ATTEST_MODULE,
+        TRANSITION_HOST_MODULE,
         "ed25519_verify",
-        |mut caller: Caller<'_, AttestCtx>, pk: i32, msg: i32, msg_len: i32, sig: i32| -> i32 {
+        |mut caller: Caller<'_, TransitionCtx>, pk: i32, msg: i32, msg_len: i32, sig: i32| -> i32 {
             let Some(mem) = det_memory(&mut caller) else {
                 return 0;
             };
@@ -244,7 +251,7 @@ mod tests {
 
     #[test]
     fn ed25519_verify_host_function() {
-        let rt = AttestedRuntime::new().unwrap();
+        let rt = TransitionRuntime::new().unwrap();
         let id = NodeIdentity::generate();
         let msg = [1u8, 2, 3, 4];
         let sig = id.sign(&msg);
@@ -268,7 +275,7 @@ mod tests {
 
     #[test]
     fn deterministic_run_is_pure() {
-        let rt = AttestedRuntime::new().unwrap();
+        let rt = TransitionRuntime::new().unwrap();
         let a = rt.run(DOUBLE_WAT, "run", &[21], DEFAULT_FUEL).unwrap();
         let b = rt.run(DOUBLE_WAT, "run", &[21], DEFAULT_FUEL).unwrap();
         assert_eq!(a, vec![21, 42]);
@@ -277,7 +284,7 @@ mod tests {
 
     #[test]
     fn runaway_program_traps_on_fuel() {
-        let rt = AttestedRuntime::new().unwrap();
+        let rt = TransitionRuntime::new().unwrap();
         let spin = br#"(module (func (export "run") (loop (br 0))))"#;
         assert!(rt.run(spin, "run", &[], 100_000).is_err());
     }

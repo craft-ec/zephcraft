@@ -1,18 +1,17 @@
-//! Phase 4 — the app-name registry: the first attested PDA registry (foundation §62
-//! A3, `REGISTRY_DESIGN.md`). A publisher submits a SIGNED head `(owner, name) →
-//! (cid, version)`; the registry *transition* validates it (owner signature +
-//! monotonic version) and upserts it into a canonical state. The state's root advances
-//! by attestation (the committee runs this transition and attests the new root).
+//! The app-name registry: an OPEN, owner-signed head registry on the program-account
+//! substrate (`REGISTRY_DESIGN.md` §0). A publisher submits a SIGNED head `(owner, name) →
+//! (cid, version)`; the registry *transition* validates it (owner signature + monotonic
+//! version) and upserts it into a canonical state. The state advances by running the
+//! transition deterministically on `(prev_state, submission)` — no committee, no
+//! attestation: the owner's signature is the sole write authority for their own key, and
+//! determinism makes every node compute the identical new root.
 //!
 //! This module is the registry's **logic** — a pure, deterministic state machine, so
-//! every committee agent computes the identical result. Two guards (REGISTRY_DESIGN
-//! §4): the *submission* is owner-signed (no one forges your mapping), and the
-//! *transition* is attested (the append is agreed) — one is here, the other is the
-//! committee wrapping `apply`.
-//!
-//! Wiring it live — packaging this transition as the network-owned WASM program, running
-//! it through the committee (phase 3b), and storing/resolving the registry head — is
-//! the follow-up; this is the tested core it stands on.
+//! every node computes the identical result. It runs either as the native
+//! [`RegistryState::apply`] (the genesis default) or as a governance-set WASM program with
+//! the same semantics. The single guard is the owner signature on the submission (no one
+//! forges your mapping); the append is agreed simply because the transition is
+//! deterministic.
 
 use serde::{Deserialize, Serialize};
 use zeph_core::{Cid, NodeId};
@@ -89,8 +88,8 @@ pub struct HeadEntry {
 }
 
 /// The registry state: the canonical (sorted by `(owner, name)`) set of current heads —
-/// one row per key, latest version. Content-hashed to a `root`; the root is what the
-/// committee attests as the registry advances.
+/// one row per key, latest version. Content-hashed to a `root`; the root is the account's
+/// state identity, recomputed deterministically as the registry advances.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RegistryState {
     entries: Vec<HeadEntry>,
@@ -465,8 +464,8 @@ mod tests {
 
     #[test]
     fn wasm_registry_matches_native() {
-        use crate::AttestedRuntime;
-        let rt = AttestedRuntime::new().unwrap();
+        use crate::TransitionRuntime;
+        let rt = TransitionRuntime::new().unwrap();
         let publisher = id();
         let sub = HeadSubmission::sign(&publisher, "feed", [1u8; 32], 1);
         let prev = RegistryState::default();
@@ -495,8 +494,8 @@ mod tests {
 
     #[test]
     fn wasm_registry_v2_rejects_an_overlong_name() {
-        use crate::AttestedRuntime;
-        let rt = AttestedRuntime::new().unwrap();
+        use crate::TransitionRuntime;
+        let rt = TransitionRuntime::new().unwrap();
         let long = "x".repeat(40); // > 32 bytes
         let sub = HeadSubmission::sign(&id(), &long, [1u8; 32], 1);
         let out = rt
@@ -513,8 +512,8 @@ mod tests {
 
     #[test]
     fn wasm_registry_rejects_a_forged_submission() {
-        use crate::AttestedRuntime;
-        let rt = AttestedRuntime::new().unwrap();
+        use crate::TransitionRuntime;
+        let rt = TransitionRuntime::new().unwrap();
         let mut sub = HeadSubmission::sign(&id(), "feed", [1u8; 32], 1);
         sub.cid = [9u8; 32]; // break the signature
         let out = rt

@@ -19,7 +19,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use zeph_com::{pda, AttestedRuntime, DEFAULT_FUEL};
+use zeph_com::{pda, TransitionRuntime, DEFAULT_FUEL};
 use zeph_core::Cid;
 use zeph_obj::{ConsumeMode, ObjEngine};
 
@@ -33,7 +33,7 @@ pub struct AdvanceResult {
 /// single-writer state advanced PURELY by running the program — no committee, no attestation.
 pub struct ProgramAccountStore {
     obj: Arc<ObjEngine>,
-    runtime: AttestedRuntime,
+    runtime: TransitionRuntime,
     dir: PathBuf,
 }
 
@@ -43,7 +43,7 @@ impl ProgramAccountStore {
         let _ = std::fs::create_dir_all(&dir);
         Self {
             obj,
-            runtime: AttestedRuntime::new().expect("program runtime"),
+            runtime: TransitionRuntime::new().expect("program runtime"),
             dir,
         }
     }
