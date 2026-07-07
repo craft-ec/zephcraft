@@ -43,7 +43,11 @@ pub struct Config {
     pub shuffle_sample: usize,
     /// How long dead peers stay visible as tombstones in snapshots before
     /// being forgotten (a rejoining peer clears its tombstone immediately).
+    /// Also the age at which a member is fully forgotten from the converged
+    /// member set (a live member re-asserts itself every sync round).
     pub dead_retention: Duration,
+    /// Cadence of the converged-membership anti-entropy round (MemberSync).
+    pub member_sync_interval: Duration,
 }
 
 impl Default for Config {
@@ -59,9 +63,16 @@ impl Default for Config {
             shuffle_interval: Duration::from_secs(30),
             shuffle_sample: 8,
             dead_retention: Duration::from_secs(600),
+            member_sync_interval: Duration::from_secs(10),
         }
     }
 }
+
+/// Window (ms) within which a member counts as alive in the [`Membership::census`].
+/// Generous on purpose: the converged set must not falsely drop a peer between
+/// anti-entropy rounds — genuine deaths age out after `dead_retention`, and a live
+/// peer re-asserts its `last_heard_ms` every sync round (well inside this TTL).
+const CENSUS_TTL_MS: u64 = 45_000;
 
 /// Live state of one known peer (active view or recently dead).
 #[derive(Debug, Clone)]
@@ -87,6 +98,16 @@ impl PeerState {
     }
 }
 
+/// One converged-member record: a dialable address plus the last time we had
+/// positive evidence the member was alive (ms since the Unix epoch). This map
+/// is the CONVERGENCE LAYER that lives BESIDE the HyParView active/passive views
+/// — it is not a replacement for them.
+#[derive(Debug, Clone)]
+struct Member {
+    addr: PeerAddr,
+    last_heard_ms: u64,
+}
+
 #[derive(Default)]
 struct Views {
     active: HashMap<NodeId, PeerState>,
@@ -94,6 +115,13 @@ struct Views {
     /// Recently-dead peers with their time of death — kept as tombstones for
     /// the status table until `dead_retention` elapses.
     dead: HashMap<NodeId, (PeerState, std::time::Instant)>,
+    /// The liveness-tracked FULL member set, gossiped by MemberSync anti-entropy.
+    /// Every node converges on the same map (union + max-`last_heard_ms` merge),
+    /// so an election over the derived census ([`Membership::census`]) is
+    /// consistent across nodes — unlike the size-bounded, per-node-divergent
+    /// active view. NOTE: full-map gossip is O(N) per round — fine at current
+    /// scale; a digest / SWIM-piggybacked delta is needed for very large N.
+    members: HashMap<NodeId, Member>,
 }
 
 /// Snapshot for the control API / dashboard.
@@ -166,6 +194,16 @@ impl Membership {
             loop {
                 interval.tick().await;
                 this.shuffle_round().await;
+            }
+        });
+
+        let this = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(this.cfg.member_sync_interval);
+            interval.tick().await; // skip the immediate first tick
+            loop {
+                interval.tick().await;
+                this.member_sync_round().await;
             }
         });
     }
@@ -353,6 +391,14 @@ impl Membership {
                         state.last_seen_unix = now_unix();
                         state.consecutive_failures = 0;
                     }
+                    // Positive liveness evidence → refresh the converged member record.
+                    views.members.insert(
+                        id,
+                        Member {
+                            addr: addr.clone(),
+                            last_heard_ms: now_ms(),
+                        },
+                    );
                     tracing::info!(
                         peer = %short(&id),
                         rtt_us = report.rtt.as_micros() as u64,
@@ -434,9 +480,156 @@ impl Membership {
         }
     }
 
+    // ── converged membership (anti-entropy layer beside HyParView) ─────────
+
+    /// One MemberSync anti-entropy round: re-assert self, gossip our full member
+    /// set to a random ACTIVE peer, merge its reply, and age out the dead.
+    async fn member_sync_round(&self) {
+        self.refresh_self().await;
+        let target = {
+            let views = self.views.read().await;
+            views
+                .active
+                .values()
+                .map(|s| s.addr.clone())
+                .collect::<Vec<_>>()
+                .choose(&mut rand::thread_rng())
+                .cloned()
+        };
+        if let Some(target) = target {
+            let msg = wire::Message::MemberSync(wire::MemberSync {
+                members: self.member_entries().await,
+            });
+            if let Some(frame) = self.request(&target, &msg, true).await {
+                if let wire::Message::MemberSync(reply) = frame.message {
+                    self.merge_members(&reply.members).await;
+                }
+            }
+        }
+        self.prune_members().await;
+    }
+
+    /// Keep SELF in the member map with a fresh `last_heard_ms` (called at the
+    /// start of every sync round and before replying) — a live node re-asserts
+    /// itself so it is never falsely aged out of any peer's converged set.
+    async fn refresh_self(&self) {
+        let addr = self.transport.addr();
+        let id = self.my_id();
+        self.views.write().await.members.insert(
+            id,
+            Member {
+                addr,
+                last_heard_ms: now_ms(),
+            },
+        );
+    }
+
+    /// This node's member map serialized as wire entries.
+    async fn member_entries(&self) -> Vec<wire::MemberEntry> {
+        self.views
+            .read()
+            .await
+            .members
+            .iter()
+            .map(|(id, m)| wire::MemberEntry {
+                id: id.0,
+                addr: m.addr.to_string(),
+                last_heard_ms: m.last_heard_ms,
+            })
+            .collect()
+    }
+
+    /// Merge an incoming member set into ours: union + max-`last_heard_ms`. Skips
+    /// entries about SELF (we manage our own record authoritatively via
+    /// [`Self::refresh_self`]). Idempotent + commutative → convergence.
+    async fn merge_members(&self, entries: &[wire::MemberEntry]) {
+        let me = self.my_id().0;
+        let mut views = self.views.write().await;
+        for e in entries {
+            if e.id == me {
+                continue;
+            }
+            merge_one(&mut views.members, e);
+        }
+    }
+
+    /// Bump the sender's `last_heard_ms` on positive evidence (an inbound message).
+    /// If the sender is not yet a known member, adopt its address from the active
+    /// view when available (its full record arrives via MemberSync regardless).
+    async fn note_heard(&self, id: NodeId) {
+        if id == self.my_id() {
+            return;
+        }
+        let now = now_ms();
+        let mut views = self.views.write().await;
+        if let Some(m) = views.members.get_mut(&id) {
+            m.last_heard_ms = now;
+        } else if let Some(addr) = views.active.get(&id).map(|s| s.addr.clone()) {
+            views.members.insert(
+                id,
+                Member {
+                    addr,
+                    last_heard_ms: now,
+                },
+            );
+        }
+    }
+
+    /// Fully forget members whose last positive evidence is older than
+    /// `dead_retention` (SELF is always retained).
+    async fn prune_members(&self) {
+        let now = now_ms();
+        let retention = self.cfg.dead_retention.as_millis() as u64;
+        let me = self.my_id();
+        self.views
+            .write()
+            .await
+            .members
+            .retain(|id, m| *id == me || now.saturating_sub(m.last_heard_ms) < retention);
+    }
+
+    /// The CONVERGED alive set: every member (incl. SELF) whose `last_heard_ms`
+    /// is within [`CENSUS_TTL_MS`]. Because the member map converges across nodes
+    /// (union + max-merge) this returns the SAME set on every node, so an election
+    /// over it is consistent — the whole point of this layer. Unlike `snapshot().active`
+    /// it is the FULL alive membership, not a size-bounded per-node partial view.
+    pub async fn census(&self) -> Vec<(NodeId, PeerAddr)> {
+        let now = now_ms();
+        let me = self.my_id();
+        let views = self.views.read().await;
+        // SELF is trivially alive — always included, with our current address.
+        let mut out = vec![(me, self.transport.addr())];
+        for (id, m) in &views.members {
+            if *id == me {
+                continue;
+            }
+            if now.saturating_sub(m.last_heard_ms) < CENSUS_TTL_MS {
+                out.push((*id, m.addr.clone()));
+            }
+        }
+        out
+    }
+
+    /// Look up a member's dialable address from the converged set (used by
+    /// consumers that elect over the census and must then reach the winner).
+    pub async fn member_addr(&self, id: NodeId) -> Option<PeerAddr> {
+        if id == self.my_id() {
+            return Some(self.transport.addr());
+        }
+        self.views
+            .read()
+            .await
+            .members
+            .get(&id)
+            .map(|m| m.addr.clone())
+    }
+
     // ── inbound ───────────────────────────────────────────────────────────
 
     async fn handle_conn(self: Arc<Self>, conn: zeph_transport::Connection) {
+        // The authenticated sender identity for this connection (iroh binds the
+        // QUIC session to the peer's NodeId), used as positive liveness evidence.
+        let sender = NodeId(*conn.remote_id().as_bytes());
         while let Ok((mut send, mut recv)) = conn.accept_bi().await {
             let Ok(bytes) = recv.read_to_end(MAX_FRAME).await else {
                 return;
@@ -448,6 +641,8 @@ impl Membership {
                     return;
                 }
             };
+            // Receiving ANY message is evidence the sender is alive.
+            self.note_heard(sender).await;
             let merge = self
                 .transport
                 .clock()
@@ -574,6 +769,15 @@ impl Membership {
                     sample: reply_sample,
                 }))
             }
+            wire::Message::MemberSync(sync) => {
+                // Merge the sender's member set (union + max-last_heard), then reply
+                // with ours so the exchange is symmetric — both sides converge.
+                self.merge_members(&sync.members).await;
+                self.refresh_self().await;
+                Some(wire::Message::MemberSync(wire::MemberSync {
+                    members: self.member_entries().await,
+                }))
+            }
             other => {
                 tracing::warn!(tag = other.type_tag(), "unexpected message on member alpn");
                 None
@@ -599,6 +803,49 @@ fn now_unix() -> Option<u64> {
         .duration_since(UNIX_EPOCH)
         .ok()
         .map(|d| d.as_secs())
+}
+
+/// Monotonic-ish millisecond wall clock (ms since the Unix epoch) — the merge key
+/// for converged membership.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Merge one wire entry into a member map: union + max-`last_heard_ms` (upserting
+/// the address when the entry is fresher). Commutative and idempotent.
+fn merge_one(members: &mut HashMap<NodeId, Member>, e: &wire::MemberEntry) {
+    let id = NodeId(e.id);
+    let Ok(addr) = e.addr.parse::<PeerAddr>() else {
+        return;
+    };
+    match members.get_mut(&id) {
+        Some(existing) if e.last_heard_ms <= existing.last_heard_ms => {}
+        Some(existing) => {
+            existing.last_heard_ms = e.last_heard_ms;
+            existing.addr = addr;
+        }
+        None => {
+            members.insert(
+                id,
+                Member {
+                    addr,
+                    last_heard_ms: e.last_heard_ms,
+                },
+            );
+        }
+    }
+}
+
+/// Merge a whole entry set (union + max-last_heard). Used by tests to exercise the
+/// convergence property directly.
+#[cfg(test)]
+fn merge_entries(members: &mut HashMap<NodeId, Member>, entries: &[wire::MemberEntry]) {
+    for e in entries {
+        merge_one(members, e);
+    }
 }
 
 fn short(id: &NodeId) -> String {
@@ -665,5 +912,115 @@ mod tests {
         let mut bytes = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut bytes);
         bytes
+    }
+
+    async fn test_addr() -> PeerAddr {
+        Transport::bind(
+            zeph_crypto_test_identity(),
+            zeph_transport::Reach::LocalOnly,
+            vec![],
+            0,
+        )
+        .await
+        .unwrap()
+        .addr()
+    }
+
+    fn entry(addr: &PeerAddr, last_heard_ms: u64) -> wire::MemberEntry {
+        wire::MemberEntry {
+            id: addr.node_id().0,
+            addr: addr.to_string(),
+            last_heard_ms,
+        }
+    }
+
+    fn last_heard(members: &HashMap<NodeId, Member>, id: NodeId) -> Option<u64> {
+        members.get(&id).map(|m| m.last_heard_ms)
+    }
+
+    #[tokio::test]
+    async fn member_merge_is_commutative_and_idempotent() {
+        let a = test_addr().await;
+        let b = test_addr().await;
+        // Two divergent views of the same two members.
+        let x_entries = vec![entry(&a, 100), entry(&b, 50)];
+        let y_entries = vec![entry(&a, 30), entry(&b, 80)];
+
+        // Converge X then Y.
+        let mut xy = HashMap::new();
+        merge_entries(&mut xy, &x_entries);
+        merge_entries(&mut xy, &y_entries);
+
+        // Converge Y then X (opposite order).
+        let mut yx = HashMap::new();
+        merge_entries(&mut yx, &y_entries);
+        merge_entries(&mut yx, &x_entries);
+
+        // Both reach the UNION with the MAX last_heard for each member.
+        for map in [&xy, &yx] {
+            assert_eq!(map.len(), 2, "union of both member sets");
+            assert_eq!(
+                last_heard(map, a.node_id()),
+                Some(100),
+                "max last_heard for A"
+            );
+            assert_eq!(
+                last_heard(map, b.node_id()),
+                Some(80),
+                "max last_heard for B"
+            );
+        }
+
+        // Idempotent: re-merging either set changes nothing.
+        merge_entries(&mut xy, &x_entries);
+        merge_entries(&mut xy, &y_entries);
+        assert_eq!(last_heard(&xy, a.node_id()), Some(100));
+        assert_eq!(last_heard(&xy, b.node_id()), Some(80));
+    }
+
+    #[tokio::test]
+    async fn census_excludes_stale_members_and_includes_self() {
+        let transport = Arc::new(
+            Transport::bind(
+                zeph_crypto_test_identity(),
+                zeph_transport::Reach::LocalOnly,
+                vec![],
+                0,
+            )
+            .await
+            .unwrap(),
+        );
+        let me = transport.node_id();
+        let membership = Membership::new(transport, Config::default());
+
+        let fresh = test_addr().await;
+        let stale = test_addr().await;
+        {
+            let mut views = membership.views.write().await;
+            views.members.insert(
+                fresh.node_id(),
+                Member {
+                    addr: fresh.clone(),
+                    last_heard_ms: now_ms(),
+                },
+            );
+            // Older than CENSUS_TTL_MS → must be excluded.
+            views.members.insert(
+                stale.node_id(),
+                Member {
+                    addr: stale.clone(),
+                    last_heard_ms: now_ms().saturating_sub(CENSUS_TTL_MS + 5_000),
+                },
+            );
+        }
+
+        let census = membership.census().await;
+        let ids: Vec<NodeId> = census.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&me), "census always includes self");
+        assert!(ids.contains(&fresh.node_id()), "fresh member is alive");
+        assert!(
+            !ids.contains(&stale.node_id()),
+            "stale member aged out of the census"
+        );
     }
 }

@@ -31,6 +31,8 @@ pub mod tag {
     pub const DISCONNECT: u32 = 0x0104;
     pub const SHUFFLE: u32 = 0x0105;
     pub const SHUFFLE_REPLY: u32 = 0x0106;
+    /// Converged full-member-set anti-entropy (union + max-last_heard merge).
+    pub const MEMBER_SYNC: u32 = 0x0107;
     // Piece exchange (CRAFTOBJ_DESIGN §Wire Protocol Additions):
     pub const PIECE_REQUEST: u32 = 0x0010;
     pub const PIECE_RESPONSE: u32 = 0x0011;
@@ -188,6 +190,25 @@ pub struct ShuffleReply {
     pub sample: Vec<PeerInfo>,
 }
 
+/// One member's liveness record on the wire: identity, dialable address, and the
+/// millisecond timestamp of the most recent positive liveness evidence the sender
+/// has for it. `last_heard_ms` is the merge key (max wins).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberEntry {
+    pub id: [u8; 32],
+    pub addr: String,
+    pub last_heard_ms: u64,
+}
+
+/// Converged-membership anti-entropy: the sender's ENTIRE liveness-tracked member
+/// set. The receiver merges it (union + max `last_heard_ms`) and replies with its
+/// own set, which the sender merges symmetrically. Union + max-merge is
+/// idempotent/commutative, so every node converges on the same map.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberSync {
+    pub members: Vec<MemberEntry>,
+}
+
 /// HealthScan live probe: "do you currently hold `cid`?" — cheap, transfers
 /// no pieces. The reply carries the VERIFIED holding (provider records are
 /// candidates; this is availability truth).
@@ -227,6 +248,7 @@ pub enum Message {
     Disconnect,
     Shuffle(Shuffle),
     ShuffleReply(ShuffleReply),
+    MemberSync(MemberSync),
     PiecePush(PiecePush),
     PiecePushAck(PiecePushAck),
     PieceRequest(PieceRequest),
@@ -253,6 +275,7 @@ impl Message {
             Message::Disconnect => tag::DISCONNECT,
             Message::Shuffle(_) => tag::SHUFFLE,
             Message::ShuffleReply(_) => tag::SHUFFLE_REPLY,
+            Message::MemberSync(_) => tag::MEMBER_SYNC,
             Message::PiecePush(_) => tag::PIECE_PUSH,
             Message::PiecePushAck(_) => tag::PIECE_PUSH_ACK,
             Message::PieceRequest(_) => tag::PIECE_REQUEST,
@@ -305,6 +328,7 @@ pub fn encode(message: &Message, hlc_ts: u64) -> Vec<u8> {
         Message::Disconnect => Ok(Vec::new()),
         Message::Shuffle(p) => postcard::to_allocvec(p),
         Message::ShuffleReply(p) => postcard::to_allocvec(p),
+        Message::MemberSync(p) => postcard::to_allocvec(p),
         Message::PiecePush(p) => postcard::to_allocvec(p),
         Message::PiecePushAck(p) => postcard::to_allocvec(p),
         Message::PieceRequest(p) => postcard::to_allocvec(p),
@@ -374,6 +398,7 @@ pub fn decode(bytes: &[u8]) -> Result<Frame, WireError> {
         tag::SHUFFLE_REPLY => {
             Message::ShuffleReply(postcard::from_bytes(payload).map_err(malformed)?)
         }
+        tag::MEMBER_SYNC => Message::MemberSync(postcard::from_bytes(payload).map_err(malformed)?),
         tag::PIECE_PUSH => Message::PiecePush(postcard::from_bytes(payload).map_err(malformed)?),
         tag::PIECE_PUSH_ACK => {
             Message::PiecePushAck(postcard::from_bytes(payload).map_err(malformed)?)
@@ -540,6 +565,20 @@ mod tests {
             }),
             Message::ShuffleReply(ShuffleReply {
                 sample: vec![info("gg@5.5.5.5:4")],
+            }),
+            Message::MemberSync(MemberSync {
+                members: vec![
+                    MemberEntry {
+                        id: [1u8; 32],
+                        addr: "hh@4.4.4.4:5".into(),
+                        last_heard_ms: 123,
+                    },
+                    MemberEntry {
+                        id: [2u8; 32],
+                        addr: "ii@3.3.3.3:6".into(),
+                        last_heard_ms: 456,
+                    },
+                ],
             }),
         ];
         for msg in msgs {

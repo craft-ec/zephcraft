@@ -55,11 +55,6 @@ pub const RT_MANIFEST: u8 = 2;
 /// state (the offline-writer fault the single-writer model could not survive).
 const REPLICATION_FACTOR: usize = 3;
 
-/// Max measured rtt (microseconds) for a peer to be eligible as a registry writer/replica. A
-/// relay-only node on a poor link (hundreds of ms) is excluded so writes/pushes never route to it;
-/// co-located peers are well under 1 ms, legitimate cross-region peers under this cap.
-const WRITER_RTT_CAP_US: u64 = 150_000;
-
 /// Identifies one registry account = one `(kind, shard)`. Threaded everywhere a shard used to
 /// be, so each kind gets its own independent per-shard account + writer set.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -209,22 +204,22 @@ impl HeadRegistry {
         }
     }
 
-    /// The set eligible to be elected writer: self + the membership's ACTIVE peers. Every node
-    /// computes the election over this same view.
+    /// The set eligible to be elected writer: the CONVERGED alive membership (self + every
+    /// live member from [`Membership::census`]). The census is a converged set — union +
+    /// max-last_heard merged across the whole network — so every node computes the election
+    /// over the SAME view. This replaces the size-5, per-node-divergent HyParView active view,
+    /// which above ~6 nodes produced inconsistent shard→writer assignment (split-brain).
+    ///
+    /// NO rtt-based exclusion: rtt is a per-observer LOCAL measurement, so filtering by it makes
+    /// the eligible set differ per node and re-breaks election consistency — the exact bug this
+    /// change fixes. Slow-writer handling now relies on the resolve fallback + the
+    /// fire-and-forget/sidecar-first tail fixes; a CONVERGED health/reachability signal for
+    /// excluding slow writers is future work.
     async fn eligible(&self) -> Vec<[u8; 32]> {
         let mut ids = vec![self.self_id];
         if let Some(m) = self.membership.read().await.as_ref() {
-            for (n, ps) in m.snapshot().await.active {
+            for (n, _addr) in m.census().await {
                 if n.0 == self.self_id {
-                    continue;
-                }
-                // Exclude PROVEN-slow peers (e.g. a relay-only node on a poor link) from the writer
-                // + replica roles. A slow WRITER stalls every write routed to it — writes have no
-                // fallback (single-writer) — and a slow REPLICA stalls its pushes/merges. A peer
-                // whose measured rtt exceeds the cap is skipped; an unprobed peer (rtt None) gets
-                // the benefit of the doubt. A clearly-slow peer (hundreds of ms) is excluded
-                // consistently by all of its fast peers, so the election stays coherent among them.
-                if matches!(ps.rtt_us, Some(rtt) if rtt >= WRITER_RTT_CAP_US) {
                     continue;
                 }
                 ids.push(n.0);
@@ -282,10 +277,16 @@ impl HeadRegistry {
         Self::replicas(sk, &elig).contains(&self.self_id)
     }
 
-    /// Look up `id`'s dialable address from the membership view (active or dead).
+    /// Look up `id`'s dialable address. Consults the CONVERGED member set first (the same set
+    /// the election runs over, so any elected writer/replica is resolvable even when it is not
+    /// in this node's bounded active view), then falls back to the active/dead snapshot.
     async fn addr_of(&self, id: [u8; 32]) -> Option<PeerAddr> {
         let guard = self.membership.read().await;
-        let snap = guard.as_ref()?.snapshot().await;
+        let m = guard.as_ref()?;
+        if let Some(addr) = m.member_addr(zeph_core::NodeId(id)).await {
+            return Some(addr);
+        }
+        let snap = m.snapshot().await;
         snap.active
             .iter()
             .chain(snap.dead.iter())
