@@ -82,6 +82,7 @@ impl ProgramAccountStore {
                 DEFAULT_FUEL,
                 &CapabilityGrant::deterministic(),
             )
+            .await
             .ok()?;
         (!out.is_empty()).then_some(out)
     }

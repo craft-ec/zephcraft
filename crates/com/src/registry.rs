@@ -462,8 +462,8 @@ mod tests {
         assert_ne!(s.root(), s2.root());
     }
 
-    #[test]
-    fn wasm_registry_matches_native() {
+    #[tokio::test]
+    async fn wasm_registry_matches_native() {
         use crate::TransitionRuntime;
         let rt = TransitionRuntime::new().unwrap();
         let publisher = id();
@@ -479,6 +479,7 @@ mod tests {
                 crate::DEFAULT_FUEL,
                 &crate::CapabilityGrant::deterministic(),
             )
+            .await
             .expect("wasm runs");
         let wasm_state = RegistryState::decode(&out).expect("wasm output decodes as RegistryState");
         // It must equal the NATIVE transition, byte for byte.
@@ -493,8 +494,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn wasm_registry_v2_rejects_an_overlong_name() {
+    #[tokio::test]
+    async fn wasm_registry_v2_rejects_an_overlong_name() {
         use crate::TransitionRuntime;
         let rt = TransitionRuntime::new().unwrap();
         let long = "x".repeat(40); // > 32 bytes
@@ -508,6 +509,7 @@ mod tests {
                 crate::DEFAULT_FUEL,
                 &crate::CapabilityGrant::deterministic(),
             )
+            .await
             .unwrap();
         assert!(out.is_empty(), "v2 rejects a name longer than 32 bytes");
     }
@@ -515,8 +517,8 @@ mod tests {
     // Phase 1 capability grant (COMPUTE_EXECUTION_DESIGN §5). registry-wasm imports
     // input/state/commit/ed25519_verify — exactly the deterministic profile → it
     // instantiates and runs (no behavior change).
-    #[test]
-    fn wasm_registry_runs_under_the_deterministic_grant() {
+    #[tokio::test]
+    async fn wasm_registry_runs_under_the_deterministic_grant() {
         use crate::{CapabilityGrant, TransitionRuntime};
         let rt = TransitionRuntime::new().unwrap();
         let sub = HeadSubmission::sign(&id(), "feed", [1u8; 32], 1);
@@ -529,6 +531,7 @@ mod tests {
                 crate::DEFAULT_FUEL,
                 &CapabilityGrant::deterministic(),
             )
+            .await
             .expect("deterministic grant binds the imports registry-wasm needs");
         assert!(!out.is_empty(), "a valid submission commits a new state");
     }
@@ -536,8 +539,8 @@ mod tests {
     // THE GATE: drop `Commit` from the grant → the host fn is NOT bound, so registry-wasm's
     // `commit` import is unresolved and it FAILS to instantiate. Proves link-time gating: a
     // non-granted capability cannot be reached.
-    #[test]
-    fn wasm_registry_without_commit_grant_fails_to_instantiate() {
+    #[tokio::test]
+    async fn wasm_registry_without_commit_grant_fails_to_instantiate() {
         use crate::{Capability, CapabilityGrant, TransitionRuntime};
         let rt = TransitionRuntime::new().unwrap();
         let sub = HeadSubmission::sign(&id(), "feed", [1u8; 32], 1);
@@ -550,13 +553,14 @@ mod tests {
                 crate::DEFAULT_FUEL,
                 &CapabilityGrant::deterministic().without(Capability::Commit),
             )
+            .await
             .is_err(),
             "an unbound `commit` import must fail instantiation"
         );
     }
 
-    #[test]
-    fn wasm_registry_rejects_a_forged_submission() {
+    #[tokio::test]
+    async fn wasm_registry_rejects_a_forged_submission() {
         use crate::TransitionRuntime;
         let rt = TransitionRuntime::new().unwrap();
         let mut sub = HeadSubmission::sign(&id(), "feed", [1u8; 32], 1);
@@ -570,6 +574,7 @@ mod tests {
                 crate::DEFAULT_FUEL,
                 &crate::CapabilityGrant::deterministic(),
             )
+            .await
             .unwrap();
         assert!(out.is_empty(), "a bad signature commits nothing");
     }
