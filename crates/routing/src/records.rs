@@ -1,4 +1,4 @@
-//! Signed routing records (provider, want, meta, root, app, manifest).
+//! Signed routing records (provider, want, meta, app).
 //!
 //! All records share one shape — a typed payload wrapped in a wire
 //! `SignedRecord` (Ed25519 over `kind ‖ node_id ‖ payload ‖ hlc_ts`). Records
@@ -12,8 +12,6 @@ use zeph_wire::SignedRecord;
 pub const KIND_PROVIDER: u8 = 1;
 pub const KIND_WANT: u8 = 4;
 pub const KIND_META: u8 = 5;
-pub const KIND_ROOT: u8 = 6;
-pub const KIND_MANIFEST: u8 = 7;
 /// RESERVED (ENCRYPTION_DESIGN.md §sharing): a signed grant — "owner grants
 /// recipient access to CID". The on-wire shape is fixed now so sharing (a CraftCOM
 /// app doing proxy re-encryption) needs no routing rework. NOT yet enforced or
@@ -120,29 +118,6 @@ pub fn meta(record: &SignedRecord) -> Option<MetaPayload> {
         .flatten()
 }
 
-/// Single-writer mutable DB root pointer: `(identity, namespace) → root_cid`.
-/// The CraftSQL head. Updated via compare-and-swap (`prev_cid` must match the
-/// current root) with a monotonic `seq` — this is what gives readers a stable
-/// "latest version" and gives writers optimistic-concurrency (§5, §33).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RootPayload {
-    /// Which DB owned by this identity (empty = the default/primary DB).
-    pub namespace: String,
-    /// The new root CID this write publishes.
-    pub root_cid: [u8; 32],
-    /// CAS condition: the root this write expects to replace. All-zeros on the
-    /// first write (expect no prior root).
-    pub prev_cid: [u8; 32],
-    /// Monotonic version, strictly increasing per (identity, namespace).
-    pub seq: u64,
-}
-
-pub fn root(record: &SignedRecord) -> Option<RootPayload> {
-    (record.kind == KIND_ROOT)
-        .then(|| postcard::from_bytes(&record.payload).ok())
-        .flatten()
-}
-
 /// A CraftCOM app head: `(publisher, name) → (wasm_cid, version)`. Signed by the
 /// publisher; highest `version` wins. This is what makes an app NAME resolvable
 /// network-wide (and versioned), vs sharing a bare cid (CRAFTCOM_DESIGN §13).
@@ -155,24 +130,6 @@ pub struct AppPayload {
 
 pub fn app(record: &SignedRecord) -> Option<AppPayload> {
     (record.kind == KIND_APP)
-        .then(|| postcard::from_bytes(&record.payload).ok())
-        .flatten()
-}
-
-/// A DB's durability manifest pointer (§33): `(identity, namespace) → the CID of
-/// the object listing the DB's erasure-coded generations`. Lets any node rebuild
-/// a dead owner's DB — resolve the manifest, reconstruct the generations from
-/// their distributed pieces, replay them. Owner is the only writer; highest
-/// `seq` wins (monotonic as generations accrue).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ManifestPayload {
-    pub namespace: String,
-    pub manifest_cid: [u8; 32],
-    pub seq: u64,
-}
-
-pub fn manifest(record: &SignedRecord) -> Option<ManifestPayload> {
-    (record.kind == KIND_MANIFEST)
         .then(|| postcard::from_bytes(&record.payload).ok())
         .flatten()
 }

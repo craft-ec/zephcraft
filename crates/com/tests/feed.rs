@@ -15,10 +15,9 @@ use zeph_com::{
 use zeph_core::{hlc::Clock, NodeId};
 use zeph_crypto::NodeIdentity;
 use zeph_obj::{ObjConfig, ObjEngine};
-use zeph_routing::ContentRouting;
-use zeph_sql::{CraftSql, ObjDurable, RoutingManifestStore, RoutingRootStore, TransportPageSource};
+use zeph_sql::{CraftSql, ObjDurable, TransportPageSource};
 use zeph_store::Store;
-use zeph_testkit::MemNet;
+use zeph_testkit::{MemHeads, MemNet};
 use zeph_transport::{Connection, Reach, Transport};
 
 // The feed app: `post` writes a row to the caller's OWN feed; `aggregate` reads a
@@ -62,7 +61,7 @@ struct Node {
     service: Arc<InvokeService>,
 }
 
-async fn node(tracker: &MemNet, dir: &Path) -> Node {
+async fn node(tracker: &MemNet, dir: &Path, heads: &MemHeads) -> Node {
     let id = Arc::new(NodeIdentity::generate());
     let node_id = id.node_id();
     let t = Arc::new(
@@ -89,20 +88,14 @@ async fn node(tracker: &MemNet, dir: &Path) -> Node {
         ObjConfig::default(),
     );
     let sql_dir = dir.join("sqlpages");
-    let routing_dyn: Arc<dyn ContentRouting> = routing.clone();
     let craftsql = Arc::new(
-        CraftSql::register(
-            &sql_dir,
-            Arc::new(RoutingRootStore::new(routing_dyn.clone())),
-            node_id,
-        )
-        .unwrap()
-        .with_source(Arc::new(TransportPageSource::new(
-            t.clone(),
-            Arc::new(tracker.peers()),
-        )))
-        .with_durable(Arc::new(ObjDurable::new(engine.clone())))
-        .with_manifests(Arc::new(RoutingManifestStore::new(routing_dyn.clone()))),
+        CraftSql::register(&sql_dir, heads.root_store(node_id), node_id)
+            .unwrap()
+            .with_source(Arc::new(TransportPageSource::new(
+                t.clone(),
+                Arc::new(tracker.peers()),
+            )))
+            .with_durable(Arc::new(ObjDurable::new(engine.clone()))),
     );
     let (obj_tx, obj_rx) = mpsc::channel(64);
     let (sql_tx, sql_rx) = mpsc::channel(64);
@@ -142,10 +135,11 @@ async fn node(tracker: &MemNet, dir: &Path) -> Node {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn federated_feed_aggregates_across_sovereign_participants() {
     let tracker = start_tracker();
+    let heads = MemHeads::new();
     let dirs: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
-    let a = node(&tracker, dirs[0].path()).await;
-    let b = node(&tracker, dirs[1].path()).await;
-    let c = node(&tracker, dirs[2].path()).await; // observer / aggregator
+    let a = node(&tracker, dirs[0].path(), &heads).await;
+    let b = node(&tracker, dirs[1].path(), &heads).await;
+    let c = node(&tracker, dirs[2].path(), &heads).await; // observer / aggregator
 
     // The app is published once; every node uses the same CID.
     let wasm_cid = a.engine.publish(FEED_WAT, true).await.unwrap().cid.0;

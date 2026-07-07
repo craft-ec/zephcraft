@@ -5,9 +5,9 @@
 //!   per publisher, all coexisting (many providers per CID). `seq` is a wall-clock stamp so
 //!   re-announces (and 22h republishes) always advance and refresh; a withdraw stores an
 //!   empty tombstone that supersedes and is skipped on read.
-//! - **root / app / manifest** — owner-keyed heads, **highest-seq/version wins** (no strict
-//!   CAS; a DHT has no single authority — foundation §62). The key embeds the owner and reads
-//!   filter to the owner's own signature, so only the owner can advance their head.
+//! - **app** — an owner-keyed head, **highest-version wins** (no strict CAS; a DHT has no
+//!   single authority — foundation §62). The key embeds the owner and reads filter to the
+//!   owner's own signature, so only the owner can advance their head.
 //!
 //! Census + enumeration are NOT DHT-native: a DHT can't list all keys or all nodes, so the
 //! trait carries no such methods. Fade uses per-CID want lookups (`is_wanted`) instead.
@@ -19,10 +19,10 @@ use zeph_core::{Cid, NodeId};
 use zeph_dht::DhtNode;
 
 use crate::records::{
-    AppPayload, ManifestPayload, MetaPayload, ProviderPayload, RootPayload, WantPayload, KIND_APP,
-    KIND_MANIFEST, KIND_META, KIND_PROVIDER, KIND_ROOT, KIND_WANT,
+    AppPayload, MetaPayload, ProviderPayload, WantPayload, KIND_APP, KIND_META, KIND_PROVIDER,
+    KIND_WANT,
 };
-use crate::{AppRecord, ContentRouting, ManifestRecord, MetaRecord, Result, RootRecord};
+use crate::{AppRecord, ContentRouting, MetaRecord, Result};
 
 /// Content routing over the DHT.
 pub struct DhtRouting {
@@ -70,7 +70,7 @@ impl DhtRouting {
         Cid::of(&b).0
     }
 
-    /// DHT key for an owner-keyed head (root/app/manifest): kind ‖ owner ‖ name.
+    /// DHT key for an owner-keyed head (app): kind ‖ owner ‖ name.
     fn owned_key(kind: u8, owner: &[u8; 32], name: &str) -> [u8; 32] {
         let mut b = Vec::with_capacity(1 + 32 + name.len());
         b.push(kind);
@@ -197,66 +197,7 @@ impl ContentRouting for DhtRouting {
             .collect())
     }
 
-    // ---- owner-keyed heads (highest-seq-wins) ------------------------------------
-
-    async fn publish_root(
-        &self,
-        namespace: &str,
-        root_cid: Cid,
-        prev_cid: Option<Cid>,
-        seq: u64,
-    ) -> Result<()> {
-        let payload = RootPayload {
-            namespace: namespace.to_string(),
-            root_cid: root_cid.0,
-            prev_cid: prev_cid.map(|c| c.0).unwrap_or([0u8; 32]),
-            seq,
-        };
-        let value = postcard::to_allocvec(&payload).expect("root serializes");
-        self.put(
-            Self::owned_key(KIND_ROOT, &self.me(), namespace),
-            value,
-            seq,
-        )
-        .await;
-        Ok(())
-    }
-
-    async fn resolve_root(&self, owner: NodeId, namespace: &str) -> Result<Option<RootRecord>> {
-        let recs = self
-            .dht
-            .get(Self::owned_key(KIND_ROOT, &owner.0, namespace))
-            .await;
-        Ok(recs
-            .into_iter()
-            .filter(|r| r.publisher == owner.0) // only the owner's signed head counts
-            .filter_map(|r| postcard::from_bytes::<RootPayload>(&r.value).ok())
-            .max_by_key(|p| p.seq)
-            .map(|p| RootRecord {
-                owner,
-                namespace: p.namespace,
-                root_cid: Cid(p.root_cid),
-                seq: p.seq,
-            }))
-    }
-
-    async fn withdraw_root(&self, namespace: &str) -> Result<()> {
-        // Tombstone at current_version + 1 so it supersedes, and a later publish can still
-        // advance past it. (Head seqs are small versions, not wall-clock stamps.)
-        let owner = NodeId(self.me());
-        let cur = self
-            .resolve_root(owner, namespace)
-            .await?
-            .map(|r| r.seq)
-            .unwrap_or(0);
-        self.put(
-            Self::owned_key(KIND_ROOT, &self.me(), namespace),
-            Vec::new(),
-            cur + 1,
-        )
-        .await;
-        Ok(())
-    }
+    // ---- owner-keyed app head (highest-version-wins) -----------------------------
 
     async fn announce_app(&self, name: &str, wasm_cid: Cid, version: u64) -> Result<()> {
         let payload = AppPayload {
@@ -285,44 +226,6 @@ impl ContentRouting for DhtRouting {
                 name: p.name,
                 wasm_cid: Cid(p.wasm_cid),
                 version: p.version,
-            }))
-    }
-
-    async fn publish_manifest(&self, namespace: &str, manifest_cid: Cid, seq: u64) -> Result<()> {
-        let payload = ManifestPayload {
-            namespace: namespace.to_string(),
-            manifest_cid: manifest_cid.0,
-            seq,
-        };
-        let value = postcard::to_allocvec(&payload).expect("manifest serializes");
-        self.put(
-            Self::owned_key(KIND_MANIFEST, &self.me(), namespace),
-            value,
-            seq,
-        )
-        .await;
-        Ok(())
-    }
-
-    async fn resolve_manifest(
-        &self,
-        owner: NodeId,
-        namespace: &str,
-    ) -> Result<Option<ManifestRecord>> {
-        let recs = self
-            .dht
-            .get(Self::owned_key(KIND_MANIFEST, &owner.0, namespace))
-            .await;
-        Ok(recs
-            .into_iter()
-            .filter(|r| r.publisher == owner.0)
-            .filter_map(|r| postcard::from_bytes::<ManifestPayload>(&r.value).ok())
-            .max_by_key(|p| p.seq)
-            .map(|p| ManifestRecord {
-                owner,
-                namespace: p.namespace,
-                manifest_cid: Cid(p.manifest_cid),
-                seq: p.seq,
             }))
     }
 }
@@ -384,14 +287,12 @@ mod tests {
         assert_eq!(providers[0].piece_count, 5);
         assert!(providers[0].pinned);
 
-        // Owner-keyed head: highest-seq-wins across two publishes.
-        a.publish_root("db", Cid([1u8; 32]), None, 1).await.unwrap();
-        a.publish_root("db", Cid([2u8; 32]), Some(Cid([1u8; 32])), 2)
-            .await
-            .unwrap();
-        let root = b.resolve_root(owner, "db").await.unwrap().expect("root");
-        assert_eq!(root.seq, 2);
-        assert_eq!(root.root_cid, Cid([2u8; 32]));
+        // Owner-keyed app head: highest-version-wins across two publishes.
+        a.announce_app("chat", Cid([1u8; 32]), 1).await.unwrap();
+        a.announce_app("chat", Cid([2u8; 32]), 2).await.unwrap();
+        let app = b.resolve_app(owner, "chat").await.unwrap().expect("app");
+        assert_eq!(app.version, 2);
+        assert_eq!(app.wasm_cid, Cid([2u8; 32]));
 
         // Withdraw removes A as a provider.
         a.withdraw(cid).await.unwrap();

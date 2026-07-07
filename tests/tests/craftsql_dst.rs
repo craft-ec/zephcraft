@@ -19,10 +19,9 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use zeph_core::NodeId;
 use zeph_crypto::NodeIdentity;
 use zeph_obj::{ObjConfig, ObjEngine};
-use zeph_routing::ContentRouting;
-use zeph_sql::{CraftSql, ObjDurable, RoutingManifestStore, RoutingRootStore, TransportPageSource};
+use zeph_sql::{CraftSql, ObjDurable, TransportPageSource};
 use zeph_store::Store;
-use zeph_testkit::{MemNet, MemRouting};
+use zeph_testkit::{MemHeads, MemNet, MemRouting};
 use zeph_transport::{Reach, Transport};
 
 /// Replaces the in-process tracker: one shared in-memory network view.
@@ -50,7 +49,7 @@ impl SqlNode {
     }
 }
 
-async fn sql_node(tracker: &MemNet, dir: &Path) -> SqlNode {
+async fn sql_node(tracker: &MemNet, heads: &MemHeads, dir: &Path) -> SqlNode {
     let id = Arc::new(NodeIdentity::generate());
     let node_id = id.node_id();
     let t = Arc::new(
@@ -77,20 +76,15 @@ async fn sql_node(tracker: &MemNet, dir: &Path) -> SqlNode {
         },
     );
     let sql_dir = dir.join("sqlpages");
-    let routing_dyn: Arc<dyn ContentRouting> = routing.clone();
     let craftsql = Arc::new(
-        CraftSql::register(
-            &sql_dir,
-            Arc::new(RoutingRootStore::new(routing_dyn.clone())),
-            node_id,
-        )
-        .unwrap()
-        .with_source(Arc::new(TransportPageSource::new(
-            t.clone(),
-            Arc::new(tracker.peers()),
-        )))
-        .with_durable(Arc::new(ObjDurable::new(engine.clone())))
-        .with_manifests(Arc::new(RoutingManifestStore::new(routing_dyn.clone()))),
+        CraftSql::register(&sql_dir, heads.root_store(node_id), node_id)
+            .unwrap()
+            .with_source(Arc::new(TransportPageSource::new(
+                t.clone(),
+                Arc::new(tracker.peers()),
+            )))
+            .with_durable(Arc::new(ObjDurable::new(engine.clone())))
+            .with_manifests(heads.manifest_store(node_id)),
     );
     let (obj_tx, obj_rx) = tokio::sync::mpsc::channel(64);
     let (sql_tx, sql_rx) = tokio::sync::mpsc::channel(64);
@@ -121,6 +115,7 @@ async fn sql_node(tracker: &MemNet, dir: &Path) -> SqlNode {
 async fn dst_craftsql_survives_churn() {
     let mut rng = StdRng::seed_from_u64(0x5EED_5EE7);
     let tracker = start_tracker();
+    let heads = MemHeads::new();
     let mut dirs: Vec<tempfile::TempDir> = Vec::new();
     let mut mk = || {
         let d = tempfile::tempdir().unwrap();
@@ -130,13 +125,13 @@ async fn dst_craftsql_survives_churn() {
     };
 
     // Owner + 5 holders.
-    let owner = sql_node(&tracker, &mk()).await;
+    let owner = sql_node(&tracker, &heads, &mk()).await;
     owner.routing.announce_node(0, 0).await.unwrap();
     let owner_id = owner.id;
     let mut holders: Vec<SqlNode> = Vec::new();
     for _ in 0..5 {
         let d = mk();
-        let n = sql_node(&tracker, &d).await;
+        let n = sql_node(&tracker, &heads, &d).await;
         n.routing.announce_node(0, 0).await.unwrap();
         holders.push(n);
     }
@@ -166,7 +161,7 @@ async fn dst_craftsql_survives_churn() {
             holders.remove(i).kill().await;
         }
         let d = mk();
-        let fresh = sql_node(&tracker, &d).await;
+        let fresh = sql_node(&tracker, &heads, &d).await;
         fresh.routing.announce_node(0, 0).await.unwrap();
         holders.push(fresh);
 
@@ -180,7 +175,7 @@ async fn dst_craftsql_survives_churn() {
         }
 
         // INVARIANT: a node holding nothing recovers the DB from name alone.
-        let reader = sql_node(&tracker, &mk()).await;
+        let reader = sql_node(&tracker, &heads, &mk()).await;
         reader.routing.announce_node(0, 0).await.unwrap();
         let restored = reader
             .craftsql

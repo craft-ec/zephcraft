@@ -9,10 +9,6 @@
 //! Fidelity notes (semantics cross-checked against `zeph_routing::DhtRouting`):
 //!  - **providers / wants / metas** — per-CID, keyed by the announcing NodeId;
 //!    many coexist; re-announce replaces, withdraw removes this node's record.
-//!  - **root** — compare-and-swap: `prev_cid` must match the current root
-//!    (None ⇒ expect no prior), `seq` must strictly advance; idempotent
-//!    re-announce of the current head is accepted.
-//!  - **manifest** — owner-keyed, seq must strictly advance.
 //!  - **app** — publisher+name-keyed head, monotonic version (equal accepted;
 //!    lower rejected).
 //!  - **census** — populated by the inherent `MemRouting::announce_node`; `MemPeers`
@@ -26,10 +22,7 @@ use async_trait::async_trait;
 use zeph_core::{Cid, NodeId};
 use zeph_crypto::NodeIdentity;
 use zeph_obj::PeerSource;
-use zeph_routing::{
-    AppRecord, ContentRouting, ManifestRecord, MetaRecord, ProviderRecord, Result, RootRecord,
-    RoutingError,
-};
+use zeph_routing::{AppRecord, ContentRouting, MetaRecord, ProviderRecord, Result, RoutingError};
 use zeph_transport::PeerAddr;
 
 // ── shared inner state ─────────────────────────────────────────────────────
@@ -43,16 +36,6 @@ struct ProviderEntry {
 struct MetaEntry {
     published_at: u64,
     comment: Option<String>,
-}
-
-struct RootEntry {
-    root_cid: [u8; 32],
-    seq: u64,
-}
-
-struct ManifestEntry {
-    manifest_cid: [u8; 32],
-    seq: u64,
 }
 
 struct AppEntry {
@@ -72,10 +55,6 @@ struct Inner {
     wants: HashMap<[u8; 32], HashSet<[u8; 32]>>,
     /// cid -> node_id -> editable metadata envelope
     metas: HashMap<[u8; 32], HashMap<[u8; 32], MetaEntry>>,
-    /// (owner, namespace) -> DB root head (single-writer CAS)
-    roots: HashMap<([u8; 32], String), RootEntry>,
-    /// (owner, namespace) -> durability-manifest head (highest seq)
-    manifests: HashMap<([u8; 32], String), ManifestEntry>,
     /// (publisher, name) -> app head (highest version)
     apps: HashMap<([u8; 32], String), AppEntry>,
     /// node_id -> census entry (map/peer registry)
@@ -296,57 +275,6 @@ impl ContentRouting for MemRouting {
             .unwrap_or_default())
     }
 
-    // ---- single-writer DB root head (compare-and-swap) -----------------------
-
-    async fn publish_root(
-        &self,
-        namespace: &str,
-        root_cid: Cid,
-        prev_cid: Option<Cid>,
-        seq: u64,
-    ) -> Result<()> {
-        let key = (self.me(), namespace.to_string());
-        let mut g = self.inner.lock().expect("memnet lock");
-        if let Some(cur) = g.roots.get(&key) {
-            // Idempotent re-announce of the current head → refresh, no CAS check.
-            if !(root_cid.0 == cur.root_cid && seq == cur.seq) {
-                let prev = prev_cid.map(|c| c.0).unwrap_or([0u8; 32]);
-                if prev != cur.root_cid {
-                    return Err(RoutingError::Conflict("root-conflict".into()));
-                }
-                if seq <= cur.seq {
-                    return Err(RoutingError::Conflict("root-stale".into()));
-                }
-            }
-        }
-        g.roots.insert(
-            key,
-            RootEntry {
-                root_cid: root_cid.0,
-                seq,
-            },
-        );
-        Ok(())
-    }
-
-    async fn resolve_root(&self, owner: NodeId, namespace: &str) -> Result<Option<RootRecord>> {
-        let g = self.inner.lock().expect("memnet lock");
-        Ok(g.roots
-            .get(&(owner.0, namespace.to_string()))
-            .map(|e| RootRecord {
-                owner,
-                namespace: namespace.to_string(),
-                root_cid: Cid(e.root_cid),
-                seq: e.seq,
-            }))
-    }
-
-    async fn withdraw_root(&self, namespace: &str) -> Result<()> {
-        let mut g = self.inner.lock().expect("memnet lock");
-        g.roots.remove(&(self.me(), namespace.to_string()));
-        Ok(())
-    }
-
     // ---- app head (publisher+name keyed, monotonic version) ------------------
 
     async fn announce_app(&self, name: &str, wasm_cid: Cid, version: u64) -> Result<()> {
@@ -378,40 +306,121 @@ impl ContentRouting for MemRouting {
                 version: e.version,
             }))
     }
+}
 
-    // ---- durability manifest head (owner keyed, highest seq) -----------------
+// ── MemHeads: shared in-memory DB-head + manifest store ─────────────────────
 
-    async fn publish_manifest(&self, namespace: &str, manifest_cid: Cid, seq: u64) -> Result<()> {
-        let key = (self.me(), namespace.to_string());
-        let mut g = self.inner.lock().expect("memnet lock");
-        if let Some(cur) = g.manifests.get(&key) {
-            if seq <= cur.seq {
-                return Err(RoutingError::Conflict("manifest-stale".into()));
-            }
-        }
-        g.manifests.insert(
-            key,
-            ManifestEntry {
-                manifest_cid: manifest_cid.0,
-                seq,
-            },
-        );
-        Ok(())
+/// Shared in-memory CraftSQL head (`RootStore`) + durability-manifest
+/// (`ManifestStore`) store for multi-node tests. It stands in for the owner-signed
+/// head registry, which lives in `noded` (above the crates these tests exercise) and
+/// so isn't reachable here. One `MemHeads` is the shared "network": every node gets a
+/// view via [`MemHeads::root_store`] / [`MemHeads::manifest_store`] that publishes as
+/// that node (implicit owner) and resolves any owner — so a head/manifest one node
+/// publishes is recoverable by another (cross-node reads + rebuild-from-name).
+/// Shared `(owner, namespace) -> (cid, seq)` table backing a [`MemHeads`].
+type HeadTable = Arc<Mutex<HashMap<(NodeId, String), ([u8; 32], u64)>>>;
+
+#[derive(Clone, Default)]
+pub struct MemHeads {
+    roots: HeadTable,
+    manifests: HeadTable,
+}
+
+impl MemHeads {
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    async fn resolve_manifest(
+    /// A [`RootStore`] view that publishes `owner`'s DB heads into the shared map.
+    pub fn root_store(&self, owner: NodeId) -> Arc<MemRootStore> {
+        Arc::new(MemRootStore {
+            owner,
+            roots: self.roots.clone(),
+        })
+    }
+
+    /// A [`ManifestStore`] view that publishes `owner`'s durability manifests.
+    pub fn manifest_store(&self, owner: NodeId) -> Arc<MemManifestStore> {
+        Arc::new(MemManifestStore {
+            owner,
+            manifests: self.manifests.clone(),
+        })
+    }
+}
+
+/// Per-node [`RootStore`] view over a shared [`MemHeads`]. Same compare-and-swap
+/// semantics as the production head store: `prev` must match the current root and
+/// `seq` must strictly advance, else [`SqlError::Conflict`].
+pub struct MemRootStore {
+    owner: NodeId,
+    roots: HeadTable,
+}
+
+#[async_trait]
+impl zeph_sql::RootStore for MemRootStore {
+    async fn resolve(
         &self,
         owner: NodeId,
         namespace: &str,
-    ) -> Result<Option<ManifestRecord>> {
-        let g = self.inner.lock().expect("memnet lock");
-        Ok(g.manifests
-            .get(&(owner.0, namespace.to_string()))
-            .map(|e| ManifestRecord {
-                owner,
-                namespace: namespace.to_string(),
-                manifest_cid: Cid(e.manifest_cid),
-                seq: e.seq,
-            }))
+    ) -> zeph_sql::Result<Option<(Cid, u64)>> {
+        Ok(self
+            .roots
+            .lock()
+            .expect("memheads lock")
+            .get(&(owner, namespace.to_string()))
+            .map(|(r, s)| (Cid(*r), *s)))
+    }
+
+    async fn publish(
+        &self,
+        namespace: &str,
+        root: Cid,
+        prev: Option<Cid>,
+        seq: u64,
+    ) -> zeph_sql::Result<()> {
+        let mut m = self.roots.lock().expect("memheads lock");
+        let key = (self.owner, namespace.to_string());
+        match m.get(&key) {
+            None if prev.is_some() => return Err(zeph_sql::SqlError::Conflict),
+            None => {}
+            Some((cur, cur_seq)) => {
+                if prev.map(|c| c.0) != Some(*cur) || seq <= *cur_seq {
+                    return Err(zeph_sql::SqlError::Conflict);
+                }
+            }
+        }
+        m.insert(key, (root.0, seq));
+        Ok(())
+    }
+}
+
+/// Per-node [`ManifestStore`] view over a shared [`MemHeads`]. Owner-keyed,
+/// last-writer-wins by strictly-advancing `seq`.
+pub struct MemManifestStore {
+    owner: NodeId,
+    manifests: HeadTable,
+}
+
+#[async_trait]
+impl zeph_sql::ManifestStore for MemManifestStore {
+    async fn publish(&self, namespace: &str, manifest_cid: Cid, seq: u64) -> zeph_sql::Result<()> {
+        self.manifests
+            .lock()
+            .expect("memheads lock")
+            .insert((self.owner, namespace.to_string()), (manifest_cid.0, seq));
+        Ok(())
+    }
+
+    async fn resolve(
+        &self,
+        owner: NodeId,
+        namespace: &str,
+    ) -> zeph_sql::Result<Option<(Cid, u64)>> {
+        Ok(self
+            .manifests
+            .lock()
+            .expect("memheads lock")
+            .get(&(owner, namespace.to_string()))
+            .map(|(c, s)| (Cid(*c), *s)))
     }
 }

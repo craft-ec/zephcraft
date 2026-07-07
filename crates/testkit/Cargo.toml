@@ -12,4 +12,5 @@ zeph-crypto.workspace = true
 zeph-transport.workspace = true
 zeph-routing.workspace = true
 zeph-obj.workspace = true
+zeph-sql.workspace = true
 async-trait.workspace = true

@@ -69,68 +69,6 @@ pub trait ManifestStore: Send + Sync {
     async fn resolve(&self, owner: NodeId, namespace: &str) -> Result<Option<(Cid, u64)>>;
 }
 
-/// Adapter binding `RootStore` to the real signed `KIND_ROOT` records over
-/// `ContentRouting` (tracker now, DHT later). Publishes sign with this node's
-/// identity (implicit owner = self).
-pub struct RoutingRootStore {
-    routing: Arc<dyn zeph_routing::ContentRouting>,
-}
-
-impl RoutingRootStore {
-    pub fn new(routing: Arc<dyn zeph_routing::ContentRouting>) -> Self {
-        Self { routing }
-    }
-}
-
-#[async_trait::async_trait]
-impl RootStore for RoutingRootStore {
-    async fn resolve(&self, owner: NodeId, namespace: &str) -> Result<Option<(Cid, u64)>> {
-        match self.routing.resolve_root(owner, namespace).await {
-            Ok(Some(r)) => Ok(Some((r.root_cid, r.seq))),
-            Ok(None) => Ok(None),
-            Err(e) => Err(SqlError::Sqlite(e.to_string())),
-        }
-    }
-
-    async fn publish(&self, namespace: &str, root: Cid, prev: Option<Cid>, seq: u64) -> Result<()> {
-        match self.routing.publish_root(namespace, root, prev, seq).await {
-            Ok(()) => Ok(()),
-            Err(zeph_routing::RoutingError::Conflict(_)) => Err(SqlError::Conflict),
-            Err(e) => Err(SqlError::Sqlite(e.to_string())),
-        }
-    }
-}
-
-/// Adapter binding `ManifestStore` to `KIND_MANIFEST` over `ContentRouting`.
-pub struct RoutingManifestStore {
-    routing: Arc<dyn zeph_routing::ContentRouting>,
-}
-
-impl RoutingManifestStore {
-    pub fn new(routing: Arc<dyn zeph_routing::ContentRouting>) -> Self {
-        Self { routing }
-    }
-}
-
-#[async_trait::async_trait]
-impl ManifestStore for RoutingManifestStore {
-    async fn publish(&self, namespace: &str, manifest_cid: Cid, seq: u64) -> Result<()> {
-        self.routing
-            .publish_manifest(namespace, manifest_cid, seq)
-            .await
-            .map_err(|e| SqlError::Sqlite(e.to_string()))
-    }
-
-    async fn resolve(&self, owner: NodeId, namespace: &str) -> Result<Option<(Cid, u64)>> {
-        Ok(self
-            .routing
-            .resolve_manifest(owner, namespace)
-            .await
-            .map_err(|e| SqlError::Sqlite(e.to_string()))?
-            .map(|r| (r.manifest_cid, r.seq)))
-    }
-}
-
 static VFS_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A CraftSQL engine bound to a page store, a head store, and this node's
@@ -262,60 +200,6 @@ impl CraftSql {
             }
         });
         crate::fetch::Fetcher::new(tx)
-    }
-
-    /// Re-announce every locally-owned DB head + durability manifest to the
-    /// tracker. Heads/manifests are otherwise published only on write, so a
-    /// tracker restart would lose them (leaving even the owner unable to open its
-    /// own DB). Reads the persisted sidecars; restore-tolerant, so it is a no-op
-    /// when the records are already current. Returns the count re-announced.
-    pub async fn reannounce_heads(&self) -> usize {
-        let mut count = 0;
-        let Ok(entries) = std::fs::read_dir(&self.store_dir) else {
-            return 0;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("gens") {
-                continue;
-            }
-            let Ok(bytes) = std::fs::read(&path) else {
-                continue;
-            };
-            let mut m: GenManifest = match postcard::from_bytes(&bytes) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            let (Some(root), false) = (m.last_root, m.namespace.is_empty()) else {
-                continue;
-            };
-            // prev=None → restore semantics (accepted when the tracker lost it).
-            let _ = self
-                .heads
-                .publish(&m.namespace, Cid(root), None, m.seq)
-                .await;
-            if let (Some(mstore), Some(mc)) = (&self.manifests, m.manifest_cid) {
-                let _ = mstore.publish(&m.namespace, Cid(mc), m.manifest_seq).await;
-            }
-            // Re-release superseded generations that still have holders — this is
-            // what reaches a node that churned (was offline) during the initial
-            // release. Drops from the list once no providers remain.
-            if !m.releasing.is_empty() {
-                if let Some(durable) = &self.durable {
-                    let pending = std::mem::take(&mut m.releasing);
-                    for g in pending {
-                        if durable.drop_generation(Cid(g)).await.unwrap_or(0) > 0 {
-                            m.releasing.push(g);
-                        }
-                    }
-                    if let Ok(blob) = postcard::to_allocvec(&m) {
-                        let _ = std::fs::write(&path, blob);
-                    }
-                }
-            }
-            count += 1;
-        }
-        count
     }
 
     /// Open this node's own DB `namespace` for reading and writing.
@@ -915,7 +799,7 @@ mod tests {
             .conn()
             .query_row("SELECT v FROM t WHERE id=1", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, "hello", "reopened from the KIND_ROOT head via RootStore");
+        assert_eq!(v, "hello", "reopened from the signed head via RootStore");
     }
 
     /// A network page source that serves objects from the owner's local store —

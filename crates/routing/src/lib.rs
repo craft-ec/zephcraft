@@ -31,15 +31,6 @@ pub struct MetaRecord {
     pub comment: Option<String>,
 }
 
-/// A resolved single-writer DB root pointer (`KIND_ROOT`) — the CraftSQL head.
-#[derive(Debug, Clone)]
-pub struct RootRecord {
-    pub owner: NodeId,
-    pub namespace: String,
-    pub root_cid: Cid,
-    pub seq: u64,
-}
-
 /// A resolved CraftCOM app head (`KIND_APP`) — `(publisher, name) → wasm_cid` at a
 /// version. Makes an app resolvable + invocable BY NAME network-wide.
 #[derive(Debug, Clone)]
@@ -48,16 +39,6 @@ pub struct AppRecord {
     pub name: String,
     pub wasm_cid: Cid,
     pub version: u64,
-}
-
-/// A resolved DB durability-manifest pointer (`KIND_MANIFEST`) — the CID of the
-/// object listing a DB's erasure-coded generations, for network recovery.
-#[derive(Debug, Clone)]
-pub struct ManifestRecord {
-    pub owner: NodeId,
-    pub namespace: String,
-    pub manifest_cid: Cid,
-    pub seq: u64,
 }
 
 /// A resolved provider: who holds `cid`, where to dial them, advisory count.
@@ -75,8 +56,8 @@ pub enum RoutingError {
     NoTracker,
     #[error("tracker error: {0}")]
     Tracker(String),
-    /// A compare-and-swap root update lost the race (stale prev_cid/seq).
-    #[error("root conflict: {0}")]
+    /// An owner-keyed head update lost the race (a non-advancing/stale version).
+    #[error("head conflict: {0}")]
     Conflict(String),
 }
 
@@ -110,18 +91,6 @@ pub trait ContentRouting: Send + Sync {
     async fn withdraw_meta(&self, cid: Cid) -> Result<()>;
     /// All metadata envelopes for `cid`, across publishers (the full-set view).
     async fn metas(&self, cid: Cid) -> Result<Vec<MetaRecord>>;
-    /// Publish this identity's DB root for `namespace` via compare-and-swap:
-    /// `prev_cid` must match the current root (None = expect no prior root),
-    /// and `seq` must strictly advance. Returns `Conflict` if the CAS loses.
-    async fn publish_root(
-        &self,
-        namespace: &str,
-        root_cid: Cid,
-        prev_cid: Option<Cid>,
-        seq: u64,
-    ) -> Result<()>;
-    /// Resolve `owner`'s current DB root for `namespace` (None if none/withdrawn).
-    async fn resolve_root(&self, owner: NodeId, namespace: &str) -> Result<Option<RootRecord>>;
 
     /// Publish this node's app head `(self, name) → (wasm_cid, version)`, signed.
     /// Default: unsupported (only tracker/DHT routing implements it).
@@ -132,15 +101,4 @@ pub trait ContentRouting: Send + Sync {
     async fn resolve_app(&self, _publisher: NodeId, _name: &str) -> Result<Option<AppRecord>> {
         Ok(None)
     }
-    /// Withdraw this identity's DB root for `namespace`.
-    async fn withdraw_root(&self, namespace: &str) -> Result<()>;
-    /// Publish this identity's DB durability-manifest pointer for `namespace`
-    /// (highest `seq` wins). Lets any node later recover the DB from its pieces.
-    async fn publish_manifest(&self, namespace: &str, manifest_cid: Cid, seq: u64) -> Result<()>;
-    /// Resolve `owner`'s current durability-manifest pointer for `namespace`.
-    async fn resolve_manifest(
-        &self,
-        owner: NodeId,
-        namespace: &str,
-    ) -> Result<Option<ManifestRecord>>;
 }

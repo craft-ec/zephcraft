@@ -17,9 +17,7 @@ mod pager;
 mod store;
 mod vfs;
 
-pub use db::{
-    CraftDb, CraftSql, ManifestStore, PageSource, RootStore, RoutingManifestStore, RoutingRootStore,
-};
+pub use db::{CraftDb, CraftSql, ManifestStore, PageSource, RootStore};
 pub use gen::DurableStore;
 pub use net::{serve_pages, ObjDurable, TransportPageSource, ALPN as PAGE_ALPN};
 pub use pager::{Pager, PAGE_SIZE};

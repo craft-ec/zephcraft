@@ -16,10 +16,9 @@ use zeph_com::{
 use zeph_core::hlc::Clock;
 use zeph_crypto::NodeIdentity;
 use zeph_obj::{ObjConfig, ObjEngine};
-use zeph_routing::ContentRouting;
-use zeph_sql::{CraftSql, ObjDurable, RoutingManifestStore, RoutingRootStore, TransportPageSource};
+use zeph_sql::{CraftSql, ObjDurable, TransportPageSource};
 use zeph_store::Store;
-use zeph_testkit::MemNet;
+use zeph_testkit::{MemHeads, MemNet};
 use zeph_transport::{Reach, Transport};
 
 /// Replaces the in-process tracker: one shared in-memory network view.
@@ -29,7 +28,7 @@ fn start_tracker() -> MemNet {
 
 /// A real node: obj engine + CraftSQL serving the piece + page ALPNs. Returns the
 /// CraftSQL + engine so a CraftBackend can be built over them.
-async fn node(tracker: &MemNet, dir: &Path) -> (Arc<CraftSql>, Arc<ObjEngine>) {
+async fn node(tracker: &MemNet, dir: &Path, heads: &MemHeads) -> (Arc<CraftSql>, Arc<ObjEngine>) {
     let id = Arc::new(NodeIdentity::generate());
     let node_id = id.node_id();
     let t = Arc::new(
@@ -52,20 +51,14 @@ async fn node(tracker: &MemNet, dir: &Path) -> (Arc<CraftSql>, Arc<ObjEngine>) {
         ObjConfig::default(),
     );
     let sql_dir = dir.join("sqlpages");
-    let routing_dyn: Arc<dyn ContentRouting> = routing.clone();
     let craftsql = Arc::new(
-        CraftSql::register(
-            &sql_dir,
-            Arc::new(RoutingRootStore::new(routing_dyn.clone())),
-            node_id,
-        )
-        .unwrap()
-        .with_source(Arc::new(TransportPageSource::new(
-            t.clone(),
-            Arc::new(tracker.peers()),
-        )))
-        .with_durable(Arc::new(ObjDurable::new(engine.clone())))
-        .with_manifests(Arc::new(RoutingManifestStore::new(routing_dyn.clone()))),
+        CraftSql::register(&sql_dir, heads.root_store(node_id), node_id)
+            .unwrap()
+            .with_source(Arc::new(TransportPageSource::new(
+                t.clone(),
+                Arc::new(tracker.peers()),
+            )))
+            .with_durable(Arc::new(ObjDurable::new(engine.clone()))),
     );
     let (obj_tx, obj_rx) = tokio::sync::mpsc::channel(64);
     let (sql_tx, sql_rx) = tokio::sync::mpsc::channel(64);
@@ -88,8 +81,9 @@ async fn node(tracker: &MemNet, dir: &Path) -> (Arc<CraftSql>, Arc<ObjEngine>) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_writes_persist_to_craftsql_and_reload() {
     let tracker = start_tracker();
+    let heads = MemHeads::new();
     let dir = tempfile::tempdir().unwrap();
-    let (craftsql, engine) = node(&tracker, dir.path()).await;
+    let (craftsql, engine) = node(&tracker, dir.path(), &heads).await;
     let backend: Arc<dyn AppBackend> =
         Arc::new(CraftBackend::new(craftsql, engine, Arc::new(Clock::new())));
 

@@ -14,10 +14,9 @@ use zeph_com::{
 use zeph_core::{hlc::Clock, NodeId};
 use zeph_crypto::NodeIdentity;
 use zeph_obj::{ObjConfig, ObjEngine};
-use zeph_routing::ContentRouting;
-use zeph_sql::{CraftSql, ObjDurable, RoutingManifestStore, RoutingRootStore, TransportPageSource};
+use zeph_sql::{CraftSql, ObjDurable, TransportPageSource};
 use zeph_store::Store;
-use zeph_testkit::MemNet;
+use zeph_testkit::{MemHeads, MemNet};
 use zeph_transport::{Connection, PeerAddr, Reach, Transport};
 
 /// Replaces the in-process tracker: one shared in-memory network view.
@@ -34,7 +33,7 @@ struct Node {
     invoke_rx: mpsc::Receiver<Connection>,
 }
 
-async fn node(tracker: &MemNet, dir: &Path) -> Node {
+async fn node(tracker: &MemNet, dir: &Path, heads: &MemHeads) -> Node {
     let id = Arc::new(NodeIdentity::generate());
     let node_id = id.node_id();
     let t = Arc::new(
@@ -61,20 +60,14 @@ async fn node(tracker: &MemNet, dir: &Path) -> Node {
         ObjConfig::default(),
     );
     let sql_dir = dir.join("sqlpages");
-    let routing_dyn: Arc<dyn ContentRouting> = routing.clone();
     let craftsql = Arc::new(
-        CraftSql::register(
-            &sql_dir,
-            Arc::new(RoutingRootStore::new(routing_dyn.clone())),
-            node_id,
-        )
-        .unwrap()
-        .with_source(Arc::new(TransportPageSource::new(
-            t.clone(),
-            Arc::new(tracker.peers()),
-        )))
-        .with_durable(Arc::new(ObjDurable::new(engine.clone())))
-        .with_manifests(Arc::new(RoutingManifestStore::new(routing_dyn.clone()))),
+        CraftSql::register(&sql_dir, heads.root_store(node_id), node_id)
+            .unwrap()
+            .with_source(Arc::new(TransportPageSource::new(
+                t.clone(),
+                Arc::new(tracker.peers()),
+            )))
+            .with_durable(Arc::new(ObjDurable::new(engine.clone()))),
     );
     let (obj_tx, obj_rx) = mpsc::channel(64);
     let (sql_tx, sql_rx) = mpsc::channel(64);
@@ -105,10 +98,11 @@ async fn node(tracker: &MemNet, dir: &Path) -> Node {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn node_b_invokes_an_app_on_node_a_as_a_distinct_identity() {
     let tracker = start_tracker();
+    let heads = MemHeads::new();
     let da = tempfile::tempdir().unwrap();
     let db = tempfile::tempdir().unwrap();
-    let host = node(&tracker, da.path()).await; // A — hosts the app
-    let caller = node(&tracker, db.path()).await; // B — invokes it
+    let host = node(&tracker, da.path(), &heads).await; // A — hosts the app
+    let caller = node(&tracker, db.path(), &heads).await; // B — invokes it
 
     // A publishes the app WASM (WAT text; the runtime compiles it) → its CID. The
     // unified ABI: `run()` takes no result and COMMITs its output — here the first byte

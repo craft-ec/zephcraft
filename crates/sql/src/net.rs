@@ -1,7 +1,7 @@
 //! Transport-backed CraftSQL page transfer: a reader fetches a DB's page
 //! objects (by CID) from the owner over iroh, and the owner serves them from
-//! its local page store. This is the network realization of `PageSource` +
-//! `RoutingRootStore`'s companion — the actual cross-node page fetch.
+//! its local page store. This is the network realization of `PageSource` — the
+//! `RootStore`'s companion, the actual cross-node page fetch.
 
 use std::path::PathBuf;
 use std::sync::Arc;
