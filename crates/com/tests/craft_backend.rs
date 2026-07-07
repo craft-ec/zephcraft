@@ -112,6 +112,7 @@ async fn agent_writes_persist_to_craftsql_and_reload() {
         Vec::new(),
         [0u8; 32],
         "feed".into(),
+        0,
         Some(backend.clone()),
     );
     let out = rt

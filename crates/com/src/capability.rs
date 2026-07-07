@@ -8,10 +8,10 @@
 //! consensus-agreeable unless explicitly granted more (fail safe). This is a
 //! `MINIMAL_KERNEL` anchor: mechanism binds the surface, the grant is the policy.
 //!
-//! The full [`Capability`] surface (§4) is declared here up front; Phase 1 only *binds*
-//! `Input`/`State`/`Commit`/`Crypto` in the transition runtime — the remaining
-//! deterministic caps (`Caller`/`Sql`/`Obj`/`Clock`) and the non-deterministic ones
-//! (`WallClock`/`Random`) are declared now and bound in later phases.
+//! The full [`Capability`] surface (§4) is bound in the transition runtime: the
+//! deterministic caps (`Input`/`Caller`/`State`/`Commit`/`Crypto`/`Sql`/`Obj`/`Clock`, the
+//! last being the *consensus* clock — `ctx.now`) plus the non-deterministic `WallClock`
+//! (real per-node wall-time, app profile only). `Random` is declared but has no host fn yet.
 
 use std::collections::HashSet;
 
@@ -56,10 +56,11 @@ impl CapabilityGrant {
     /// The **deterministic profile** — the ✅ subset only (§5). For consensus-critical
     /// programs (registry, governance, config, agreed program-accounts): it cannot observe
     /// anything host-varying, so every node computes the identical result. This is the
-    /// native default. `Clock` (the future *consensus* clock, §6) is deliberately NOT here
-    /// yet: the only clock host fn today reads each node's per-node HLC (`now_millis`),
-    /// which is host-varying → it binds under `WallClock`, not the deterministic profile.
-    /// The consensus clock is Phase 4.
+    /// native default. `Clock` IS granted here (Phase 4): it returns the CONSENSUS
+    /// timestamp `ctx.now` (the writer's HLC value, already agreed by the single-writer/
+    /// replica substrate), so every node reads the same "now" and the result stays
+    /// reproducible — exactly §6's block-time model. Real per-node wall-time is the separate
+    /// `WallClock` capability (`wall_clock` host fn), which is app-profile only.
     pub fn deterministic() -> Self {
         Self {
             caps: [
@@ -70,6 +71,7 @@ impl CapabilityGrant {
                 Capability::Crypto,
                 Capability::Sql,
                 Capability::Obj,
+                Capability::Clock,
             ]
             .into_iter()
             .collect(),
@@ -78,8 +80,8 @@ impl CapabilityGrant {
 
     /// The **app (full) profile** — the deterministic subset **plus** `wall_clock`/`random`
     /// (§5). For userspace apps that are not consensus-critical and may be
-    /// non-deterministic. (`clock`/`now_millis` binds here under `WallClock` until the
-    /// consensus clock lands in Phase 4; `Random` has no host fn bound yet.)
+    /// non-deterministic. `WallClock` binds the `wall_clock` host fn (real per-node
+    /// wall-time); `Random` has no host fn bound yet.
     pub fn full() -> Self {
         let mut g = Self::deterministic();
         g.caps.insert(Capability::WallClock);
@@ -115,15 +117,16 @@ mod tests {
             Capability::Crypto,
             Capability::Sql,
             Capability::Obj,
+            Capability::Clock,
         ] {
             assert!(g.allows(cap), "{cap:?} is deterministic → granted");
         }
-        // The per-node clock host fn binds under WallClock (host-varying); the deterministic
-        // profile must NOT grant it (the consensus clock is Phase 4).
+        // Clock (the CONSENSUS clock, ctx.now) IS deterministic — reproducible across nodes.
         assert!(
-            !g.allows(Capability::Clock),
-            "consensus clock not bound yet"
+            g.allows(Capability::Clock),
+            "consensus clock is granted by the deterministic profile"
         );
+        // Real per-node wall-time (`wall_clock`) is host-varying → NOT deterministic.
         assert!(!g.allows(Capability::WallClock), "wall-clock is non-det");
         assert!(!g.allows(Capability::Random), "random is non-det");
     }

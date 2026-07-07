@@ -6,8 +6,8 @@
 //! There is ONE runtime — the unified [`TransitionRuntime`] (see [`transition`]) — with a
 //! per-program [`CapabilityGrant`]: consensus-critical programs run under the deterministic
 //! subset, userspace apps under `full`. The host ABI (`input`/`state`/`commit`/`caller`/
-//! `sql_*`/`obj_*`/`clock`/`ed25519_verify`) is bound per grant at link time, so a program
-//! importing a non-granted capability fails to instantiate (`COMPUTE_EXECUTION_DESIGN.md`).
+//! `sql_*`/`obj_*`/`clock`/`wall_clock`/`ed25519_verify`) is bound per grant at link time, so a
+//! program importing a non-granted capability fails to instantiate (`COMPUTE_EXECUTION_DESIGN.md`).
 //!
 //! The namespace gate is STRUCTURAL — the sql/obj host functions expose no namespace
 //! parameter, so an agent can only ever write its OWN app namespace and read across other
@@ -19,7 +19,8 @@
 //! `(ptr, len)`; an app declares its output via `commit(ptr, len)` and exports `run()`
 //! (no result). Read helpers write into a guest-provided `(out_ptr, out_cap)` and return
 //! the actual length (`-1` on error / insufficient capacity).
-//! - `clock() -> i64` — HLC millis.
+//! - `clock() -> i64` — CONSENSUS time millis (`ctx.now`, reproducible; deterministic profile).
+//! - `wall_clock() -> i64` — real per-node wall-time millis (app profile only).
 //! - `caller(out, cap) -> i32` — writes the 32-byte invoking NodeId.
 //! - `input(out, cap) -> i32` — writes the invocation input bytes.
 //! - `commit(ptr, len) -> i32` — declare the invocation output bytes.

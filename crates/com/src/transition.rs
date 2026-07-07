@@ -47,20 +47,28 @@ pub struct TransitionCtx {
     caller: [u8; 32],
     /// The app namespace sql/obj writes are confined to (the structural gate).
     app_ns: String,
-    /// The substrate sql/obj/clock act on. `None` under the deterministic grant (protocol
-    /// programs don't import those functions); a called sql/obj/clock fn with `None`
+    /// The CONSENSUS timestamp (millis) the `clock` host fn returns — the writer's HLC value,
+    /// agreed by the single-writer/replica substrate (§6). Deterministic/reproducible: every
+    /// node runs the transition with the SAME `now`, so `clock` reads identically everywhere.
+    /// Distinct from real per-node wall-time, which is the app-only `wall_clock` (reads
+    /// `backend.now_millis()`).
+    pub now: u64,
+    /// The substrate sql/obj/wall_clock act on. `None` under the deterministic grant (protocol
+    /// programs don't import those functions); a called sql/obj/wall_clock fn with `None`
     /// returns its failure path rather than panicking.
     backend: Option<Arc<dyn AppBackend>>,
 }
 
 impl TransitionCtx {
     /// A backend-backed context — for apps/tests supplying a real (or mock) [`AppBackend`],
-    /// the invoking `caller`, and the `app_ns` sql/obj writes are confined to.
+    /// the invoking `caller`, the `app_ns` sql/obj writes are confined to, and the consensus
+    /// `now` (the timestamp the `clock` host fn returns).
     pub fn new(
         prev_state: Vec<u8>,
         input: Vec<u8>,
         caller: [u8; 32],
         app_ns: String,
+        now: u64,
         backend: Option<Arc<dyn AppBackend>>,
     ) -> Self {
         Self {
@@ -69,15 +77,16 @@ impl TransitionCtx {
             output: Vec::new(),
             caller,
             app_ns,
+            now,
             backend,
         }
     }
 
-    /// The deterministic context: prior state + request, no backend, default
-    /// caller/app_ns. This is what [`TransitionRuntime::run_transition`] builds, so protocol
-    /// programs run exactly as before.
-    pub fn deterministic(prev_state: Vec<u8>, input: Vec<u8>) -> Self {
-        Self::new(prev_state, input, [0u8; 32], String::new(), None)
+    /// The deterministic context: prior state + request + the consensus `now`, no backend,
+    /// default caller/app_ns. This is what [`TransitionRuntime::run_transition`] builds, so
+    /// protocol programs run with a reproducible clock and no host-varying surface.
+    pub fn deterministic(prev_state: Vec<u8>, input: Vec<u8>, now: u64) -> Self {
+        Self::new(prev_state, input, [0u8; 32], String::new(), now, None)
     }
 }
 
@@ -126,7 +135,10 @@ impl TransitionRuntime {
         fuel: u64,
         grant: &CapabilityGrant,
     ) -> anyhow::Result<Vec<u8>> {
-        let ctx = TransitionCtx::deterministic(prev_state.to_vec(), request.to_vec());
+        // `now = 0` here: the convenience path has no substrate clock. The account-store
+        // substrate threads the node's real consensus HLC by building its own ctx (setting
+        // `now = clock.now().millis()`) and calling `run_program` directly.
+        let ctx = TransitionCtx::deterministic(prev_state.to_vec(), request.to_vec(), 0);
         self.run_program(wasm, func, ctx, fuel, grant).await
     }
 
@@ -232,12 +244,13 @@ fn det_write(
 /// capability is granted, so a program importing a non-granted capability fails to
 /// instantiate (`unknown import`; `COMPUTE_EXECUTION_DESIGN.md` §5). This is the unified
 /// surface: `input` (Input), `state` (State), `commit` (Commit), `ed25519_verify` (Crypto),
-/// `caller` (Caller), `sql_execute`/`sql_query` (Sql), `obj_put`/`obj_get` (Obj), and
-/// `clock` (WallClock — the per-node HLC is host-varying, so it is NOT in the deterministic
-/// profile). Wasm-facing names are identical to the capability `Runtime` in `lib.rs`. The
-/// deterministic grant binds the ✅ subset (backend-less); a `full` grant additionally binds
-/// `clock`. The sql/obj/clock functions read `ctx.backend` and return their failure path
-/// (never panic) when it is `None`.
+/// `caller` (Caller), `sql_execute`/`sql_query` (Sql), `obj_put`/`obj_get` (Obj), `clock`
+/// (Clock — the CONSENSUS timestamp `ctx.now`, reproducible → IN the deterministic profile),
+/// and `wall_clock` (WallClock — real per-node wall-time, host-varying → app profile only).
+/// Wasm-facing names are identical to the capability `Runtime` in `lib.rs`. The deterministic
+/// grant binds the ✅ subset (backend-less, `clock` included); a `full` grant additionally
+/// binds `wall_clock`. The sql/obj functions read `ctx.backend` and return their failure path
+/// (never panic) when it is `None`; `clock` reads `ctx.now` and needs no backend.
 fn bind_granted(linker: &mut Linker<TransitionCtx>, grant: &CapabilityGrant) -> anyhow::Result<()> {
     if grant.allows(Capability::Input) {
         linker.func_wrap_async(
@@ -462,18 +475,34 @@ fn bind_granted(linker: &mut Linker<TransitionCtx>, grant: &CapabilityGrant) -> 
             },
         )?;
     }
-    if grant.allows(Capability::WallClock) {
-        // `clock() -> i64` — the per-node HLC (`now_millis`). Host-varying (each node's own
-        // clock), so it binds under WallClock, NOT the deterministic profile (the consensus
-        // clock is Phase 4). Mirrors lib.rs `clock`. Backend-None → -1.
+    if grant.allows(Capability::Clock) {
+        // `clock() -> i64` — the CONSENSUS timestamp (`ctx.now`): the writer's HLC value,
+        // already agreed by the single-writer/replica substrate (§6). Reproducible — every
+        // node runs the transition with the SAME `now`, so this reads identically everywhere,
+        // which is why it belongs to the deterministic profile. NOT the machine wall-clock
+        // (that is `wall_clock` below). Reads `ctx.now` directly; no backend needed.
         linker.func_wrap_async(
             TRANSITION_HOST_MODULE,
             "clock",
             |caller: Caller<'_, TransitionCtx>, (): ()| {
+                Box::new(async move { caller.data().now as i64 })
+            },
+        )?;
+    }
+    if grant.allows(Capability::WallClock) {
+        // `wall_clock() -> i64` — real per-node wall-time (`backend.now_millis()`, the HLC's
+        // wall reading). Host-varying (each node's own clock), so it binds ONLY under the app
+        // (full) profile, never the deterministic one. Backend-None → 0 (apps always have a
+        // backend; a backend-less run simply reports 0). Distinct craftcom import from
+        // `clock` above.
+        linker.func_wrap_async(
+            TRANSITION_HOST_MODULE,
+            "wall_clock",
+            |caller: Caller<'_, TransitionCtx>, (): ()| {
                 Box::new(async move {
                     match caller.data().backend.as_ref() {
                         Some(backend) => backend.now_millis() as i64,
-                        None => -1,
+                        None => 0,
                     }
                 })
             },
@@ -650,6 +679,7 @@ mod tests {
             Vec::new(),
             [0u8; 32],
             "feed".into(),
+            0,
             Some(backend.clone()),
         );
         rt.run_program(
@@ -668,6 +698,7 @@ mod tests {
             Vec::new(),
             [0u8; 32],
             "feed".into(),
+            0,
             Some(backend),
         );
         let err = rt
@@ -693,7 +724,7 @@ mod tests {
     #[tokio::test]
     async fn obj_put_with_no_backend_does_not_panic() {
         let rt = TransitionRuntime::new().unwrap();
-        let ctx = TransitionCtx::deterministic(Vec::new(), Vec::new());
+        let ctx = TransitionCtx::deterministic(Vec::new(), Vec::new(), 0);
         rt.run_program(
             OBJ_PUT_WAT,
             "run",
@@ -705,76 +736,55 @@ mod tests {
         .expect("obj_put with backend=None returns its failure path, no panic");
     }
 
-    // `clock` binds under WallClock (per-node HLC) — NOT the deterministic profile — and
-    // reads the backend's `now_millis`, committed so the value is observable.
+    // A minimal backend whose `now_millis` returns a fixed real-time reading, for the
+    // wall_clock tests. sql/obj are no-ops.
+    struct ClockBackend(u64);
+    #[async_trait::async_trait]
+    impl AppBackend for ClockBackend {
+        async fn sql_execute(&self, _n: &str, _s: &str) -> anyhow::Result<u64> {
+            Ok(0)
+        }
+        async fn sql_query(
+            &self,
+            _o: Option<[u8; 32]>,
+            _n: &str,
+            _s: &str,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+        async fn obj_put(&self, _d: &[u8]) -> anyhow::Result<[u8; 32]> {
+            Ok([0u8; 32])
+        }
+        async fn obj_get(&self, _c: [u8; 32]) -> anyhow::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn now_millis(&self) -> u64 {
+            self.0
+        }
+    }
+
+    // ---- phase 4: the consensus clock ----
+
+    // `clock` returns the CONSENSUS timestamp `ctx.now` (deterministic/reproducible) and is
+    // in the deterministic profile. A program committing the clock value under a chosen
+    // `ctx.now` must observe exactly that value — proving `clock` reads ctx.now, not any
+    // machine time. It needs no backend.
     #[tokio::test]
-    async fn clock_binds_under_wall_clock_and_reads_backend() {
-        // clock() -> i64; store its low byte and commit it.
+    async fn clock_returns_ctx_now_under_deterministic() {
+        // clock() -> i64; store all 8 little-endian bytes and commit them.
         const CLOCK_WAT: &[u8] = br#"(module
           (import "craftcom" "clock" (func $clock (result i64)))
           (import "craftcom" "commit" (func $commit (param i32 i32) (result i32)))
           (memory (export "memory") 1)
           (func (export "run")
-            (i32.store8 (i32.const 0) (i32.wrap_i64 (call $clock)))
-            (drop (call $commit (i32.const 0) (i32.const 1)))))"#;
+            (i64.store (i32.const 0) (call $clock))
+            (drop (call $commit (i32.const 0) (i32.const 8)))))"#;
 
-        struct ClockBackend;
-        #[async_trait::async_trait]
-        impl AppBackend for ClockBackend {
-            async fn sql_execute(&self, _n: &str, _s: &str) -> anyhow::Result<u64> {
-                Ok(0)
-            }
-            async fn sql_query(
-                &self,
-                _o: Option<[u8; 32]>,
-                _n: &str,
-                _s: &str,
-            ) -> anyhow::Result<String> {
-                Ok(String::new())
-            }
-            async fn obj_put(&self, _d: &[u8]) -> anyhow::Result<[u8; 32]> {
-                Ok([0u8; 32])
-            }
-            async fn obj_get(&self, _c: [u8; 32]) -> anyhow::Result<Vec<u8>> {
-                Ok(Vec::new())
-            }
-            fn now_millis(&self) -> u64 {
-                42
-            }
-        }
         let rt = TransitionRuntime::new().unwrap();
-        let backend: Arc<dyn AppBackend> = Arc::new(ClockBackend);
-
-        // Under `full` (grants WallClock) → clock binds, returns 42.
-        let ctx = TransitionCtx::new(
-            Vec::new(),
-            Vec::new(),
-            [0u8; 32],
-            String::new(),
-            Some(backend.clone()),
-        );
+        // A chosen consensus timestamp; no backend at all (clock reads ctx.now directly).
+        let ctx = TransitionCtx::deterministic(Vec::new(), Vec::new(), 12345);
         let out = rt
             .run_program(
-                CLOCK_WAT,
-                "run",
-                ctx,
-                DEFAULT_FUEL,
-                &CapabilityGrant::full(),
-            )
-            .await
-            .expect("full grants WallClock → clock binds");
-        assert_eq!(out, vec![42], "clock returned the backend's now_millis");
-
-        // Under the deterministic grant (no WallClock) → clock is unbound → fails to link.
-        let ctx = TransitionCtx::new(
-            Vec::new(),
-            Vec::new(),
-            [0u8; 32],
-            String::new(),
-            Some(backend),
-        );
-        assert!(
-            rt.run_program(
                 CLOCK_WAT,
                 "run",
                 ctx,
@@ -782,8 +792,67 @@ mod tests {
                 &CapabilityGrant::deterministic(),
             )
             .await
+            .expect("deterministic profile grants the consensus clock");
+        let got = u64::from_le_bytes(out.as_slice().try_into().expect("8-byte clock value"));
+        assert_eq!(got, 12345, "clock returns ctx.now deterministically");
+    }
+
+    // `wall_clock` (real per-node time) is APP-ONLY: a program importing it instantiates under
+    // `full` (grants WallClock, reads the backend's now_millis) but FAILS to instantiate under
+    // the deterministic profile (WallClock ungranted → unbound import).
+    #[tokio::test]
+    async fn wall_clock_is_app_only() {
+        // wall_clock() -> i64; store its low byte and commit it.
+        const WALL_WAT: &[u8] = br#"(module
+          (import "craftcom" "wall_clock" (func $wall (result i64)))
+          (import "craftcom" "commit" (func $commit (param i32 i32) (result i32)))
+          (memory (export "memory") 1)
+          (func (export "run")
+            (i32.store8 (i32.const 0) (i32.wrap_i64 (call $wall)))
+            (drop (call $commit (i32.const 0) (i32.const 1)))))"#;
+
+        let rt = TransitionRuntime::new().unwrap();
+        let backend: Arc<dyn AppBackend> = Arc::new(ClockBackend(42));
+
+        // Under `full` (grants WallClock) → wall_clock binds, returns the backend's real time.
+        let ctx = TransitionCtx::new(
+            Vec::new(),
+            Vec::new(),
+            [0u8; 32],
+            String::new(),
+            0,
+            Some(backend.clone()),
+        );
+        let out = rt
+            .run_program(WALL_WAT, "run", ctx, DEFAULT_FUEL, &CapabilityGrant::full())
+            .await
+            .expect("full grants WallClock → wall_clock binds");
+        assert_eq!(
+            out,
+            vec![42],
+            "wall_clock returned the backend's now_millis"
+        );
+
+        // Under the deterministic grant (no WallClock) → wall_clock is unbound → fails to link.
+        let ctx = TransitionCtx::new(
+            Vec::new(),
+            Vec::new(),
+            [0u8; 32],
+            String::new(),
+            0,
+            Some(backend),
+        );
+        assert!(
+            rt.run_program(
+                WALL_WAT,
+                "run",
+                ctx,
+                DEFAULT_FUEL,
+                &CapabilityGrant::deterministic(),
+            )
+            .await
             .is_err(),
-            "deterministic profile must NOT bind the per-node clock"
+            "deterministic profile must NOT bind the real per-node wall_clock"
         );
     }
 }

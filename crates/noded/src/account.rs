@@ -19,8 +19,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use zeph_com::{pda, CapabilityGrant, TransitionRuntime, DEFAULT_FUEL};
-use zeph_core::Cid;
+use zeph_com::{pda, CapabilityGrant, TransitionCtx, TransitionRuntime, DEFAULT_FUEL};
+use zeph_core::{hlc::Clock, Cid};
 use zeph_obj::{ConsumeMode, ObjEngine};
 
 /// The outcome of advancing an account.
@@ -35,16 +35,21 @@ pub struct ProgramAccountStore {
     obj: Arc<ObjEngine>,
     runtime: TransitionRuntime,
     dir: PathBuf,
+    /// The node's HLC — the authoritative consensus time fed to each transition as `ctx.now`
+    /// (the `clock` host fn returns it). The SAME clock the registry/programreg elect on, so
+    /// the writer's HLC is the account substrate's notion of "now".
+    clock: Arc<Clock>,
 }
 
 impl ProgramAccountStore {
-    pub fn open(obj: Arc<ObjEngine>, data_dir: &Path) -> Self {
+    pub fn open(obj: Arc<ObjEngine>, data_dir: &Path, clock: Arc<Clock>) -> Self {
         let dir = data_dir.join("accounts");
         let _ = std::fs::create_dir_all(&dir);
         Self {
             obj,
             runtime: TransitionRuntime::new().expect("program runtime"),
             dir,
+            clock,
         }
     }
 
@@ -71,14 +76,20 @@ impl ProgramAccountStore {
     async fn run(&self, program_cid: [u8; 32], prev: &[u8], request: &[u8]) -> Option<Vec<u8>> {
         let wasm = self.fetch_program(program_cid).await?;
         // Protocol program-accounts are consensus-critical → the deterministic profile
-        // (the safe default): every node computes the identical new state.
+        // (the safe default): every node computes the identical new state. Feed the CONSENSUS
+        // timestamp `now` from the node's HLC — the `clock` host fn returns it, giving programs
+        // a reproducible "now" (§6, block-time). NOTE: full re-run reproducibility on an
+        // INDEPENDENT verifier (persisting `now` in the request so any node recomputes the
+        // identical state) is a verification-layer concern, deferred; under the single-writer
+        // model the writer's HLC is the authoritative time.
+        let now = self.clock.now().millis();
+        let ctx = TransitionCtx::deterministic(prev.to_vec(), request.to_vec(), now);
         let out = self
             .runtime
-            .run_transition(
+            .run_program(
                 &wasm,
                 "run",
-                prev,
-                request,
+                ctx,
                 DEFAULT_FUEL,
                 &CapabilityGrant::deterministic(),
             )

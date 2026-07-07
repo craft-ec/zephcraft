@@ -1168,8 +1168,11 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // Control state, shared by the heartbeat loop and the control servers.
     // Generic program accounts — any program's single-writer state (the program IS the writer).
     // Built FIRST so the program registry can share this same store Arc.
-    let account_store =
-        std::sync::Arc::new(account::ProgramAccountStore::open(engine.clone(), data_dir));
+    let account_store = std::sync::Arc::new(account::ProgramAccountStore::open(
+        engine.clone(),
+        data_dir,
+        transport.clock(),
+    ));
     // Phase 4c: the durable program-name registry — a THIN consumer of the account store.
     // The writer for each epoch is ELECTED deterministically from the membership view + HLC
     // clock (a rotating writer); non-writers forward to the current epoch's writer.

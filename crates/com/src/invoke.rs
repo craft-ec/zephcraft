@@ -76,6 +76,9 @@ impl InvokeService {
             req.input.clone(),
             caller,
             req.app_ns.clone(),
+            // Apps are non-consensus: `clock` reads the invoking node's own time (same source
+            // as `wall_clock`). There is no agreed consensus timestamp for a one-off app run.
+            self.backend.now_millis(),
             Some(self.backend.clone()),
         );
         self.runtime
