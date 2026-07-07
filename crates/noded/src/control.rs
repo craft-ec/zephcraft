@@ -189,9 +189,9 @@ pub struct State {
     pub settings: NodeSettings,
     /// CraftCOM invocation service — run user-level app WASM (local invoke).
     pub com: std::sync::Arc<zeph_com::InvokeService>,
-    /// Phase 4c: durable program-name registry (open owner-signed CRDT), a thin
-    /// consumer of the program-account store.
-    pub programreg: std::sync::Arc<crate::programreg::ProgramRegistry>,
+    /// Durable owner-signed HEAD registry (open CRDT) — program names, DB roots, and
+    /// manifests — a thin consumer of the program-account store.
+    pub registry: std::sync::Arc<crate::headreg::HeadRegistry>,
     /// Governance: one durable chain deriving both the governor set and program registry.
     pub gov: std::sync::Arc<crate::governance::GovernanceChainStore>,
     /// Generic program accounts — any program's single-writer state (the program is the writer).
@@ -1108,7 +1108,7 @@ async fn rpc_program_resolve(
 /// Resolve a published app name → its current cid WITHOUT fetching content. Mirrors the
 /// registry resolution done inside `rpc_invoke`, but stops at the name→cid lookup: this is the
 /// resolve-only path that lets a resolve be tested (and tolerate a briefly-unreachable writer,
-/// via the replica-fallback in `ProgramRegistry::resolve`) with no object fetch. Params:
+/// via the replica-fallback in `HeadRegistry::resolve`) with no object fetch. Params:
 /// `{ "owner": "<hex64>", "name": "<str>" }`. Returns `{ "cid": "<hex64>" }` or `{ "cid": null }`.
 async fn rpc_resolve_name(
     state: &State,
@@ -1128,7 +1128,7 @@ async fn rpc_resolve_name(
         Some(o) => o,
         None => return rpc_err(id, "owner must be 64 hex chars".into()),
     };
-    let cid = state.programreg.resolve(owner, name).await;
+    let cid = state.registry.resolve(owner, name).await;
     serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"cid": cid.map(hex::encode)}})
 }
 
@@ -1313,8 +1313,8 @@ async fn deploy_bytes(
     let version = match parse_node_id(&state.node_id) {
         Some(own) => {
             state
-                .programreg
-                .current_version(crate::programreg::RT_PROGRAM, own.0, name)
+                .registry
+                .current_version(crate::headreg::RT_PROGRAM, own.0, name)
                 .await
                 + 1
         }
@@ -1324,9 +1324,9 @@ async fn deploy_bytes(
     // (e.g. rejects an invalid name), failing the deploy if so. The program-account store
     // persists + publishes it durably; no DHT announce.
     state
-        .programreg
+        .registry
         .register(
-            crate::programreg::RT_PROGRAM,
+            crate::headreg::RT_PROGRAM,
             name,
             cid.0,
             version,
@@ -1377,7 +1377,7 @@ async fn rpc_invoke(
         // Registry resolution: the program-name registry itself now handles cross-node
         // resolution (a non-writer queries the designated writer over REGISTRY_ALPN), so
         // there is no DHT/KIND_APP fallback — a `None` here is a genuine not-found.
-        match state.programreg.resolve(publisher.0, app_name).await {
+        match state.registry.resolve(publisher.0, app_name).await {
             Some(cid) => (cid, app_name.to_string()),
             None => return rpc_err(id, format!("app '{nm}' not found (deploy it first?)")),
         }
@@ -1868,7 +1868,7 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         if params.token != *ctx.token {
             return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
         }
-        let (epoch, eligible, writer_shards, entries) = ctx.state.programreg.status().await;
+        let (epoch, eligible, writer_shards, entries) = ctx.state.registry.status().await;
         axum::Json(serde_json::json!({
             "epoch": epoch,
             "eligible": eligible,

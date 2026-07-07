@@ -1,4 +1,5 @@
-//! Phase 4c/4d — the live program-name registry, a THIN consumer of the generic
+//! The node's durable owner-signed HEAD registry — program names, CraftSQL DB roots, and
+//! durability manifests (RT_PROGRAM / RT_DBROOT / RT_MANIFEST) — a thin consumer of the
 //! [`ProgramAccountStore`] substrate. `deploy` registers a signed head by advancing a
 //! per-shard registry account (`pda(registry_program_cid(), shard_seed(shard))`); resolution
 //! reads that account's state. The account state itself is persisted + published durably by
@@ -68,7 +69,7 @@ struct ShardKey {
 }
 
 /// Boundary-race grace window, in milliseconds. During the first `GRACE_MILLIS` of a new epoch
-/// the PREVIOUS epoch's writer stays authoritative (see [`ProgramRegistry::effective_epoch`]),
+/// the PREVIOUS epoch's writer stays authoritative (see [`HeadRegistry::effective_epoch`]),
 /// so a bounded clock skew (< grace) can't produce two live writers at a boundary.
 const GRACE_MILLIS: u64 = 2_000;
 
@@ -92,7 +93,7 @@ fn shard_seed(sk: ShardKey) -> Vec<u8> {
     .concat()
 }
 
-/// The node's durable program-name registry — a thin consumer of [`ProgramAccountStore`].
+/// The node's durable owner-signed HEAD registry — a thin consumer of [`ProgramAccountStore`].
 ///
 /// Cross-node model: for each shard the writer for an epoch is ELECTED DETERMINISTICALLY (a
 /// rotating writer), so the write duty circulates among active nodes independently per shard.
@@ -102,7 +103,7 @@ fn shard_seed(sk: ShardKey) -> Vec<u8> {
 /// resolves that shard locally; otherwise it forwards registrations and queries to the shard's
 /// current writer over `REGISTRY_ALPN`. As the epoch rotates the writer is recomputed, and the
 /// new writer adopts the previous writer's state (see [`Self::ensure_current`]).
-pub struct ProgramRegistry {
+pub struct HeadRegistry {
     identity: Arc<NodeIdentity>,
     /// Shared generic program-account store — each shard's state lives in the account
     /// `pda(registry_program_cid(), shard_seed(shard))` here.
@@ -124,7 +125,7 @@ pub struct ProgramRegistry {
     last_epoch: RwLock<std::collections::HashMap<ShardKey, u64>>,
 }
 
-impl ProgramRegistry {
+impl HeadRegistry {
     /// Open the registry over a shared program-account store. The `clock` drives the per-epoch
     /// per-shard writer election — the writer is computed, not configured.
     pub fn open(

@@ -36,7 +36,7 @@ pub struct ProgramAccountStore {
     runtime: TransitionRuntime,
     dir: PathBuf,
     /// The node's HLC — the authoritative consensus time fed to each transition as `ctx.now`
-    /// (the `clock` host fn returns it). The SAME clock the registry/programreg elect on, so
+    /// (the `clock` host fn returns it). The SAME clock the head registry elects on, so
     /// the writer's HLC is the account substrate's notion of "now".
     clock: Arc<Clock>,
 }

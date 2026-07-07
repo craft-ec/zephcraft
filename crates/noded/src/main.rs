@@ -7,8 +7,8 @@
 mod account;
 mod control;
 mod governance;
+mod headreg;
 mod peers;
-mod programreg;
 mod registry_heads;
 mod registry_net;
 
@@ -1092,7 +1092,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // The writer for each epoch is ELECTED deterministically from the membership view + HLC
     // clock (a rotating writer); non-writers forward to the current epoch's writer. Built BEFORE
     // CraftSQL so its DB roots/manifests can ride this same registry substrate.
-    let programreg_store = std::sync::Arc::new(programreg::ProgramRegistry::open(
+    let head_registry = std::sync::Arc::new(headreg::HeadRegistry::open(
         identity.clone(),
         account_store.clone(),
         transport.clock(),
@@ -1105,7 +1105,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // not the DHT — persisted + replicated by the program-account store.
     let sql_dir = data_dir.join("sqlpages");
     let sql_heads = Arc::new(registry_heads::RegistryRootStore::new(
-        programreg_store.clone(),
+        head_registry.clone(),
         transport.clock(),
     ));
     let sql_source = Arc::new(zeph_sql::TransportPageSource::new(
@@ -1113,7 +1113,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         mem_peers.clone(),
     ));
     let sql_manifests = Arc::new(registry_heads::RegistryManifestStore::new(
-        programreg_store.clone(),
+        head_registry.clone(),
         transport.clock(),
     ));
     let craftsql = Arc::new(
@@ -1244,7 +1244,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         event_counts: tokio::sync::RwLock::new(std::collections::BTreeMap::new()),
         hosting_cids: std::sync::atomic::AtomicU64::new(0),
         com: com_service.clone(),
-        programreg: programreg_store.clone(),
+        registry: head_registry.clone(),
         gov: governance_store.clone(),
         accounts: account_store.clone(),
         settings: {
@@ -1333,7 +1333,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     tokio::spawn(zeph_sql::serve_pages(sql_dir.clone(), sqlpage_rx));
     tokio::spawn(zeph_com::serve_invocations(invoke_rx, com_service.clone()));
     // Serve cross-node registry requests (writer path advances; queries resolve).
-    tokio::spawn(programreg_store.clone().serve(registry_rx));
+    tokio::spawn(head_registry.clone().serve(registry_rx));
     // Cheap "pending distribution" refresh (provider records, no probing) — independent
     // of the verified health scan so the dashboard stays fresh.
     let pending_engine = engine.clone();
@@ -1405,10 +1405,8 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     );
     membership.start(peers, member_rx);
     governance_store.set_membership(membership.clone()).await;
-    programreg_store.set_membership(membership.clone()).await;
-    programreg_store
-        .set_programs(governance_store.clone())
-        .await;
+    head_registry.set_membership(membership.clone()).await;
+    head_registry.set_programs(governance_store.clone()).await;
     mem_peers.set(membership.clone()).await;
     // Membership is the health scan's LIVENESS source (on both routing paths): a holder that
     // SWIM marks dead is excluded from durability counts so repair fires, instead of its stale

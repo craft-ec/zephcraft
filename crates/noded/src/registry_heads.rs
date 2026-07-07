@@ -14,18 +14,18 @@ use zeph_core::hlc::Clock;
 use zeph_core::{Cid, NodeId};
 use zeph_sql::{ManifestStore, Result, RootStore, SqlError};
 
-use crate::programreg::{ProgramRegistry, RT_DBROOT, RT_MANIFEST};
+use crate::headreg::{HeadRegistry, RT_DBROOT, RT_MANIFEST};
 
 /// [`RootStore`] backed by the owner-signed registry ([`RT_DBROOT`]). Single-writer per DB, so
 /// `prev` (the CAS expectation) is intentionally ignored — the registry is LWW-by-seq and the
 /// prior DHT backend already ignored `prev`, so no compare-and-swap is lost.
 pub struct RegistryRootStore {
-    reg: Arc<ProgramRegistry>,
+    reg: Arc<HeadRegistry>,
     clock: Arc<Clock>,
 }
 
 impl RegistryRootStore {
-    pub fn new(reg: Arc<ProgramRegistry>, clock: Arc<Clock>) -> Self {
+    pub fn new(reg: Arc<HeadRegistry>, clock: Arc<Clock>) -> Self {
         Self { reg, clock }
     }
 }
@@ -64,12 +64,12 @@ impl RootStore for RegistryRootStore {
 /// [`ManifestStore`] backed by the owner-signed registry ([`RT_MANIFEST`]). Manifests carry no
 /// CAS — a publish is a plain LWW-by-seq advance, so any error maps to [`SqlError::Sqlite`].
 pub struct RegistryManifestStore {
-    reg: Arc<ProgramRegistry>,
+    reg: Arc<HeadRegistry>,
     clock: Arc<Clock>,
 }
 
 impl RegistryManifestStore {
-    pub fn new(reg: Arc<ProgramRegistry>, clock: Arc<Clock>) -> Self {
+    pub fn new(reg: Arc<HeadRegistry>, clock: Arc<Clock>) -> Self {
         Self { reg, clock }
     }
 }
