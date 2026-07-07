@@ -570,11 +570,17 @@ async fn owned_add(state: &State, cid: &str) {
 /// Register a deployed CraftCOM app in the private "apps" index (name → the app's
 /// SYSTEM-object cid). Upserts by name — re-deploying updates the cid (a light
 /// name→current-CID versioning, cf. CRAFTCOM_DESIGN §13).
-async fn apps_add(state: &State, name: &str, cid: &str, version: u64) {
-    let now = state.clock.now().millis();
+async fn apps_add(
+    craftsql: std::sync::Arc<zeph_sql::CraftSql>,
+    clock: std::sync::Arc<zeph_core::hlc::Clock>,
+    name: String,
+    cid: String,
+    version: u64,
+) {
+    let now = clock.now().millis();
     // Best-effort migration: add the `version` column to a pre-existing table (a
     // no-op / ignored error if the table is absent or already migrated).
-    if let Ok(mut db) = state.craftsql.open_private("apps").await {
+    if let Ok(mut db) = craftsql.open_private("apps").await {
         let _ = db
             .write("ALTER TABLE apps ADD COLUMN version INTEGER DEFAULT 1")
             .await;
@@ -583,12 +589,12 @@ async fn apps_add(state: &State, name: &str, cid: &str, version: u64) {
         "CREATE TABLE IF NOT EXISTS apps(name TEXT PRIMARY KEY, cid TEXT, version INTEGER, deployed_at INTEGER);\n\
          INSERT INTO apps(name, cid, version, deployed_at) VALUES ('{}', '{}', {}, {})\n\
          ON CONFLICT(name) DO UPDATE SET cid = excluded.cid, version = excluded.version, deployed_at = excluded.deployed_at;",
-        sql_esc(name),
-        sql_esc(cid),
+        sql_esc(&name),
+        sql_esc(&cid),
         version,
         now,
     );
-    if let Ok(mut db) = state.craftsql.open_private("apps").await {
+    if let Ok(mut db) = craftsql.open_private("apps").await {
         if let Err(e) = db.write(&sql).await {
             tracing::warn!(%e, "apps index write failed");
         }
@@ -1316,7 +1322,17 @@ async fn deploy_bytes(
         .register(name, cid.0, version, state.clock.now().millis())
         .await
         .map_err(|e| e.to_string())?;
-    apps_add(state, name, &cid.to_hex(), version).await;
+    // The app index (the UI's "apps" table) is local bookkeeping — a CraftSQL write whose
+    // page-commit publishes durably, hitting the same slow-peer publish path. Don't block the
+    // deploy on it; fire-and-forget.
+    {
+        let craftsql = state.craftsql.clone();
+        let clock = state.clock.clone();
+        let (n, c) = (name.to_string(), cid.to_hex());
+        tokio::spawn(async move {
+            apps_add(craftsql, clock, n, c, version).await;
+        });
+    }
     Ok(serde_json::json!({
         "name": name, "cid": cid.to_hex(), "size": bytes.len(), "version": version
     }))
