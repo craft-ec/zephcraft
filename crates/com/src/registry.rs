@@ -477,6 +477,7 @@ mod tests {
                 &prev.encode(),
                 &sub.encode(),
                 crate::DEFAULT_FUEL,
+                &crate::CapabilityGrant::deterministic(),
             )
             .expect("wasm runs");
         let wasm_state = RegistryState::decode(&out).expect("wasm output decodes as RegistryState");
@@ -505,9 +506,53 @@ mod tests {
                 &[],
                 &sub.encode(),
                 crate::DEFAULT_FUEL,
+                &crate::CapabilityGrant::deterministic(),
             )
             .unwrap();
         assert!(out.is_empty(), "v2 rejects a name longer than 32 bytes");
+    }
+
+    // Phase 1 capability grant (COMPUTE_EXECUTION_DESIGN §5). registry-wasm imports
+    // input/state/commit/ed25519_verify — exactly the deterministic profile → it
+    // instantiates and runs (no behavior change).
+    #[test]
+    fn wasm_registry_runs_under_the_deterministic_grant() {
+        use crate::{CapabilityGrant, TransitionRuntime};
+        let rt = TransitionRuntime::new().unwrap();
+        let sub = HeadSubmission::sign(&id(), "feed", [1u8; 32], 1);
+        let out = rt
+            .run_transition(
+                REGISTRY_WASM,
+                "run",
+                &[],
+                &sub.encode(),
+                crate::DEFAULT_FUEL,
+                &CapabilityGrant::deterministic(),
+            )
+            .expect("deterministic grant binds the imports registry-wasm needs");
+        assert!(!out.is_empty(), "a valid submission commits a new state");
+    }
+
+    // THE GATE: drop `Commit` from the grant → the host fn is NOT bound, so registry-wasm's
+    // `commit` import is unresolved and it FAILS to instantiate. Proves link-time gating: a
+    // non-granted capability cannot be reached.
+    #[test]
+    fn wasm_registry_without_commit_grant_fails_to_instantiate() {
+        use crate::{Capability, CapabilityGrant, TransitionRuntime};
+        let rt = TransitionRuntime::new().unwrap();
+        let sub = HeadSubmission::sign(&id(), "feed", [1u8; 32], 1);
+        assert!(
+            rt.run_transition(
+                REGISTRY_WASM,
+                "run",
+                &[],
+                &sub.encode(),
+                crate::DEFAULT_FUEL,
+                &CapabilityGrant::deterministic().without(Capability::Commit),
+            )
+            .is_err(),
+            "an unbound `commit` import must fail instantiation"
+        );
     }
 
     #[test]
@@ -523,6 +568,7 @@ mod tests {
                 &[],
                 &sub.encode(),
                 crate::DEFAULT_FUEL,
+                &crate::CapabilityGrant::deterministic(),
             )
             .unwrap();
         assert!(out.is_empty(), "a bad signature commits nothing");

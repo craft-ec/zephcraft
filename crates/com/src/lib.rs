@@ -29,11 +29,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use wasmtime::{Caller, Config, Engine, Extern, Linker, Memory, Module, Store};
 
+mod capability;
 mod craft;
 mod gov;
 mod invoke;
 mod registry;
 mod transition;
+pub use capability::{Capability, CapabilityGrant};
 pub use craft::CraftBackend;
 pub use gov::{
     GovAction, GovSignature, GovernanceApproval, GovernanceChain, GovernanceProposal, GovernanceSet,

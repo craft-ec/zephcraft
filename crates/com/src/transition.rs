@@ -17,6 +17,8 @@ use wasmtime::{Caller, Config, Engine, Extern, Linker, Memory, Module, Store};
 use zeph_core::{Cid, NodeId};
 use zeph_crypto::NodeIdentity;
 
+use crate::{Capability, CapabilityGrant};
+
 /// Import module the restricted deterministic ABI is bound under (shares the `craftcom`
 /// namespace with the capability runtime, but exposes only `input` + `commit` + `state`).
 const TRANSITION_HOST_MODULE: &str = "craftcom";
@@ -55,7 +57,14 @@ impl TransitionRuntime {
         request: &[u8],
         fuel: u64,
     ) -> anyhow::Result<Vec<u8>> {
-        self.run_transition(wasm, func, &[], request, fuel)
+        self.run_transition(
+            wasm,
+            func,
+            &[],
+            request,
+            fuel,
+            &CapabilityGrant::deterministic(),
+        )
     }
 
     /// Run a state-transition program: the prior state is exposed via the `state` host
@@ -67,6 +76,7 @@ impl TransitionRuntime {
         prev_state: &[u8],
         request: &[u8],
         fuel: u64,
+        grant: &CapabilityGrant,
     ) -> anyhow::Result<Vec<u8>> {
         let module = Module::new(&self.engine, wasm)?;
         let mut store = Store::new(
@@ -79,7 +89,7 @@ impl TransitionRuntime {
         );
         store.set_fuel(fuel)?;
         let mut linker = Linker::new(&self.engine);
-        bind_deterministic(&mut linker)?;
+        bind_granted(&mut linker, grant)?;
         let instance = linker.instantiate(&mut store, &module)?;
         let f = instance.get_typed_func::<(), ()>(&mut store, func)?;
         f.call(&mut store, ())?;
@@ -151,73 +161,91 @@ fn det_write(
     }
 }
 
-/// Bind ONLY the deterministic ABI — `input` (read the request) and `commit` (declare
-/// the output). No clock, no rng, no sql/obj: the run is a pure function of its input.
-fn bind_deterministic(linker: &mut Linker<TransitionCtx>) -> anyhow::Result<()> {
-    linker.func_wrap(
-        TRANSITION_HOST_MODULE,
-        "input",
-        |mut caller: Caller<'_, TransitionCtx>, out: i32, cap: i32| -> i32 {
-            let input = caller.data().input.clone();
-            let Some(mem) = det_memory(&mut caller) else {
-                return -1;
-            };
-            det_write(&mut caller, &mem, out, cap, &input)
-        },
-    )?;
-    linker.func_wrap(
-        TRANSITION_HOST_MODULE,
-        "commit",
-        |mut caller: Caller<'_, TransitionCtx>, ptr: i32, len: i32| -> i32 {
-            let Some(mem) = det_memory(&mut caller) else {
-                return -1;
-            };
-            let Some(bytes) = det_read(&caller, &mem, ptr, len) else {
-                return -1;
-            };
-            let n = bytes.len() as i32;
-            caller.data_mut().output = bytes;
-            n
-        },
-    )?;
-    linker.func_wrap(
-        TRANSITION_HOST_MODULE,
-        "state",
-        |mut caller: Caller<'_, TransitionCtx>, out: i32, cap: i32| -> i32 {
-            let ps = caller.data().prev_state.clone();
-            let Some(mem) = det_memory(&mut caller) else {
-                return -1;
-            };
-            det_write(&mut caller, &mem, out, cap, &ps)
-        },
-    )?;
-    // Deterministic ed25519 verification — the one crypto primitive a transition program
-    // needs (e.g. the registry program checking an owner's signed submission). Reads a
-    // 32-byte pubkey, `msg_len` message bytes, and a 64-byte signature from guest memory;
-    // returns 1 if valid, else 0. Verification is deterministic, so it's safe here.
-    linker.func_wrap(
-        TRANSITION_HOST_MODULE,
-        "ed25519_verify",
-        |mut caller: Caller<'_, TransitionCtx>, pk: i32, msg: i32, msg_len: i32, sig: i32| -> i32 {
-            let Some(mem) = det_memory(&mut caller) else {
-                return 0;
-            };
-            let (Some(pk), Some(m), Some(s)) = (
-                det_read(&caller, &mem, pk, 32),
-                det_read(&caller, &mem, msg, msg_len),
-                det_read(&caller, &mem, sig, 64),
-            ) else {
-                return 0;
-            };
-            let (Ok(pk), Ok(s)) = (
-                <[u8; 32]>::try_from(pk.as_slice()),
-                <[u8; 64]>::try_from(s.as_slice()),
-            ) else {
-                return 0;
-            };
-            i32::from(NodeIdentity::verify(&NodeId(pk), &m, &s))
-        },
-    )?;
+/// Bind the host ABI per the capability `grant` — a function is bound **only if** its
+/// capability is granted, so a program importing a non-granted capability fails to
+/// instantiate (`unknown import`; `COMPUTE_EXECUTION_DESIGN.md` §5). Phase 1 binds the
+/// four caps a transition needs: `input` (Input), `state` (State), `commit` (Commit), and
+/// `ed25519_verify` (Crypto). The deterministic grant allows all four → today's exact
+/// surface (no behavior change); the remaining §4 caps are bound in later phases.
+fn bind_granted(linker: &mut Linker<TransitionCtx>, grant: &CapabilityGrant) -> anyhow::Result<()> {
+    if grant.allows(Capability::Input) {
+        linker.func_wrap(
+            TRANSITION_HOST_MODULE,
+            "input",
+            |mut caller: Caller<'_, TransitionCtx>, out: i32, cap: i32| -> i32 {
+                let input = caller.data().input.clone();
+                let Some(mem) = det_memory(&mut caller) else {
+                    return -1;
+                };
+                det_write(&mut caller, &mem, out, cap, &input)
+            },
+        )?;
+    }
+    if grant.allows(Capability::Commit) {
+        linker.func_wrap(
+            TRANSITION_HOST_MODULE,
+            "commit",
+            |mut caller: Caller<'_, TransitionCtx>, ptr: i32, len: i32| -> i32 {
+                let Some(mem) = det_memory(&mut caller) else {
+                    return -1;
+                };
+                let Some(bytes) = det_read(&caller, &mem, ptr, len) else {
+                    return -1;
+                };
+                let n = bytes.len() as i32;
+                caller.data_mut().output = bytes;
+                n
+            },
+        )?;
+    }
+    if grant.allows(Capability::State) {
+        linker.func_wrap(
+            TRANSITION_HOST_MODULE,
+            "state",
+            |mut caller: Caller<'_, TransitionCtx>, out: i32, cap: i32| -> i32 {
+                let ps = caller.data().prev_state.clone();
+                let Some(mem) = det_memory(&mut caller) else {
+                    return -1;
+                };
+                det_write(&mut caller, &mem, out, cap, &ps)
+            },
+        )?;
+    }
+    if grant.allows(Capability::Crypto) {
+        // Deterministic ed25519 verification — the one crypto primitive a transition
+        // program needs (e.g. the registry program checking an owner's signed submission).
+        // Reads a 32-byte pubkey, `msg_len` message bytes, and a 64-byte signature from
+        // guest memory; returns 1 if valid, else 0. Verification is deterministic, so it's
+        // safe here.
+        linker.func_wrap(
+            TRANSITION_HOST_MODULE,
+            "ed25519_verify",
+            |mut caller: Caller<'_, TransitionCtx>,
+             pk: i32,
+             msg: i32,
+             msg_len: i32,
+             sig: i32|
+             -> i32 {
+                let Some(mem) = det_memory(&mut caller) else {
+                    return 0;
+                };
+                let (Some(pk), Some(m), Some(s)) = (
+                    det_read(&caller, &mem, pk, 32),
+                    det_read(&caller, &mem, msg, msg_len),
+                    det_read(&caller, &mem, sig, 64),
+                ) else {
+                    return 0;
+                };
+                let (Ok(pk), Ok(s)) = (
+                    <[u8; 32]>::try_from(pk.as_slice()),
+                    <[u8; 64]>::try_from(s.as_slice()),
+                ) else {
+                    return 0;
+                };
+                i32::from(NodeIdentity::verify(&NodeId(pk), &m, &s))
+            },
+        )?;
+    }
     Ok(())
 }
 
@@ -287,5 +315,46 @@ mod tests {
         let rt = TransitionRuntime::new().unwrap();
         let spin = br#"(module (func (export "run") (loop (br 0))))"#;
         assert!(rt.run(spin, "run", &[], 100_000).is_err());
+    }
+
+    // The DOUBLE_WAT program imports only `input` + `commit` — both in the deterministic
+    // grant → it instantiates and runs, proving the grant binds today's surface.
+    #[test]
+    fn deterministic_grant_binds_input_and_commit() {
+        let rt = TransitionRuntime::new().unwrap();
+        let out = rt
+            .run_transition(
+                DOUBLE_WAT,
+                "run",
+                &[],
+                &[21],
+                DEFAULT_FUEL,
+                &CapabilityGrant::deterministic(),
+            )
+            .expect("input+commit are granted");
+        assert_eq!(out, vec![21, 42]);
+    }
+
+    // THE GATE: with `commit` removed from the grant, the host fn is NOT bound, so the same
+    // program can't resolve its `commit` import and fails to instantiate (link-time
+    // gating). A non-granted import cannot be escaped.
+    #[test]
+    fn a_non_granted_import_fails_to_instantiate() {
+        let rt = TransitionRuntime::new().unwrap();
+        let err = rt
+            .run_transition(
+                DOUBLE_WAT,
+                "run",
+                &[],
+                &[21],
+                DEFAULT_FUEL,
+                &CapabilityGrant::deterministic().without(Capability::Commit),
+            )
+            .expect_err("commit is not bound → unknown import");
+        let msg = format!("{err:#}").to_lowercase();
+        assert!(
+            msg.contains("commit") || msg.contains("import") || msg.contains("unknown"),
+            "instantiation failed on the missing `commit` import: {msg}"
+        );
     }
 }

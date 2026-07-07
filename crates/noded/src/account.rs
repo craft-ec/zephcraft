@@ -19,7 +19,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use zeph_com::{pda, TransitionRuntime, DEFAULT_FUEL};
+use zeph_com::{pda, CapabilityGrant, TransitionRuntime, DEFAULT_FUEL};
 use zeph_core::Cid;
 use zeph_obj::{ConsumeMode, ObjEngine};
 
@@ -70,9 +70,18 @@ impl ProgramAccountStore {
     /// (empty output) or its wasm is unavailable.
     async fn run(&self, program_cid: [u8; 32], prev: &[u8], request: &[u8]) -> Option<Vec<u8>> {
         let wasm = self.fetch_program(program_cid).await?;
+        // Protocol program-accounts are consensus-critical → the deterministic profile
+        // (the safe default): every node computes the identical new state.
         let out = self
             .runtime
-            .run_transition(&wasm, "run", prev, request, DEFAULT_FUEL)
+            .run_transition(
+                &wasm,
+                "run",
+                prev,
+                request,
+                DEFAULT_FUEL,
+                &CapabilityGrant::deterministic(),
+            )
             .ok()?;
         (!out.is_empty()).then_some(out)
     }
