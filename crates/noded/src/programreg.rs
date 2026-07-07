@@ -355,28 +355,44 @@ impl ProgramRegistry {
         Ok(root)
     }
 
-    /// Push `sk`'s freshly-written state to every OTHER replica present in the eligible set,
-    /// each of which MERGES it (LWW). Best-effort: the ≤ `REPLICATION_FACTOR - 1` sends are
-    /// awaited sequentially, and any error is swallowed — a push failure NEVER fails the write.
+    /// Push `sk`'s freshly-written state to every OTHER replica, each of which MERGES it (LWW).
+    /// FIRE-AND-FORGET: we resolve the replica addresses (local, instant) and then send the pushes
+    /// in a BACKGROUND task — the write must NOT block on the network. The writer already holds the
+    /// state (`put_state` ran before this), so it can serve immediately; replicas catch up
+    /// asynchronously, and takeover-merge covers any that miss a push. Awaiting the sends here (the
+    /// old behaviour) made every write as slow as the slowest replica — a relay-only peer could
+    /// stall a register for seconds. Best-effort: push errors are swallowed, never failing the write.
     async fn replicate(&self, sk: ShardKey, state: &[u8]) {
         let elig = self.eligible().await;
+        let mut targets = Vec::new();
         for id in Self::replicas(sk, &elig) {
             if id == self.self_id {
                 continue;
             }
             if let Some(addr) = self.addr_of(id).await {
+                targets.push(addr);
+            }
+        }
+        if targets.is_empty() {
+            return;
+        }
+        let transport = self.transport.clone();
+        let state = state.to_vec();
+        let (rtype, shard) = (sk.rtype, sk.shard);
+        tokio::spawn(async move {
+            for addr in targets {
                 let _ = request_registry(
-                    &self.transport,
+                    &transport,
                     &addr,
                     &RegistryReq::PushState {
-                        rtype: sk.rtype,
-                        shard: sk.shard,
-                        state: state.to_vec(),
+                        rtype,
+                        shard,
+                        state: state.clone(),
                     },
                 )
                 .await;
             }
-        }
+        });
     }
 
     /// Local resolve against this node's own copy of `sk`'s registry account.
