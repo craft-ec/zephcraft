@@ -117,7 +117,14 @@ impl ProgramAccountStore {
             .await
             .ok_or_else(|| anyhow::anyhow!("program rejected the request"))?;
         std::fs::write(self.state_path(account), &new_state)?;
-        let _ = self.obj.publish_system(&new_state).await; // durable content (survives node loss)
+        // Publish durably in the BACKGROUND: the writer already retains the state locally (the file
+        // above), so a write must never block on distribution — a slow/relay peer would otherwise
+        // stall every registry write. Durability is reached async (and by the health scan).
+        let obj = self.obj.clone();
+        let blob = new_state.clone();
+        tokio::spawn(async move {
+            let _ = obj.publish_system(&blob).await;
+        });
         Ok(AdvanceResult {
             account,
             new_root: Cid::of(&new_state).0,
@@ -142,7 +149,12 @@ impl ProgramAccountStore {
     ) -> anyhow::Result<()> {
         let account = pda(&program_id, seed).0;
         std::fs::write(self.state_path(account), bytes)?;
-        let _ = self.obj.publish_system(bytes).await; // durable content (survives node loss)
+        // Background publish — see `advance`: the state is retained locally, so don't block on it.
+        let obj = self.obj.clone();
+        let blob = bytes.to_vec();
+        tokio::spawn(async move {
+            let _ = obj.publish_system(&blob).await;
+        });
         Ok(())
     }
 }

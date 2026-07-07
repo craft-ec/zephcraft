@@ -149,8 +149,12 @@ pub struct ScaleReport {
 /// the same node isn't always elected (BLAKE3(node ‖ cid ‖ epoch)).
 const HEALTH_EPOCH_MS: u64 = 30_000;
 
-/// Per-piece push timeout — a slow/stalled peer mustn't hang a publish.
-const PUSH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Per-piece push timeout. A publish `join_all`s every piece-push, so this is effectively the
+/// publish's worst-case latency: one slow peer (e.g. a relay-only node on a poor link) stalls the
+/// whole publish for this long. A healthy push completes in well under a second, so keep this a
+/// tight cap — a straggler is dropped (the health scan redistributes to it later) rather than
+/// holding an interactive publish/deploy hostage.
+const PUSH_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Outcome of publishing a file (content + its manifest).
 #[derive(Debug, Clone)]
