@@ -1292,11 +1292,18 @@ async fn deploy_bytes(
     if name.is_empty() || name.chars().any(|c| c.is_control()) {
         return Err("invalid app name (empty or control chars reserved)".into());
     }
-    let cid = state
-        .engine
-        .publish_system(bytes)
-        .await
-        .map_err(|e| format!("deploy failed: {e}"))?;
+    // Content-addressing: the cid is BLAKE3(bytes) — known instantly, so there is NO need to wait
+    // for the publish to distribute pieces to peers. The node retains its own copy; durability is
+    // reached asynchronously (background pushes + health scan). Retain+distribute in the background
+    // and register the cid now, so a deploy stays sub-second even when a peer is slow.
+    let cid = zeph_core::Cid::of(bytes);
+    {
+        let engine = state.engine.clone();
+        let blob = bytes.to_vec();
+        tokio::spawn(async move {
+            let _ = engine.publish_system(&blob).await;
+        });
+    }
     let version = match parse_node_id(&state.node_id) {
         Some(own) => state.programreg.current_version(own.0, name).await + 1,
         None => 1,
