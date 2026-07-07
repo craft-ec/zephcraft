@@ -1,10 +1,10 @@
 //! [`CraftBackend`] — the real substrate behind [`AppBackend`]: an agent's host
 //! functions routed to the node's CraftSQL + CraftOBJ engines (phase 3).
 //!
-//! User-level app data lives under the `app/<name>` CraftSQL namespace, owned by
+//! User-level app data lives under the `app.<name>` CraftSQL namespace, owned by
 //! the invoking user's identity — separate from personal namespaces (e.g. the
 //! drive's `owned`), consistent with the userspace model. `sql_execute` writes the
-//! OWN `(own, app/ns)`; `sql_query` reads own or another participant's `(·, app/ns)`
+//! OWN `(own, app.ns)`; `sql_query` reads own or another participant's `(·, app.ns)`
 //! — the same-namespace confinement the structural gate already guarantees.
 
 use std::sync::Arc;

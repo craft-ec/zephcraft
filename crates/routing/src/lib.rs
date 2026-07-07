@@ -18,7 +18,9 @@ use zeph_transport::PeerAddr;
 
 pub use records::ProviderPayload;
 
-/// ALPN for the tracker protocol.
+/// ALPN for the content-routing protocol. The DHT is the sole backend; the `tracker` token
+/// in the wire name is retained ONLY for wire-compatibility with deployed peers — do not
+/// change this string.
 pub const ALPN: &[u8] = b"/craftec/tracker/1";
 
 /// A resolved metadata envelope (`KIND_META`) — one publisher's editable claim
@@ -52,6 +54,9 @@ pub struct ProviderRecord {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RoutingError {
+    // NOTE: the `NoTracker` / `Tracker` variant names (and their message strings) are
+    // legacy from the retired tracker backend; the DHT is now the sole backend. Renaming
+    // them is a follow-up identifier refactor (tech-debt), deliberately out of scope here.
     #[error("no tracker reachable")]
     NoTracker,
     #[error("tracker error: {0}")]
@@ -63,7 +68,8 @@ pub enum RoutingError {
 
 pub type Result<T> = std::result::Result<T, RoutingError>;
 
-/// Swappable content-routing backend (tracker now, iroh DHT later).
+/// Swappable content-routing backend. The Kademlia DHT (`DhtRouting`) is the sole backend;
+/// the trait stays swappable (decision R7) so the backend can change without touching callers.
 #[async_trait]
 pub trait ContentRouting: Send + Sync {
     /// Announce this node as a provider for `cid`.
@@ -93,7 +99,7 @@ pub trait ContentRouting: Send + Sync {
     async fn metas(&self, cid: Cid) -> Result<Vec<MetaRecord>>;
 
     /// Publish this node's app head `(self, name) → (wasm_cid, version)`, signed.
-    /// Default: unsupported (only tracker/DHT routing implements it).
+    /// Default: unsupported (only the DHT routing backend implements it).
     async fn announce_app(&self, _name: &str, _wasm_cid: Cid, _version: u64) -> Result<()> {
         Err(RoutingError::NoTracker)
     }

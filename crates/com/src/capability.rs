@@ -11,14 +11,16 @@
 //! The full [`Capability`] surface (§4) is bound in the transition runtime: the
 //! deterministic caps (`Input`/`Caller`/`State`/`Commit`/`Crypto`/`Sql`/`Obj`/`Clock`, the
 //! last being the *consensus* clock — `ctx.now`) plus the non-deterministic `WallClock`
-//! (real per-node wall-time, app profile only). `Random` is declared but has no host fn yet.
+//! (real per-node wall-time, app profile only). `Random` is a reserved variant with NO bound
+//! host fn (kernel primitive K2, deferred), so no profile — not even `full` — grants it.
 
 use std::collections::HashSet;
 
 /// The unified host-function surface (`COMPUTE_EXECUTION_DESIGN.md` §4). Each variant tags
 /// one capability; the grant decides which are bound at link time. The ✅ deterministic
-/// subset is safe for consensus-critical programs; `WallClock`/`Random` are host-varying
-/// and belong to the app profile only.
+/// subset is safe for consensus-critical programs; `WallClock` is host-varying and belongs
+/// to the app profile only. `Random` is reserved (no bound host fn yet) and is granted by no
+/// profile.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Capability {
     /// `input` — read the request/args. Deterministic.
@@ -39,7 +41,10 @@ pub enum Capability {
     Clock,
     /// `wall_clock` — true wall-time. Non-deterministic; app profile only.
     WallClock,
-    /// `random` — true RNG. Non-deterministic; app profile only.
+    /// reserved — binding is kernel primitive K2 (deferred): it interacts with
+    /// verification/replay, since a random app can't be re-verified unless the randomness
+    /// is request-seeded. NOT bound by any profile (including `full`) until then.
+    #[allow(dead_code)]
     Random,
 }
 
@@ -78,14 +83,15 @@ impl CapabilityGrant {
         }
     }
 
-    /// The **app (full) profile** — the deterministic subset **plus** `wall_clock`/`random`
-    /// (§5). For userspace apps that are not consensus-critical and may be
-    /// non-deterministic. `WallClock` binds the `wall_clock` host fn (real per-node
-    /// wall-time); `Random` has no host fn bound yet.
+    /// The **app (full) profile** — the deterministic subset **plus** `wall_clock` (§5). For
+    /// userspace apps that are not consensus-critical and may be non-deterministic.
+    /// `WallClock` binds the `wall_clock` host fn (real per-node wall-time). `Random` is
+    /// deliberately NOT granted: it has no bound host fn (K2, deferred), and the advertised
+    /// grant must match the actually-bound host fns — otherwise a full-profile app importing
+    /// `random` would fail to instantiate (`unknown import`).
     pub fn full() -> Self {
         let mut g = Self::deterministic();
         g.caps.insert(Capability::WallClock);
-        g.caps.insert(Capability::Random);
         g
     }
 
@@ -132,10 +138,15 @@ mod tests {
     }
 
     #[test]
-    fn full_profile_adds_wall_clock_and_random() {
+    fn full_profile_adds_wall_clock_but_not_random() {
         let g = CapabilityGrant::full();
         assert!(g.allows(Capability::WallClock));
-        assert!(g.allows(Capability::Random));
+        // `Random` has no bound host fn (K2, deferred), so the advertised grant must NOT
+        // include it — else a full-profile app importing `random` fails to instantiate.
+        assert!(
+            !g.allows(Capability::Random),
+            "random is not bound → not granted"
+        );
         assert!(g.allows(Capability::Commit), "full ⊇ deterministic");
     }
 

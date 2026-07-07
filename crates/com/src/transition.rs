@@ -8,8 +8,9 @@
 //! the same input computes the identical `new_state` — no attestation, no committee; the
 //! determinism itself is what makes the result reproducible.
 //!
-//! Its own sync engine (no async, no threads), fuel-metered, isolated from the
-//! capability [`crate::Runtime`]. Reused as the execution core behind program accounts.
+//! A fuel-metered engine that is the node's ONE WASM runtime (there is no separate
+//! capability runtime — that type was removed; capabilities are now a per-program grant
+//! over this same runtime). Reused as the execution core behind program accounts.
 //! Also exposes [`pda`] — deriving a program-derived account identity — used by the
 //! registry and generic-account paths.
 
@@ -27,8 +28,9 @@ const TRANSITION_HOST_MODULE: &str = "craftcom";
 
 /// A deterministic WASM runner. Restricted ABI: the program reads `input` and declares
 /// its `output` via `commit` — and nothing else — so every honest node computes the
-/// identical output. Async, fuel-metered `Engine` (async so a unified runtime can await
-/// sql/obj I/O in later phases), isolated from the capability [`crate::Runtime`].
+/// identical output. Async, fuel-metered `Engine` (async so this unified runtime can await
+/// sql/obj I/O in later phases). It is the node's SINGLE WASM runtime; a program's surface
+/// is decided by its [`CapabilityGrant`], not by a separate runtime type.
 pub struct TransitionRuntime {
     engine: Engine,
 }
@@ -247,7 +249,8 @@ fn det_write(
 /// `caller` (Caller), `sql_execute`/`sql_query` (Sql), `obj_put`/`obj_get` (Obj), `clock`
 /// (Clock — the CONSENSUS timestamp `ctx.now`, reproducible → IN the deterministic profile),
 /// and `wall_clock` (WallClock — real per-node wall-time, host-varying → app profile only).
-/// Wasm-facing names are identical to the capability `Runtime` in `lib.rs`. The deterministic
+/// These wasm-facing host-fn names are the full [`Capability`] surface bound over this one
+/// runtime (there is no separate capability runtime type). The deterministic
 /// grant binds the ✅ subset (backend-less, `clock` included); a `full` grant additionally
 /// binds `wall_clock`. The sql/obj functions read `ctx.backend` and return their failure path
 /// (never panic) when it is `None`; `clock` reads `ctx.now` and needs no backend.

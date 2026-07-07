@@ -4,11 +4,13 @@
 //! only the network's OWN policy: which WASM is canonical for a network-owned program,
 //! protocol config, and the governor set itself. A change is a [`GovernanceProposal`]
 //! approved by a **k-of-n multisig of governors** — that signature is the human
-//! *judgment*. The deterministic layer (the program/config registry) then verifies the
-//! approval and records it, and the attestation committee attests that recording. So:
-//! **governance decides (manual), everything downstream is automated** (foundation
-//! mechanism/policy split). Governance is separate from the attestation committee — the
-//! committee proves facts, governance makes decisions.
+//! *judgment*. The approval is then appended to a durable, self-verifying **governance
+//! chain**: every node independently FOLDS that chain to derive the identical current
+//! governor set + program/config registry (see [`GovernanceChain`]), so the recording is
+//! reproduced deterministically cross-node with NO gossip and NO attestation committee.
+//! So: **governance decides (manual), everything downstream is automated** (foundation
+//! mechanism/policy split) — the multisig quorum makes the decision, the chain-fold makes
+//! it durable and self-verifying.
 
 use std::collections::HashSet;
 

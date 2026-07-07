@@ -95,14 +95,17 @@ fn shard_seed(sk: ShardKey) -> Vec<u8> {
 
 /// The node's durable owner-signed HEAD registry — a thin consumer of [`ProgramAccountStore`].
 ///
-/// Cross-node model: for each shard the writer for an epoch is ELECTED DETERMINISTICALLY (a
-/// rotating writer), so the write duty circulates among active nodes independently per shard.
-/// `writer(shard, epoch)` = the eligible member (self + active membership) with the smallest
-/// `blake3(shard_le ‖ epoch_le ‖ node_id)`. Every node computes the same winner from its
-/// membership view + HLC clock. If this node is a shard's current writer it advances and
-/// resolves that shard locally; otherwise it forwards registrations and queries to the shard's
-/// current writer over `REGISTRY_ALPN`. As the epoch rotates the writer is recomputed, and the
-/// new writer adopts the previous writer's state (see [`Self::ensure_current`]).
+/// Cross-node model: writer election is TWO-STAGE, computed identically on every node from its
+/// membership view + HLC clock, and independent per shard. (1) A STABLE K-replica set = the
+/// [`REPLICATION_FACTOR`] eligible members (self + active membership) with the lowest
+/// `blake3(rtype ‖ shard_le ‖ node_id)` — NOTE: NO epoch term, so this set shifts only on
+/// membership change and a fixed group holds each account's state. (2) The writer for an epoch
+/// is `replicas[effective_epoch % replicas.len()]` — the role ROTATES through that stable set,
+/// while the other replicas stay warm followers already carrying the state. If this node is a
+/// shard's current writer it advances and resolves that shard locally; otherwise it forwards
+/// registrations and queries to the shard's current writer over `REGISTRY_ALPN`. As the epoch
+/// rotates the writer role moves to the next replica, which already holds the state (see
+/// [`Self::replicas`] / [`Self::current_writer`]).
 pub struct HeadRegistry {
     identity: Arc<NodeIdentity>,
     /// Shared generic program-account store — each shard's state lives in the account
@@ -523,7 +526,7 @@ impl HeadRegistry {
     ///       keeps state fresh);
     ///   (b) the current-epoch writer (if remote);
     ///   (c) each OTHER replica (remote).
-    /// Every remote call is bounded by the 3s [`request_registry`] timeout, so a dead-but-not-
+    /// Every remote call is bounded by the 8s [`request_registry`] timeout, so a dead-but-not-
     /// yet-dropped writer fails fast and the next replica is tried. Returns `None` only if all
     /// candidates miss. Targets are deduped (the writer is one of the replicas) and self is
     /// skipped in the remote loop.

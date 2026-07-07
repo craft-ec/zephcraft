@@ -5980,6 +5980,7 @@ dependencies = [
  "zeph-crypto",
  "zeph-obj",
  "zeph-routing",
+ "zeph-sql",
  "zeph-transport",
 ]
 

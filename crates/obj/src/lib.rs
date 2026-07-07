@@ -2,9 +2,12 @@
 //! routing + erasure into network behaviors (CRAFTOBJ_DESIGN v2.0).
 //!
 //! M2.3a scope: the store-and-retrieve core.
-//!  - `publish`: encode → store locally (pin by default) → push n pieces
-//!    across ≥K distinct peers → announce providers. Reports durable only
-//!    at ≥K distinct peer acks (the durability rule).
+//!  - `publish`: encode → retain the pieces locally (pin by default, stored
+//!    SYNCHRONOUSLY) → spawn background distribution + provider announce, and
+//!    return the cid IMMEDIATELY. Publish is fire-and-forget: it reports
+//!    `durable: false` at return time — the local copy is the only guaranteed
+//!    replica, and peer replication happens asynchronously afterwards (a later
+//!    HealthScan / durability manifest is what confirms cross-peer durability).
 //!  - `get`: resolve providers via routing (no manual peer) → fetch pieces
 //!    (exclude-list) → vtag-verify each → progressive decode → verify whole
 //!    content → apply consume mode (seed/drop/ephemeral).
