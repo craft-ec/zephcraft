@@ -67,18 +67,29 @@ pub enum RegistryResp {
     Err(String),
 }
 
+/// Overall deadline for a single registry round-trip. Bounds the connect+request+read so an
+/// unreachable peer (e.g. a dead-but-not-yet-dropped writer/replica) fails in ~3s instead of
+/// hanging forever — the caller can then fall back to another replica.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Send a registry request to the writer at `addr` and read its response. Mirrors the
-/// removed `request_attestation` client shape.
+/// removed `request_attestation` client shape. The whole network round-trip is bounded by
+/// [`REQUEST_TIMEOUT`]: on elapse it returns an `Err` rather than hanging, so a briefly
+/// unreachable peer never blocks a resolve/register/version query indefinitely.
 pub async fn request_registry(
     transport: &Transport,
     addr: &PeerAddr,
     req: &RegistryReq,
 ) -> anyhow::Result<RegistryResp> {
-    let conn = transport.connect(addr, REGISTRY_ALPN).await?;
-    let (mut send, mut recv) = conn.open_bi().await?;
-    send.write_all(&postcard::to_allocvec(req)?).await?;
-    send.finish()?;
-    let resp = recv.read_to_end(MAX_FRAME).await?;
-    conn.close(0u32.into(), b"done");
-    Ok(postcard::from_bytes(&resp)?)
+    tokio::time::timeout(REQUEST_TIMEOUT, async {
+        let conn = transport.connect(addr, REGISTRY_ALPN).await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        send.write_all(&postcard::to_allocvec(req)?).await?;
+        send.finish()?;
+        let resp = recv.read_to_end(MAX_FRAME).await?;
+        conn.close(0u32.into(), b"done");
+        Ok(postcard::from_bytes(&resp)?)
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("registry request timed out after {REQUEST_TIMEOUT:?}"))?
 }

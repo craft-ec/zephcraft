@@ -107,6 +107,13 @@ enum Command {
         #[arg(long)]
         input: Option<String>,
     },
+    /// Resolve a published app NAME to its current cid — WITHOUT fetching content.
+    /// Tolerant of a briefly-unreachable writer (tries the shard's replicas in turn).
+    Resolve {
+        /// `<publisher_hex>/<app>` — the owner's node id (64 hex) and the app name.
+        #[arg(long)]
+        name: String,
+    },
     /// Deploy a CraftCOM app: publish the WASM as a SYSTEM object (durable, managed
     /// like a database — NOT a drive file) and register it by name.
     Deploy {
@@ -372,6 +379,7 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
+        Some(Command::Resolve { name }) => cmd_resolve(&data_dir, &name).await,
         Some(Command::Deploy { file, name }) => cmd_deploy(&data_dir, &file, name.as_deref()).await,
         Some(Command::Apps) => cmd_apps(&data_dir).await,
         Some(Command::PublishProgram { file }) => cmd_publish_program(&data_dir, &file).await,
@@ -495,6 +503,22 @@ async fn cmd_invoke(
     let fuel = res.get("fuel_used").and_then(|v| v.as_u64()).unwrap_or(0);
     let label = name.or(app).unwrap_or("app");
     println!("app '{label}' returned {value}  (fuel {fuel})");
+    Ok(())
+}
+
+/// `zeph resolve --name <ownerhex>/<app>` — print the app's current cid (or `not found`)
+/// WITHOUT fetching content. Splits on the FIRST '/', mirroring `invoke --name <pub>/<app>`.
+async fn cmd_resolve(data_dir: &Path, name: &str) -> anyhow::Result<()> {
+    let (owner, app) = match name.split_once('/') {
+        Some((ph, n)) => (ph, n),
+        None => anyhow::bail!("name: bad publisher (expected <hex>/<app>)"),
+    };
+    let params = serde_json::json!({"owner": owner, "name": app});
+    let r = control::query_unix_params(&data_dir.join("zeph.sock"), "resolve_name", params).await?;
+    match r.get("cid").and_then(|v| v.as_str()) {
+        Some(cid) => println!("{cid}"),
+        None => println!("not found"),
+    }
     Ok(())
 }
 

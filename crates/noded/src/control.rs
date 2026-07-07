@@ -427,6 +427,7 @@ async fn handle_rpc(state: &State, line: &str) -> serde_json::Value {
         Some("publish_program") => rpc_publish_program(state, &request, id).await,
         Some("program_advance") => rpc_program_advance(state, &request, id).await,
         Some("program_resolve") => rpc_program_resolve(state, &request, id).await,
+        Some("resolve_name") => rpc_resolve_name(state, &request, id).await,
         Some("gov") => rpc_gov(state, id).await,
         Some("gov_propose") => rpc_gov_propose(state, &request, id).await,
         Some("gov_sign") => rpc_gov_sign(state, &request, id).await,
@@ -1096,6 +1097,33 @@ async fn rpc_program_resolve(
     let account = hex::encode(zeph_com::pda(&program, &seed).0);
     serde_json::json!({"jsonrpc":"2.0","id":id,"result":
         {"account": account, "state": hex::encode(&st), "size": st.len()}})
+}
+
+/// Resolve a published app name → its current cid WITHOUT fetching content. Mirrors the
+/// registry resolution done inside `rpc_invoke`, but stops at the name→cid lookup: this is the
+/// resolve-only path that lets a resolve be tested (and tolerate a briefly-unreachable writer,
+/// via the replica-fallback in `ProgramRegistry::resolve`) with no object fetch. Params:
+/// `{ "owner": "<hex64>", "name": "<str>" }`. Returns `{ "cid": "<hex64>" }` or `{ "cid": null }`.
+async fn rpc_resolve_name(
+    state: &State,
+    req: &serde_json::Value,
+    id: serde_json::Value,
+) -> serde_json::Value {
+    let (Some(owner_hex), Some(name)) = (
+        param(req, "owner").and_then(|v| v.as_str()),
+        param(req, "name").and_then(|v| v.as_str()),
+    ) else {
+        return rpc_err(id, "resolve_name needs 'owner' and 'name'".into());
+    };
+    let owner: [u8; 32] = match hex::decode(owner_hex.trim())
+        .ok()
+        .and_then(|b| b.try_into().ok())
+    {
+        Some(o) => o,
+        None => return rpc_err(id, "owner must be 64 hex chars".into()),
+    };
+    let cid = state.programreg.resolve(owner, name).await;
+    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"cid": cid.map(hex::encode)}})
 }
 
 async fn rpc_deploy(

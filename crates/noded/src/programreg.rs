@@ -445,33 +445,69 @@ impl ProgramRegistry {
         }
     }
 
-    /// Resolve a name published by `owner` to its current cid. Routes the key to its shard;
-    /// the shard's writer resolves locally, a non-writer queries that writer over
-    /// `REGISTRY_ALPN` (no caching yet — see follow-up).
+    /// Resolve a name published by `owner` to its current cid, TOLERANT of a briefly-unreachable
+    /// writer. Routes the key to its shard, then tries in order, returning the first hit:
+    ///   (a) THIS node's own copy, if it is in the shard's stable replica set (reads are
+    ///       best-effort across replicas — no `ensure_current`; the writer's own takeover merge
+    ///       keeps state fresh);
+    ///   (b) the current-epoch writer (if remote);
+    ///   (c) each OTHER replica (remote).
+    /// Every remote call is bounded by the 3s [`request_registry`] timeout, so a dead-but-not-
+    /// yet-dropped writer fails fast and the next replica is tried. Returns `None` only if all
+    /// candidates miss. Targets are deduped (the writer is one of the replicas) and self is
+    /// skipped in the remote loop.
     pub async fn resolve(&self, owner: [u8; 32], name: &str) -> Option<[u8; 32]> {
         let sk = ShardKey {
             rtype: RT_PROGRAM,
             shard: shard_of(&owner, name),
         };
-        if self.is_writer(sk).await {
-            return self.resolve_local(sk, owner, name).await;
+        let elig = self.eligible().await;
+        let reps = Self::replicas(sk, &elig);
+        // (a) Local read if this node holds the shard's state as a replica.
+        if reps.contains(&self.self_id) {
+            if let Some(cid) = RegistryState::decode(
+                &self
+                    .store
+                    .resolve(registry_program_cid(), &shard_seed(sk))
+                    .await,
+            )
+            .and_then(|s| s.resolve(&owner, name).map(|e| e.cid))
+            {
+                return Some(cid);
+            }
         }
-        let addr = self.writer_addr(sk).await.ok()?;
-        match request_registry(
-            &self.transport,
-            &addr,
-            &RegistryReq::Resolve {
-                rtype: RT_PROGRAM,
-                owner,
-                name: name.to_string(),
-            },
-        )
-        .await
-        .ok()?
-        {
-            RegistryResp::Resolved(cid) => cid,
-            _ => None,
+        // Ordered remote targets: current writer first, then the other replicas. Deduped, and
+        // self is skipped (its copy was already consulted in (a)).
+        let mut targets: Vec<[u8; 32]> = Vec::new();
+        if let Some(w) = self.current_writer(sk).await {
+            if w != self.self_id {
+                targets.push(w);
+            }
         }
+        for id in reps {
+            if id != self.self_id && !targets.contains(&id) {
+                targets.push(id);
+            }
+        }
+        for t in targets {
+            let Some(addr) = self.addr_of(t).await else {
+                continue;
+            };
+            if let Ok(RegistryResp::Resolved(Some(cid))) = request_registry(
+                &self.transport,
+                &addr,
+                &RegistryReq::Resolve {
+                    rtype: sk.rtype,
+                    owner,
+                    name: name.to_string(),
+                },
+            )
+            .await
+            {
+                return Some(cid);
+            }
+        }
+        None
     }
 
     /// Serve `REGISTRY_ALPN` requests: as a shard's writer, advance the shard account on
