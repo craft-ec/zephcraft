@@ -43,11 +43,10 @@ const SHARD_COUNT: u64 = 256;
 /// [`shard_seed`], so `(rtype, shard)` addresses distinct state). Lets program heads, database
 /// roots, and manifests share one substrate without colliding.
 pub const RT_PROGRAM: u8 = 0;
-/// Reserved kinds — the substrate already routes them (type-in-seed); the DB-root and manifest
-/// registries that will use them are not wired yet, so tolerate the unused tags for now.
-#[allow(dead_code)]
+/// CraftSQL DB roots (`KIND_ROOT`) and durability manifests (`KIND_MANIFEST`) now ride this same
+/// substrate (type-in-seed): each `(rtype, shard)` is a distinct account, so program heads, DB
+/// roots, and manifests never collide. See `registry_heads.rs`.
 pub const RT_DBROOT: u8 = 1;
-#[allow(dead_code)]
 pub const RT_MANIFEST: u8 = 2;
 
 /// How many replicas hold each shard's state. The writer ROTATES among this stable set and
@@ -410,8 +409,14 @@ impl ProgramRegistry {
         });
     }
 
-    /// Local resolve against this node's own copy of `sk`'s registry account.
-    async fn resolve_local(&self, sk: ShardKey, owner: [u8; 32], name: &str) -> Option<[u8; 32]> {
+    /// Local resolve against this node's own copy of `sk`'s registry account. Returns the head
+    /// `(cid, version)` so a version-aware caller gets the seq.
+    async fn resolve_local(
+        &self,
+        sk: ShardKey,
+        owner: [u8; 32],
+        name: &str,
+    ) -> Option<([u8; 32], u64)> {
         // Merge the other replicas' state if we've just become the writer, before resolving.
         self.ensure_current(sk).await;
         let raw = self
@@ -420,7 +425,7 @@ impl ProgramRegistry {
             .await;
         RegistryState::decode(&raw)?
             .resolve(&owner, name)
-            .map(|e| e.cid)
+            .map(|e| (e.cid, e.version))
     }
 
     /// The canonical app-registry program cid — resolved via the governance program store
@@ -443,6 +448,7 @@ impl ProgramRegistry {
     /// state. Returns the new root.
     pub async fn register(
         &self,
+        rtype: u8,
         name: &str,
         cid: [u8; 32],
         version: u64,
@@ -451,7 +457,7 @@ impl ProgramRegistry {
         // The OWNER (this node's identity) signs the submission either way.
         let sub = HeadSubmission::sign(&self.identity, name, cid, version);
         let sk = ShardKey {
-            rtype: RT_PROGRAM,
+            rtype,
             shard: shard_of(&self.self_id, name),
         };
         if self.is_writer(sk).await {
@@ -464,7 +470,7 @@ impl ProgramRegistry {
             &self.transport,
             &addr,
             &RegistryReq::Submit {
-                rtype: RT_PROGRAM,
+                rtype,
                 sub: sub.encode(),
             },
         )
@@ -488,23 +494,40 @@ impl ProgramRegistry {
     /// candidates miss. Targets are deduped (the writer is one of the replicas) and self is
     /// skipped in the remote loop.
     pub async fn resolve(&self, owner: [u8; 32], name: &str) -> Option<[u8; 32]> {
+        self.resolve_entry(RT_PROGRAM, owner, name)
+            .await
+            .map(|(cid, _)| cid)
+    }
+
+    /// Resolve `(rtype, owner, name)` to its current head `(cid, version)`, surfacing the seq
+    /// (the DB-root `RootStore` needs it). Same fault-tolerant candidate order as [`Self::resolve`]:
+    ///   (a) THIS node's own copy, if it is in the shard's stable replica set;
+    ///   (b) the current-epoch writer (if remote);
+    ///   (c) each OTHER replica (remote).
+    /// Returns `None` only if all candidates miss.
+    pub async fn resolve_entry(
+        &self,
+        rtype: u8,
+        owner: [u8; 32],
+        name: &str,
+    ) -> Option<([u8; 32], u64)> {
         let sk = ShardKey {
-            rtype: RT_PROGRAM,
+            rtype,
             shard: shard_of(&owner, name),
         };
         let elig = self.eligible().await;
         let reps = Self::replicas(sk, &elig);
         // (a) Local read if this node holds the shard's state as a replica.
         if reps.contains(&self.self_id) {
-            if let Some(cid) = RegistryState::decode(
+            if let Some(entry) = RegistryState::decode(
                 &self
                     .store
                     .resolve(registry_program_cid(), &shard_seed(sk))
                     .await,
             )
-            .and_then(|s| s.resolve(&owner, name).map(|e| e.cid))
+            .and_then(|s| s.resolve(&owner, name).map(|e| (e.cid, e.version)))
             {
-                return Some(cid);
+                return Some(entry);
             }
         }
         // Ordered remote targets: current writer first, then the other replicas. Deduped, and
@@ -524,7 +547,7 @@ impl ProgramRegistry {
             let Some(addr) = self.addr_of(t).await else {
                 continue;
             };
-            if let Ok(RegistryResp::Resolved(Some(cid))) = request_registry(
+            if let Ok(RegistryResp::Resolved(Some(entry))) = request_registry(
                 &self.transport,
                 &addr,
                 &RegistryReq::Resolve {
@@ -535,7 +558,7 @@ impl ProgramRegistry {
             )
             .await
             {
-                return Some(cid);
+                return Some(entry);
             }
         }
         None
@@ -633,9 +656,9 @@ impl ProgramRegistry {
     /// The current version of `(owner, name)` (0 if unregistered), so a deploy advances to
     /// `prev + 1` from the registry itself — no DHT lookup. Routes the key to its shard: the
     /// shard's writer reads it locally, a non-writer queries the writer over `REGISTRY_ALPN`.
-    pub async fn current_version(&self, owner: [u8; 32], name: &str) -> u64 {
+    pub async fn current_version(&self, rtype: u8, owner: [u8; 32], name: &str) -> u64 {
         let sk = ShardKey {
-            rtype: RT_PROGRAM,
+            rtype,
             shard: shard_of(&owner, name),
         };
         if self.is_writer(sk).await {
@@ -654,7 +677,7 @@ impl ProgramRegistry {
             &self.transport,
             &addr,
             &RegistryReq::CurrentVersion {
-                rtype: RT_PROGRAM,
+                rtype,
                 owner,
                 name: name.to_string(),
             },

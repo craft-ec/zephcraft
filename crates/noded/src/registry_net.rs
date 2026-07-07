@@ -53,8 +53,9 @@ pub enum RegistryReq {
 pub enum RegistryResp {
     /// A `Submit` was applied; the new registry-account root.
     SubmitAck([u8; 32]),
-    /// A `Resolve` result (`None` = not registered).
-    Resolved(Option<[u8; 32]>),
+    /// A `Resolve` result: the current head `(cid, version)` (`None` = not registered). The
+    /// version is surfaced so a version-aware caller (e.g. a `RootStore`) gets the head seq.
+    Resolved(Option<([u8; 32], u64)>),
     /// The full registry-account state bytes (empty = no state yet) — reply to `GetState`,
     /// used for the takeover merge.
     State(Vec<u8>),

@@ -9,6 +9,7 @@ mod control;
 mod governance;
 mod peers;
 mod programreg;
+mod registry_heads;
 mod registry_net;
 
 use std::path::{Path, PathBuf};
@@ -1079,16 +1080,42 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         &identity.secret_key_bytes(),
     ));
 
+    // Generic program accounts — any program's single-writer state (the program IS the writer).
+    // Built FIRST so the program registry (and CraftSQL's registry-backed head stores) can share
+    // this same store Arc.
+    let account_store = std::sync::Arc::new(account::ProgramAccountStore::open(
+        engine.clone(),
+        data_dir,
+        transport.clock(),
+    ));
+    // Phase 4c: the durable program-name registry — a THIN consumer of the account store.
+    // The writer for each epoch is ELECTED deterministically from the membership view + HLC
+    // clock (a rotating writer); non-writers forward to the current epoch's writer. Built BEFORE
+    // CraftSQL so its DB roots/manifests can ride this same registry substrate.
+    let programreg_store = std::sync::Arc::new(programreg::ProgramRegistry::open(
+        identity.clone(),
+        account_store.clone(),
+        transport.clock(),
+        transport.clone(),
+    ));
+
     // CraftSQL: SQLite over content-addressed pages; single-writer head via
-    // KIND_ROOT, cross-node page fetch over the transport.
+    // KIND_ROOT, cross-node page fetch over the transport. Heads (DB roots) and durability
+    // manifests are published/resolved through the owner-signed registry (RT_DBROOT/RT_MANIFEST),
+    // not the DHT — persisted + replicated by the program-account store.
     let sql_dir = data_dir.join("sqlpages");
-    let routing_dyn: Arc<dyn zeph_routing::ContentRouting> = routing.clone();
-    let sql_heads = Arc::new(zeph_sql::RoutingRootStore::new(routing_dyn.clone()));
+    let sql_heads = Arc::new(registry_heads::RegistryRootStore::new(
+        programreg_store.clone(),
+        transport.clock(),
+    ));
     let sql_source = Arc::new(zeph_sql::TransportPageSource::new(
         transport.clone(),
         mem_peers.clone(),
     ));
-    let sql_manifests = Arc::new(zeph_sql::RoutingManifestStore::new(routing.clone()));
+    let sql_manifests = Arc::new(registry_heads::RegistryManifestStore::new(
+        programreg_store.clone(),
+        transport.clock(),
+    ));
     let craftsql = Arc::new(
         zeph_sql::CraftSql::register(&sql_dir, sql_heads, transport.node_id())?
             .with_source(sql_source)
@@ -1165,23 +1192,6 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         });
     }
 
-    // Control state, shared by the heartbeat loop and the control servers.
-    // Generic program accounts — any program's single-writer state (the program IS the writer).
-    // Built FIRST so the program registry can share this same store Arc.
-    let account_store = std::sync::Arc::new(account::ProgramAccountStore::open(
-        engine.clone(),
-        data_dir,
-        transport.clock(),
-    ));
-    // Phase 4c: the durable program-name registry — a THIN consumer of the account store.
-    // The writer for each epoch is ELECTED deterministically from the membership view + HLC
-    // clock (a rotating writer); non-writers forward to the current epoch's writer.
-    let programreg_store = std::sync::Arc::new(programreg::ProgramRegistry::open(
-        identity.clone(),
-        account_store.clone(),
-        transport.clock(),
-        transport.clone(),
-    ));
     // Governance: one durable, self-verifying chain that derives BOTH the governor set
     // and the program registry, published + resolved cross-node (seeded 1-of-1 with this
     // node's key by default).
@@ -1348,7 +1358,6 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // discoverable across restart and churn. Interval well inside the provider
     // TTL and short enough to recover quickly.
     let announce_engine = engine.clone();
-    let announce_sql = craftsql.clone();
     let announce_jobs = jobs.clone();
     let reannounce_secs = cfg.reannounce_secs.max(1);
     tokio::spawn(async move {
@@ -1356,7 +1365,6 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         loop {
             interval.tick().await;
             let e = announce_engine.clone();
-            let sql = announce_sql.clone();
             // Distribution priority: getting records to peers matters, but yields
             // to Repair. Deduped so a slow re-announce can't stack.
             announce_jobs.submit(
@@ -1365,19 +1373,15 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                 1,
                 move || {
                     let e = e.clone();
-                    let sql = sql.clone();
                     async move {
                         let n = e.reannounce_providers().await;
                         if n > 0 {
                             tracing::info!(cids = n, "re-announced provider records");
                         }
-                        // Re-publish owned DB heads + manifests (lost on tracker
-                        // restart otherwise). First tick fires immediately, so this
-                        // also restores heads right after our own restart.
-                        let h = sql.reannounce_heads().await;
-                        if h > 0 {
-                            tracing::info!(dbs = h, "re-announced CraftSQL heads/manifests");
-                        }
+                        // NOTE: CraftSQL DB heads + durability manifests are NO LONGER re-announced
+                        // here — they ride the owner-signed registry substrate now (RT_DBROOT /
+                        // RT_MANIFEST), which persists + replicates them, so a DHT re-announce is
+                        // redundant. `CraftSql::reannounce_heads` is retained (phase 2) but unused.
                         Ok(())
                     }
                 },

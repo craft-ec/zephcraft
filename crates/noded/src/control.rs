@@ -1311,7 +1311,13 @@ async fn deploy_bytes(
         });
     }
     let version = match parse_node_id(&state.node_id) {
-        Some(own) => state.programreg.current_version(own.0, name).await + 1,
+        Some(own) => {
+            state
+                .programreg
+                .current_version(crate::programreg::RT_PROGRAM, own.0, name)
+                .await
+                + 1
+        }
         None => 1,
     };
     // Register into the program registry — the registry program validates the submission
@@ -1319,7 +1325,13 @@ async fn deploy_bytes(
     // persists + publishes it durably; no DHT announce.
     state
         .programreg
-        .register(name, cid.0, version, state.clock.now().millis())
+        .register(
+            crate::programreg::RT_PROGRAM,
+            name,
+            cid.0,
+            version,
+            state.clock.now().millis(),
+        )
         .await
         .map_err(|e| e.to_string())?;
     // The app index (the UI's "apps" table) is local bookkeeping — a CraftSQL write whose
