@@ -1,11 +1,25 @@
 # SQL-backed Registry — Design (2026-07-08)
 
-> **STATUS: DESIGN → building.** Replaces the per-shard `RegistryState` postcard blob with a
-> per-shard **CraftSQL database**, so registry writes/resolves/replication/durability scale as
-> O(1)/O(changed) instead of O(rows-in-shard). Motivated by the target topology (thousands of
-> nodes, ~80% NAT readers, ~20% reachable writer/replica backbone) where blob write-amplification
-> and whole-shard replication flood the scarce writer tier. See the session discussion in
-> `.claude/feature-progress.md`.
+> **STATUS: SHIPPED + PROVEN LIVE (2026-07-09).** Replaces the per-shard `RegistryState` postcard
+> blob with a per-shard **CraftSQL database**, so registry writes/resolves/replication/durability
+> scale as O(1)/O(changed) instead of O(rows-in-shard). Motivated by the target topology (thousands
+> of nodes, ~80% NAT readers, ~20% reachable writer/replica backbone) where blob write-amplification
+> and whole-shard replication flood the scarce writer tier. Deployed to the 5-node cluster; proven:
+> cross-node + offline-owner resolve, online reshard over SQL, erasure durability. Commits: `376daab`
+> (core) `2942cf3` (erasure) `f4db195`+`1a55f00` (O(held)) `402f26d` (readiness gate).
+>
+> **Amendments after the first cut (read these — they revise §3, §6 P4, §7):**
+> - **Erasure durability IS on** (§6 P4 originally deferred it). The first cut dropped `ObjDurable`
+>   to dodge a write failure; the real cause was the shard-DB **namespace containing slashes**
+>   (`reg/<rtype>/<bits>/<shard>`), which broke CraftSQL's `.gens` durability-sidecar filesystem
+>   path. Fix: **slash-free namespace `reg_<rtype>_<bits>_<shard>`** + re-add `ObjDurable`. Shard
+>   pages now get the default k=8/n=32 erasure durability, on top of K-replica row-push.
+> - **Enumeration is O(held), not O(2^bits).** A persistent held-shards index drives status/migrate/
+>   reshard/GC. Critically, **reads must NOT create a shard DB** (a read that opened-to-create
+>   published an empty root, which the held-index backfill then counted, snowballing `held` toward
+>   all shards) — reads go through `shard_db_existing` (open only if a root exists).
+> - **Readiness gate:** register/resolve wait for the node's census to settle before routing, so a
+>   freshly-restarted node never routes against an unconverged writer election.
 
 ## 1. Granularity — one CraftDb per `(rtype, bits, shard)`
 
@@ -16,7 +30,8 @@ holds a **bounded** number of substantial DBs (e.g. 4096 shards ×3 / hundreds o
 so the per-DB overhead amortizes; it is only wasteful at tiny scale (few writers, near-empty
 shards), which is an accepted transitional cost.
 
-DB namespace (per node, `CraftSql.owner = self`): `reg/<rtype>/<bits>/<shard>` (a stable string).
+DB namespace (per node, `CraftSql.owner = self`): `reg_<rtype>_<bits>_<shard>` (a stable string;
+SLASH-FREE — a slash would break CraftSQL's `.gens` durability sidecar path, see the header banner).
 The engine's single writer identity is this node; the namespace distinguishes shards.
 
 ## 2. Breaking the recursion — blob-backed RootStore
