@@ -160,18 +160,19 @@ impl GovernanceChainStore {
             .collect()
     }
 
-    /// Publish our chain as durable content + announce our head (version = seq, so the
-    /// longest chain wins the announce CAS).
+    /// Publish our chain as durable content + announce our head. The announce version MUST
+    /// strictly increase with the chain seq, because the DHT record store keeps the
+    /// highest-seq-per-publisher and REJECTS an equal seq (record.rs: `existing.seq >= rec.seq`).
+    /// Use `seq + 1` (never 0, and monotonic): a bare `seq` would announce genesis at 0, while the
+    /// old `seq.max(1)` floored BOTH seq 0 and seq 1 to version 1 — so the very first governance
+    /// change (0→1) could never supersede the genesis record in the DHT and never propagated.
     async fn publish(&self) {
         let (bytes, seq) = {
             let c = self.chain.read().await;
             (c.encode(), c.seq())
         };
         if let Ok(cid) = self.obj.publish_system(&bytes).await {
-            let _ = self
-                .routing
-                .announce_app(GOV_HEAD_NAME, cid, seq.max(1))
-                .await;
+            let _ = self.routing.announce_app(GOV_HEAD_NAME, cid, seq + 1).await;
         }
     }
 
