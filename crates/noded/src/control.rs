@@ -1859,7 +1859,7 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
     }
 
     // Head-registry status: the open, owner-signed, sharded registry's live view from THIS
-    // node — current writer-election epoch, eligible node count, how many of the 256 shards
+    // node — current writer-election epoch, eligible node count, how many of the live shards
     // this node currently writes, and the per-type head counts (program heads, DB roots,
     // manifests) across the shards it writes.
     async fn api_registry(
@@ -1874,7 +1874,7 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
             "epoch": st.epoch,
             "eligible": st.eligible,
             "writer_shards": st.writer_shards,
-            "shard_count": 256,
+            "shard_count": st.shard_count,
             "program_heads": st.program_heads,
             "dbroots": st.dbroots,
             "manifests": st.manifests,

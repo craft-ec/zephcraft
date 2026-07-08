@@ -11,7 +11,7 @@
 //! LOCALLY to validate an owner-signed submission, then merges. See
 //! `docs/VERIFICATION_DESIGN.md` §2 and `docs/REGISTRY_DESIGN.md` §2.1.
 //!
-//! Sharding: the keyspace is split into [`SHARD_COUNT`] shards. Every `(owner, name)` key
+//! Sharding: the keyspace is split into `2^shard_bits` shards (a runtime count). Every `(owner, name)` key
 //! routes to exactly ONE shard via [`shard_of`]; each shard is its own account (seeded by
 //! [`shard_seed`]) with its own independent rotating-writer election. So at one moment
 //! different shards may be written by different nodes, and the write load spreads across the
@@ -36,9 +36,10 @@ const MAX_FRAME: usize = 256 * 1024;
 /// tunable. `epoch = clock.now().millis() / EPOCH_MILLIS`.
 const EPOCH_MILLIS: u64 = 30_000;
 
-/// Number of registry shards. Each `(owner, name)` key routes to one shard (see [`shard_of`]);
-/// each shard is an independent account with its own rotating-writer election.
-const SHARD_COUNT: u64 = 256;
+/// Default shard-count exponent: the keyspace starts as `2^DEFAULT_SHARD_BITS` shards. The live
+/// count is a runtime value ([`HeadRegistry::shard_bits`]) so it can grow/shrink by split/merge.
+/// `DEFAULT_SHARD_BITS = 8` → 256 shards, matching the prior fixed count exactly.
+const DEFAULT_SHARD_BITS: u32 = 8;
 
 /// Consecutive migration-loop ticks the census must be UNCHANGED before state migration runs.
 /// The loop ticks every 10s, so this debounces migration to ~30s of stable membership — during
@@ -80,11 +81,15 @@ struct ShardKey {
 /// so a bounded clock skew (< grace) can't produce two live writers at a boundary.
 const GRACE_MILLIS: u64 = 2_000;
 
-/// Route a `(owner, name)` key to its shard. Register and resolve of the same key MUST agree,
-/// so this ONE function is used everywhere a shard is derived.
-fn shard_of(owner: &[u8; 32], name: &str) -> u64 {
+/// Route a `(owner, name)` key to its shard = the low `bits` of the key hash (so `bits = 8`
+/// reproduces the prior `% 256`). Low-bit routing makes split/merge LOCAL: doubling the count
+/// (`bits → bits+1`) sends shard `s`'s keys to children `s` and `s | (1 << bits)` by one new bit,
+/// so only that shard's keys move and only to its two children. Register and resolve of the same
+/// key MUST use the same `bits`, so this ONE function is the only router.
+fn shard_of(owner: &[u8; 32], name: &str, bits: u32) -> u64 {
     let h = Cid::of(&[owner.as_slice(), name.as_bytes()].concat()).0;
-    u64::from_le_bytes(h[..8].try_into().unwrap()) % SHARD_COUNT
+    let mask = (1u64 << bits) - 1;
+    u64::from_le_bytes(h[..8].try_into().unwrap()) & mask
 }
 
 /// The per-account seed — replaces the bare `REGISTRY_SEED` in every account op so each
@@ -190,6 +195,9 @@ pub struct HeadRegistry {
     /// network round-trip per resolve. TTL'd ([`RESOLVE_CACHE_TTL_MS`]) for other-node writes;
     /// [`Self::register`] invalidates the key so this node's own writes are read-your-writes.
     resolve_cache: ResolveCache,
+    /// Live shard-count exponent: the keyspace is `2^shard_bits` shards. Runtime (not const) so
+    /// the count can change by split/merge; starts at [`DEFAULT_SHARD_BITS`].
+    shard_bits: u32,
 }
 
 /// One head row for the dashboard — hex-encoded `(owner, cid)` + `name` + `version`.
@@ -214,12 +222,14 @@ pub struct RegistryEntries {
 }
 
 /// Registry status for the dashboard. `writer_shards` = how many RT_PROGRAM shards this node
-/// currently writes (of [`SHARD_COUNT`]); the per-type counts are the `(owner, name)` rows
+/// currently writes (of the live `2^shard_bits`); the per-type counts are the `(owner, name)` rows
 /// across exactly the shards this node writes for each type — a per-node partial view.
 pub struct RegistryStatus {
     pub epoch: u64,
     pub eligible: usize,
     pub writer_shards: usize,
+    /// The live shard count (`2^shard_bits`) — dynamic, so reported rather than assumed 256.
+    pub shard_count: u64,
     pub program_heads: usize,
     pub dbroots: usize,
     pub manifests: usize,
@@ -246,7 +256,13 @@ impl HeadRegistry {
             last_epoch: RwLock::new(std::collections::HashMap::new()),
             last_census: RwLock::new(None),
             resolve_cache: ResolveCache::default(),
+            shard_bits: DEFAULT_SHARD_BITS,
         }
+    }
+
+    /// The live shard count = `2^shard_bits`.
+    fn shard_count(&self) -> u64 {
+        1u64 << self.shard_bits
     }
 
     /// State-migration anti-entropy: when the census changes, the stable replica set of each
@@ -285,7 +301,7 @@ impl HeadRegistry {
         }
         // Census has SETTLED: re-replicate every shard we hold local state for to its new replica set.
         for &rtype in &[RT_PROGRAM, RT_DBROOT, RT_MANIFEST] {
-            for shard in 0..SHARD_COUNT {
+            for shard in 0..self.shard_count() {
                 let sk = ShardKey { rtype, shard };
                 let state = self
                     .store
@@ -616,7 +632,7 @@ impl HeadRegistry {
         let sub = HeadSubmission::sign(&self.identity, name, cid, version);
         let sk = ShardKey {
             rtype,
-            shard: shard_of(&self.self_id, name),
+            shard: shard_of(&self.self_id, name, self.shard_bits),
         };
         let root = if self.is_writer(sk).await {
             self.advance_local(sk, &sub.encode()).await?
@@ -680,7 +696,7 @@ impl HeadRegistry {
     ) -> Option<([u8; 32], u64)> {
         let sk = ShardKey {
             rtype,
-            shard: shard_of(&owner, name),
+            shard: shard_of(&owner, name, self.shard_bits),
         };
         let elig = self.eligible().await;
         let reps = Self::replicas(sk, &elig);
@@ -779,7 +795,7 @@ impl HeadRegistry {
                                 Some(s) => {
                                     let sk = ShardKey {
                                         rtype,
-                                        shard: shard_of(&s.owner, &s.name),
+                                        shard: shard_of(&s.owner, &s.name, this.shard_bits),
                                     };
                                     match this.advance_local(sk, &sub).await {
                                         Ok(root) => RegistryResp::SubmitAck(root),
@@ -792,7 +808,7 @@ impl HeadRegistry {
                         Ok(RegistryReq::Resolve { rtype, owner, name }) => {
                             let sk = ShardKey {
                                 rtype,
-                                shard: shard_of(&owner, &name),
+                                shard: shard_of(&owner, &name, this.shard_bits),
                             };
                             RegistryResp::Resolved(this.resolve_local(sk, owner, &name).await)
                         }
@@ -809,7 +825,7 @@ impl HeadRegistry {
                         Ok(RegistryReq::CurrentVersion { rtype, owner, name }) => {
                             let sk = ShardKey {
                                 rtype,
-                                shard: shard_of(&owner, &name),
+                                shard: shard_of(&owner, &name, this.shard_bits),
                             };
                             let raw = this
                                 .store
@@ -860,7 +876,7 @@ impl HeadRegistry {
     pub async fn current_version(&self, rtype: u8, owner: [u8; 32], name: &str) -> u64 {
         let sk = ShardKey {
             rtype,
-            shard: shard_of(&owner, name),
+            shard: shard_of(&owner, name, self.shard_bits),
         };
         if self.is_writer(sk).await {
             let raw = self
@@ -896,7 +912,7 @@ impl HeadRegistry {
     #[allow(dead_code)]
     pub async fn rows(&self) -> Vec<(String, String, String, u64)> {
         let mut out = Vec::new();
-        for shard in 0..SHARD_COUNT {
+        for shard in 0..self.shard_count() {
             let sk = ShardKey {
                 rtype: RT_PROGRAM,
                 shard,
@@ -926,7 +942,7 @@ impl HeadRegistry {
     pub async fn summary(&self) -> (usize, String) {
         let mut count = 0;
         let mut combined: Vec<u8> = Vec::new();
-        for shard in 0..SHARD_COUNT {
+        for shard in 0..self.shard_count() {
             let sk = ShardKey {
                 rtype: RT_PROGRAM,
                 shard,
@@ -955,7 +971,7 @@ impl HeadRegistry {
         let mut writer_shards = 0usize;
         let (mut program_heads, mut dbroots, mut manifests) = (0usize, 0usize, 0usize);
         for &rtype in &[RT_PROGRAM, RT_DBROOT, RT_MANIFEST] {
-            for shard in 0..SHARD_COUNT {
+            for shard in 0..self.shard_count() {
                 let sk = ShardKey { rtype, shard };
                 if !self.is_writer(sk).await {
                     continue;
@@ -979,6 +995,7 @@ impl HeadRegistry {
             epoch,
             eligible,
             writer_shards,
+            shard_count: self.shard_count(),
             program_heads,
             dbroots,
             manifests,
@@ -992,7 +1009,7 @@ impl HeadRegistry {
     async fn local_head_rows(&self) -> Vec<HeadRowWire> {
         let mut out = Vec::new();
         for &rtype in &[RT_PROGRAM, RT_DBROOT, RT_MANIFEST] {
-            for shard in 0..SHARD_COUNT {
+            for shard in 0..self.shard_count() {
                 let sk = ShardKey { rtype, shard };
                 if !self.is_writer(sk).await {
                     continue;
@@ -1127,6 +1144,32 @@ impl HeadRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shard_of_is_prefix_stable_under_growth() {
+        let owner = [7u8; 32];
+        // bits = 8 reproduces the prior `% 256` exactly (low 8 bits of the LE key hash).
+        let h = Cid::of(&[owner.as_slice(), b"myapp".as_slice()].concat()).0;
+        let full = u64::from_le_bytes(h[..8].try_into().unwrap());
+        assert_eq!(shard_of(&owner, "myapp", 8), full % 256);
+
+        // The split invariant: growing the count by one bit preserves the low-k prefix and only
+        // appends the next bit — a key's shard at k+1 is either s or s | (1<<k), where s is its
+        // shard at k. This is what makes split/merge a LOCAL migration (parent -> two children).
+        for k in 4..20u32 {
+            let s_k = shard_of(&owner, "myapp", k);
+            let s_k1 = shard_of(&owner, "myapp", k + 1);
+            assert_eq!(
+                s_k1 & ((1u64 << k) - 1),
+                s_k,
+                "the low-k prefix must be preserved across a split"
+            );
+            assert!(
+                s_k1 == s_k || s_k1 == s_k | (1u64 << k),
+                "a child shard is its parent or parent | (1<<k)"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn resolve_cache_serves_fresh_expires_isolates_and_invalidates() {
