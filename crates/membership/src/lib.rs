@@ -473,38 +473,25 @@ impl Membership {
 
     /// Keep the active view full: promote random passive candidates while
     /// there is room (standard HyParView maintenance).
+    /// Keep the active view full: promote random passive candidates while there is room. A FAILED
+    /// promotion DROPS the candidate (it stays popped) — this SELF-CLEANS the passive view of
+    /// unreachable/stale addresses so promotions keep finding reachable peers. An earlier
+    /// "self-heal" version capped attempts and re-queued failures; that polluted the passive with
+    /// dead addresses and left a flaky node unable to fill its active view at all (a regression).
+    /// The full-isolation case that motivated it is handled instead by `recover_isolated`'s seed
+    /// dial, so draining is safe.
     async fn fill_active(&self) {
-        let mut requeue = Vec::new();
-        let mut attempts = 0;
         loop {
             let candidate = {
                 let mut views = self.views.write().await;
-                if views.active.len() >= self.cfg.active_size
-                    || views.passive.is_empty()
-                    || attempts >= self.cfg.active_size
-                {
-                    break;
+                if views.active.len() >= self.cfg.active_size || views.passive.is_empty() {
+                    return;
                 }
                 views.passive.shuffle(&mut rand::thread_rng());
                 views.passive.pop()
             };
-            let Some(candidate) = candidate else { break };
-            attempts += 1;
-            if !self.try_promote(candidate.clone()).await {
-                // A transient promote failure must NOT erase peer knowledge (the old code
-                // popped the candidate and dropped it on failure): re-queue it so a later
-                // round retries once the peer is reachable again. Draining the passive view on
-                // a network blip was half of what left a flaky node permanently isolated.
-                requeue.push(candidate);
-            }
-        }
-        if !requeue.is_empty() {
-            let mut views = self.views.write().await;
-            for c in requeue {
-                if !views.passive.iter().any(|p| p.node_id() == c.node_id()) {
-                    views.passive.push(c);
-                }
-            }
+            let Some(candidate) = candidate else { return };
+            let _ = self.try_promote(candidate).await;
         }
     }
 
