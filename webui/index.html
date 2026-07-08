@@ -744,7 +744,7 @@ async function loadGovernance(){
           + '</tbody></table>'
         : '<div class="muted">none</div>';
       host.innerHTML=`${ptable}
-        <div class="note">The programs the network itself runs. <b>Governance</b> approves which WASM cid is canonical for each, so they upgrade with no binary release. The <b>head registry</b> (see <b>Registry</b>) is the protocol program that lists the user programs.</div>`;
+        <div class="note">Network-owned WASM programs whose canonical cid <b>Governance</b> sets, so they upgrade with no binary release (none listed = the network runs no governed WASM program yet). The <b>head registry</b> (see <b>Registry</b>) is <b>not</b> one of these — it validates writes <b>natively</b> (owner signature + name limit) as kernel mechanism, so it does not appear here. Governance still owns the governor set and protocol config (e.g. the shard count).</div>`;
     }catch(e){ host.textContent="error: "+e; }
   }
 }

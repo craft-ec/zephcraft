@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use zeph_core::{Cid, NodeId};
 use zeph_crypto::NodeIdentity;
 
-use crate::registry::{registry_program_cid, ConfigRegistryState, ProgramRegistryState};
+use crate::registry::{ConfigRegistryState, ProgramRegistryState};
 
 const GOV_DOMAIN: &[u8] = b"craftec/gov/1";
 
@@ -214,13 +214,16 @@ impl GovernanceChain {
         }
     }
 
-    /// The program registry derived from the chain: seed `app-registry` -> the native
-    /// program at v0, then replay every `SetProgram` approval (version = its seq). Every
-    /// node computes the identical result from the same chain.
+    /// The program registry derived from the chain: replay every `SetProgram` approval over an
+    /// EMPTY map (version = its seq). Every node computes the identical result from the same chain.
+    ///
+    /// No `app-registry` seed: the head registry validates writes NATIVELY (owner sig + name
+    /// limit) — it is NOT a governed-WASM protocol program (memory
+    /// `registry-native-validation-not-wasm-hook`), so seeding it here would misrepresent it as a
+    /// governed anchor in the dashboard. The registry starts empty until a real `SetProgram` lists
+    /// a network-owned WASM program.
     pub fn program_registry(&self) -> ProgramRegistryState {
-        let mut prg = ProgramRegistryState::default()
-            .set("app-registry", registry_program_cid(), 0)
-            .unwrap_or_default();
+        let mut prg = ProgramRegistryState::default();
         let mut seq = self.genesis.seq;
         for a in &self.approvals {
             seq += 1;
@@ -341,19 +344,17 @@ mod tests {
         let mut chain = GovernanceChain::new(genesis.clone());
         assert_eq!(chain.seq(), 0);
         assert_eq!(chain.current(), Some(genesis));
-        // genesis program registry: app-registry -> native, v0
-        let native = crate::registry_program_cid();
-        assert_eq!(
-            chain.program_registry().resolve("app-registry"),
-            Some(native)
-        );
+        // genesis program registry is EMPTY — no app-registry seed (the registry validates
+        // natively, it is not a governed-WASM program).
+        assert_eq!(chain.program_registry().resolve("app-registry"), None);
+        assert!(chain.program_registry().entries().is_empty());
 
         // append a SetProgram approval -> derived program registry updates
         let a = approve(
             &g,
             1,
             GovAction::SetProgram {
-                name: "app-registry".into(),
+                name: "some-program".into(),
                 cid: [7u8; 32],
             },
             1,
@@ -362,7 +363,7 @@ mod tests {
         assert_eq!(chain.seq(), 1);
         assert!(chain.current().is_some());
         assert_eq!(
-            chain.program_registry().resolve("app-registry"),
+            chain.program_registry().resolve("some-program"),
             Some([7u8; 32]),
             "SetProgram is reflected in the derived registry"
         );
@@ -405,11 +406,8 @@ mod tests {
         );
         assert!(chain.append(a2));
         assert_eq!(chain.config_registry().resolve("shard_bits"), Some(10));
-        // SetConfig does not disturb the program registry
-        assert_eq!(
-            chain.program_registry().resolve("app-registry"),
-            Some(crate::registry_program_cid())
-        );
+        // SetConfig does not disturb the (empty) program registry
+        assert!(chain.program_registry().entries().is_empty());
     }
 
     #[test]
