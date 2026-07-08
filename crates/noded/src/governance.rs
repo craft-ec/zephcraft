@@ -193,23 +193,45 @@ impl GovernanceChainStore {
         GovernanceChain::decode(&bytes)
     }
 
-    /// One anti-entropy tick: publish ours, then pull each live peer's chain and adopt the
+    /// One anti-entropy tick: publish ours, then pull each peer's chain and adopt the
     /// **longest valid** one that shares our genesis. No gossip — durable content, pulled.
+    ///
+    /// Pull targets = the CONVERGED census ∪ the current governor set (minus self):
+    /// - **census, not the HyParView active view.** The active view is bounded (~5) and diverges
+    ///   per node, so a governor may be absent from a given node's active view — then that node
+    ///   never pulls the governor's chain and a change never propagates. The census is the
+    ///   converged, union-merged member set (the same set registry election was moved onto), so
+    ///   every node reaches every member. This is the ROOT-CAUSE hardening behind the earlier
+    ///   symptom fix (the announce-version floor): even with a correct version, active-view-only
+    ///   pulling could strand propagation on a sparse/WAN topology.
+    /// - **plus the governors explicitly.** Governors are the SOURCE of every change; a
+    ///   flaky/relay-only governor can sit right at the census-TTL edge and drop out of the census
+    ///   transiently, so we always include the governor ids as pull targets. `fetch` resolves a
+    ///   peer's head via the DHT, so a governor need not be a direct active peer to be pulled from.
+    ///
+    /// Cost is O(targets) `fetch`es per tick — fine at 10s–100s of nodes (governance is tiny and
+    /// changes rarely); a digest/sampled pull is the scale follow-up (mirrors the membership note).
     pub async fn tick(&self) {
         self.publish().await;
-        let peers: Vec<[u8; 32]> = match self.membership.read().await.as_ref() {
-            Some(m) => m
-                .snapshot()
-                .await
-                .active
-                .iter()
-                .filter(|(_, ps)| ps.alive)
-                .map(|(n, _)| n.0)
-                .collect(),
-            None => return,
-        };
+        let mut targets: Vec<[u8; 32]> = Vec::new();
+        {
+            let guard = self.membership.read().await;
+            let Some(m) = guard.as_ref() else {
+                return;
+            };
+            for (n, _addr) in m.census().await {
+                if n.0 != self.self_id && !targets.contains(&n.0) {
+                    targets.push(n.0);
+                }
+            }
+        }
+        for g in self.current().await.governors {
+            if g != self.self_id && !targets.contains(&g) {
+                targets.push(g);
+            }
+        }
         let genesis = self.chain.read().await.genesis.clone();
-        for p in peers {
+        for p in targets {
             let Some(fetched) = self.fetch(p).await else {
                 continue;
             };
