@@ -961,11 +961,22 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     };
 
     // Fail fast on malformed peer addresses.
-    let peers: Vec<PeerAddr> = cfg
+    let mut peers: Vec<PeerAddr> = cfg
         .peers
         .iter()
         .map(|s| s.parse().map_err(anyhow::Error::from))
         .collect::<anyhow::Result<_>>()?;
+    // Seed membership from dht_seeds too. With only dht_seeds configured, the membership bootstrap
+    // would be EMPTY, so a fully-isolated node could never re-bootstrap (its recover_isolated has
+    // no seed to dial) — this is what left the relay Mac STUCK at eligible=1 after losing its
+    // overlay, unable to reconnect even once its peers returned.
+    for entry in &cfg.dht_seeds {
+        if let Ok(addr) = entry.parse::<PeerAddr>() {
+            if !peers.iter().any(|p| p.node_id() == addr.node_id()) {
+                peers.push(addr);
+            }
+        }
+    }
 
     let relay_urls = cfg
         .relay_urls
