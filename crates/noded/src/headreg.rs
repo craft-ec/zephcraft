@@ -11,16 +11,23 @@
 //! LOCALLY to validate an owner-signed submission, then merges. See
 //! `docs/VERIFICATION_DESIGN.md` §2 and `docs/REGISTRY_DESIGN.md` §2.1.
 //!
-//! Sharding: the keyspace is split into `2^shard_bits` shards (a runtime count). Every `(owner, name)` key
-//! routes to exactly ONE shard via [`shard_of`]; each shard is its own account (seeded by
-//! [`shard_seed`]) with its own independent rotating-writer election. So at one moment
-//! different shards may be written by different nodes, and the write load spreads across the
-//! membership.
+//! Sharding: the keyspace is split into `2^shard_bits` shards. `shard_bits` is a GOVERNED value
+//! (a `SetConfig` on the governance chain), so every node agrees on the count. Every `(owner,
+//! name)` key routes to exactly ONE shard via [`shard_of`] (the low `bits` of the key hash); each
+//! `(rtype, generation, shard)` is its own account (seeded by [`shard_seed`]) with its own
+//! independent rotating-writer election, so different shards may be written by different nodes and
+//! the write load spreads across the membership.
+//!
+//! Online resharding: because `shard_seed` encodes the shard-count GENERATION (`bits`), the count
+//! can change on a LIVE cluster with no wipe — [`HeadRegistry::reshard_round`] split/merges each
+//! held shard's heads from the old generation into the new one, and reads fall through to the
+//! adjacent generation during the migration window. Low-bit routing keeps a split LOCAL (a parent
+//! shard's keys go only to its two children).
 
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, RwLock};
-use zeph_com::{registry_program_cid, HeadSubmission, RegistryState, REGISTRY_SEED};
+use zeph_com::{registry_program_cid, HeadEntry, HeadSubmission, RegistryState, REGISTRY_SEED};
 use zeph_core::Cid;
 use zeph_crypto::NodeIdentity;
 use zeph_membership::Membership;
@@ -75,11 +82,16 @@ const REPLICATION_FACTOR: usize = 3;
 /// (read-your-writes). Replicas never use it — they read authoritative local state.
 const RESOLVE_CACHE_TTL_MS: u64 = 3_000;
 
-/// Identifies one registry account = one `(kind, shard)`. Threaded everywhere a shard used to
-/// be, so each kind gets its own independent per-shard account + writer set.
+/// Identifies one registry account = one `(kind, generation, shard)`. `bits` is the shard-count
+/// GENERATION the account belongs to, so `(rtype, 8, 5)` and `(rtype, 9, 5)` are DISTINCT
+/// accounts — the split/merge reshard reads the old generation and writes the new one without the
+/// two colliding. NOTE the writer election ([`HeadRegistry::replicas`]) deliberately ignores
+/// `bits` and keys only on `(rtype, shard)`, so a shard number maps to a STABLE replica set across
+/// generations (parent shard `s` and child-0 `s` share replicas → migration locality).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct ShardKey {
     rtype: u8,
+    bits: u32,
     shard: u64,
 }
 
@@ -104,13 +116,12 @@ fn shard_of(owner: &[u8; 32], name: &str, bits: u32) -> u64 {
 /// `[1, MAX_SHARD_BITS]` so a bad/hostile governance value can't drive the O(2^bits) shard loops
 /// out of bounds. Pure (no I/O) so the fallback + clamp is unit-testable in isolation.
 ///
-/// OPERATOR NOTE — changing the count is a WIPE-AND-RESTART operation, not an online reshard.
-/// `shard_seed` does NOT encode the count, and there is no split/merge migration, so a `SetConfig`
-/// that changes `shard_bits` on a RUNNING cluster silently strands existing heads (their state
-/// sits at the old shard numbers while reads route to the new ones). To change the count: stop the
-/// nodes, wipe the registry accounts (`accounts/`), set the new `shard_bits`, restart. Online
-/// resharding (generation-in-seed + live split/merge) is deferred until a network exists that
-/// can't be wiped — see `.claude/feature-progress.md` (dynamic-sharding B3/B4).
+/// OPERATOR NOTE — changing the count is an ONLINE reshard, no wipe needed. A governance
+/// `SetConfig{"shard_bits", n}` is picked up by every node ([`HeadRegistry::shard_bits`]); each
+/// node's [`HeadRegistry::reshard_round`] then split/merges its held shards from the old
+/// generation into the new one (`shard_seed` encodes the generation, so the two never collide),
+/// and [`HeadRegistry::resolve_entry`] reads through to the adjacent generation during the window.
+/// Change one bit at a time (±1) and let the cluster settle between steps.
 fn resolve_shard_bits(governed: Option<i64>) -> u32 {
     governed
         .map(|v| v.clamp(1, MAX_SHARD_BITS as i64) as u32)
@@ -118,16 +129,44 @@ fn resolve_shard_bits(governed: Option<i64>) -> u32 {
 }
 
 /// The per-account seed — replaces the bare `REGISTRY_SEED` in every account op so each
-/// `(rtype, shard)` gets a distinct `pda(registry_program_cid(), shard_seed(sk))`. The KIND
-/// tag is folded in FIRST, so a program head and a database root at the same shard live in
-/// separate accounts (type-in-seed).
+/// `(rtype, generation, shard)` gets a distinct `pda(registry_program_cid(), shard_seed(sk))`.
+/// The KIND tag is folded in FIRST (a program head and a DB root at the same shard live in
+/// separate accounts — type-in-seed), then the shard-count GENERATION `bits`, so the same shard
+/// number at two counts addresses two accounts — which is what lets an online reshard read the
+/// old generation and write the new one without clobbering it.
 fn shard_seed(sk: ShardKey) -> Vec<u8> {
     [
         REGISTRY_SEED,
         &[sk.rtype],
+        sk.bits.to_le_bytes().as_slice(),
         sk.shard.to_le_bytes().as_slice(),
     ]
     .concat()
+}
+
+/// Seed of the per-node GENERATION MARKER account — records the shard-count `bits` this node
+/// last resharded to, so on the next tick it can detect a governed `shard_bits` change and run the
+/// split/merge exactly once. Deliberately NOT a [`shard_seed`] output (own prefix), so it never
+/// collides with a real `(rtype, bits, shard)` account. Persisted like any account (survives
+/// restart), so a node that was down during a reshard catches up when it returns.
+const GEN_MARKER_SEED: &[u8] = b"craftec/registry/shard-generation/1";
+
+/// Re-bucket a batch of heads to their shards at `new_bits` — the pure core of the online reshard.
+/// Every entry is routed by [`shard_of`] at the NEW count and grouped by its new shard, so the
+/// caller can write each group into that new-generation account. Handles grow (a parent's keys
+/// fan out to two children), shrink (two children funnel into a parent), and any multi-step jump
+/// uniformly, because it simply re-routes each key at the target count.
+fn rebucket_entries(
+    entries: &[HeadEntry],
+    new_bits: u32,
+) -> std::collections::HashMap<u64, Vec<HeadEntry>> {
+    let mut grouped: std::collections::HashMap<u64, Vec<HeadEntry>> =
+        std::collections::HashMap::new();
+    for e in entries {
+        let shard = shard_of(&e.owner, &e.name, new_bits);
+        grouped.entry(shard).or_default().push(e.clone());
+    }
+    grouped
 }
 
 /// Resolve-cache backing map: `(rtype, owner, name)` → `((cid, version), expiry_ms)`.
@@ -299,11 +338,6 @@ impl HeadRegistry {
         resolve_shard_bits(governed)
     }
 
-    /// The live shard count = `2^shard_bits`.
-    async fn shard_count(&self) -> u64 {
-        1u64 << self.shard_bits().await
-    }
-
     /// State-migration anti-entropy: when the census changes, the stable replica set of each
     /// shard shifts, so re-replicate every shard THIS node holds to its CURRENT replica set —
     /// newly-elected replicas receive the state, and a node that is no longer a replica hands its
@@ -338,10 +372,13 @@ impl HeadRegistry {
         if !should_migrate {
             return;
         }
-        // Census has SETTLED: re-replicate every shard we hold local state for to its new replica set.
+        // Census has SETTLED: re-replicate every shard we hold local state for to its new replica
+        // set. Operates at the CURRENT generation (`bits`) — the reshard loop handles generation
+        // change separately.
+        let bits = self.shard_bits().await;
         for &rtype in &[RT_PROGRAM, RT_DBROOT, RT_MANIFEST] {
-            for shard in 0..self.shard_count().await {
-                let sk = ShardKey { rtype, shard };
+            for shard in 0..(1u64 << bits) {
+                let sk = ShardKey { rtype, bits, shard };
                 let state = self
                     .store
                     .resolve(registry_program_cid(), &shard_seed(sk))
@@ -351,6 +388,108 @@ impl HeadRegistry {
                 }
             }
         }
+    }
+
+    /// This node's last-resharded generation (the `shard_bits` it last migrated to), or `None`
+    /// before it has ever recorded one.
+    async fn load_gen(&self) -> Option<u32> {
+        let raw = self
+            .store
+            .resolve(registry_program_cid(), GEN_MARKER_SEED)
+            .await;
+        (raw.len() == 4).then(|| u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+    }
+
+    /// Record `bits` as this node's current generation (persisted, so a restart resumes correctly).
+    async fn save_gen(&self, bits: u32) {
+        let _ = self
+            .store
+            .put_state(registry_program_cid(), GEN_MARKER_SEED, &bits.to_le_bytes())
+            .await;
+    }
+
+    /// ONLINE RESHARD — the split/merge that lets a live cluster change its shard count without a
+    /// wipe. Detects that the governed `shard_bits` differs from the generation this node last
+    /// migrated to, then re-buckets every head it holds at the OLD generation into the accounts of
+    /// the NEW generation and pushes them to the new owners. Gated on `last != current`, so the
+    /// common (stable) path is one governance read + one marker read — no traffic while the count
+    /// is unchanged, mirroring `migrate_round`'s event-driven discipline.
+    ///
+    /// Correctness / convergence:
+    /// - MERGE-FORWARD, never delete: the old-generation accounts are left intact, so during the
+    ///   propagation window a peer still on the old count keeps resolving (its reads carry the old
+    ///   `bits` and hit the old accounts), while readers on the new count hit the freshly-written
+    ///   new accounts. Both generations resolve until every node has migrated.
+    /// - IDEMPOTENT: re-bucketing is an LWW merge, and `save_gen` runs only after a full pass, so a
+    ///   crash mid-reshard just re-runs on restart (at-least-once). Every replica of an old shard
+    ///   runs this, so the new owners receive the state redundantly and converge.
+    /// - KNOWN WINDOW (accepted, documented): a WRITE that lands on the old generation AFTER this
+    ///   node has already migrated is not swept forward again — it is visible only to old-count
+    ///   readers until the writer itself moves to the new count. Bounded by governance-propagation
+    ///   time (seconds); acceptable pre-production. `resolve_entry`'s adjacent-generation fallback
+    ///   softens the read side during the window.
+    async fn reshard_round(&self) {
+        let current = self.shard_bits().await;
+        let last = match self.load_gen().await {
+            Some(b) => b,
+            // First run on this node: adopt the current generation without migrating (nothing to
+            // move — a fresh account set is already at `current`).
+            None => {
+                self.save_gen(current).await;
+                return;
+            }
+        };
+        if last == current {
+            return; // no reshard pending — the cheap, common path
+        }
+        let elig = self.eligible().await;
+        for &rtype in &[RT_PROGRAM, RT_DBROOT, RT_MANIFEST] {
+            // 1. Gather every head this node holds at the OLD generation. Election is
+            //    bits-independent, so the shards we replicate at `last` are the same set we would
+            //    now — `replicas(sk)` over the current eligible set.
+            let mut entries: Vec<HeadEntry> = Vec::new();
+            for shard in 0..(1u64 << last) {
+                let sk_old = ShardKey {
+                    rtype,
+                    bits: last,
+                    shard,
+                };
+                if !Self::replicas(sk_old, &elig).contains(&self.self_id) {
+                    continue;
+                }
+                let raw = self
+                    .store
+                    .resolve(registry_program_cid(), &shard_seed(sk_old))
+                    .await;
+                if let Some(s) = RegistryState::decode(&raw) {
+                    entries.extend(s.entries().iter().cloned());
+                }
+            }
+            if entries.is_empty() {
+                continue;
+            }
+            // 2. Re-bucket to the NEW count, then merge each group into its new-generation account
+            //    and push to that account's (new) replica set so the new owners hold it.
+            for (new_shard, group) in rebucket_entries(&entries, current) {
+                let sk_new = ShardKey {
+                    rtype,
+                    bits: current,
+                    shard: new_shard,
+                };
+                let seed = shard_seed(sk_new);
+                let mut local =
+                    RegistryState::decode(&self.store.resolve(registry_program_cid(), &seed).await)
+                        .unwrap_or_default();
+                local.merge_entries(group);
+                let bytes = local.encode();
+                let _ = self
+                    .store
+                    .put_state(registry_program_cid(), &seed, &bytes)
+                    .await;
+                self.replicate(sk_new, &bytes).await;
+            }
+        }
+        self.save_gen(current).await;
     }
 
     /// Wire the governance chain so the app-registry program cid is resolved THROUGH it
@@ -522,6 +661,7 @@ impl HeadRegistry {
                     &addr,
                     &RegistryReq::GetState {
                         rtype: sk.rtype,
+                        bits: sk.bits,
                         shard: sk.shard,
                     },
                 )
@@ -605,7 +745,7 @@ impl HeadRegistry {
         }
         let transport = self.transport.clone();
         let state = state.to_vec();
-        let (rtype, shard) = (sk.rtype, sk.shard);
+        let (rtype, bits, shard) = (sk.rtype, sk.bits, sk.shard);
         tokio::spawn(async move {
             for addr in targets {
                 let _ = request_registry(
@@ -613,6 +753,7 @@ impl HeadRegistry {
                     &addr,
                     &RegistryReq::PushState {
                         rtype,
+                        bits,
                         shard,
                         state: state.clone(),
                     },
@@ -674,6 +815,7 @@ impl HeadRegistry {
         let bits = self.shard_bits().await;
         let sk = ShardKey {
             rtype,
+            bits,
             shard: shard_of(&self.self_id, name, bits),
         };
         let root = if self.is_writer(sk).await {
@@ -737,18 +879,70 @@ impl HeadRegistry {
         owner: [u8; 32],
         name: &str,
     ) -> Option<([u8; 32], u64)> {
-        // Route with this node's live (governed) bits; remote replicas are stamped the same
-        // `bits` so they route the key to the same shard.
+        // Resolve at this node's live (governed) generation first.
         let bits = self.shard_bits().await;
         let sk = ShardKey {
             rtype,
+            bits,
+            shard: shard_of(&owner, name, bits),
+        };
+        // NON-replica fast path: a fresh cached resolve at the CURRENT generation skips the network
+        // round-trip. A replica of the current shard reads authoritative local state (inside
+        // `resolve_at_bits`) and never consults the cache.
+        let is_replica_now = Self::replicas(sk, &self.eligible().await).contains(&self.self_id);
+        if !is_replica_now {
+            if let Some(entry) = self
+                .resolve_cache
+                .get(rtype, &owner, name, self.clock.now().millis())
+                .await
+            {
+                return Some(entry);
+            }
+        }
+        if let Some(entry) = self.resolve_at_bits(rtype, bits, owner, name).await {
+            if !is_replica_now {
+                self.resolve_cache
+                    .put(rtype, owner, name, entry, self.clock.now().millis())
+                    .await;
+            }
+            return Some(entry);
+        }
+        // TRANSITION FALLBACK: during an in-flight ±1 online reshard the key may still live at an
+        // ADJACENT generation — on a grow, at `bits-1` until the split lands; on a shrink, at
+        // `bits+1` until the merge lands. Try each adjacent generation once so a resolve doesn't
+        // fail in the migration window. NOT cached — the adjacent generation is transient.
+        for alt in [bits.wrapping_sub(1), bits + 1] {
+            if !(1..=MAX_SHARD_BITS).contains(&alt) || alt == bits {
+                continue;
+            }
+            if let Some(entry) = self.resolve_at_bits(rtype, alt, owner, name).await {
+                return Some(entry);
+            }
+        }
+        None
+    }
+
+    /// Resolve `(rtype, owner, name)` against ONE specific shard-count generation (`bits`), trying
+    /// in order: this node's own copy if it replicates that generation's shard, then the shard's
+    /// current-epoch writer, then its other replicas (each remote call 8s-bounded). No cache — the
+    /// caller owns caching for the current generation. Returns the first hit, else `None`. This is
+    /// the per-generation core shared by the current-generation read and the transition fallback.
+    async fn resolve_at_bits(
+        &self,
+        rtype: u8,
+        bits: u32,
+        owner: [u8; 32],
+        name: &str,
+    ) -> Option<([u8; 32], u64)> {
+        let sk = ShardKey {
+            rtype,
+            bits,
             shard: shard_of(&owner, name, bits),
         };
         let elig = self.eligible().await;
         let reps = Self::replicas(sk, &elig);
-        let is_replica = reps.contains(&self.self_id);
         // (a) Local read if this node holds the shard's state as a replica.
-        if is_replica {
+        if reps.contains(&self.self_id) {
             if let Some(entry) = RegistryState::decode(
                 &self
                     .store
@@ -760,19 +954,8 @@ impl HeadRegistry {
                 return Some(entry);
             }
         }
-        // (a′) NON-replica: a fresh cached resolve avoids the network round-trip below. Replicas
-        // skip the cache — their authoritative local read above is the source of truth.
-        if !is_replica {
-            if let Some(entry) = self
-                .resolve_cache
-                .get(rtype, &owner, name, self.clock.now().millis())
-                .await
-            {
-                return Some(entry);
-            }
-        }
-        // Ordered remote targets: current writer first, then the other replicas. Deduped, and
-        // self is skipped (its copy was already consulted in (a)).
+        // (b/c) Ordered remote targets: current writer first, then the other replicas. Deduped,
+        // and self is skipped (its copy was already consulted in (a)).
         let mut targets: Vec<[u8; 32]> = Vec::new();
         if let Some(w) = self.current_writer(sk).await {
             if w != self.self_id {
@@ -792,7 +975,7 @@ impl HeadRegistry {
                 &self.transport,
                 &addr,
                 &RegistryReq::Resolve {
-                    rtype: sk.rtype,
+                    rtype,
                     bits,
                     owner,
                     name: name.to_string(),
@@ -800,11 +983,6 @@ impl HeadRegistry {
             )
             .await
             {
-                if !is_replica {
-                    self.resolve_cache
-                        .put(rtype, owner, name, entry, self.clock.now().millis())
-                        .await;
-                }
                 return Some(entry);
             }
         }
@@ -816,15 +994,18 @@ impl HeadRegistry {
     /// `CurrentVersion`. The shard is derived from the request's key so a key always lands on
     /// the SAME shard as the registering node computed.
     pub async fn serve(self: Arc<Self>, mut conns: mpsc::Receiver<Connection>) {
-        // State-migration anti-entropy loop — re-replicate held shards to their current replica
-        // set whenever the census changes (see `migrate_round`). Event-driven, so it adds no
-        // registry traffic while membership is stable.
+        // Anti-entropy loop — two event-driven jobs, each gated so it adds NO registry traffic
+        // while nothing has changed: `reshard_round` (governed shard-count change → split/merge to
+        // the new generation) then `migrate_round` (census change → re-replicate held shards to
+        // their new replica set). Reshard first, so a just-migrated new-generation account is then
+        // replicated to its set in the same tick.
         {
             let this = self.clone();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
                 loop {
                     tick.tick().await;
+                    this.reshard_round().await;
                     this.migrate_round().await;
                 }
             });
@@ -844,6 +1025,7 @@ impl HeadRegistry {
                                 Some(s) => {
                                     let sk = ShardKey {
                                         rtype,
+                                        bits,
                                         shard: shard_of(&s.owner, &s.name, bits),
                                     };
                                     match this.advance_local(sk, &sub).await {
@@ -863,16 +1045,17 @@ impl HeadRegistry {
                         }) => {
                             let sk = ShardKey {
                                 rtype,
+                                bits,
                                 shard: shard_of(&owner, &name, bits),
                             };
                             RegistryResp::Resolved(this.resolve_local(sk, owner, &name).await)
                         }
-                        // Serve the full current account state for the takeover merge.
-                        Ok(RegistryReq::GetState { rtype, shard }) => RegistryResp::State(
+                        // Serve the full account state (at the requested generation) for the merge.
+                        Ok(RegistryReq::GetState { rtype, bits, shard }) => RegistryResp::State(
                             this.store
                                 .resolve(
                                     registry_program_cid(),
-                                    &shard_seed(ShardKey { rtype, shard }),
+                                    &shard_seed(ShardKey { rtype, bits, shard }),
                                 )
                                 .await,
                         ),
@@ -886,6 +1069,7 @@ impl HeadRegistry {
                         }) => {
                             let sk = ShardKey {
                                 rtype,
+                                bits,
                                 shard: shard_of(&owner, &name, bits),
                             };
                             let raw = this
@@ -897,13 +1081,14 @@ impl HeadRegistry {
                                 .unwrap_or(0);
                             RegistryResp::Version(v)
                         }
-                        // A pushed replica state — MERGE (LWW) into our own copy, don't overwrite.
+                        // A pushed replica state (at its generation) — MERGE (LWW), don't overwrite.
                         Ok(RegistryReq::PushState {
                             rtype,
+                            bits,
                             shard,
                             state,
                         }) => {
-                            let seed = shard_seed(ShardKey { rtype, shard });
+                            let seed = shard_seed(ShardKey { rtype, bits, shard });
                             let mut local = RegistryState::decode(
                                 &this.store.resolve(registry_program_cid(), &seed).await,
                             )
@@ -938,6 +1123,7 @@ impl HeadRegistry {
         let bits = self.shard_bits().await;
         let sk = ShardKey {
             rtype,
+            bits,
             shard: shard_of(&owner, name, bits),
         };
         if self.is_writer(sk).await {
@@ -975,9 +1161,11 @@ impl HeadRegistry {
     #[allow(dead_code)]
     pub async fn rows(&self) -> Vec<(String, String, String, u64)> {
         let mut out = Vec::new();
-        for shard in 0..self.shard_count().await {
+        let bits = self.shard_bits().await;
+        for shard in 0..(1u64 << bits) {
             let sk = ShardKey {
                 rtype: RT_PROGRAM,
+                bits,
                 shard,
             };
             if !self.is_writer(sk).await {
@@ -1005,9 +1193,11 @@ impl HeadRegistry {
     pub async fn summary(&self) -> (usize, String) {
         let mut count = 0;
         let mut combined: Vec<u8> = Vec::new();
-        for shard in 0..self.shard_count().await {
+        let bits = self.shard_bits().await;
+        for shard in 0..(1u64 << bits) {
             let sk = ShardKey {
                 rtype: RT_PROGRAM,
+                bits,
                 shard,
             };
             if !self.is_writer(sk).await {
@@ -1033,9 +1223,10 @@ impl HeadRegistry {
         let eligible = self.eligible().await.len();
         let mut writer_shards = 0usize;
         let (mut program_heads, mut dbroots, mut manifests) = (0usize, 0usize, 0usize);
+        let bits = self.shard_bits().await;
         for &rtype in &[RT_PROGRAM, RT_DBROOT, RT_MANIFEST] {
-            for shard in 0..self.shard_count().await {
-                let sk = ShardKey { rtype, shard };
+            for shard in 0..(1u64 << bits) {
+                let sk = ShardKey { rtype, bits, shard };
                 if !self.is_writer(sk).await {
                     continue;
                 }
@@ -1058,7 +1249,7 @@ impl HeadRegistry {
             epoch,
             eligible,
             writer_shards,
-            shard_count: self.shard_count().await,
+            shard_count: 1u64 << bits,
             program_heads,
             dbroots,
             manifests,
@@ -1071,9 +1262,10 @@ impl HeadRegistry {
     /// and the global gather in [`Self::entries_global`].
     async fn local_head_rows(&self) -> Vec<HeadRowWire> {
         let mut out = Vec::new();
+        let bits = self.shard_bits().await;
         for &rtype in &[RT_PROGRAM, RT_DBROOT, RT_MANIFEST] {
-            for shard in 0..self.shard_count().await {
-                let sk = ShardKey { rtype, shard };
+            for shard in 0..(1u64 << bits) {
+                let sk = ShardKey { rtype, bits, shard };
                 if !self.is_writer(sk).await {
                     continue;
                 }
@@ -1232,6 +1424,79 @@ mod tests {
                 "a child shard is its parent or parent | (1<<k)"
             );
         }
+    }
+
+    #[test]
+    fn shard_seed_is_distinct_per_generation() {
+        // The whole online-reshard cutover rests on this: the SAME (rtype, shard) at two different
+        // generations (bits) must address two DIFFERENT accounts, so a reshard can read the old
+        // generation and write the new one without one clobbering the other.
+        let a = shard_seed(ShardKey {
+            rtype: RT_PROGRAM,
+            bits: 8,
+            shard: 5,
+        });
+        let b = shard_seed(ShardKey {
+            rtype: RT_PROGRAM,
+            bits: 9,
+            shard: 5,
+        });
+        assert_ne!(a, b, "same shard at bits 8 vs 9 must be distinct accounts");
+        // rtype and shard still discriminate within a generation
+        assert_ne!(
+            shard_seed(ShardKey {
+                rtype: RT_PROGRAM,
+                bits: 8,
+                shard: 5
+            }),
+            shard_seed(ShardKey {
+                rtype: RT_DBROOT,
+                bits: 8,
+                shard: 5
+            })
+        );
+        assert_ne!(
+            shard_seed(ShardKey {
+                rtype: RT_PROGRAM,
+                bits: 8,
+                shard: 5
+            }),
+            shard_seed(ShardKey {
+                rtype: RT_PROGRAM,
+                bits: 8,
+                shard: 6
+            })
+        );
+    }
+
+    #[test]
+    fn rebucket_routes_every_entry_and_splits_parent_into_two_children() {
+        let entries: Vec<HeadEntry> = (0..300)
+            .map(|i| HeadEntry {
+                owner: [1u8; 32],
+                name: format!("app{i}"),
+                cid: [0u8; 32],
+                version: 1,
+            })
+            .collect();
+        let grouped = rebucket_entries(&entries, 9);
+        // no entry lost: the groups partition the input
+        let total: usize = grouped.values().map(|v| v.len()).sum();
+        assert_eq!(total, entries.len(), "every entry re-bucketed exactly once");
+        for (shard, group) in &grouped {
+            for e in group {
+                // each entry lands under its shard at the NEW count...
+                assert_eq!(shard_of(&e.owner, &e.name, 9), *shard);
+                // ...and a bits-8 parent's keys only fan out to children `p` and `p | 256`
+                let parent = shard_of(&e.owner, &e.name, 8);
+                assert!(*shard == parent || *shard == parent | 256);
+            }
+        }
+        // a real split actually populates the new high shards (>= 256), not just relabels
+        assert!(
+            grouped.keys().any(|s| *s >= 256),
+            "split populates shards >= 256"
+        );
     }
 
     #[test]

@@ -183,6 +183,22 @@ impl RegistryState {
             }
         }
     }
+
+    /// Merge a batch of raw entries (same LWW-per-`(owner, name)` join as [`Self::merge`]) —
+    /// used by the registry's online reshard to move heads from an OLD shard-count generation's
+    /// accounts into a NEW generation's account. Idempotent, so re-running the reshard converges.
+    pub fn merge_entries(&mut self, entries: impl IntoIterator<Item = HeadEntry>) {
+        for e in entries {
+            match self.find(&e.owner, &e.name) {
+                Ok(i) => {
+                    if e.version > self.entries[i].version {
+                        self.entries[i] = e;
+                    }
+                }
+                Err(i) => self.entries.insert(i, e),
+            }
+        }
+    }
 }
 
 /// The well-known program CID of the app-name registry — a NATIVE network-owned

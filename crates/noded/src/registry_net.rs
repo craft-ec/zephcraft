@@ -35,10 +35,11 @@ pub enum RegistryReq {
         owner: [u8; 32],
         name: String,
     },
-    /// Ask a replica for the FULL current registry-account state bytes of `(rtype, shard)`.
-    /// Used for the takeover MERGE: a node becoming the new epoch's writer fetches the other
-    /// replicas' state and merges it before serving so registrations survive rotation.
-    GetState { rtype: u8, shard: u64 },
+    /// Ask a replica for the FULL current registry-account state bytes of `(rtype, bits, shard)`.
+    /// `bits` is the shard-count generation, so the request addresses the right generation's
+    /// account. Used for the takeover MERGE: a node becoming the new epoch's writer fetches the
+    /// other replicas' state and merges it before serving so registrations survive rotation.
+    GetState { rtype: u8, bits: u32, shard: u64 },
     /// Ask the writer for the current version of `(owner, name)` under `rtype` (0 if
     /// unregistered) — so a non-writer can compute `prev + 1` without holding the shard. `bits`
     /// is the querier's live shard-count exponent (routed with — see `Submit`).
@@ -48,10 +49,12 @@ pub enum RegistryReq {
         owner: [u8; 32],
         name: String,
     },
-    /// Push the writer's FULL `(rtype, shard)` state to a replica, which MERGES it (LWW) into
-    /// its own copy. Sent on every write so the K-replica set stays warm.
+    /// Push the writer's FULL `(rtype, bits, shard)` state to a replica, which MERGES it (LWW)
+    /// into its own copy. `bits` is the shard-count generation the state belongs to. Sent on
+    /// every write so the K-replica set stays warm.
     PushState {
         rtype: u8,
+        bits: u32,
         shard: u64,
         state: Vec<u8>,
     },
