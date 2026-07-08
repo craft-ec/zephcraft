@@ -192,9 +192,9 @@
   </section>
 
   <section id="tab-registry" class="tab" hidden>
-    <div class="muted" style="font-size:.76rem;line-height:1.55;margin-bottom:1rem">Everything the network runs is a <b style="color:var(--fg)">WASM program</b>. The <b style="color:var(--fg)">head registry</b> is the open, owner-signed map of heads — it holds <b style="color:var(--fg)">program heads, DB roots, and manifests</b> — sharded, with a rotating writer per shard and no committee. A small set of <b style="color:var(--fg)">protocol programs</b> the network owns and governs live under <b style="color:var(--fg)">Governance</b>; everything else is a <b style="color:var(--fg)">user program</b>, listed here by the head registry.</div>
+    <div class="muted" style="font-size:.76rem;line-height:1.55;margin-bottom:1rem">Everything the network runs is a <b style="color:var(--fg)">WASM program</b>. The <b style="color:var(--fg)">head registry</b> is the open, owner-signed map of heads — it holds <b style="color:var(--fg)">program heads, DB roots, and manifests</b> — sharded into a <b style="color:var(--fg)">governed, dynamically-resizable</b> number of shards, each a <b style="color:var(--fg)">per-shard CraftSQL table</b> with a rotating writer and no committee; a write is validated natively (owner signature + name limit) and upserts one row. A small set of <b style="color:var(--fg)">protocol programs</b> the network owns and governs live under <b style="color:var(--fg)">Governance</b>; everything else is a <b style="color:var(--fg)">user program</b>, listed here by the head registry.</div>
     <div class="card">
-      <div class="cardhead">head registry <span class="muted">— open, owner-signed · sharded, rotating writer per shard · no committee · holds program heads, DB roots &amp; manifests</span></div>
+      <div class="cardhead">head registry <span class="muted">— open, owner-signed · per-shard CraftSQL · governed shard count, rotating writer per shard · no committee · holds program heads, DB roots &amp; manifests</span></div>
       <div id="reg-status"><div class="muted">…</div></div>
     </div>
     <div class="card">
@@ -675,6 +675,7 @@ async function loadRegistry(){
       // so they are NOT shown here — this endpoint must stay cheap and not trigger a gather.
       rs.innerHTML=`
         <div class="kv"><span>epoch</span><b>${r.epoch||0}</b></div>
+        <div class="kv"><span>shards</span><b>${sc} <span class="muted">· governed · per-shard CraftSQL</span></b></div>
         <div class="kv"><span>writer for</span><b>${r.writer_shards||0} of ${sc} shards</b></div>
         <div class="kv"><span>eligible nodes</span><b>${r.eligible||0}</b></div>`;
     }catch(e){ rs.textContent="error: "+e; }
