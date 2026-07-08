@@ -32,7 +32,7 @@ use zeph_com::{registry_program_cid, HeadEntry, HeadSubmission, RegistryState};
 use zeph_core::Cid;
 use zeph_crypto::NodeIdentity;
 use zeph_membership::Membership;
-use zeph_sql::{CraftDb, CraftSql};
+use zeph_sql::{CraftDb, CraftSql, RootStore};
 use zeph_transport::{Connection, PeerAddr, Transport};
 
 use crate::account::ProgramAccountStore;
@@ -416,6 +416,43 @@ impl HeadRegistry {
                 .collect()
         })
         .await
+    }
+
+    /// ONE-TIME held-index backfill: if the marker account has never been persisted (a fresh node,
+    /// or the first boot after the held-index upgrade when existing shard DBs predate the index),
+    /// rebuild `held` by probing the shard-ROOT pointers for every shard at the current generation —
+    /// a Some root means that shard DB exists, so this node holds it. Uses `shard_roots.resolve`
+    /// (an account read), which does NOT create a DB, unlike `shard_db`. O(2^bits) once, then
+    /// persisted so it never repeats. Without this, existing heads would silently vanish from the
+    /// dashboard after the upgrade until re-written.
+    async fn backfill_held_if_needed(&self) {
+        let raw = self
+            .store
+            .resolve(registry_program_cid(), HELD_MARKER_SEED)
+            .await;
+        if !raw.is_empty() {
+            return; // a held index is already persisted
+        }
+        let bits = self.shard_bits().await;
+        let owner = zeph_core::NodeId(self.self_id);
+        let mut set = HashSet::new();
+        for &rtype in &[RT_PROGRAM, RT_DBROOT, RT_MANIFEST] {
+            for shard in 0..(1u64 << bits) {
+                let sk = ShardKey { rtype, bits, shard };
+                if self
+                    .shard_roots
+                    .resolve(owner, &Self::ns_of(sk))
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    set.insert(sk);
+                }
+            }
+        }
+        *self.held.write().await = Some(set);
+        self.save_held().await; // persist so the O(2^bits) scan never runs again
     }
 
     /// Persist the current held index to its marker account (`postcard(Vec<(rtype,bits,shard)>)`).
@@ -1213,6 +1250,14 @@ impl HeadRegistry {
     /// `CurrentVersion`. The shard is derived from the request's key so a key always lands on
     /// the SAME shard as the registering node computed.
     pub async fn serve(self: Arc<Self>, mut conns: mpsc::Receiver<Connection>) {
+        // One-time held-index backfill (fresh node or first boot after the held-index upgrade), so
+        // the O(held) enumeration loops see shard DBs written by a prior binary.
+        {
+            let this = self.clone();
+            tokio::spawn(async move {
+                this.backfill_held_if_needed().await;
+            });
+        }
         // Anti-entropy loop — two event-driven jobs, each gated so it adds NO registry traffic
         // while nothing has changed: `reshard_round` (governed shard-count change → split/merge to
         // the new generation) then `migrate_round` (census change → re-replicate held shards to
