@@ -20,7 +20,7 @@ Since the 07-07 audit, the registry control-plane — the doc's #1 scaling conce
 
 **Still open (accurate below):** K10 SWIM Suspect/Dead dissemination (the converged *census* is built; proper epidemic death-detection is not) · K2 `random` host fn (unbound) · the doc-reconciliation sweep itself (REGISTRY_DESIGN / foundation §62·Part F / GOVERNANCE §4·§6 still describe attestation/committee/postcard-blob/256-fixed-shard models) · the Tier-4 trust primitives (K3–K7) · encryption sharing (phase 5).
 
-**Design docs added:** `SQL_REGISTRY_DESIGN.md`.
+**Design docs added:** `SQL_REGISTRY_DESIGN.md` · **`ZEPHCRAFT.md` (2026-07-09) — THE consolidated design & state document**: the Tier-0 consolidation this roadmap called for, reconciling every design doc against code, adversarially verified. For any architecture question, read it first; this file remains the working phase ledger.
 
 ---
 
