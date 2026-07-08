@@ -1188,7 +1188,18 @@ fn parse_gov_action(p: &serde_json::Value) -> Result<zeph_com::GovAction, String
                 .to_string(),
             cid: hex32(p.get("cid"))?,
         }),
-        _ => Err("unknown action (add|remove|threshold|set_program)".into()),
+        Some("set_config") => Ok(GovAction::SetConfig {
+            key: p
+                .get("key")
+                .and_then(|v| v.as_str())
+                .ok_or("missing key")?
+                .to_string(),
+            value: p
+                .get("value")
+                .and_then(|v| v.as_i64())
+                .ok_or("missing value")?,
+        }),
+        _ => Err("unknown action (add|remove|threshold|set_program|set_config)".into()),
     }
 }
 

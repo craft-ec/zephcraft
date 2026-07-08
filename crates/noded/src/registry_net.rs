@@ -1,5 +1,6 @@
 //! Cross-node program-registry protocol (`REGISTRY_ALPN`). Closes the offline-owner gap:
-//! the keyspace is split into 256 sharded accounts, each seeded
+//! the keyspace is split into `2^shard_bits` sharded accounts (a governed, cluster-agreed
+//! count — the key-routed requests carry the submitter's `bits`), each seeded
 //! `REGISTRY_SEED ‖ rtype ‖ shard` (`pda(registry_program_cid(), shard_seed(sk))`), and each
 //! shard's writer ROTATES per shard among its stable replica set. Non-writer nodes forward
 //! registrations and resolution queries to the shard's current writer over this ALPN. Mirrors
@@ -22,10 +23,15 @@ const MAX_FRAME: usize = 256 * 1024;
 pub enum RegistryReq {
     /// Forward an owner-signed [`zeph_com::HeadSubmission`] (its `encode()` bytes) to the
     /// writer, which advances the `(rtype, shard)` registry account and returns the new root.
-    Submit { rtype: u8, sub: Vec<u8> },
-    /// Ask the writer to resolve `(owner, name)` to its current head cid, under `rtype`.
+    /// `bits` is the SUBMITTER's live shard-count exponent: the writer routes the key with the
+    /// submitter's `bits`, not its own, so a `shard_bits` change in flight can't split-route a
+    /// key (the writer and submitter always agree on the shard for one request).
+    Submit { rtype: u8, bits: u32, sub: Vec<u8> },
+    /// Ask the writer to resolve `(owner, name)` to its current head cid, under `rtype`. `bits`
+    /// is the querier's live shard-count exponent (routed with, not the writer's — see `Submit`).
     Resolve {
         rtype: u8,
+        bits: u32,
         owner: [u8; 32],
         name: String,
     },
@@ -34,9 +40,11 @@ pub enum RegistryReq {
     /// replicas' state and merges it before serving so registrations survive rotation.
     GetState { rtype: u8, shard: u64 },
     /// Ask the writer for the current version of `(owner, name)` under `rtype` (0 if
-    /// unregistered) — so a non-writer can compute `prev + 1` without holding the shard.
+    /// unregistered) — so a non-writer can compute `prev + 1` without holding the shard. `bits`
+    /// is the querier's live shard-count exponent (routed with — see `Submit`).
     CurrentVersion {
         rtype: u8,
+        bits: u32,
         owner: [u8; 32],
         name: String,
     },

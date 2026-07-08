@@ -290,12 +290,93 @@ impl ProgramRegistryState {
     }
 }
 
+/// The **config registry** state: `protocol config key → (value, version)`. Mirrors
+/// [`ProgramRegistryState`] but for governed INTEGER config (e.g. the registry's shard-count
+/// exponent `shard_bits`). Its writes are authorized by governance (a `SetConfig` approval);
+/// every node folds the same governance chain to derive the identical map, so a config value is
+/// cluster-agreed with no gossip. Empty by default — an unset key resolves to `None` so the
+/// consumer applies its built-in default.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConfigRegistryState {
+    /// (key, value, version) sorted by key — one entry per config key.
+    values: Vec<(String, i64, u64)>,
+}
+
+impl ConfigRegistryState {
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.is_empty() {
+            return Some(Self::default());
+        }
+        postcard::from_bytes(bytes).ok()
+    }
+    pub fn encode(&self) -> Vec<u8> {
+        postcard::to_allocvec(self).unwrap_or_default()
+    }
+    pub fn root(&self) -> [u8; 32] {
+        Cid::of(&self.encode()).0
+    }
+    pub fn entries(&self) -> &[(String, i64, u64)] {
+        &self.values
+    }
+
+    /// The current value for a protocol config key (`None` if unset).
+    pub fn resolve(&self, key: &str) -> Option<i64> {
+        self.values
+            .binary_search_by(|(k, _, _)| k.as_str().cmp(key))
+            .ok()
+            .map(|i| self.values[i].1)
+    }
+
+    /// Set a config value (upsert). Version must strictly increase for an existing key.
+    /// Returns the new state, or an error.
+    pub fn set(
+        &self,
+        key: &str,
+        value: i64,
+        version: u64,
+    ) -> Result<ConfigRegistryState, &'static str> {
+        let mut next = self.clone();
+        match next
+            .values
+            .binary_search_by(|(k, _, _)| k.as_str().cmp(key))
+        {
+            Ok(i) => {
+                if version <= next.values[i].2 {
+                    return Err("stale-version");
+                }
+                next.values[i] = (key.to_string(), value, version);
+            }
+            Err(i) => next.values.insert(i, (key.to_string(), value, version)),
+        }
+        Ok(next)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn id() -> NodeIdentity {
         NodeIdentity::generate()
+    }
+
+    #[test]
+    fn config_registry_upserts_resolves_and_rejects_stale() {
+        let s = ConfigRegistryState::default();
+        assert_eq!(s.resolve("shard_bits"), None, "unset key resolves to None");
+        let s = s.set("shard_bits", 8, 1).unwrap();
+        assert_eq!(s.resolve("shard_bits"), Some(8));
+        // strictly-increasing version upserts
+        let s = s.set("shard_bits", 9, 2).unwrap();
+        assert_eq!(s.resolve("shard_bits"), Some(9));
+        // same/older version is rejected (monotonic, like the program registry)
+        assert_eq!(s.set("shard_bits", 10, 2), Err("stale-version"));
+        assert_eq!(s.set("shard_bits", 10, 1), Err("stale-version"));
+        // keys are isolated + sorted
+        let s = s.set("another", 3, 1).unwrap();
+        assert_eq!(s.resolve("another"), Some(3));
+        assert_eq!(s.resolve("shard_bits"), Some(9));
+        assert_eq!(ConfigRegistryState::decode(&s.encode()), Some(s));
     }
 
     #[test]

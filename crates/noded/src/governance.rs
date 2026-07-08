@@ -140,6 +140,14 @@ impl GovernanceChainStore {
             .or_else(|| (name == "app-registry").then(registry_program_cid))
     }
 
+    /// Resolve a protocol config value from the derived config registry (`None` = unset, so the
+    /// consumer applies its built-in default). The value is cluster-agreed: every node folds the
+    /// same governance chain, so all nodes read the identical value. Set via a `SetConfig`
+    /// governance approval. Used e.g. for the registry `shard_bits` (the live shard-count exponent).
+    pub async fn resolve_config(&self, key: &str) -> Option<i64> {
+        self.chain.read().await.config_registry().resolve(key)
+    }
+
     /// `(name, cid_hex, version)` rows of the derived program registry (dashboard).
     pub async fn rows(&self) -> Vec<(String, String, u64)> {
         self.chain

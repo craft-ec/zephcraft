@@ -36,10 +36,17 @@ const MAX_FRAME: usize = 256 * 1024;
 /// tunable. `epoch = clock.now().millis() / EPOCH_MILLIS`.
 const EPOCH_MILLIS: u64 = 30_000;
 
-/// Default shard-count exponent: the keyspace starts as `2^DEFAULT_SHARD_BITS` shards. The live
-/// count is a runtime value ([`HeadRegistry::shard_bits`]) so it can grow/shrink by split/merge.
-/// `DEFAULT_SHARD_BITS = 8` → 256 shards, matching the prior fixed count exactly.
+/// Default shard-count exponent: the keyspace starts as `2^DEFAULT_SHARD_BITS` shards. Applied
+/// when the governed `shard_bits` config value is unset (or before governance is wired), so a
+/// fresh network self-starts. `DEFAULT_SHARD_BITS = 8` → 256 shards, matching the prior fixed
+/// count exactly. The live value is read from governance (see [`HeadRegistry::shard_bits`]).
 const DEFAULT_SHARD_BITS: u32 = 8;
+
+/// Upper bound on the governed `shard_bits`. The registry's status / migrate / enumeration loops
+/// are O(2^bits), so an out-of-range governance value is clamped here to keep them bounded.
+/// 12 → up to 4096 shards, ample headroom over the default 256; the O(shards) loops remain the
+/// real scaling ceiling to lift later (see `.claude/feature-progress.md`).
+const MAX_SHARD_BITS: u32 = 12;
 
 /// Consecutive migration-loop ticks the census must be UNCHANGED before state migration runs.
 /// The loop ticks every 10s, so this debounces migration to ~30s of stable membership — during
@@ -105,12 +112,15 @@ fn shard_seed(sk: ShardKey) -> Vec<u8> {
     .concat()
 }
 
+/// Resolve-cache backing map: `(rtype, owner, name)` → `((cid, version), expiry_ms)`.
+type ResolveCacheMap = std::collections::HashMap<(u8, [u8; 32], String), (([u8; 32], u64), u64)>;
+
 /// A TTL'd cache of `(rtype, owner, name)` → `(cid, version)` resolves. The clock is injected
 /// (`now` is passed in) so the cache is unit-testable without a live registry. Consulted only for
 /// NON-replica reads — a replica reads authoritative local state (see [`HeadRegistry`]).
 #[derive(Default)]
 struct ResolveCache {
-    map: RwLock<std::collections::HashMap<(u8, [u8; 32], String), (([u8; 32], u64), u64)>>,
+    map: RwLock<ResolveCacheMap>,
 }
 
 impl ResolveCache {
@@ -195,9 +205,6 @@ pub struct HeadRegistry {
     /// network round-trip per resolve. TTL'd ([`RESOLVE_CACHE_TTL_MS`]) for other-node writes;
     /// [`Self::register`] invalidates the key so this node's own writes are read-your-writes.
     resolve_cache: ResolveCache,
-    /// Live shard-count exponent: the keyspace is `2^shard_bits` shards. Runtime (not const) so
-    /// the count can change by split/merge; starts at [`DEFAULT_SHARD_BITS`].
-    shard_bits: u32,
 }
 
 /// One head row for the dashboard — hex-encoded `(owner, cid)` + `name` + `version`.
@@ -256,13 +263,29 @@ impl HeadRegistry {
             last_epoch: RwLock::new(std::collections::HashMap::new()),
             last_census: RwLock::new(None),
             resolve_cache: ResolveCache::default(),
-            shard_bits: DEFAULT_SHARD_BITS,
         }
     }
 
+    /// The live shard-count exponent = the governed `shard_bits` config value, agreed
+    /// cluster-wide via the governance chain (a `SetConfig` approval), so every node routes a
+    /// key to the SAME shard. Falls back to [`DEFAULT_SHARD_BITS`] when the value is unset or
+    /// before governance is wired, and is clamped to `[1, MAX_SHARD_BITS]` so a bad governance
+    /// value can't blow up the O(2^bits) shard loops. Read ONCE per operation (register /
+    /// resolve / status / migrate) and threaded into [`shard_of`], so a single op stays
+    /// internally consistent even if governance changes mid-op.
+    async fn shard_bits(&self) -> u32 {
+        let governed = match self.programs.read().await.as_ref() {
+            Some(p) => p.resolve_config("shard_bits").await,
+            None => None,
+        };
+        governed
+            .map(|v| v.clamp(1, MAX_SHARD_BITS as i64) as u32)
+            .unwrap_or(DEFAULT_SHARD_BITS)
+    }
+
     /// The live shard count = `2^shard_bits`.
-    fn shard_count(&self) -> u64 {
-        1u64 << self.shard_bits
+    async fn shard_count(&self) -> u64 {
+        1u64 << self.shard_bits().await
     }
 
     /// State-migration anti-entropy: when the census changes, the stable replica set of each
@@ -301,7 +324,7 @@ impl HeadRegistry {
         }
         // Census has SETTLED: re-replicate every shard we hold local state for to its new replica set.
         for &rtype in &[RT_PROGRAM, RT_DBROOT, RT_MANIFEST] {
-            for shard in 0..self.shard_count() {
+            for shard in 0..self.shard_count().await {
                 let sk = ShardKey { rtype, shard };
                 let state = self
                     .store
@@ -630,9 +653,12 @@ impl HeadRegistry {
     ) -> anyhow::Result<[u8; 32]> {
         // The OWNER (this node's identity) signs the submission either way.
         let sub = HeadSubmission::sign(&self.identity, name, cid, version);
+        // Route with this node's live (governed) bits; the writer is stamped the same `bits` so
+        // it routes identically even if governance changed the count in flight.
+        let bits = self.shard_bits().await;
         let sk = ShardKey {
             rtype,
-            shard: shard_of(&self.self_id, name, self.shard_bits),
+            shard: shard_of(&self.self_id, name, bits),
         };
         let root = if self.is_writer(sk).await {
             self.advance_local(sk, &sub.encode()).await?
@@ -645,6 +671,7 @@ impl HeadRegistry {
                 &addr,
                 &RegistryReq::Submit {
                     rtype,
+                    bits,
                     sub: sub.encode(),
                 },
             )
@@ -694,9 +721,12 @@ impl HeadRegistry {
         owner: [u8; 32],
         name: &str,
     ) -> Option<([u8; 32], u64)> {
+        // Route with this node's live (governed) bits; remote replicas are stamped the same
+        // `bits` so they route the key to the same shard.
+        let bits = self.shard_bits().await;
         let sk = ShardKey {
             rtype,
-            shard: shard_of(&owner, name, self.shard_bits),
+            shard: shard_of(&owner, name, bits),
         };
         let elig = self.eligible().await;
         let reps = Self::replicas(sk, &elig);
@@ -747,6 +777,7 @@ impl HeadRegistry {
                 &addr,
                 &RegistryReq::Resolve {
                     rtype: sk.rtype,
+                    bits,
                     owner,
                     name: name.to_string(),
                 },
@@ -790,12 +821,14 @@ impl HeadRegistry {
                         break;
                     };
                     let resp = match postcard::from_bytes::<RegistryReq>(&bytes) {
-                        Ok(RegistryReq::Submit { rtype, sub }) => {
+                        // Route with the SUBMITTER's `bits` (from the wire), not this node's, so a
+                        // `shard_bits` change in flight can't split-route the key.
+                        Ok(RegistryReq::Submit { rtype, bits, sub }) => {
                             match HeadSubmission::decode(&sub) {
                                 Some(s) => {
                                     let sk = ShardKey {
                                         rtype,
-                                        shard: shard_of(&s.owner, &s.name, this.shard_bits),
+                                        shard: shard_of(&s.owner, &s.name, bits),
                                     };
                                     match this.advance_local(sk, &sub).await {
                                         Ok(root) => RegistryResp::SubmitAck(root),
@@ -805,10 +838,16 @@ impl HeadRegistry {
                                 None => RegistryResp::Err("bad submission".into()),
                             }
                         }
-                        Ok(RegistryReq::Resolve { rtype, owner, name }) => {
+                        // Route with the querier's `bits` (from the wire).
+                        Ok(RegistryReq::Resolve {
+                            rtype,
+                            bits,
+                            owner,
+                            name,
+                        }) => {
                             let sk = ShardKey {
                                 rtype,
-                                shard: shard_of(&owner, &name, this.shard_bits),
+                                shard: shard_of(&owner, &name, bits),
                             };
                             RegistryResp::Resolved(this.resolve_local(sk, owner, &name).await)
                         }
@@ -822,10 +861,16 @@ impl HeadRegistry {
                                 .await,
                         ),
                         // Report the current version of a key from its account (0 if none).
-                        Ok(RegistryReq::CurrentVersion { rtype, owner, name }) => {
+                        // Route with the querier's `bits` (from the wire).
+                        Ok(RegistryReq::CurrentVersion {
+                            rtype,
+                            bits,
+                            owner,
+                            name,
+                        }) => {
                             let sk = ShardKey {
                                 rtype,
-                                shard: shard_of(&owner, &name, this.shard_bits),
+                                shard: shard_of(&owner, &name, bits),
                             };
                             let raw = this
                                 .store
@@ -874,9 +919,10 @@ impl HeadRegistry {
     /// `prev + 1` from the registry itself — no DHT lookup. Routes the key to its shard: the
     /// shard's writer reads it locally, a non-writer queries the writer over `REGISTRY_ALPN`.
     pub async fn current_version(&self, rtype: u8, owner: [u8; 32], name: &str) -> u64 {
+        let bits = self.shard_bits().await;
         let sk = ShardKey {
             rtype,
-            shard: shard_of(&owner, name, self.shard_bits),
+            shard: shard_of(&owner, name, bits),
         };
         if self.is_writer(sk).await {
             let raw = self
@@ -895,6 +941,7 @@ impl HeadRegistry {
             &addr,
             &RegistryReq::CurrentVersion {
                 rtype,
+                bits,
                 owner,
                 name: name.to_string(),
             },
@@ -912,7 +959,7 @@ impl HeadRegistry {
     #[allow(dead_code)]
     pub async fn rows(&self) -> Vec<(String, String, String, u64)> {
         let mut out = Vec::new();
-        for shard in 0..self.shard_count() {
+        for shard in 0..self.shard_count().await {
             let sk = ShardKey {
                 rtype: RT_PROGRAM,
                 shard,
@@ -942,7 +989,7 @@ impl HeadRegistry {
     pub async fn summary(&self) -> (usize, String) {
         let mut count = 0;
         let mut combined: Vec<u8> = Vec::new();
-        for shard in 0..self.shard_count() {
+        for shard in 0..self.shard_count().await {
             let sk = ShardKey {
                 rtype: RT_PROGRAM,
                 shard,
@@ -971,7 +1018,7 @@ impl HeadRegistry {
         let mut writer_shards = 0usize;
         let (mut program_heads, mut dbroots, mut manifests) = (0usize, 0usize, 0usize);
         for &rtype in &[RT_PROGRAM, RT_DBROOT, RT_MANIFEST] {
-            for shard in 0..self.shard_count() {
+            for shard in 0..self.shard_count().await {
                 let sk = ShardKey { rtype, shard };
                 if !self.is_writer(sk).await {
                     continue;
@@ -995,7 +1042,7 @@ impl HeadRegistry {
             epoch,
             eligible,
             writer_shards,
-            shard_count: self.shard_count(),
+            shard_count: self.shard_count().await,
             program_heads,
             dbroots,
             manifests,
@@ -1009,7 +1056,7 @@ impl HeadRegistry {
     async fn local_head_rows(&self) -> Vec<HeadRowWire> {
         let mut out = Vec::new();
         for &rtype in &[RT_PROGRAM, RT_DBROOT, RT_MANIFEST] {
-            for shard in 0..self.shard_count() {
+            for shard in 0..self.shard_count().await {
                 let sk = ShardKey { rtype, shard };
                 if !self.is_writer(sk).await {
                     continue;

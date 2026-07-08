@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use zeph_core::{Cid, NodeId};
 use zeph_crypto::NodeIdentity;
 
-use crate::registry::{registry_program_cid, ProgramRegistryState};
+use crate::registry::{registry_program_cid, ConfigRegistryState, ProgramRegistryState};
 
 const GOV_DOMAIN: &[u8] = b"craftec/gov/1";
 
@@ -232,6 +232,26 @@ impl GovernanceChain {
         }
         prg
     }
+
+    /// The config registry derived from the chain: replay every `SetConfig` approval
+    /// (version = its seq) over an empty map. Mirrors [`Self::program_registry`] — every node
+    /// computes the identical result from the same chain, so a protocol config value (e.g. the
+    /// registry `shard_bits`) is cluster-agreed with no gossip. Unlike the program registry
+    /// there is NO genesis seed: an unset key resolves to `None`, and the consumer applies its
+    /// built-in default.
+    pub fn config_registry(&self) -> ConfigRegistryState {
+        let mut cfg = ConfigRegistryState::default();
+        let mut seq = self.genesis.seq;
+        for a in &self.approvals {
+            seq += 1;
+            if let GovAction::SetConfig { key, value } = &a.proposal.action {
+                if let Ok(next) = cfg.set(key, *value, seq) {
+                    cfg = next;
+                }
+            }
+        }
+        cfg
+    }
 }
 
 #[cfg(test)]
@@ -351,6 +371,45 @@ mod tests {
         assert!(!chain.append(bad));
         // encode/decode roundtrip
         assert_eq!(GovernanceChain::decode(&chain.encode()), Some(chain));
+    }
+
+    #[test]
+    fn chain_derives_config_registry_from_set_config() {
+        let g = govs(1);
+        let mut chain = GovernanceChain::new(set(&g, 1));
+        // empty chain -> no config values (consumer falls back to its default)
+        assert_eq!(chain.config_registry().resolve("shard_bits"), None);
+
+        // a SetConfig approval lands in the derived config registry at version = its seq
+        let a = approve(
+            &g,
+            1,
+            GovAction::SetConfig {
+                key: "shard_bits".into(),
+                value: 9,
+            },
+            1,
+        );
+        assert!(chain.append(a), "valid SetConfig appends");
+        assert_eq!(chain.config_registry().resolve("shard_bits"), Some(9));
+
+        // a later SetConfig upserts (version = new seq, strictly greater)
+        let a2 = approve(
+            &g,
+            1,
+            GovAction::SetConfig {
+                key: "shard_bits".into(),
+                value: 10,
+            },
+            2,
+        );
+        assert!(chain.append(a2));
+        assert_eq!(chain.config_registry().resolve("shard_bits"), Some(10));
+        // SetConfig does not disturb the program registry
+        assert_eq!(
+            chain.program_registry().resolve("app-registry"),
+            Some(crate::registry_program_cid())
+        );
     }
 
     #[test]
