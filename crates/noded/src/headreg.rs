@@ -24,7 +24,7 @@
 //! adjacent generation during the migration window. Low-bit routing keeps a split LOCAL (a parent
 //! shard's keys go only to its two children).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, Mutex, RwLock};
@@ -166,6 +166,14 @@ fn resolve_shard_bits(governed: Option<i64>) -> u32 {
 /// restart), so a node that was down during a reshard catches up when it returns.
 const GEN_MARKER_SEED: &[u8] = b"craftec/registry/shard-generation/1";
 
+/// Seed of the per-node HELD-SHARDS INDEX account — the set of `(rtype, bits, shard)` this node
+/// has a shard DB for (has written state to). Lets the enumeration loops (status / migrate / sweep
+/// / gc / rows) iterate ONLY the shards this node actually holds — O(held) — instead of every one
+/// of the `2^bits` shards (O(2^bits)), the ceiling that would otherwise cap the governed count.
+/// Persisted (survives restart) so the loops stay correct after a restart; a crash may lose the
+/// last additions, but the DBs still exist and a subsequent write re-adds them.
+const HELD_MARKER_SEED: &[u8] = b"craftec/registry/held-shards/1";
+
 /// Re-bucket a batch of heads to their shards at `new_bits` — the pure core of the online reshard.
 /// Every entry is routed by [`shard_of`] at the NEW count and grouped by its new shard, so the
 /// caller can write each group into that new-generation account. Handles grow (a parent's keys
@@ -291,6 +299,12 @@ pub struct HeadRegistry {
     /// Open shard-DB handles, cached by namespace (opening a `CraftDb` is expensive). One writer
     /// per shard, so serializing a shard's ops behind its `Mutex` is free.
     dbs: RwLock<HashMap<String, Arc<Mutex<CraftDb>>>>,
+    /// The HELD-SHARDS index: every `(rtype, bits, shard)` this node has written a shard DB for.
+    /// `None` until lazily loaded from [`HELD_MARKER_SEED`]. The enumeration loops iterate this
+    /// (O(held)) instead of `0..2^bits` (O(2^bits)) — empty shards have no state, so skipping them
+    /// is correct. Mutated + persisted IMMEDIATELY by [`Self::held_add`] (via [`Self::sql_upsert`])
+    /// and [`Self::gc_generation`], so a restart loads an accurate set.
+    held: RwLock<Option<HashSet<ShardKey>>>,
 }
 
 /// One head row for the dashboard — hex-encoded `(owner, cid)` + `name` + `version`.
@@ -355,7 +369,66 @@ impl HeadRegistry {
             sql,
             shard_roots,
             dbs: RwLock::new(HashMap::new()),
+            held: RwLock::new(None),
         }
+    }
+
+    /// Lazily load the held-shards index from its marker account (once), then run `f` over it.
+    /// The index is `postcard(Vec<(rtype, bits, shard)>)`.
+    async fn with_held<R>(&self, f: impl FnOnce(&mut HashSet<ShardKey>) -> R) -> R {
+        {
+            let mut g = self.held.write().await;
+            if g.is_none() {
+                let raw = self
+                    .store
+                    .resolve(registry_program_cid(), HELD_MARKER_SEED)
+                    .await;
+                let set = postcard::from_bytes::<Vec<(u8, u32, u64)>>(&raw)
+                    .map(|v| {
+                        v.into_iter()
+                            .map(|(rtype, bits, shard)| ShardKey { rtype, bits, shard })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                *g = Some(set);
+            }
+            f(g.as_mut().expect("loaded"))
+        }
+    }
+
+    /// Record that this node now holds shard `sk` (has written its DB) and PERSIST the index.
+    /// Idempotent + persists only on an ACTUAL insert, so the cost is per-new-shard (once per
+    /// shard), not per-write — the register hot path (repeat writes to a held shard) is unaffected.
+    /// Persist is immediate (not debounced) so a restart within seconds of a first-write still loads
+    /// a correct held set — the loops depend on it being accurate.
+    async fn held_add(&self, sk: ShardKey) {
+        if self.with_held(|h| h.insert(sk)).await {
+            self.save_held().await;
+        }
+    }
+
+    /// The held shards matching `(rtype?, bits)` — the loop domain. `rtype = None` = all kinds.
+    async fn held_shards(&self, rtype: Option<u8>, bits: u32) -> Vec<ShardKey> {
+        self.with_held(|h| {
+            h.iter()
+                .filter(|sk| sk.bits == bits && rtype.map(|r| sk.rtype == r).unwrap_or(true))
+                .copied()
+                .collect()
+        })
+        .await
+    }
+
+    /// Persist the current held index to its marker account (`postcard(Vec<(rtype,bits,shard)>)`).
+    /// Snapshots under the lock, then writes without holding it.
+    async fn save_held(&self) {
+        let list: Vec<(u8, u32, u64)> = self
+            .with_held(|h| h.iter().map(|sk| (sk.rtype, sk.bits, sk.shard)).collect())
+            .await;
+        let bytes = postcard::to_allocvec(&list).unwrap_or_default();
+        let _ = self
+            .store
+            .put_state(registry_program_cid(), HELD_MARKER_SEED, &bytes)
+            .await;
     }
 
     /// The namespace of shard `sk`'s CraftSQL DB.
@@ -423,7 +496,12 @@ impl HeadRegistry {
             e.version
         );
         db.write(&sql).await?;
-        Ok(db.root().map(|c| c.0).unwrap_or_default())
+        let root = db.root().map(|c| c.0).unwrap_or_default();
+        drop(db);
+        // This node now holds shard `sk` — record it so the enumeration loops iterate held shards
+        // (O(held)) rather than every 2^bits shard.
+        self.held_add(sk).await;
+        Ok(root)
     }
 
     /// Snapshot shard `sk`'s heads as a [`RegistryState`] — the wire/merge DTO for `GetState`,
@@ -534,17 +612,14 @@ impl HeadRegistry {
         if !should_migrate {
             return;
         }
-        // Census has SETTLED: re-replicate every shard we hold local state for to its new replica
-        // set. Operates at the CURRENT generation (`bits`) — the reshard loop handles generation
-        // change separately.
+        // Census has SETTLED: re-replicate every shard we HOLD to its new replica set. Iterates the
+        // held index (O(held)) not all 2^bits shards. Operates at the CURRENT generation — the
+        // reshard loop handles generation change separately.
         let bits = self.shard_bits().await;
-        for &rtype in &[RT_PROGRAM, RT_DBROOT, RT_MANIFEST] {
-            for shard in 0..(1u64 << bits) {
-                let sk = ShardKey { rtype, bits, shard };
-                let state = self.sql_state(sk).await;
-                if !state.is_empty() {
-                    self.replicate(sk, &state.encode()).await;
-                }
+        for sk in self.held_shards(None, bits).await {
+            let state = self.sql_state(sk).await;
+            if !state.is_empty() {
+                self.replicate(sk, &state.encode()).await;
             }
         }
     }
@@ -623,30 +698,20 @@ impl HeadRegistry {
         }
     }
 
-    /// Re-bucket every head this node holds at generation `from` into the accounts of generation
-    /// `to`, LWW-merging each group into the target account and pushing it to that account's replica
-    /// set. The core migration step of a reshard; idempotent, so it is safe to run repeatedly during
-    /// the drain window. Only sweeps shards this node replicates at `from` (election is
-    /// bits-independent, so that set matches its current replica assignment).
+    /// Re-bucket every head this node HOLDS at generation `from` into the generation-`to` shard DBs,
+    /// LWW-merging each group and pushing it to the target's replica set. The core migration step of
+    /// a reshard; idempotent, so it is safe to run repeatedly during the drain window. Iterates the
+    /// held index at `from` (O(held)) — the shards this node actually has state for.
     async fn sweep_generation(&self, from: u32, to: u32) {
-        let elig = self.eligible().await;
-        for &rtype in &[RT_PROGRAM, RT_DBROOT, RT_MANIFEST] {
-            let mut entries: Vec<HeadEntry> = Vec::new();
-            for shard in 0..(1u64 << from) {
-                let sk_old = ShardKey {
-                    rtype,
-                    bits: from,
-                    shard,
-                };
-                if !Self::replicas(sk_old, &elig).contains(&self.self_id) {
-                    continue;
-                }
-                entries.extend(self.sql_state(sk_old).await.entries().iter().cloned());
+        let mut entries: Vec<(u8, Vec<HeadEntry>)> = Vec::new();
+        for sk_old in self.held_shards(None, from).await {
+            let es: Vec<HeadEntry> = self.sql_state(sk_old).await.entries().to_vec();
+            if !es.is_empty() {
+                entries.push((sk_old.rtype, es));
             }
-            if entries.is_empty() {
-                continue;
-            }
-            for (new_shard, group) in rebucket_entries(&entries, to) {
+        }
+        for (rtype, es) in entries {
+            for (new_shard, group) in rebucket_entries(&es, to) {
                 let sk_new = ShardKey {
                     rtype,
                     bits: to,
@@ -660,23 +725,23 @@ impl HeadRegistry {
         }
     }
 
-    /// GC a fully-drained generation: DROP this node's shard DB for every shard it holds at
-    /// generation `bits` (all rtypes) — clear the root pointer, evict the cached handle, and delete
-    /// the DB's local pages. Called only after [`DRAIN_TICKS`] of sweeping, by which point the old
-    /// generation has been carried forward and no peer still writes it. Local-only; other replicas
-    /// GC their own copies on the same schedule.
+    /// GC a fully-drained generation: DROP this node's shard DB for every shard it HOLDS at
+    /// generation `bits` — drop the cached handle, clear the root pointer, and forget it from the
+    /// held index. Iterates the held index at `bits` (O(held)). Called only after [`DRAIN_TICKS`] of
+    /// sweeping, by which point the old generation has been carried forward and no peer still writes
+    /// it. Local-only; other replicas GC their own copies on the same schedule.
     async fn gc_generation(&self, bits: u32) {
-        let elig = self.eligible().await;
-        for &rtype in &[RT_PROGRAM, RT_DBROOT, RT_MANIFEST] {
-            for shard in 0..(1u64 << bits) {
-                let sk = ShardKey { rtype, bits, shard };
-                if !Self::replicas(sk, &elig).contains(&self.self_id) {
-                    continue;
-                }
-                let ns = Self::ns_of(sk);
-                self.dbs.write().await.remove(&ns); // drop the cached handle (closes the connection)
-                self.shard_roots.clear(&ns).await; // forget the shard-DB root pointer
-            }
+        let doomed = self.held_shards(None, bits).await;
+        for sk in &doomed {
+            let ns = Self::ns_of(*sk);
+            self.dbs.write().await.remove(&ns); // drop the cached handle (closes the connection)
+            self.shard_roots.clear(&ns).await; // forget the shard-DB root pointer
+        }
+        if !doomed.is_empty() {
+            let doomed_set: HashSet<ShardKey> = doomed.into_iter().collect();
+            self.with_held(|h| h.retain(|sk| !doomed_set.contains(sk)))
+                .await;
+            self.save_held().await;
         }
     }
 
@@ -758,11 +823,22 @@ impl HeadRegistry {
     /// wired) → self, so a fresh/single node still writes every account.
     async fn current_writer(&self, sk: ShardKey) -> Option<[u8; 32]> {
         let elig = self.eligible().await;
-        let reps = Self::replicas(sk, &elig);
+        Some(Self::writer_of(
+            sk,
+            &elig,
+            self.effective_epoch(),
+            self.self_id,
+        ))
+    }
+
+    /// Pure writer election for `sk` given a precomputed eligible set + effective epoch — so the
+    /// dashboard loops can hoist `eligible()` out and check many shards without an async call each.
+    fn writer_of(sk: ShardKey, eligible: &[[u8; 32]], eff: u64, self_id: [u8; 32]) -> [u8; 32] {
+        let reps = Self::replicas(sk, eligible);
         if reps.is_empty() {
-            Some(self.self_id)
+            self_id
         } else {
-            Some(reps[(self.effective_epoch() as usize) % reps.len()])
+            reps[(eff as usize) % reps.len()]
         }
     }
 
@@ -1291,13 +1367,10 @@ impl HeadRegistry {
     pub async fn rows(&self) -> Vec<(String, String, String, u64)> {
         let mut out = Vec::new();
         let bits = self.shard_bits().await;
-        for shard in 0..(1u64 << bits) {
-            let sk = ShardKey {
-                rtype: RT_PROGRAM,
-                bits,
-                shard,
-            };
-            if !self.is_writer(sk).await {
+        let elig = self.eligible().await;
+        let eff = self.effective_epoch();
+        for sk in self.held_shards(Some(RT_PROGRAM), bits).await {
+            if Self::writer_of(sk, &elig, eff, self.self_id) != self.self_id {
                 continue;
             }
             for e in self.sql_state(sk).await.entries() {
@@ -1319,13 +1392,10 @@ impl HeadRegistry {
         let mut count = 0;
         let mut combined: Vec<u8> = Vec::new();
         let bits = self.shard_bits().await;
-        for shard in 0..(1u64 << bits) {
-            let sk = ShardKey {
-                rtype: RT_PROGRAM,
-                bits,
-                shard,
-            };
-            if !self.is_writer(sk).await {
+        let elig = self.eligible().await;
+        let eff = self.effective_epoch();
+        for sk in self.held_shards(Some(RT_PROGRAM), bits).await {
+            if Self::writer_of(sk, &elig, eff, self.self_id) != self.self_id {
                 continue;
             }
             let s = self.sql_state(sk).await;
@@ -1335,31 +1405,30 @@ impl HeadRegistry {
         (count, hex::encode(Cid::of(&combined).0))
     }
 
-    /// Registry status for the dashboard. `writer_shards` = the RT_PROGRAM shards THIS node
-    /// currently writes; `program_heads` / `dbroots` / `manifests` = the total `(owner, name)`
-    /// rows across exactly the shards this node writes for each registry type (a per-node
-    /// partial view — the registry is sharded, so no single node sees every shard).
+    /// Registry status for the dashboard. Iterates only the shards this node HOLDS at the current
+    /// generation (O(held), not O(2^bits)). `writer_shards` = the HELD RT_PROGRAM shards this node
+    /// currently writes (data-bearing writer shards — an elected-but-empty shard has no DB, so it
+    /// isn't counted); `program_heads` / `dbroots` / `manifests` = the `(owner, name)` row counts
+    /// across the held shards this node writes for each kind (a per-node partial view).
     pub async fn status(&self) -> RegistryStatus {
         let epoch = self.effective_epoch();
-        let eligible = self.eligible().await.len();
+        let elig = self.eligible().await;
+        let eligible = elig.len();
         let mut writer_shards = 0usize;
         let (mut program_heads, mut dbroots, mut manifests) = (0usize, 0usize, 0usize);
         let bits = self.shard_bits().await;
-        for &rtype in &[RT_PROGRAM, RT_DBROOT, RT_MANIFEST] {
-            for shard in 0..(1u64 << bits) {
-                let sk = ShardKey { rtype, bits, shard };
-                if !self.is_writer(sk).await {
-                    continue;
-                }
-                if rtype == RT_PROGRAM {
+        for sk in self.held_shards(None, bits).await {
+            if Self::writer_of(sk, &elig, epoch, self.self_id) != self.self_id {
+                continue;
+            }
+            let n = self.sql_count(sk).await;
+            match sk.rtype {
+                RT_PROGRAM => {
                     writer_shards += 1;
+                    program_heads += n;
                 }
-                let n = self.sql_count(sk).await;
-                match rtype {
-                    RT_PROGRAM => program_heads += n,
-                    RT_DBROOT => dbroots += n,
-                    _ => manifests += n,
-                }
+                RT_DBROOT => dbroots += n,
+                _ => manifests += n,
             }
         }
         RegistryStatus {
@@ -1380,21 +1449,20 @@ impl HeadRegistry {
     async fn local_head_rows(&self) -> Vec<HeadRowWire> {
         let mut out = Vec::new();
         let bits = self.shard_bits().await;
-        for &rtype in &[RT_PROGRAM, RT_DBROOT, RT_MANIFEST] {
-            for shard in 0..(1u64 << bits) {
-                let sk = ShardKey { rtype, bits, shard };
-                if !self.is_writer(sk).await {
-                    continue;
-                }
-                for e in self.sql_state(sk).await.entries() {
-                    out.push(HeadRowWire {
-                        rtype,
-                        owner: e.owner,
-                        name: e.name.clone(),
-                        cid: e.cid,
-                        version: e.version,
-                    });
-                }
+        let elig = self.eligible().await;
+        let eff = self.effective_epoch();
+        for sk in self.held_shards(None, bits).await {
+            if Self::writer_of(sk, &elig, eff, self.self_id) != self.self_id {
+                continue;
+            }
+            for e in self.sql_state(sk).await.entries() {
+                out.push(HeadRowWire {
+                    rtype: sk.rtype,
+                    owner: e.owner,
+                    name: e.name.clone(),
+                    cid: e.cid,
+                    version: e.version,
+                });
             }
         }
         out
