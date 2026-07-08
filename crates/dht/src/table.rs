@@ -86,6 +86,15 @@ impl RoutingTable {
         }
     }
 
+    /// Remove a contact by id (dead-node eviction). No-op if it isn't held. Pairs with the
+    /// liveness tracking in `DhtNode`: a peer that fails repeated requests is evicted so
+    /// lookups stop re-dialing it (the fix for dead-node lookup storms).
+    pub fn remove(&mut self, id: &NodeId) {
+        if let Some(idx) = bucket_index(&self.self_id, &id.0) {
+            self.buckets[idx].retain(|c| &c.id != id);
+        }
+    }
+
     /// The `count` contacts closest (by XOR distance) to `target`.
     pub fn closest(&self, target: &[u8; 32], count: usize) -> Vec<Contact> {
         let mut all: Vec<Contact> = self.buckets.iter().flatten().cloned().collect();
@@ -216,6 +225,21 @@ mod tests {
         for b in &t.buckets {
             assert!(b.len() <= K);
         }
+    }
+
+    #[test]
+    fn remove_evicts_only_the_named_contact() {
+        let me = NodeId(key(0));
+        let mut t = RoutingTable::new(me);
+        t.insert(contact(0b1000_0000));
+        t.insert(contact(0b0100_0000));
+        assert_eq!(t.len(), 2);
+        t.remove(&NodeId(key(0b1000_0000)));
+        assert_eq!(t.len(), 1);
+        assert!(!t.contains(&NodeId(key(0b1000_0000))));
+        assert!(t.contains(&NodeId(key(0b0100_0000))));
+        t.remove(&NodeId(key(0b0010_0000))); // absent → no-op
+        assert_eq!(t.len(), 1);
     }
 
     #[test]

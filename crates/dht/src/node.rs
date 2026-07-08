@@ -18,6 +18,13 @@ use crate::{ALPHA, ALPN};
 
 const MAX_FRAME: usize = 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Consecutive failed requests before a (non-seed) contact is evicted as dead.
+const EVICT_AFTER: u32 = 3;
+/// How long an evicted-dead contact stays un-relearnable (ms). Breaks the re-teach storm:
+/// after eviction a peer or provider record can hand the dead id right back, so we refuse to
+/// re-insert it until the tombstone expires. 10 min — long enough to converge, short enough
+/// that a node which genuinely returns is picked back up.
+const TOMBSTONE_TTL_MS: u64 = 600_000;
 
 pub struct DhtNode {
     identity: Arc<NodeIdentity>,
@@ -29,6 +36,14 @@ pub struct DhtNode {
     /// stream per request) instead of connect+close per op — the per-op teardown re-ran the
     /// QUIC/multipath handshake every time and stormed the network during the cutover.
     conns: Mutex<HashMap<[u8; 32], Connection>>,
+    /// Consecutive failed-request count per peer; crossing `EVICT_AFTER` evicts it.
+    failures: Mutex<HashMap<[u8; 32], u32>>,
+    /// Evicted-dead peers → expiry millis. `learn` refuses to re-add a live tombstone, so a
+    /// peer or record re-teaching a dead node can't immediately re-storm it.
+    tombstones: Mutex<HashMap<[u8; 32], u64>>,
+    /// Seed (bootstrap) node ids — never evicted or tombstoned, so a transient network blip
+    /// can never drop the nodes we rely on to rejoin the overlay.
+    seeds: Mutex<HashSet<[u8; 32]>>,
 }
 
 impl DhtNode {
@@ -48,7 +63,54 @@ impl DhtNode {
             me,
             transport,
             conns: Mutex::new(HashMap::new()),
+            failures: Mutex::new(HashMap::new()),
+            tombstones: Mutex::new(HashMap::new()),
+            seeds: Mutex::new(HashSet::new()),
         })
+    }
+
+    /// A request to `id` succeeded — clear any accumulated failure count.
+    fn note_alive(&self, id: &[u8; 32]) {
+        self.failures.lock().expect("failures").remove(id);
+    }
+
+    /// A request to `peer` failed (both attempts). Count it; once a NON-seed peer crosses
+    /// `EVICT_AFTER` consecutive failures, evict it from the routing table, drop its cached
+    /// connection, and tombstone it so peers/records can't immediately re-teach it. Seeds are
+    /// never evicted — they are the bootstrap path.
+    fn note_dead(&self, peer: &Contact) {
+        let id = peer.id.0;
+        if self.seeds.lock().expect("seeds").contains(&id) {
+            return;
+        }
+        let mut failures = self.failures.lock().expect("failures");
+        let n = failures.entry(id).or_insert(0);
+        *n += 1;
+        if *n >= EVICT_AFTER {
+            failures.remove(&id);
+            drop(failures);
+            self.table.lock().expect("table").remove(&peer.id);
+            self.conns.lock().expect("conns").remove(&id);
+            self.tombstones
+                .lock()
+                .expect("tombstones")
+                .insert(id, self.now_millis() + TOMBSTONE_TTL_MS);
+        }
+    }
+
+    /// Is `id` currently tombstoned (evicted-dead, not yet expired)? Expired entries are
+    /// swept as they're checked.
+    fn tombstoned(&self, id: &[u8; 32]) -> bool {
+        let now = self.now_millis();
+        let mut tomb = self.tombstones.lock().expect("tombstones");
+        match tomb.get(id) {
+            Some(&expiry) if expiry > now => true,
+            Some(_) => {
+                tomb.remove(id);
+                false
+            }
+            None => false,
+        }
     }
 
     /// This node's own dialable contact.
@@ -126,13 +188,18 @@ impl DhtNode {
         (&self.me).into()
     }
 
-    /// Fold contacts into the routing table (never ourselves).
+    /// Fold contacts into the routing table (never ourselves, never a live tombstone). The
+    /// tombstone check is what stops a peer or provider record from re-teaching a dead node
+    /// we just evicted — without it, eviction alone would thrash (evict → re-learn → re-dial).
+    /// Tombstones are checked before the table lock is taken, so the two locks never nest.
     fn learn(&self, contacts: impl IntoIterator<Item = Contact>) {
+        let fresh: Vec<Contact> = contacts
+            .into_iter()
+            .filter(|c| c.id != self.me.id && !self.tombstoned(&c.id.0))
+            .collect();
         let mut t = self.table.lock().expect("table");
-        for c in contacts {
-            if c.id != self.me.id {
-                t.insert(c);
-            }
+        for c in fresh {
+            t.insert(c);
         }
     }
 
@@ -229,12 +296,15 @@ impl DhtNode {
         // Reuse a cached connection (a fresh stream per request); if the cached one is dead,
         // drop it and reconnect once. No per-request close → no handshake/multipath churn.
         for attempt in 0..2 {
-            let conn = self.conn_for(peer, attempt == 1).await?;
-            if let Some(reply) = Self::request_on(&conn, msg).await {
-                return Some(reply);
+            if let Some(conn) = self.conn_for(peer, attempt == 1).await {
+                if let Some(reply) = Self::request_on(&conn, msg).await {
+                    self.note_alive(&peer.id.0);
+                    return Some(reply);
+                }
+                self.conns.lock().expect("conns").remove(&peer.id.0);
             }
-            self.conns.lock().expect("conns").remove(&peer.id.0);
         }
+        self.note_dead(peer);
         None
     }
 
@@ -323,6 +393,12 @@ impl DhtNode {
     /// Join the overlay: seed the table with known contacts, then self-lookup so peers learn
     /// us and we fill our buckets with the neighbourhood around our own id.
     pub async fn bootstrap(&self, seeds: Vec<Contact>) {
+        {
+            let mut s = self.seeds.lock().expect("seeds");
+            for c in &seeds {
+                s.insert(c.id.0);
+            }
+        }
         self.learn(seeds);
         let found = self.lookup(self.me.id.0).await;
         self.learn(found);
