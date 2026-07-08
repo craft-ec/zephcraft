@@ -40,6 +40,11 @@ const EPOCH_MILLIS: u64 = 30_000;
 /// each shard is an independent account with its own rotating-writer election.
 const SHARD_COUNT: u64 = 256;
 
+/// Consecutive migration-loop ticks the census must be UNCHANGED before state migration runs.
+/// The loop ticks every 10s, so this debounces migration to ~30s of stable membership — during
+/// convergence/churn the census changes every tick, which must NOT trigger the scan+push storm.
+const MIGRATE_STABLE_TICKS: u32 = 3;
+
 /// Registry KIND tags — each kind is a SEPARATE account per shard (the tag is folded into
 /// [`shard_seed`], so `(rtype, shard)` addresses distinct state). Lets program heads, database
 /// roots, and manifests share one substrate without colliding.
@@ -121,11 +126,13 @@ pub struct HeadRegistry {
     /// writer) has performed the takeover merge. Guards [`Self::ensure_current`] so the
     /// merge-from-replicas runs once per epoch per account.
     last_epoch: RwLock<std::collections::HashMap<ShardKey, u64>>,
-    /// Digest of the last census (sorted eligible ids) the migration loop acted on. When the
-    /// census changes (a node joins/leaves) the shard→replica assignment shifts, so the loop
-    /// re-replicates the shards this node holds to their NEW replica set — state follows the
-    /// election. `None` until the first pass. Event-driven: no work while membership is stable.
-    last_census: RwLock<Option<[u8; 32]>>,
+    /// `(digest of the census, consecutive ticks it has been UNCHANGED)`. The migration loop
+    /// re-replicates held shards to their new replica set ONLY after the census has been STABLE
+    /// for [`MIGRATE_STABLE_TICKS`] ticks — never on every change. Critical: during a join storm
+    /// the census changes on EVERY gossip tick, so firing per-change would storm the registry and
+    /// contend with the gossip, stalling the very convergence it depends on. Debounced → migration
+    /// runs once per settled membership. `None` until the first observation.
+    last_census: RwLock<Option<([u8; 32], u32)>>,
 }
 
 /// One head row for the dashboard — hex-encoded `(owner, cid)` + `name` + `version`.
@@ -195,14 +202,30 @@ impl HeadRegistry {
         let mut ids = self.eligible().await;
         ids.sort();
         let digest = Cid::of(&ids.concat()).0;
-        {
-            let mut last = self.last_census.write().await;
-            if *last == Some(digest) {
-                return; // membership unchanged — nothing to migrate
+        // Debounce: migrate only once the census has been UNCHANGED for MIGRATE_STABLE_TICKS ticks.
+        // During convergence/churn the census changes every tick — firing the scan+push then would
+        // storm the registry and stall the very gossip convergence it depends on.
+        let should_migrate = {
+            let mut g = self.last_census.write().await;
+            match g.as_mut() {
+                Some((d, ticks)) if *d == digest => {
+                    if *ticks < MIGRATE_STABLE_TICKS {
+                        *ticks += 1;
+                        *ticks == MIGRATE_STABLE_TICKS // fire exactly once, on reaching the threshold
+                    } else {
+                        false // already migrated for this settled census
+                    }
+                }
+                _ => {
+                    *g = Some((digest, 0)); // census changed (or first) — reset stability, don't migrate
+                    false
+                }
             }
-            *last = Some(digest);
+        };
+        if !should_migrate {
+            return;
         }
-        // Census changed: re-replicate every shard we hold local state for to its new replica set.
+        // Census has SETTLED: re-replicate every shard we hold local state for to its new replica set.
         for &rtype in &[RT_PROGRAM, RT_DBROOT, RT_MANIFEST] {
             for shard in 0..SHARD_COUNT {
                 let sk = ShardKey { rtype, shard };
