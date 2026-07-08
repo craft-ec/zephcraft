@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ZephCraft — the internet's shared storage grid</title>
-<meta name="description" content="Every device contributes spare disk into one content-addressed pool that replicates only what matters. A decentralized storage grid — not the cloud, not BitTorrent.">
+<meta name="description" content="Every device contributes spare disk into one content-addressed pool that replicates only what matters. Storage, SQL databases, and WASM compute on one decentralized grid — not the cloud, not BitTorrent, not a blockchain.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='84' fill='%2358a6ff' font-family='monospace'%3E%E2%8C%81%3C/text%3E%3C/svg%3E">
 <meta property="og:title" content="ZephCraft — the internet's shared storage grid">
 <meta property="og:description" content="Spare disk on every device, pooled into one network that replicates only what matters.">
@@ -178,7 +178,8 @@
   <div class="navlinks">
     <a href="#network">network</a>
     <a href="#thesis">thesis</a>
-    <a href="#how">how</a>
+    <a href="#stack">stack</a>
+    <a href="https://docs.craft.ec/zeph">docs</a>
     <a class="live" href="#network"><span class="pulse"></span><span id="nav-live">live</span></a>
   </div>
 </div></nav>
@@ -189,7 +190,8 @@
     <div class="eyebrow">ZephCraft · decentralized storage</div>
     <h1><span class="l1">The internet's</span><span class="l2 grad">shared storage grid.</span></h1>
     <p class="lede">Every device contributes spare disk into one content-addressed pool —
-      that replicates <b>only what matters</b>. Not the cloud. Not BitTorrent. A grid.</p>
+      that replicates <b>only what matters</b>. Storage, databases, and compute on one grid.
+      Not the cloud. Not BitTorrent. Not a blockchain.</p>
     <div class="hero-cta">
       <span class="term"><span class="p">$</span> <span>zeph publish</span> <span class="c">./file</span></span>
       <a class="ghost" href="#network">see it running →</a>
@@ -203,7 +205,7 @@
   <div class="sec-head reveal">
     <div class="eyebrow">live · right now</div>
     <h2>This isn't a whitepaper. The network is running.</h2>
-    <p>Real numbers, pulled live from a tracker on the network. It's early — small on purpose,
+    <p>Real numbers, served live by a node on the network. It's early — small on purpose,
       honest by default. No projections, no vanity metrics.</p>
   </div>
   <div class="livecard reveal">
@@ -242,8 +244,8 @@
   </div>
   <div class="knobs">
     <div class="knob reveal"><div class="n">01 · FLOOR</div><h3>Erasure coding</h3>
-      <p>~3× redundancy survives losing two-thirds of holders. Full-copy replication needs ~20× for the
-        same durability. The floor is cheap.</p></div>
+      <p>4× redundancy survives losing three-quarters of all pieces. Full-copy replication needs ~20×
+        for the same durability. The floor is cheap.</p></div>
     <div class="knob reveal"><div class="n">02 · DEMAND</div><h3>Scaling</h3>
       <p>Popular content gains providers where there's traffic — and sheds them when demand fades.
         Temporary, bandwidth-driven.</p></div>
@@ -282,6 +284,30 @@
   </table></div>
 </div></section>
 
+<!-- STACK -->
+<section id="stack"><div class="wrap">
+  <div class="sec-head reveal">
+    <div class="eyebrow">the full vertical · all live</div>
+    <h2>Storage was the floor. The grid runs a stack.</h2>
+    <p>The same network that stores your bytes runs real databases, sandboxed compute, and a
+      durable name registry — every layer built and validated on the live cluster.</p>
+  </div>
+  <div class="knobs">
+    <div class="knob reveal"><div class="n">L1 · STORAGE</div><h3>CraftOBJ</h3>
+      <p>Content-addressed objects, self-healing erasure coding, demand-driven lifecycle.
+        Private files are ciphertext-only on the wire.</p></div>
+    <div class="knob reveal"><div class="n">L2 · DATABASE</div><h3>CraftSQL</h3>
+      <p>Real SQLite over content-addressed pages. One writer per database, anyone reads —
+        durable and recoverable from the grid even if the owner dies.</p></div>
+    <div class="knob reveal"><div class="n">L3 · COMPUTE</div><h3>WASM programs</h3>
+      <p>Fuel-metered sandboxes with capability-scoped SQL + storage. Deploy by name,
+        invoke from any node — the caller's identity comes free with the connection.</p></div>
+    <div class="knob reveal"><div class="n">L4 · COORDINATION</div><h3>Head registry</h3>
+      <p>A durable, owner-signed name registry — sharded, writer-elected, resharded live by
+        governance. Your names resolve with you offline. No committee anywhere.</p></div>
+  </div>
+</div></section>
+
 <!-- HOW -->
 <section id="how"><div class="wrap">
   <div class="sec-head reveal">
@@ -300,8 +326,8 @@
       <p>Single-writer-per-identity means no blockchain, no gas, no global agreement. It scales linearly,
         not O(N).</p></div>
     <div class="how-item reveal"><h3>Founder-proof</h3>
-      <p>A keypair is the only credential. Anyone can run a node, relay, or tracker. If we vanish, the
-        network keeps healing.</p></div>
+      <p>A keypair is the only credential. Anyone can run a node, a relay, or the routing DHT. If we
+        vanish, the network keeps healing.</p></div>
   </div>
 </div></section>
 
@@ -326,7 +352,7 @@
 
 <footer><div class="wrap">
   <span>ZephCraft · a Craftec protocol · <span id="foot-live">building in the open</span></span>
-  <span>store bytes · retrieve bytes · keep them alive</span>
+  <span><a href="https://docs.craft.ec/zeph">docs</a> · store bytes · run databases · keep them alive</span>
 </div></footer>
 
 <script>
