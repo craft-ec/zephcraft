@@ -74,10 +74,6 @@ impl Default for Config {
 // exceed that diffusion time or transitively-known peers flap in and out of the census.
 const CENSUS_TTL_MS: u64 = 120_000;
 
-/// Minimum interval (ms) between isolation-recovery seed dials. Keeps recovery GENTLE so a
-/// transient loss doesn't storm a fragile relay every probe round (which prevented recovery).
-const RECOVER_INTERVAL_MS: u64 = 15_000;
-
 /// Live state of one known peer (active view or recently dead).
 #[derive(Debug, Clone)]
 pub struct PeerState {
@@ -144,9 +140,6 @@ pub struct Membership {
     /// loss that drains the views leaves a node permanently isolated (shuffle needs a live
     /// active peer; the initial bootstrap runs only once).
     bootstrap: RwLock<Vec<PeerAddr>>,
-    /// Last time isolation recovery dialed a seed (ms). Rate-limits recovery so a hiccup
-    /// doesn't trigger a per-probe-round connection storm on a fragile relay.
-    last_recover_ms: RwLock<u64>,
 }
 
 impl Membership {
@@ -156,7 +149,6 @@ impl Membership {
             cfg,
             views: RwLock::new(Views::default()),
             bootstrap: RwLock::new(Vec::new()),
-            last_recover_ms: RwLock::new(0),
         })
     }
 
@@ -376,48 +368,30 @@ impl Membership {
     }
 
     /// Re-run the seed bootstrap joins to recover from total isolation (active view empty).
-    /// Rate-limited isolation recovery: at most once per [`RECOVER_INTERVAL_MS`], dial ONE
-    /// random seed to re-enter the overlay. GENTLE by design — the old path dialed EVERY seed
-    /// every probe round (on top of `fill_active`), storming fragile relay peers and preventing
-    /// the very recovery it attempted (a transient hiccup became a sustained collapse).
-    /// Pre-membership had no recovery here at all; this restores that light footprint while
-    /// still fixing the permanent-isolation bug.
-    async fn recover_isolated(&self) {
-        {
-            let now = now_ms();
-            let mut last = self.last_recover_ms.write().await;
-            if now.saturating_sub(*last) < RECOVER_INTERVAL_MS {
-                return;
-            }
-            *last = now;
+    async fn rejoin_bootstrap(&self) {
+        let peers = self.bootstrap.read().await.clone();
+        if peers.is_empty() {
+            return;
         }
+        tracing::warn!("membership isolated (active view empty) — re-bootstrapping from seeds");
         let me = self.my_id();
-        let seed = {
-            let peers = self.bootstrap.read().await;
-            peers
-                .iter()
-                .filter(|p| p.node_id() != me)
-                .cloned()
-                .collect::<Vec<_>>()
-                .choose(&mut rand::thread_rng())
-                .cloned()
-        };
-        if let Some(seed) = seed {
-            tracing::warn!(peer = %short(&seed.node_id()), "isolated — re-bootstrapping (one seed)");
-            self.join(&seed).await;
+        for peer in peers {
+            if peer.node_id() != me {
+                self.join(&peer).await;
+            }
         }
     }
 
     // ── periodic tasks ────────────────────────────────────────────────────
 
     async fn probe_round(&self) {
-        // With a live overlay, top up the active view (promotions succeed cheaply). When fully
-        // ISOLATED, do NOT also run the aggressive fill — recover gently + rate-limited so we
-        // don't storm a fragile relay every 5s and block the recovery we're attempting.
+        self.fill_active().await;
+        // Self-heal from TOTAL isolation: if fill_active could not restore a single active
+        // peer (every view drained by a transient network loss), re-run the seed bootstrap.
+        // Otherwise a node that loses all peers never rediscovers the network — shuffle needs
+        // a live active peer and the initial bootstrap runs only once.
         if self.views.read().await.active.is_empty() {
-            self.recover_isolated().await;
-        } else {
-            self.fill_active().await;
+            self.rejoin_bootstrap().await;
         }
         let targets: Vec<(NodeId, PeerAddr)> = {
             let views = self.views.read().await;
