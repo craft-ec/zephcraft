@@ -46,8 +46,6 @@ pub struct Config {
     /// Also the age at which a member is fully forgotten from the converged
     /// member set (a live member re-asserts itself every sync round).
     pub dead_retention: Duration,
-    /// Cadence of the converged-membership anti-entropy round (MemberSync).
-    pub member_sync_interval: Duration,
 }
 
 impl Default for Config {
@@ -63,7 +61,6 @@ impl Default for Config {
             shuffle_interval: Duration::from_secs(30),
             shuffle_sample: 8,
             dead_retention: Duration::from_secs(600),
-            member_sync_interval: Duration::from_secs(10),
         }
     }
 }
@@ -72,7 +69,10 @@ impl Default for Config {
 /// Generous on purpose: the converged set must not falsely drop a peer between
 /// anti-entropy rounds — genuine deaths age out after `dead_retention`, and a live
 /// peer re-asserts its `last_heard_ms` every sync round (well inside this TTL).
-const CENSUS_TTL_MS: u64 = 45_000;
+// Gossip now diffuses via the 30s shuffle (folded in) rather than a 10s dedicated round, so a
+// member's fresh evidence takes a few shuffle hops to reach every node — the TTL must comfortably
+// exceed that diffusion time or transitively-known peers flap in and out of the census.
+const CENSUS_TTL_MS: u64 = 120_000;
 
 /// Live state of one known peer (active view or recently dead).
 #[derive(Debug, Clone)]
@@ -201,16 +201,6 @@ impl Membership {
             loop {
                 interval.tick().await;
                 this.shuffle_round().await;
-            }
-        });
-
-        let this = self.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(this.cfg.member_sync_interval);
-            interval.tick().await; // skip the immediate first tick
-            loop {
-                interval.tick().await;
-                this.member_sync_round().await;
             }
         });
     }
@@ -494,6 +484,7 @@ impl Membership {
     }
 
     async fn shuffle_round(&self) {
+        self.refresh_self().await;
         let (target, sample) = {
             let views = self.views.read().await;
             let actives: Vec<PeerAddr> = views.active.values().map(|s| s.addr.clone()).collect();
@@ -519,6 +510,7 @@ impl Membership {
         let msg = wire::Message::Shuffle(wire::Shuffle {
             origin: self.me(),
             sample,
+            members: self.member_entries().await,
         });
         if let Some(frame) = self.request(&target, &msg, true).await {
             if let wire::Message::ShuffleReply(reply) = frame.message {
@@ -527,42 +519,18 @@ impl Membership {
                         self.add_passive(addr).await;
                     }
                 }
-            }
-        }
-    }
-
-    // ── converged membership (anti-entropy layer beside HyParView) ─────────
-
-    /// One MemberSync anti-entropy round: re-assert self, gossip our full member
-    /// set to a random ACTIVE peer, merge its reply, and age out the dead.
-    async fn member_sync_round(&self) {
-        self.refresh_self().await;
-        let target = {
-            let views = self.views.read().await;
-            views
-                .active
-                .values()
-                .map(|s| s.addr.clone())
-                .collect::<Vec<_>>()
-                .choose(&mut rand::thread_rng())
-                .cloned()
-        };
-        if let Some(target) = target {
-            let msg = wire::Message::MemberSync(wire::MemberSync {
-                members: self.member_entries().await,
-            });
-            if let Some(frame) = self.request(&target, &msg, true).await {
-                if let wire::Message::MemberSync(reply) = frame.message {
-                    self.merge_members(&reply.members).await;
-                }
+                // Converged-membership gossip rides the shuffle reply — no extra connection.
+                self.merge_members(&reply.members).await;
             }
         }
         self.prune_members().await;
     }
 
-    /// Keep SELF in the member map with a fresh `last_heard_ms` (called at the
-    /// start of every sync round and before replying) — a live node re-asserts
-    /// itself so it is never falsely aged out of any peer's converged set.
+    // ── converged membership (anti-entropy layer beside HyParView) ─────────
+
+    /// Keep SELF in the member map with a fresh `last_heard_ms` (called each probe/shuffle
+    /// round and before replying to a shuffle) — a live node re-asserts itself so it is never
+    /// falsely aged out of any peer's converged set.
     async fn refresh_self(&self) {
         let addr = self.transport.addr();
         let id = self.my_id();
@@ -816,8 +784,13 @@ impl Membership {
                 if let Ok(origin) = shuffle.origin.addr.parse::<PeerAddr>() {
                     self.add_passive(origin).await;
                 }
+                // Converged-membership gossip rides the shuffle: merge the sender's member set
+                // and reply with ours — no separate connection (that congested relay peers).
+                self.merge_members(&shuffle.members).await;
+                self.refresh_self().await;
                 Some(wire::Message::ShuffleReply(wire::ShuffleReply {
                     sample: reply_sample,
+                    members: self.member_entries().await,
                 }))
             }
             wire::Message::MemberSync(sync) => {

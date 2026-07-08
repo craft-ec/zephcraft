@@ -183,11 +183,17 @@ pub struct NeighborReply {
 pub struct Shuffle {
     pub origin: PeerInfo,
     pub sample: Vec<PeerInfo>,
+    /// Converged-membership gossip PIGGYBACKED on the shuffle — the sender's member set.
+    /// Folded in here (rather than a separate periodic connection) because an extra
+    /// membership connection every 10s collapsed fragile relay-only peers' probe path.
+    pub members: Vec<MemberEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShuffleReply {
     pub sample: Vec<PeerInfo>,
+    /// The responder's member set, merged symmetrically by the shuffle initiator.
+    pub members: Vec<MemberEntry>,
 }
 
 /// One member's liveness record on the wire: identity, dialable address, and the
