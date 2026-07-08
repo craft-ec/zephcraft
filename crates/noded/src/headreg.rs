@@ -60,6 +60,13 @@ pub const RT_MANIFEST: u8 = 2;
 /// state (the offline-writer fault the single-writer model could not survive).
 const REPLICATION_FACTOR: usize = 3;
 
+/// Resolve-cache TTL. A NON-replica node caches a remote resolve for this long so repeated reads
+/// of the same key skip the 8s-bounded network round-trip — this is what takes a hot shard's
+/// writer from "tens → thousands" of readers. Short enough that another node's write becomes
+/// visible within it; this node's own `register()` invalidates the entry immediately
+/// (read-your-writes). Replicas never use it — they read authoritative local state.
+const RESOLVE_CACHE_TTL_MS: u64 = 3_000;
+
 /// Identifies one registry account = one `(kind, shard)`. Threaded everywhere a shard used to
 /// be, so each kind gets its own independent per-shard account + writer set.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -91,6 +98,51 @@ fn shard_seed(sk: ShardKey) -> Vec<u8> {
         sk.shard.to_le_bytes().as_slice(),
     ]
     .concat()
+}
+
+/// A TTL'd cache of `(rtype, owner, name)` → `(cid, version)` resolves. The clock is injected
+/// (`now` is passed in) so the cache is unit-testable without a live registry. Consulted only for
+/// NON-replica reads — a replica reads authoritative local state (see [`HeadRegistry`]).
+#[derive(Default)]
+struct ResolveCache {
+    map: RwLock<std::collections::HashMap<(u8, [u8; 32], String), (([u8; 32], u64), u64)>>,
+}
+
+impl ResolveCache {
+    /// The cached `(cid, version)` for the key, or `None` if absent or expired at `now`.
+    async fn get(
+        &self,
+        rtype: u8,
+        owner: &[u8; 32],
+        name: &str,
+        now: u64,
+    ) -> Option<([u8; 32], u64)> {
+        match self
+            .map
+            .read()
+            .await
+            .get(&(rtype, *owner, name.to_string()))
+        {
+            Some((entry, expiry)) if *expiry > now => Some(*entry),
+            _ => None,
+        }
+    }
+
+    /// Cache `entry` for the key until `now + RESOLVE_CACHE_TTL_MS`.
+    async fn put(&self, rtype: u8, owner: [u8; 32], name: &str, entry: ([u8; 32], u64), now: u64) {
+        self.map.write().await.insert(
+            (rtype, owner, name.to_string()),
+            (entry, now + RESOLVE_CACHE_TTL_MS),
+        );
+    }
+
+    /// Drop any cached entry for the key (after this node writes it).
+    async fn invalidate(&self, rtype: u8, owner: &[u8; 32], name: &str) {
+        self.map
+            .write()
+            .await
+            .remove(&(rtype, *owner, name.to_string()));
+    }
 }
 
 /// The node's durable owner-signed HEAD registry — a thin consumer of [`ProgramAccountStore`].
@@ -133,6 +185,11 @@ pub struct HeadRegistry {
     /// contend with the gossip, stalling the very convergence it depends on. Debounced → migration
     /// runs once per settled membership. `None` until the first observation.
     last_census: RwLock<Option<([u8; 32], u32)>>,
+    /// Read cache for NON-replica resolves: `(rtype, owner, name)` → `((cid, version), expiry_ms)`.
+    /// A replica reads its shard locally and never consults this; a non-replica otherwise pays a
+    /// network round-trip per resolve. TTL'd ([`RESOLVE_CACHE_TTL_MS`]) for other-node writes;
+    /// [`Self::register`] invalidates the key so this node's own writes are read-your-writes.
+    resolve_cache: ResolveCache,
 }
 
 /// One head row for the dashboard — hex-encoded `(owner, cid)` + `name` + `version`.
@@ -188,6 +245,7 @@ impl HeadRegistry {
             self_id,
             last_epoch: RwLock::new(std::collections::HashMap::new()),
             last_census: RwLock::new(None),
+            resolve_cache: ResolveCache::default(),
         }
     }
 
@@ -560,26 +618,35 @@ impl HeadRegistry {
             rtype,
             shard: shard_of(&self.self_id, name),
         };
-        if self.is_writer(sk).await {
-            return self.advance_local(sk, &sub.encode()).await;
-        }
-        // Non-writer: forward the signed submission to the shard's writer, which advances the
-        // shard account and returns the new root.
-        let addr = self.writer_addr(sk).await?;
-        match request_registry(
-            &self.transport,
-            &addr,
-            &RegistryReq::Submit {
-                rtype,
-                sub: sub.encode(),
-            },
-        )
-        .await?
-        {
-            RegistryResp::SubmitAck(root) => Ok(root),
-            RegistryResp::Err(e) => Err(anyhow::anyhow!("registry writer rejected submit: {e}")),
-            other => Err(anyhow::anyhow!("unexpected registry response: {other:?}")),
-        }
+        let root = if self.is_writer(sk).await {
+            self.advance_local(sk, &sub.encode()).await?
+        } else {
+            // Non-writer: forward the signed submission to the shard's writer, which advances the
+            // shard account and returns the new root.
+            let addr = self.writer_addr(sk).await?;
+            match request_registry(
+                &self.transport,
+                &addr,
+                &RegistryReq::Submit {
+                    rtype,
+                    sub: sub.encode(),
+                },
+            )
+            .await?
+            {
+                RegistryResp::SubmitAck(root) => root,
+                RegistryResp::Err(e) => {
+                    return Err(anyhow::anyhow!("registry writer rejected submit: {e}"))
+                }
+                other => return Err(anyhow::anyhow!("unexpected registry response: {other:?}")),
+            }
+        };
+        // This node just wrote the key under its own identity — drop any stale cached resolve so
+        // the write is immediately visible to this node's reads (read-your-writes).
+        self.resolve_cache
+            .invalidate(rtype, &self.self_id, name)
+            .await;
+        Ok(root)
     }
 
     /// Resolve a name published by `owner` to its current cid, TOLERANT of a briefly-unreachable
@@ -617,8 +684,9 @@ impl HeadRegistry {
         };
         let elig = self.eligible().await;
         let reps = Self::replicas(sk, &elig);
+        let is_replica = reps.contains(&self.self_id);
         // (a) Local read if this node holds the shard's state as a replica.
-        if reps.contains(&self.self_id) {
+        if is_replica {
             if let Some(entry) = RegistryState::decode(
                 &self
                     .store
@@ -626,6 +694,17 @@ impl HeadRegistry {
                     .await,
             )
             .and_then(|s| s.resolve(&owner, name).map(|e| (e.cid, e.version)))
+            {
+                return Some(entry);
+            }
+        }
+        // (a′) NON-replica: a fresh cached resolve avoids the network round-trip below. Replicas
+        // skip the cache — their authoritative local read above is the source of truth.
+        if !is_replica {
+            if let Some(entry) = self
+                .resolve_cache
+                .get(rtype, &owner, name, self.clock.now().millis())
+                .await
             {
                 return Some(entry);
             }
@@ -658,6 +737,11 @@ impl HeadRegistry {
             )
             .await
             {
+                if !is_replica {
+                    self.resolve_cache
+                        .put(rtype, owner, name, entry, self.clock.now().millis())
+                        .await;
+                }
                 return Some(entry);
             }
         }
@@ -1037,5 +1121,34 @@ impl HeadRegistry {
             });
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn resolve_cache_serves_fresh_expires_isolates_and_invalidates() {
+        let c = ResolveCache::default();
+        let owner = [1u8; 32];
+        let entry = ([9u8; 32], 7u64);
+
+        c.put(RT_PROGRAM, owner, "app", entry, 1_000).await;
+        // fresh within the TTL window
+        assert_eq!(c.get(RT_PROGRAM, &owner, "app", 1_500).await, Some(entry));
+        // at/after expiry it is stale (expiry is exclusive)
+        let expiry = 1_000 + RESOLVE_CACHE_TTL_MS;
+        assert_eq!(c.get(RT_PROGRAM, &owner, "app", expiry).await, None);
+
+        // key isolation: a different name, rtype, or owner is a miss
+        c.put(RT_PROGRAM, owner, "app", entry, 1_000).await;
+        assert_eq!(c.get(RT_PROGRAM, &owner, "other", 1_100).await, None);
+        assert_eq!(c.get(RT_DBROOT, &owner, "app", 1_100).await, None);
+        assert_eq!(c.get(RT_PROGRAM, &[2u8; 32], "app", 1_100).await, None);
+
+        // invalidate drops it immediately (read-your-writes after register())
+        c.invalidate(RT_PROGRAM, &owner, "app").await;
+        assert_eq!(c.get(RT_PROGRAM, &owner, "app", 1_100).await, None);
     }
 }
