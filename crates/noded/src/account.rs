@@ -136,6 +136,13 @@ impl ProgramAccountStore {
         self.load_state(pda(&program_cid, seed).0)
     }
 
+    /// Delete the local state of `pda(program_id, seed)` (remove its `.state` file). Best-effort:
+    /// a missing file is fine. Used by the registry reshard to GC a fully-drained old-generation
+    /// account. Only touches this node's local copy (durable content is not un-published here).
+    pub async fn clear(&self, program_id: [u8; 32], seed: &[u8]) {
+        let _ = std::fs::remove_file(self.state_path(pda(&program_id, seed).0));
+    }
+
     /// Adopt `bytes` DIRECTLY as the state of `pda(program_id, seed)` — write it as the
     /// account's state file and publish it as durable content WITHOUT running a program.
     /// Used to adopt a registry state handed off from the previous epoch's writer (the state

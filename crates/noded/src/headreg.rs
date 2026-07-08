@@ -60,6 +60,12 @@ const MAX_SHARD_BITS: u32 = 12;
 /// convergence/churn the census changes every tick, which must NOT trigger the scan+push storm.
 const MIGRATE_STABLE_TICKS: u32 = 3;
 
+/// After a reshard, how many loop ticks to keep DRAINING the old generation (re-sweeping it
+/// forward to catch writes that landed on it during the governance-propagation window) before
+/// GC-ing its accounts. The loop ticks every 10s and propagation is ~20s, so 6 (~60s) generously
+/// covers the window in which a straggler node still writes the old count.
+const DRAIN_TICKS: u32 = 6;
+
 /// Registry KIND tags — each kind is a SEPARATE account per shard (the tag is folded into
 /// [`shard_seed`], so `(rtype, shard)` addresses distinct state). Lets program heads, database
 /// roots, and manifests share one substrate without colliding.
@@ -262,6 +268,12 @@ pub struct HeadRegistry {
     /// network round-trip per resolve. TTL'd ([`RESOLVE_CACHE_TTL_MS`]) for other-node writes;
     /// [`Self::register`] invalidates the key so this node's own writes are read-your-writes.
     resolve_cache: ResolveCache,
+    /// Reshard drain state: `Some((old_gen, ticks))` while an OLD shard-count generation is being
+    /// drained after a reshard — [`Self::reshard_round`] keeps re-sweeping `old_gen` forward for
+    /// [`DRAIN_TICKS`] ticks (catching writes that landed there during the propagation window),
+    /// then GC's its accounts and clears this back to `None`. In-memory (a restart just leaves the
+    /// old generation un-GC'd, which is harmless — reads resolve at the current generation).
+    draining: RwLock<Option<(u32, u32)>>,
 }
 
 /// One head row for the dashboard — hex-encoded `(owner, cid)` + `name` + `version`.
@@ -320,6 +332,7 @@ impl HeadRegistry {
             last_epoch: RwLock::new(std::collections::HashMap::new()),
             last_census: RwLock::new(None),
             resolve_cache: ResolveCache::default(),
+            draining: RwLock::new(None),
         }
     }
 
@@ -410,24 +423,23 @@ impl HeadRegistry {
 
     /// ONLINE RESHARD — the split/merge that lets a live cluster change its shard count without a
     /// wipe. Detects that the governed `shard_bits` differs from the generation this node last
-    /// migrated to, then re-buckets every head it holds at the OLD generation into the accounts of
-    /// the NEW generation and pushes them to the new owners. Gated on `last != current`, so the
-    /// common (stable) path is one governance read + one marker read — no traffic while the count
-    /// is unchanged, mirroring `migrate_round`'s event-driven discipline.
+    /// migrated to, sweeps every head from the OLD generation into the NEW one, then DRAINS the old
+    /// generation (keeps re-sweeping it to catch late writes) and finally GC's it. Gated so the
+    /// common (stable, not-draining) path is one governance read + one marker read — no traffic
+    /// while the count is unchanged, mirroring `migrate_round`'s event-driven discipline.
     ///
     /// Correctness / convergence:
-    /// - MERGE-FORWARD, never delete: the old-generation accounts are left intact, so during the
-    ///   propagation window a peer still on the old count keeps resolving (its reads carry the old
-    ///   `bits` and hit the old accounts), while readers on the new count hit the freshly-written
-    ///   new accounts. Both generations resolve until every node has migrated.
-    /// - IDEMPOTENT: re-bucketing is an LWW merge, and `save_gen` runs only after a full pass, so a
-    ///   crash mid-reshard just re-runs on restart (at-least-once). Every replica of an old shard
-    ///   runs this, so the new owners receive the state redundantly and converge.
-    /// - KNOWN WINDOW (accepted, documented): a WRITE that lands on the old generation AFTER this
-    ///   node has already migrated is not swept forward again — it is visible only to old-count
-    ///   readers until the writer itself moves to the new count. Bounded by governance-propagation
-    ///   time (seconds); acceptable pre-production. `resolve_entry`'s adjacent-generation fallback
-    ///   softens the read side during the window.
+    /// - MERGE-FORWARD, never overwrite: [`Self::sweep_generation`] LWW-merges into the new
+    ///   accounts, so nothing is lost and the sweep is idempotent (safe to repeat during the drain).
+    /// - DRAIN window closes the "late write" gap: after the switch, some peers are briefly still on
+    ///   the old count and write to the old generation. We keep sweeping the old generation forward
+    ///   for [`DRAIN_TICKS`] ticks (>> the governance-propagation window), so those late writes are
+    ///   carried to the new generation rather than stranded. Reads also fall through to the adjacent
+    ///   generation ([`Self::resolve_entry`]) meanwhile, so nothing is unresolvable in the interim.
+    /// - GC: once drained, [`Self::gc_generation`] deletes this node's old-generation account files
+    ///   (each replica GC's its own copy on the same schedule) — the old generation is gone for good.
+    /// - Crash safety: `save_gen` marks the new generation before draining; a restart mid-drain just
+    ///   leaves the old generation un-GC'd (harmless — reads resolve at the current generation).
     async fn reshard_round(&self) {
         let current = self.shard_bits().await;
         let last = match self.load_gen().await {
@@ -439,19 +451,45 @@ impl HeadRegistry {
                 return;
             }
         };
-        if last == current {
-            return; // no reshard pending — the cheap, common path
+        if last != current {
+            // Generation just changed: sweep old→new, mark the new generation, and begin draining
+            // the old one (re-swept each tick below until DRAIN_TICKS, then GC'd).
+            self.sweep_generation(last, current).await;
+            self.save_gen(current).await;
+            *self.draining.write().await = Some((last, 0));
+            return;
         }
+        // Stable generation. If an old generation is still draining, keep sweeping it forward to
+        // catch writes that landed on it during the propagation window, then GC once fully drained.
+        let drain = *self.draining.read().await;
+        if let Some((old, ticks)) = drain {
+            if old == current {
+                *self.draining.write().await = None; // safety: never drain the live generation
+                return;
+            }
+            self.sweep_generation(old, current).await;
+            if ticks + 1 >= DRAIN_TICKS {
+                self.gc_generation(old).await;
+                *self.draining.write().await = None;
+            } else {
+                *self.draining.write().await = Some((old, ticks + 1));
+            }
+        }
+    }
+
+    /// Re-bucket every head this node holds at generation `from` into the accounts of generation
+    /// `to`, LWW-merging each group into the target account and pushing it to that account's replica
+    /// set. The core migration step of a reshard; idempotent, so it is safe to run repeatedly during
+    /// the drain window. Only sweeps shards this node replicates at `from` (election is
+    /// bits-independent, so that set matches its current replica assignment).
+    async fn sweep_generation(&self, from: u32, to: u32) {
         let elig = self.eligible().await;
         for &rtype in &[RT_PROGRAM, RT_DBROOT, RT_MANIFEST] {
-            // 1. Gather every head this node holds at the OLD generation. Election is
-            //    bits-independent, so the shards we replicate at `last` are the same set we would
-            //    now — `replicas(sk)` over the current eligible set.
             let mut entries: Vec<HeadEntry> = Vec::new();
-            for shard in 0..(1u64 << last) {
+            for shard in 0..(1u64 << from) {
                 let sk_old = ShardKey {
                     rtype,
-                    bits: last,
+                    bits: from,
                     shard,
                 };
                 if !Self::replicas(sk_old, &elig).contains(&self.self_id) {
@@ -468,12 +506,10 @@ impl HeadRegistry {
             if entries.is_empty() {
                 continue;
             }
-            // 2. Re-bucket to the NEW count, then merge each group into its new-generation account
-            //    and push to that account's (new) replica set so the new owners hold it.
-            for (new_shard, group) in rebucket_entries(&entries, current) {
+            for (new_shard, group) in rebucket_entries(&entries, to) {
                 let sk_new = ShardKey {
                     rtype,
-                    bits: current,
+                    bits: to,
                     shard: new_shard,
                 };
                 let seed = shard_seed(sk_new);
@@ -489,7 +525,25 @@ impl HeadRegistry {
                 self.replicate(sk_new, &bytes).await;
             }
         }
-        self.save_gen(current).await;
+    }
+
+    /// GC a fully-drained generation: delete this node's local account state for every shard it
+    /// holds at generation `bits` (all rtypes). Called only after [`DRAIN_TICKS`] of sweeping, by
+    /// which point the old generation has been carried forward and no peer still writes it, so the
+    /// files are dead weight. Local-only; other replicas GC their own copies on the same schedule.
+    async fn gc_generation(&self, bits: u32) {
+        let elig = self.eligible().await;
+        for &rtype in &[RT_PROGRAM, RT_DBROOT, RT_MANIFEST] {
+            for shard in 0..(1u64 << bits) {
+                let sk = ShardKey { rtype, bits, shard };
+                if !Self::replicas(sk, &elig).contains(&self.self_id) {
+                    continue;
+                }
+                self.store
+                    .clear(registry_program_cid(), &shard_seed(sk))
+                    .await;
+            }
+        }
     }
 
     /// Wire the governance chain so the app-registry program cid is resolved THROUGH it
