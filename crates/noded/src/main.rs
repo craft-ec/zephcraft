@@ -159,6 +159,9 @@ enum Command {
         /// name=cid : set a network-owned program's canonical wasm cid.
         #[arg(long)]
         set_program: Option<String>,
+        /// key=value : set a protocol config value (integer), e.g. `shard_bits=9`.
+        #[arg(long)]
+        set_config: Option<String>,
     },
     /// Execute write SQL against your own CraftSQL database `ns`
     /// (commits + publishes the KIND_ROOT head).
@@ -399,7 +402,8 @@ async fn main() -> anyhow::Result<()> {
             remove,
             threshold,
             set_program,
-        }) => cmd_gov_propose(&data_dir, add, remove, threshold, set_program).await,
+            set_config,
+        }) => cmd_gov_propose(&data_dir, add, remove, threshold, set_program, set_config).await,
         Some(Command::SqlExec { ns, sql }) => cmd_sql_exec(&data_dir, &ns, &sql).await,
         Some(Command::SqlQuery { ns, sql, owner }) => {
             cmd_sql_query(&data_dir, owner.as_deref(), &ns, &sql).await
@@ -643,6 +647,7 @@ async fn cmd_gov_propose(
     remove: Option<String>,
     threshold: Option<u64>,
     set_program: Option<String>,
+    set_config: Option<String>,
 ) -> anyhow::Result<()> {
     let params = if let Some(h) = add {
         serde_json::json!({"action": "add", "governor": h})
@@ -655,8 +660,17 @@ async fn cmd_gov_propose(
             .split_once('=')
             .ok_or_else(|| anyhow::anyhow!("--set-program name=cid"))?;
         serde_json::json!({"action": "set_program", "name": name, "cid": cid})
+    } else if let Some(kv) = set_config {
+        let (key, value) = kv
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--set-config key=value"))?;
+        let value: i64 = value
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("--set-config value must be an integer"))?;
+        serde_json::json!({"action": "set_config", "key": key, "value": value})
     } else {
-        anyhow::bail!("give one of --add/--remove/--threshold/--set-program");
+        anyhow::bail!("give one of --add/--remove/--threshold/--set-program/--set-config");
     };
     let res =
         control::query_unix_params(&data_dir.join("zeph.sock"), "gov_propose", params).await?;
