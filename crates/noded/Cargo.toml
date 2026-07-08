@@ -38,6 +38,7 @@ serde_json.workspace = true
 axum.workspace = true
 rand.workspace = true
 hex.workspace = true
+rusqlite = { version = "0.31", features = ["bundled"] }
 dirs.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

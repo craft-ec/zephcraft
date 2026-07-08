@@ -11,6 +11,7 @@ mod headreg;
 mod peers;
 mod registry_heads;
 mod registry_net;
+mod shard_root;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1113,6 +1114,22 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         data_dir,
         transport.clock(),
     ));
+    // The registry's per-shard state is a CraftSQL DB (SQL_REGISTRY_DESIGN). Its own CraftSql
+    // engine, owned by this node, with a BLOB-backed RootStore (shard-DB roots stored in account
+    // blobs, NOT back through the registry — breaks the recursion). NO PageSource and NO ObjDurable:
+    // durability is K-replica row-push (each replica builds its shard DB from pushed submissions and
+    // backfills via GetState), so no cross-node page fetch is needed and the write path never blocks
+    // on (or fails from) synchronous erasure coding — matching the old registry's fire-and-forget
+    // durability. Erasure-coded shard-page durability as a best-effort background layer is a
+    // follow-up (see docs/SQL_REGISTRY_DESIGN.md).
+    let shard_root_store =
+        std::sync::Arc::new(shard_root::ShardRootStore::new(account_store.clone()));
+    let shard_sql = std::sync::Arc::new(zeph_sql::CraftSql::register(
+        data_dir.join("regshards"),
+        shard_root_store.clone(),
+        transport.node_id(),
+    )?);
+
     // Phase 4c: the durable program-name registry — a THIN consumer of the account store.
     // The writer for each epoch is ELECTED deterministically from the membership view + HLC
     // clock (a rotating writer); non-writers forward to the current epoch's writer. Built BEFORE
@@ -1122,6 +1139,8 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         account_store.clone(),
         transport.clock(),
         transport.clone(),
+        shard_sql.clone(),
+        shard_root_store.clone(),
     ));
 
     // CraftSQL: SQLite over content-addressed pages; single-writer head via

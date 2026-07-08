@@ -24,17 +24,42 @@
 //! adjacent generation during the migration window. Low-bit routing keeps a split LOCAL (a parent
 //! shard's keys go only to its two children).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, RwLock};
-use zeph_com::{registry_program_cid, HeadEntry, HeadSubmission, RegistryState, REGISTRY_SEED};
+use tokio::sync::{mpsc, Mutex, RwLock};
+use zeph_com::{registry_program_cid, HeadEntry, HeadSubmission, RegistryState};
 use zeph_core::Cid;
 use zeph_crypto::NodeIdentity;
 use zeph_membership::Membership;
+use zeph_sql::{CraftDb, CraftSql};
 use zeph_transport::{Connection, PeerAddr, Transport};
 
 use crate::account::ProgramAccountStore;
 use crate::registry_net::{request_registry, HeadRowWire, RegistryReq, RegistryResp};
+use crate::shard_root::ShardRootStore;
+
+/// Max owner-program name length — the old char-limit "v2" validation, now enforced NATIVELY on the
+/// registry write path (mechanism, not a governed-WASM policy hook — see memory
+/// `registry-native-validation-not-wasm-hook`).
+const MAX_NAME_LEN: usize = 32;
+
+/// The per-shard heads table: `(owner, name) -> (cid, version)`, indexed by the PK for O(log n)
+/// resolve. One such table per shard DB.
+const CREATE_HEADS: &str = "CREATE TABLE IF NOT EXISTS heads (\
+     owner BLOB NOT NULL, name TEXT NOT NULL, cid BLOB NOT NULL, version INTEGER NOT NULL, \
+     PRIMARY KEY (owner, name))";
+
+/// A BLOB literal `X'..'` for embedding a 32-byte id in write SQL.
+fn hexlit(b: &[u8; 32]) -> String {
+    format!("X'{}'", hex::encode(b))
+}
+
+/// A single-quoted TEXT literal with `'` escaped — names are untrusted, so this is the
+/// SQL-injection guard on the write path.
+fn textlit(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
 
 /// Max size of a registry request/response frame served over `REGISTRY_ALPN`.
 const MAX_FRAME: usize = 256 * 1024;
@@ -132,22 +157,6 @@ fn resolve_shard_bits(governed: Option<i64>) -> u32 {
     governed
         .map(|v| v.clamp(1, MAX_SHARD_BITS as i64) as u32)
         .unwrap_or(DEFAULT_SHARD_BITS)
-}
-
-/// The per-account seed — replaces the bare `REGISTRY_SEED` in every account op so each
-/// `(rtype, generation, shard)` gets a distinct `pda(registry_program_cid(), shard_seed(sk))`.
-/// The KIND tag is folded in FIRST (a program head and a DB root at the same shard live in
-/// separate accounts — type-in-seed), then the shard-count GENERATION `bits`, so the same shard
-/// number at two counts addresses two accounts — which is what lets an online reshard read the
-/// old generation and write the new one without clobbering it.
-fn shard_seed(sk: ShardKey) -> Vec<u8> {
-    [
-        REGISTRY_SEED,
-        &[sk.rtype],
-        sk.bits.to_le_bytes().as_slice(),
-        sk.shard.to_le_bytes().as_slice(),
-    ]
-    .concat()
 }
 
 /// Seed of the per-node GENERATION MARKER account — records the shard-count `bits` this node
@@ -274,6 +283,14 @@ pub struct HeadRegistry {
     /// then GC's its accounts and clears this back to `None`. In-memory (a restart just leaves the
     /// old generation un-GC'd, which is harmless — reads resolve at the current generation).
     draining: RwLock<Option<(u32, u32)>>,
+    /// The registry's own CraftSQL engine — each shard's heads live in a per-shard DB
+    /// (namespace `reg/<rtype>/<bits>/<shard>`) here, indexed by `(owner, name)`.
+    sql: Arc<CraftSql>,
+    /// The shard DBs' blob-backed root store — used to GC a shard-DB's root pointer on drop.
+    shard_roots: Arc<ShardRootStore>,
+    /// Open shard-DB handles, cached by namespace (opening a `CraftDb` is expensive). One writer
+    /// per shard, so serializing a shard's ops behind its `Mutex` is free.
+    dbs: RwLock<HashMap<String, Arc<Mutex<CraftDb>>>>,
 }
 
 /// One head row for the dashboard — hex-encoded `(owner, cid)` + `name` + `version`.
@@ -319,6 +336,8 @@ impl HeadRegistry {
         store: Arc<ProgramAccountStore>,
         clock: Arc<zeph_core::hlc::Clock>,
         transport: Arc<Transport>,
+        sql: Arc<CraftSql>,
+        shard_roots: Arc<ShardRootStore>,
     ) -> Self {
         let self_id = identity.node_id().0;
         Self {
@@ -333,7 +352,137 @@ impl HeadRegistry {
             last_census: RwLock::new(None),
             resolve_cache: ResolveCache::default(),
             draining: RwLock::new(None),
+            sql,
+            shard_roots,
+            dbs: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// The namespace of shard `sk`'s CraftSQL DB.
+    fn ns_of(sk: ShardKey) -> String {
+        format!("reg/{}/{}/{}", sk.rtype, sk.bits, sk.shard)
+    }
+
+    /// Get (or open + create-schema) the cached [`CraftDb`] for shard `sk`. Opening is expensive,
+    /// so handles are memoized by namespace; the write lock across the open serializes first-opens
+    /// (one-time per shard). Each returned handle is behind a `Mutex` (one writer per shard).
+    async fn shard_db(&self, sk: ShardKey) -> anyhow::Result<Arc<Mutex<CraftDb>>> {
+        let ns = Self::ns_of(sk);
+        if let Some(db) = self.dbs.read().await.get(&ns) {
+            return Ok(db.clone());
+        }
+        let mut g = self.dbs.write().await;
+        if let Some(db) = g.get(&ns) {
+            return Ok(db.clone());
+        }
+        let mut db = self.sql.open(&ns).await?;
+        db.write(CREATE_HEADS).await?;
+        let handle = Arc::new(Mutex::new(db));
+        g.insert(ns, handle.clone());
+        Ok(handle)
+    }
+
+    /// Read the current `(cid, version)` for `(owner, name)` in shard `sk`'s DB, or `None`.
+    async fn sql_resolve(
+        &self,
+        sk: ShardKey,
+        owner: &[u8; 32],
+        name: &str,
+    ) -> Option<([u8; 32], u64)> {
+        let db = self.shard_db(sk).await.ok()?;
+        let db = db.lock().await;
+        let row = db.conn().query_row(
+            "SELECT cid, version FROM heads WHERE owner = ?1 AND name = ?2",
+            rusqlite::params![&owner[..], name],
+            |r| {
+                let cid: Vec<u8> = r.get(0)?;
+                let version: i64 = r.get(1)?;
+                Ok((cid, version as u64))
+            },
+        );
+        match row {
+            Ok((cid, version)) if cid.len() == 32 => {
+                Some((cid.try_into().expect("32 bytes"), version))
+            }
+            _ => None,
+        }
+    }
+
+    /// Upsert one owner-signed head into shard `sk`'s DB, version-guarded (monotonic). Returns the
+    /// shard-DB's new root as the operation's "root". The submission is assumed already verified.
+    async fn sql_upsert(&self, sk: ShardKey, e: &HeadEntry) -> anyhow::Result<[u8; 32]> {
+        let db = self.shard_db(sk).await?;
+        let mut db = db.lock().await;
+        let sql = format!(
+            "INSERT INTO heads(owner,name,cid,version) VALUES({},{},{},{}) \
+             ON CONFLICT(owner,name) DO UPDATE SET cid=excluded.cid, version=excluded.version \
+             WHERE excluded.version > heads.version",
+            hexlit(&e.owner),
+            textlit(&e.name),
+            hexlit(&e.cid),
+            e.version
+        );
+        db.write(&sql).await?;
+        Ok(db.root().map(|c| c.0).unwrap_or_default())
+    }
+
+    /// Snapshot shard `sk`'s heads as a [`RegistryState`] — the wire/merge DTO for `GetState`,
+    /// replication pushes, the dashboard, and the reshard sweep. `SELECT *` over the shard DB.
+    async fn sql_state(&self, sk: ShardKey) -> RegistryState {
+        let Ok(db) = self.shard_db(sk).await else {
+            return RegistryState::default();
+        };
+        let db = db.lock().await;
+        let mut stmt = match db
+            .conn()
+            .prepare("SELECT owner,name,cid,version FROM heads")
+        {
+            Ok(s) => s,
+            Err(_) => return RegistryState::default(),
+        };
+        let rows = stmt.query_map([], |r| {
+            let owner: Vec<u8> = r.get(0)?;
+            let name: String = r.get(1)?;
+            let cid: Vec<u8> = r.get(2)?;
+            let version: i64 = r.get(3)?;
+            Ok((owner, name, cid, version as u64))
+        });
+        let mut out = RegistryState::default();
+        if let Ok(rows) = rows {
+            let entries: Vec<HeadEntry> = rows
+                .flatten()
+                .filter(|(o, _, c, _)| o.len() == 32 && c.len() == 32)
+                .map(|(o, name, c, version)| HeadEntry {
+                    owner: o.try_into().expect("32"),
+                    name,
+                    cid: c.try_into().expect("32"),
+                    version,
+                })
+                .collect();
+            out.merge_entries(entries);
+        }
+        out
+    }
+
+    /// Upsert every row of `state` into shard `sk`'s DB (version-guarded per row). Used by the
+    /// `PushState` replica handler, takeover merge, and reshard — the SQL form of a CRDT merge.
+    async fn sql_merge(&self, sk: ShardKey, state: &RegistryState) -> anyhow::Result<()> {
+        for e in state.entries() {
+            self.sql_upsert(sk, e).await?;
+        }
+        Ok(())
+    }
+
+    /// Count of heads in shard `sk`'s DB.
+    async fn sql_count(&self, sk: ShardKey) -> usize {
+        let Ok(db) = self.shard_db(sk).await else {
+            return 0;
+        };
+        let db = db.lock().await;
+        db.conn()
+            .query_row("SELECT COUNT(*) FROM heads", [], |r| r.get::<_, i64>(0))
+            .map(|n| n as usize)
+            .unwrap_or(0)
     }
 
     /// The live shard-count exponent = the governed `shard_bits` config value, agreed
@@ -392,12 +541,9 @@ impl HeadRegistry {
         for &rtype in &[RT_PROGRAM, RT_DBROOT, RT_MANIFEST] {
             for shard in 0..(1u64 << bits) {
                 let sk = ShardKey { rtype, bits, shard };
-                let state = self
-                    .store
-                    .resolve(registry_program_cid(), &shard_seed(sk))
-                    .await;
+                let state = self.sql_state(sk).await;
                 if !state.is_empty() {
-                    self.replicate(sk, &state).await;
+                    self.replicate(sk, &state.encode()).await;
                 }
             }
         }
@@ -495,13 +641,7 @@ impl HeadRegistry {
                 if !Self::replicas(sk_old, &elig).contains(&self.self_id) {
                     continue;
                 }
-                let raw = self
-                    .store
-                    .resolve(registry_program_cid(), &shard_seed(sk_old))
-                    .await;
-                if let Some(s) = RegistryState::decode(&raw) {
-                    entries.extend(s.entries().iter().cloned());
-                }
+                entries.extend(self.sql_state(sk_old).await.entries().iter().cloned());
             }
             if entries.is_empty() {
                 continue;
@@ -512,25 +652,19 @@ impl HeadRegistry {
                     bits: to,
                     shard: new_shard,
                 };
-                let seed = shard_seed(sk_new);
-                let mut local =
-                    RegistryState::decode(&self.store.resolve(registry_program_cid(), &seed).await)
-                        .unwrap_or_default();
+                let mut local = RegistryState::default();
                 local.merge_entries(group);
-                let bytes = local.encode();
-                let _ = self
-                    .store
-                    .put_state(registry_program_cid(), &seed, &bytes)
-                    .await;
-                self.replicate(sk_new, &bytes).await;
+                let _ = self.sql_merge(sk_new, &local).await;
+                self.replicate(sk_new, &local.encode()).await;
             }
         }
     }
 
-    /// GC a fully-drained generation: delete this node's local account state for every shard it
-    /// holds at generation `bits` (all rtypes). Called only after [`DRAIN_TICKS`] of sweeping, by
-    /// which point the old generation has been carried forward and no peer still writes it, so the
-    /// files are dead weight. Local-only; other replicas GC their own copies on the same schedule.
+    /// GC a fully-drained generation: DROP this node's shard DB for every shard it holds at
+    /// generation `bits` (all rtypes) — clear the root pointer, evict the cached handle, and delete
+    /// the DB's local pages. Called only after [`DRAIN_TICKS`] of sweeping, by which point the old
+    /// generation has been carried forward and no peer still writes it. Local-only; other replicas
+    /// GC their own copies on the same schedule.
     async fn gc_generation(&self, bits: u32) {
         let elig = self.eligible().await;
         for &rtype in &[RT_PROGRAM, RT_DBROOT, RT_MANIFEST] {
@@ -539,9 +673,9 @@ impl HeadRegistry {
                 if !Self::replicas(sk, &elig).contains(&self.self_id) {
                     continue;
                 }
-                self.store
-                    .clear(registry_program_cid(), &shard_seed(sk))
-                    .await;
+                let ns = Self::ns_of(sk);
+                self.dbs.write().await.remove(&ns); // drop the cached handle (closes the connection)
+                self.shard_roots.clear(&ns).await; // forget the shard-DB root pointer
             }
         }
     }
@@ -698,13 +832,6 @@ impl HeadRegistry {
             return;
         }
         let elig = self.eligible().await;
-        let mut local = RegistryState::decode(
-            &self
-                .store
-                .resolve(registry_program_cid(), &shard_seed(sk))
-                .await,
-        )
-        .unwrap_or_default();
         for id in Self::replicas(sk, &elig) {
             if id == self.self_id {
                 continue;
@@ -722,57 +849,44 @@ impl HeadRegistry {
                 .await
                 {
                     if let Some(other) = RegistryState::decode(&bytes) {
-                        local.merge(&other);
+                        let _ = self.sql_merge(sk, &other).await; // LWW upsert into our shard DB
                     }
                 }
             }
         }
-        let _ = self
-            .store
-            .put_state(registry_program_cid(), &shard_seed(sk), &local.encode())
-            .await;
         // Best-effort: mark this epoch handled regardless — on failure we keep local state.
         self.last_epoch.write().await.insert(sk, eff);
     }
 
-    /// Advance `sk`'s registry account from an owner-signed submission's raw bytes.
-    /// Runs the governance-resolved registry program on the writer's own store — the same
-    /// advance logic as the local writer path, but on already-signed bytes (no re-sign).
-    /// After persisting, PUSHES the new state to the other replicas so the K-replica set stays
-    /// warm (best-effort — a push failure never fails the write).
+    /// Advance `sk`'s shard DB from an owner-signed submission. Validation is NATIVE — owner
+    /// signature + a name char-limit (mechanism, not a governed-WASM policy hook; see
+    /// `docs/SQL_REGISTRY_DESIGN.md` §5 and memory `registry-native-validation-not-wasm-hook`).
+    /// The validated head is upserted (version-guarded) into the per-shard `heads` table, then the
+    /// single row is PUSHED to the other replicas — a 1-row `RegistryState`, the O(1)-per-write
+    /// replication that replaces shipping the whole shard blob. Best-effort push; never fails the
+    /// write. Returns the shard-DB's new root.
     async fn advance_local(&self, sk: ShardKey, sub_bytes: &[u8]) -> anyhow::Result<[u8; 32]> {
-        // Merge the other replicas' state if we've just become the writer, before advancing.
+        // Catch up on any writes this node missed before it became this epoch's writer.
         self.ensure_current(sk).await;
-        let code = self.program_cid().await;
-        let seed = shard_seed(sk);
-        // NATIVE DEFAULT (the built-in local registry program). When governance has NOT set a WASM
-        // registry program, run `RegistryState::apply` directly — so a FRESH network self-starts
-        // with no publish/governance bootstrap. A governance `SetProgram` swaps in the WASM (e.g.
-        // the char-limit v2) as the upgrade on top. (MINIMAL_KERNEL: every anchor has a default.)
-        let (new_state_bytes, root) = if code == registry_program_cid() {
-            let prev =
-                RegistryState::decode(&self.store.resolve(registry_program_cid(), &seed).await)
-                    .unwrap_or_default();
-            let sub = HeadSubmission::decode(sub_bytes)
-                .ok_or_else(|| anyhow::anyhow!("bad head submission"))?;
-            let next = prev
-                .apply(&sub)
-                .map_err(|e| anyhow::anyhow!("registry rejected the submission: {e}"))?;
-            let bytes = next.encode();
-            self.store
-                .put_state(registry_program_cid(), &seed, &bytes)
-                .await?;
-            (bytes, next.root())
-        } else {
-            let r = self
-                .store
-                .advance(registry_program_cid(), code, &seed, sub_bytes)
-                .await?;
-            let bytes = self.store.resolve(registry_program_cid(), &seed).await;
-            (bytes, r.new_root)
+        let sub = HeadSubmission::decode(sub_bytes)
+            .ok_or_else(|| anyhow::anyhow!("bad head submission"))?;
+        if !sub.verify() {
+            anyhow::bail!("registry rejected the submission: bad-signature");
+        }
+        if sub.name.len() > MAX_NAME_LEN {
+            anyhow::bail!("registry rejected the submission: name exceeds {MAX_NAME_LEN} chars");
+        }
+        let entry = HeadEntry {
+            owner: sub.owner,
+            name: sub.name.clone(),
+            cid: sub.cid,
+            version: sub.version,
         };
-        // Push-on-write: keep the replica set warm. Best-effort; never fails the write.
-        self.replicate(sk, &new_state_bytes).await;
+        let root = self.sql_upsert(sk, &entry).await?;
+        // Row-level replication: push just this head (a 1-row RegistryState) to the replicas.
+        let mut one = RegistryState::default();
+        one.merge_entries([entry]);
+        self.replicate(sk, &one.encode()).await;
         Ok(root)
     }
 
@@ -827,25 +941,7 @@ impl HeadRegistry {
     ) -> Option<([u8; 32], u64)> {
         // Merge the other replicas' state if we've just become the writer, before resolving.
         self.ensure_current(sk).await;
-        let raw = self
-            .store
-            .resolve(registry_program_cid(), &shard_seed(sk))
-            .await;
-        RegistryState::decode(&raw)?
-            .resolve(&owner, name)
-            .map(|e| (e.cid, e.version))
-    }
-
-    /// The canonical app-registry program cid — resolved via the governance program store
-    /// (governance-upgradeable), falling back to the native cid.
-    async fn program_cid(&self) -> [u8; 32] {
-        match self.programs.read().await.as_ref() {
-            Some(p) => p
-                .resolve("app-registry")
-                .await
-                .unwrap_or_else(registry_program_cid),
-            None => registry_program_cid(),
-        }
+        self.sql_resolve(sk, &owner, name).await
     }
 
     /// Register (or advance) an app head under THIS node's identity. Routes the key to its
@@ -997,14 +1093,7 @@ impl HeadRegistry {
         let reps = Self::replicas(sk, &elig);
         // (a) Local read if this node holds the shard's state as a replica.
         if reps.contains(&self.self_id) {
-            if let Some(entry) = RegistryState::decode(
-                &self
-                    .store
-                    .resolve(registry_program_cid(), &shard_seed(sk))
-                    .await,
-            )
-            .and_then(|s| s.resolve(&owner, name).map(|e| (e.cid, e.version)))
-            {
+            if let Some(entry) = self.sql_resolve(sk, &owner, name).await {
                 return Some(entry);
             }
         }
@@ -1104,16 +1193,13 @@ impl HeadRegistry {
                             };
                             RegistryResp::Resolved(this.resolve_local(sk, owner, &name).await)
                         }
-                        // Serve the full account state (at the requested generation) for the merge.
-                        Ok(RegistryReq::GetState { rtype, bits, shard }) => RegistryResp::State(
-                            this.store
-                                .resolve(
-                                    registry_program_cid(),
-                                    &shard_seed(ShardKey { rtype, bits, shard }),
-                                )
-                                .await,
-                        ),
-                        // Report the current version of a key from its account (0 if none).
+                        // Serve the full shard state (at the requested generation) as the wire DTO
+                        // (`SELECT *` → RegistryState) for the takeover merge.
+                        Ok(RegistryReq::GetState { rtype, bits, shard }) => {
+                            let sk = ShardKey { rtype, bits, shard };
+                            RegistryResp::State(this.sql_state(sk).await.encode())
+                        }
+                        // Report the current version of a key from its shard DB (0 if none).
                         // Route with the querier's `bits` (from the wire).
                         Ok(RegistryReq::CurrentVersion {
                             rtype,
@@ -1126,34 +1212,25 @@ impl HeadRegistry {
                                 bits,
                                 shard: shard_of(&owner, &name, bits),
                             };
-                            let raw = this
-                                .store
-                                .resolve(registry_program_cid(), &shard_seed(sk))
-                                .await;
-                            let v = RegistryState::decode(&raw)
-                                .and_then(|s| s.resolve(&owner, &name).map(|e| e.version))
+                            let v = this
+                                .sql_resolve(sk, &owner, &name)
+                                .await
+                                .map(|(_, v)| v)
                                 .unwrap_or(0);
                             RegistryResp::Version(v)
                         }
-                        // A pushed replica state (at its generation) — MERGE (LWW), don't overwrite.
+                        // A pushed replica state (at its generation) — MERGE (LWW) each row into our
+                        // shard DB. Normal writes push a 1-row state; takeover/migrate push many.
                         Ok(RegistryReq::PushState {
                             rtype,
                             bits,
                             shard,
                             state,
                         }) => {
-                            let seed = shard_seed(ShardKey { rtype, bits, shard });
-                            let mut local = RegistryState::decode(
-                                &this.store.resolve(registry_program_cid(), &seed).await,
-                            )
-                            .unwrap_or_default();
+                            let sk = ShardKey { rtype, bits, shard };
                             if let Some(pushed) = RegistryState::decode(&state) {
-                                local.merge(&pushed);
+                                let _ = this.sql_merge(sk, &pushed).await;
                             }
-                            let _ = this
-                                .store
-                                .put_state(registry_program_cid(), &seed, &local.encode())
-                                .await;
                             RegistryResp::Ack
                         }
                         // Return ALL of this node's local heads for the global dashboard union.
@@ -1181,12 +1258,10 @@ impl HeadRegistry {
             shard: shard_of(&owner, name, bits),
         };
         if self.is_writer(sk).await {
-            let raw = self
-                .store
-                .resolve(registry_program_cid(), &shard_seed(sk))
-                .await;
-            return RegistryState::decode(&raw)
-                .and_then(|s| s.resolve(&owner, name).map(|e| e.version))
+            return self
+                .sql_resolve(sk, &owner, name)
+                .await
+                .map(|(_, v)| v)
                 .unwrap_or(0);
         }
         let Ok(addr) = self.writer_addr(sk).await else {
@@ -1225,11 +1300,7 @@ impl HeadRegistry {
             if !self.is_writer(sk).await {
                 continue;
             }
-            let raw = self
-                .store
-                .resolve(registry_program_cid(), &shard_seed(sk))
-                .await;
-            for e in RegistryState::decode(&raw).unwrap_or_default().entries() {
+            for e in self.sql_state(sk).await.entries() {
                 out.push((
                     hex::encode(e.owner),
                     e.name.clone(),
@@ -1257,11 +1328,7 @@ impl HeadRegistry {
             if !self.is_writer(sk).await {
                 continue;
             }
-            let raw = self
-                .store
-                .resolve(registry_program_cid(), &shard_seed(sk))
-                .await;
-            let s = RegistryState::decode(&raw).unwrap_or_default();
+            let s = self.sql_state(sk).await;
             count += s.len();
             combined.extend_from_slice(&s.root());
         }
@@ -1287,11 +1354,7 @@ impl HeadRegistry {
                 if rtype == RT_PROGRAM {
                     writer_shards += 1;
                 }
-                let raw = self
-                    .store
-                    .resolve(registry_program_cid(), &shard_seed(sk))
-                    .await;
-                let n = RegistryState::decode(&raw).map(|s| s.len()).unwrap_or(0);
+                let n = self.sql_count(sk).await;
                 match rtype {
                     RT_PROGRAM => program_heads += n,
                     RT_DBROOT => dbroots += n,
@@ -1323,11 +1386,7 @@ impl HeadRegistry {
                 if !self.is_writer(sk).await {
                     continue;
                 }
-                let raw = self
-                    .store
-                    .resolve(registry_program_cid(), &shard_seed(sk))
-                    .await;
-                for e in RegistryState::decode(&raw).unwrap_or_default().entries() {
+                for e in self.sql_state(sk).await.entries() {
                     out.push(HeadRowWire {
                         rtype,
                         owner: e.owner,
@@ -1481,46 +1540,18 @@ mod tests {
     }
 
     #[test]
-    fn shard_seed_is_distinct_per_generation() {
-        // The whole online-reshard cutover rests on this: the SAME (rtype, shard) at two different
-        // generations (bits) must address two DIFFERENT accounts, so a reshard can read the old
-        // generation and write the new one without one clobbering the other.
-        let a = shard_seed(ShardKey {
-            rtype: RT_PROGRAM,
-            bits: 8,
-            shard: 5,
-        });
-        let b = shard_seed(ShardKey {
-            rtype: RT_PROGRAM,
-            bits: 9,
-            shard: 5,
-        });
-        assert_ne!(a, b, "same shard at bits 8 vs 9 must be distinct accounts");
-        // rtype and shard still discriminate within a generation
+    fn ns_is_distinct_per_generation_and_kind() {
+        // Shard DBs are addressed by namespace; the SAME (rtype, shard) at two generations (bits)
+        // must be DISTINCT namespaces so a reshard reads the old generation and writes the new one
+        // without collision, and rtype/shard discriminate within a generation.
+        let ns = |rtype, bits, shard| HeadRegistry::ns_of(ShardKey { rtype, bits, shard });
         assert_ne!(
-            shard_seed(ShardKey {
-                rtype: RT_PROGRAM,
-                bits: 8,
-                shard: 5
-            }),
-            shard_seed(ShardKey {
-                rtype: RT_DBROOT,
-                bits: 8,
-                shard: 5
-            })
+            ns(RT_PROGRAM, 8, 5),
+            ns(RT_PROGRAM, 9, 5),
+            "bits 8 vs 9 distinct"
         );
-        assert_ne!(
-            shard_seed(ShardKey {
-                rtype: RT_PROGRAM,
-                bits: 8,
-                shard: 5
-            }),
-            shard_seed(ShardKey {
-                rtype: RT_PROGRAM,
-                bits: 8,
-                shard: 6
-            })
-        );
+        assert_ne!(ns(RT_PROGRAM, 8, 5), ns(RT_DBROOT, 8, 5), "rtype distinct");
+        assert_ne!(ns(RT_PROGRAM, 8, 5), ns(RT_PROGRAM, 8, 6), "shard distinct");
     }
 
     #[test]
