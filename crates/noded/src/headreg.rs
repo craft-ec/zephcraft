@@ -99,6 +99,24 @@ fn shard_of(owner: &[u8; 32], name: &str, bits: u32) -> u64 {
     u64::from_le_bytes(h[..8].try_into().unwrap()) & mask
 }
 
+/// Map the governed `shard_bits` config value to the live exponent: the value if set, else the
+/// built-in [`DEFAULT_SHARD_BITS`] (unset, or governance not yet wired), clamped to
+/// `[1, MAX_SHARD_BITS]` so a bad/hostile governance value can't drive the O(2^bits) shard loops
+/// out of bounds. Pure (no I/O) so the fallback + clamp is unit-testable in isolation.
+///
+/// OPERATOR NOTE — changing the count is a WIPE-AND-RESTART operation, not an online reshard.
+/// `shard_seed` does NOT encode the count, and there is no split/merge migration, so a `SetConfig`
+/// that changes `shard_bits` on a RUNNING cluster silently strands existing heads (their state
+/// sits at the old shard numbers while reads route to the new ones). To change the count: stop the
+/// nodes, wipe the registry accounts (`accounts/`), set the new `shard_bits`, restart. Online
+/// resharding (generation-in-seed + live split/merge) is deferred until a network exists that
+/// can't be wiped — see `.claude/feature-progress.md` (dynamic-sharding B3/B4).
+fn resolve_shard_bits(governed: Option<i64>) -> u32 {
+    governed
+        .map(|v| v.clamp(1, MAX_SHARD_BITS as i64) as u32)
+        .unwrap_or(DEFAULT_SHARD_BITS)
+}
+
 /// The per-account seed — replaces the bare `REGISTRY_SEED` in every account op so each
 /// `(rtype, shard)` gets a distinct `pda(registry_program_cid(), shard_seed(sk))`. The KIND
 /// tag is folded in FIRST, so a program head and a database root at the same shard live in
@@ -278,9 +296,7 @@ impl HeadRegistry {
             Some(p) => p.resolve_config("shard_bits").await,
             None => None,
         };
-        governed
-            .map(|v| v.clamp(1, MAX_SHARD_BITS as i64) as u32)
-            .unwrap_or(DEFAULT_SHARD_BITS)
+        resolve_shard_bits(governed)
     }
 
     /// The live shard count = `2^shard_bits`.
@@ -1216,6 +1232,43 @@ mod tests {
                 "a child shard is its parent or parent | (1<<k)"
             );
         }
+    }
+
+    #[test]
+    fn resolve_shard_bits_falls_back_and_clamps() {
+        // unset (or governance not wired) -> the built-in default
+        assert_eq!(resolve_shard_bits(None), DEFAULT_SHARD_BITS);
+        // a governed value in range is honored
+        assert_eq!(resolve_shard_bits(Some(9)), 9);
+        assert_eq!(
+            resolve_shard_bits(Some(MAX_SHARD_BITS as i64)),
+            MAX_SHARD_BITS
+        );
+        // out-of-range / hostile values are clamped, never able to drive the O(2^bits) loops away
+        assert_eq!(resolve_shard_bits(Some(0)), 1);
+        assert_eq!(resolve_shard_bits(Some(-5)), 1);
+        assert_eq!(resolve_shard_bits(Some(1_000)), MAX_SHARD_BITS);
+    }
+
+    #[test]
+    fn routing_honors_a_non_default_count() {
+        // At a governed count other than 256, every key must land within [0, 2^bits) and route by
+        // the low `bits` of the hash — this is what a governed shard_bits actually buys.
+        let owner = [3u8; 32];
+        for bits in [1u32, 9, MAX_SHARD_BITS] {
+            let count = 1u64 << bits;
+            for name in ["a", "app", "guestbook2", "x-y-z", "verylongprogramname"] {
+                let s = shard_of(&owner, name, bits);
+                assert!(s < count, "shard {s} must be < {count} at bits={bits}");
+                let h = Cid::of(&[owner.as_slice(), name.as_bytes()].concat()).0;
+                let full = u64::from_le_bytes(h[..8].try_into().unwrap());
+                assert_eq!(s, full & (count - 1), "route by the low {bits} bits");
+            }
+        }
+        // bits=9 (512 shards) genuinely uses shards >= 256 that bits=8 never could — proof the
+        // count actually grew, not just re-labeled the same 256.
+        let uses_high = (0..2000).any(|i| shard_of(&[9u8; 32], &format!("k{i}"), 9) >= 256);
+        assert!(uses_high, "a 512-shard count must populate shards >= 256");
     }
 
     #[tokio::test]
