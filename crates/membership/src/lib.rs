@@ -135,6 +135,11 @@ pub struct Membership {
     transport: Arc<Transport>,
     cfg: Config,
     views: RwLock<Views>,
+    /// The seed peers (dht_seeds) passed to [`Self::start`], RETAINED so the node can
+    /// RE-bootstrap if it ever loses its whole overlay. Without this, a transient network
+    /// loss that drains the views leaves a node permanently isolated (shuffle needs a live
+    /// active peer; the initial bootstrap runs only once).
+    bootstrap: RwLock<Vec<PeerAddr>>,
 }
 
 impl Membership {
@@ -143,6 +148,7 @@ impl Membership {
             transport,
             cfg,
             views: RwLock::new(Views::default()),
+            bootstrap: RwLock::new(Vec::new()),
         })
     }
 
@@ -173,6 +179,7 @@ impl Membership {
 
         let this = self.clone();
         tokio::spawn(async move {
+            *this.bootstrap.write().await = bootstrap.clone();
             for peer in bootstrap {
                 this.join(&peer).await;
             }
@@ -353,7 +360,7 @@ impl Membership {
         }
     }
 
-    async fn try_promote(&self, candidate: PeerAddr) {
+    async fn try_promote(&self, candidate: PeerAddr) -> bool {
         let high = self.views.read().await.active.is_empty();
         let msg = wire::Message::Neighbor(wire::Neighbor {
             origin: self.me(),
@@ -363,7 +370,24 @@ impl Membership {
             if let wire::Message::NeighborReply(reply) = frame.message {
                 if reply.accepted {
                     self.add_active(candidate).await;
+                    return true;
                 }
+            }
+        }
+        false
+    }
+
+    /// Re-run the seed bootstrap joins to recover from total isolation (active view empty).
+    async fn rejoin_bootstrap(&self) {
+        let peers = self.bootstrap.read().await.clone();
+        if peers.is_empty() {
+            return;
+        }
+        tracing::warn!("membership isolated (active view empty) — re-bootstrapping from seeds");
+        let me = self.my_id();
+        for peer in peers {
+            if peer.node_id() != me {
+                self.join(&peer).await;
             }
         }
     }
@@ -372,6 +396,13 @@ impl Membership {
 
     async fn probe_round(&self) {
         self.fill_active().await;
+        // Self-heal from TOTAL isolation: if fill_active could not restore a single active
+        // peer (every view drained by a transient network loss), re-run the seed bootstrap.
+        // Otherwise a node that loses all peers never rediscovers the network — shuffle needs
+        // a live active peer and the initial bootstrap runs only once.
+        if self.views.read().await.active.is_empty() {
+            self.rejoin_bootstrap().await;
+        }
         let targets: Vec<(NodeId, PeerAddr)> = {
             let views = self.views.read().await;
             views
@@ -428,17 +459,37 @@ impl Membership {
     /// Keep the active view full: promote random passive candidates while
     /// there is room (standard HyParView maintenance).
     async fn fill_active(&self) {
+        let mut requeue = Vec::new();
+        let mut attempts = 0;
         loop {
             let candidate = {
                 let mut views = self.views.write().await;
-                if views.active.len() >= self.cfg.active_size || views.passive.is_empty() {
-                    return;
+                if views.active.len() >= self.cfg.active_size
+                    || views.passive.is_empty()
+                    || attempts >= self.cfg.active_size
+                {
+                    break;
                 }
                 views.passive.shuffle(&mut rand::thread_rng());
                 views.passive.pop()
             };
-            let Some(candidate) = candidate else { return };
-            self.try_promote(candidate).await;
+            let Some(candidate) = candidate else { break };
+            attempts += 1;
+            if !self.try_promote(candidate.clone()).await {
+                // A transient promote failure must NOT erase peer knowledge (the old code
+                // popped the candidate and dropped it on failure): re-queue it so a later
+                // round retries once the peer is reachable again. Draining the passive view on
+                // a network blip was half of what left a flaky node permanently isolated.
+                requeue.push(candidate);
+            }
+        }
+        if !requeue.is_empty() {
+            let mut views = self.views.write().await;
+            for c in requeue {
+                if !views.passive.iter().any(|p| p.node_id() == c.node_id()) {
+                    views.passive.push(c);
+                }
+            }
         }
     }
 
