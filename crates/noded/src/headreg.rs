@@ -495,6 +495,28 @@ impl HeadRegistry {
         Ok(handle)
     }
 
+    /// Like [`Self::shard_db`] but does NOT create the DB — returns `None` if this node has no
+    /// shard DB for `sk` yet (no root published). READ paths MUST use this: opening-to-create on a
+    /// read would publish an empty root, which then makes the held-index backfill count that shard,
+    /// snowballing `held` toward all `2^bits` shards and defeating the O(held) loops.
+    async fn shard_db_existing(&self, sk: ShardKey) -> Option<Arc<Mutex<CraftDb>>> {
+        let ns = Self::ns_of(sk);
+        if let Some(db) = self.dbs.read().await.get(&ns) {
+            return Some(db.clone());
+        }
+        // Only open if the DB actually exists (a root was published by a prior write).
+        let owner = zeph_core::NodeId(self.self_id);
+        self.shard_roots.resolve(owner, &ns).await.ok().flatten()?;
+        let mut g = self.dbs.write().await;
+        if let Some(db) = g.get(&ns) {
+            return Some(db.clone());
+        }
+        let db = self.sql.open(&ns).await.ok()?; // existing DB already has the schema
+        let handle = Arc::new(Mutex::new(db));
+        g.insert(ns, handle.clone());
+        Some(handle)
+    }
+
     /// Read the current `(cid, version)` for `(owner, name)` in shard `sk`'s DB, or `None`.
     async fn sql_resolve(
         &self,
@@ -502,7 +524,7 @@ impl HeadRegistry {
         owner: &[u8; 32],
         name: &str,
     ) -> Option<([u8; 32], u64)> {
-        let db = self.shard_db(sk).await.ok()?;
+        let db = self.shard_db_existing(sk).await?; // read: don't create an empty DB
         let db = db.lock().await;
         let row = db.conn().query_row(
             "SELECT cid, version FROM heads WHERE owner = ?1 AND name = ?2",
@@ -547,8 +569,8 @@ impl HeadRegistry {
     /// Snapshot shard `sk`'s heads as a [`RegistryState`] — the wire/merge DTO for `GetState`,
     /// replication pushes, the dashboard, and the reshard sweep. `SELECT *` over the shard DB.
     async fn sql_state(&self, sk: ShardKey) -> RegistryState {
-        let Ok(db) = self.shard_db(sk).await else {
-            return RegistryState::default();
+        let Some(db) = self.shard_db_existing(sk).await else {
+            return RegistryState::default(); // read: don't create an empty DB
         };
         let db = db.lock().await;
         let mut stmt = match db
@@ -593,8 +615,8 @@ impl HeadRegistry {
 
     /// Count of heads in shard `sk`'s DB.
     async fn sql_count(&self, sk: ShardKey) -> usize {
-        let Ok(db) = self.shard_db(sk).await else {
-            return 0;
+        let Some(db) = self.shard_db_existing(sk).await else {
+            return 0; // read: don't create an empty DB
         };
         let db = db.lock().await;
         db.conn()
