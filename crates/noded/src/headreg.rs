@@ -468,9 +468,12 @@ impl HeadRegistry {
             .await;
     }
 
-    /// The namespace of shard `sk`'s CraftSQL DB.
+    /// The namespace of shard `sk`'s CraftSQL DB. SLASH-FREE (underscores) on purpose: CraftSQL's
+    /// per-DB durability sidecar is a real filesystem path `store_dir/<owner16>_<ns>.gens`, so a
+    /// slash in the namespace would make it a NESTED path whose parent dirs don't exist and break
+    /// the durability sweep. Kept flat so `with_durable` (erasure-coded page durability) works.
     fn ns_of(sk: ShardKey) -> String {
-        format!("reg/{}/{}/{}", sk.rtype, sk.bits, sk.shard)
+        format!("reg_{}_{}_{}", sk.rtype, sk.bits, sk.shard)
     }
 
     /// Get (or open + create-schema) the cached [`CraftDb`] for shard `sk`. Opening is expensive,

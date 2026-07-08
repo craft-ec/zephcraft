@@ -1116,19 +1116,22 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     ));
     // The registry's per-shard state is a CraftSQL DB (SQL_REGISTRY_DESIGN). Its own CraftSql
     // engine, owned by this node, with a BLOB-backed RootStore (shard-DB roots stored in account
-    // blobs, NOT back through the registry — breaks the recursion). NO PageSource and NO ObjDurable:
-    // durability is K-replica row-push (each replica builds its shard DB from pushed submissions and
-    // backfills via GetState), so no cross-node page fetch is needed and the write path never blocks
-    // on (or fails from) synchronous erasure coding — matching the old registry's fire-and-forget
-    // durability. Erasure-coded shard-page durability as a best-effort background layer is a
-    // follow-up (see docs/SQL_REGISTRY_DESIGN.md).
+    // blobs, NOT back through the registry — breaks the recursion). ObjDurable gives the shard pages
+    // the DEFAULT erasure-coded durability (each commit's changed pages coded + distributed +
+    // repaired — parity with the old blob registry, which published every state via publish_system),
+    // on top of K-replica row-push. NO PageSource: replicas build their shard DBs from pushed
+    // submissions and backfill via GetState, so no cross-node page fetch is needed. (Shard-DB
+    // namespaces are slash-free so the `.gens` durability sidecar path stays valid — see ns_of.)
     let shard_root_store =
         std::sync::Arc::new(shard_root::ShardRootStore::new(account_store.clone()));
-    let shard_sql = std::sync::Arc::new(zeph_sql::CraftSql::register(
-        data_dir.join("regshards"),
-        shard_root_store.clone(),
-        transport.node_id(),
-    )?);
+    let shard_sql = std::sync::Arc::new(
+        zeph_sql::CraftSql::register(
+            data_dir.join("regshards"),
+            shard_root_store.clone(),
+            transport.node_id(),
+        )?
+        .with_durable(Arc::new(zeph_sql::ObjDurable::new(engine.clone()))),
+    );
 
     // Phase 4c: the durable program-name registry — a THIN consumer of the account store.
     // The writer for each epoch is ELECTED deterministically from the membership view + HLC
