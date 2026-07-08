@@ -91,6 +91,17 @@ const MIGRATE_STABLE_TICKS: u32 = 3;
 /// covers the window in which a straggler node still writes the old count.
 const DRAIN_TICKS: u32 = 6;
 
+/// READINESS GATE (mirrors the health-scan restart gate). After (re)start a node's census is still
+/// converging, so its registry writer election differs from the settled cluster and it would route
+/// registers/resolves to the WRONG node ("not found"/misrouted writes) until it catches up. The
+/// node is "registry-ready" only once its census (member count) has been UNCHANGED for
+/// `READY_STABLE_SECS`, bounded by `READY_MAX_SECS` (a genuinely-alone/slow node still proceeds).
+const READY_STABLE_SECS: u64 = 10;
+const READY_MAX_SECS: u64 = 90;
+/// How long a register/resolve will WAIT for readiness before proceeding best-effort. Bounds the
+/// startup-window latency; in steady state the node is already ready, so there is no wait.
+const READY_WAIT_SECS: u64 = 20;
+
 /// Registry KIND tags — each kind is a SEPARATE account per shard (the tag is folded into
 /// [`shard_seed`], so `(rtype, shard)` addresses distinct state). Lets program heads, database
 /// roots, and manifests share one substrate without colliding.
@@ -305,6 +316,10 @@ pub struct HeadRegistry {
     /// is correct. Mutated + persisted IMMEDIATELY by [`Self::held_add`] (via [`Self::sql_upsert`])
     /// and [`Self::gc_generation`], so a restart loads an accurate set.
     held: RwLock<Option<HashSet<ShardKey>>>,
+    /// Registry readiness (a one-way latch): `false` until the census has settled after (re)start,
+    /// then `true` forever. Registers/resolves wait for it (bounded) so a node never routes against
+    /// an unconverged election. Set by the readiness task spawned in [`Self::serve`].
+    ready: std::sync::atomic::AtomicBool,
 }
 
 /// One head row for the dashboard — hex-encoded `(owner, cid)` + `name` + `version`.
@@ -370,6 +385,27 @@ impl HeadRegistry {
             shard_roots,
             dbs: RwLock::new(HashMap::new()),
             held: RwLock::new(None),
+            ready: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Registry readiness: has the census settled since (re)start? Registers/resolves gate on this.
+    fn is_ready(&self) -> bool {
+        self.ready.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Wait (bounded) for the node to become registry-ready. Returns immediately once ready (the
+    /// steady-state case), else polls until ready or `READY_WAIT_SECS` elapses, then proceeds
+    /// best-effort. Called at the top of register/resolve/current_version so a freshly-restarted
+    /// node doesn't route against an unconverged writer election.
+    async fn wait_ready(&self) {
+        if self.is_ready() {
+            return;
+        }
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(READY_WAIT_SECS);
+        while !self.is_ready() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     }
 
@@ -1096,6 +1132,9 @@ impl HeadRegistry {
         version: u64,
         _now_millis: u64,
     ) -> anyhow::Result<[u8; 32]> {
+        // Don't route a write against a still-converging election (would land the head on the wrong
+        // writer). Waits only during the post-restart window; a no-op once ready.
+        self.wait_ready().await;
         // The OWNER (this node's identity) signs the submission either way.
         let sub = HeadSubmission::sign(&self.identity, name, cid, version);
         // Route with this node's live (governed) bits; the writer is stamped the same `bits` so
@@ -1167,6 +1206,9 @@ impl HeadRegistry {
         owner: [u8; 32],
         name: &str,
     ) -> Option<([u8; 32], u64)> {
+        // Don't route against a still-converging election (would query the wrong writer and miss).
+        // Waits only during the post-restart window; a no-op once ready.
+        self.wait_ready().await;
         // Resolve at this node's live (governed) generation first.
         let bits = self.shard_bits().await;
         let sk = ShardKey {
@@ -1283,6 +1325,34 @@ impl HeadRegistry {
                 this.backfill_held_if_needed().await;
             });
         }
+        // READINESS GATE (mirrors the health-scan restart gate): flip `ready` once the census has
+        // SETTLED — the member count is stable (not merely non-empty) for READY_STABLE_SECS — so a
+        // freshly-restarted node doesn't register/resolve against a still-converging writer election.
+        // Bounded by READY_MAX_SECS so a genuinely-alone/slow node still proceeds.
+        {
+            let this = self.clone();
+            tokio::spawn(async move {
+                let start = tokio::time::Instant::now();
+                let mut last = usize::MAX;
+                let mut stable_since = start;
+                loop {
+                    let n = this.eligible().await.len();
+                    if n != last {
+                        last = n;
+                        stable_since = tokio::time::Instant::now();
+                    }
+                    let settled = last > 0
+                        && stable_since.elapsed()
+                            >= std::time::Duration::from_secs(READY_STABLE_SECS);
+                    if settled || start.elapsed() >= std::time::Duration::from_secs(READY_MAX_SECS)
+                    {
+                        this.ready.store(true, std::sync::atomic::Ordering::Relaxed);
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            });
+        }
         // Anti-entropy loop — two event-driven jobs, each gated so it adds NO registry traffic
         // while nothing has changed: `reshard_round` (governed shard-count change → split/merge to
         // the new generation) then `migrate_round` (census change → re-replicate held shards to
@@ -1397,6 +1467,8 @@ impl HeadRegistry {
     /// `prev + 1` from the registry itself — no DHT lookup. Routes the key to its shard: the
     /// shard's writer reads it locally, a non-writer queries the writer over `REGISTRY_ALPN`.
     pub async fn current_version(&self, rtype: u8, owner: [u8; 32], name: &str) -> u64 {
+        // Gate on readiness so a deploy computes prev+1 against the right writer (see register).
+        self.wait_ready().await;
         let bits = self.shard_bits().await;
         let sk = ShardKey {
             rtype,
