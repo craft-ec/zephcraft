@@ -1531,6 +1531,74 @@ const DASHBOARD_HTML: &str = include_str!("../../../webui/index.html");
 
 /// Load or create the dashboard auth token (`<data_dir>/control.token`,
 /// 0600). Persisted so an open dashboard survives daemon restarts.
+/// PUBLIC network-stats endpoint (`GET /stats`) — token-free, CORS-open, safe-to-expose JSON for
+/// the zeph.craft.ec website's live-network section. Replaces the retired tracker's
+/// `--public-stats-port` (which served zeros once nodes stopped announcing to it): `nodes` comes
+/// from the CONVERGED membership census (a real network-wide count), `provider_records` from this
+/// node's DHT record store, and the content/storage figures are THIS node's local view (honest,
+/// slightly understating the cluster — a network-wide aggregate is future work). Field names match
+/// the tracker's schema exactly so the website needs no change. Binds 0.0.0.0 (public by design —
+/// exposes only counts, no ids/addresses/content).
+pub async fn serve_public_stats(
+    state: Arc<State>,
+    membership: Arc<zeph_membership::Membership>,
+    dht: Arc<zeph_dht::DhtNode>,
+    relays: usize,
+    storage_quota_gib: f64,
+    port: u16,
+) -> anyhow::Result<()> {
+    use axum::extract::State as AxumState;
+    use axum::routing::get;
+
+    #[derive(Clone)]
+    struct StatsCtx {
+        state: Arc<State>,
+        membership: Arc<zeph_membership::Membership>,
+        dht: Arc<zeph_dht::DhtNode>,
+        relays: usize,
+        capacity_bytes: u64,
+    }
+
+    async fn stats(AxumState(ctx): AxumState<StatsCtx>) -> impl axum::response::IntoResponse {
+        let nodes = ctx.membership.census().await.len();
+        let (cids, pieces, _pinned, bytes) = *ctx.state.storage.read().await;
+        let capacity = ctx.capacity_bytes;
+        let body = serde_json::json!({
+            "nodes": nodes,
+            "content_cids": cids,
+            "provider_records": ctx.dht.stored_len(),
+            "relays": ctx.relays,
+            "pieces_tracked": pieces,
+            "storage_used_bytes": bytes,
+            "storage_capacity_bytes": capacity,
+            "storage_available_bytes": capacity.saturating_sub(bytes),
+        });
+        (
+            [
+                (axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+                (axum::http::header::CACHE_CONTROL, "no-store"),
+            ],
+            axum::Json(body),
+        )
+    }
+
+    let ctx = StatsCtx {
+        state,
+        membership,
+        dht,
+        relays,
+        capacity_bytes: (storage_quota_gib * 1024.0 * 1024.0 * 1024.0) as u64,
+    };
+    let app = axum::Router::new()
+        .route("/stats", get(stats))
+        .with_state(ctx);
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(stats = %format!("http://{addr}/stats"), "public stats listening");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
 pub fn load_or_create_token(data_dir: &std::path::Path) -> anyhow::Result<String> {
     let path = data_dir.join("control.token");
     if path.exists() {

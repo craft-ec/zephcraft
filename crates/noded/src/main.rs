@@ -228,6 +228,11 @@ struct RunArgs {
     #[arg(long)]
     dashboard_port: Option<u16>,
 
+    /// PUBLIC network-stats port on 0.0.0.0 (0 disables; token-free JSON at /stats for the
+    /// website's live-network section). Overrides config.toml.
+    #[arg(long)]
+    public_stats_port: Option<u16>,
+
     /// Relay URL (repeatable). REPLACES config.toml relay_urls when given.
     #[arg(long = "relay-url", global = true)]
     relay_urls: Vec<String>,
@@ -247,6 +252,10 @@ struct Config {
     listen_port: u16,
     /// Web dashboard port on 127.0.0.1; 0 disables. Remote access: ssh -L.
     dashboard_port: u16,
+    /// PUBLIC network-stats port on 0.0.0.0; 0 (default) disables. Token-free `GET /stats`
+    /// JSON (counts only) for the website's live-network section — the retired tracker's
+    /// `--public-stats-port` replacement.
+    public_stats_port: u16,
     /// Relay mesh (foundation §26): our relays first; n0 appended as
     /// fallback unless fallback_relays = false.
     relay_urls: Vec<String>,
@@ -301,6 +310,7 @@ impl Default for Config {
             heartbeat_secs: 5,
             listen_port: 0,
             dashboard_port: 9945,
+            public_stats_port: 0,
             relay_urls: vec!["https://relay1.zeph.craft.ec".to_string()],
             fallback_relays: true,
             relay_operator_urls: Vec::new(),
@@ -961,6 +971,9 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     if let Some(port) = args.dashboard_port {
         cfg.dashboard_port = port;
     }
+    if let Some(port) = args.public_stats_port {
+        cfg.public_stats_port = port;
+    }
     if !args.relay_urls.is_empty() {
         cfg.relay_urls = args.relay_urls;
     }
@@ -1455,6 +1468,33 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     head_registry.set_membership(membership.clone()).await;
     head_registry.set_programs(governance_store.clone()).await;
     mem_peers.set(membership.clone()).await;
+    // PUBLIC stats endpoint (0 = disabled): token-free counts for the website's live-network
+    // section, served from the converged census + this node's store/DHT — the retired tracker's
+    // `--public-stats-port` replacement (api.zeph.craft.ec/stats proxies here).
+    if cfg.public_stats_port != 0 {
+        if let Some(dht) = &dht_node {
+            let stats_state = state.clone();
+            let stats_membership = membership.clone();
+            let stats_dht = dht.clone();
+            let relays = cfg.relay_urls.len();
+            let quota = cfg.storage_quota_gib;
+            let port = cfg.public_stats_port;
+            tokio::spawn(async move {
+                if let Err(err) = control::serve_public_stats(
+                    stats_state,
+                    stats_membership,
+                    stats_dht,
+                    relays,
+                    quota,
+                    port,
+                )
+                .await
+                {
+                    tracing::error!(%err, "public stats server failed");
+                }
+            });
+        }
+    }
     // Membership is the health scan's LIVENESS source (on both routing paths): a holder that
     // SWIM marks dead is excluded from durability counts so repair fires, instead of its stale
     // provider record lingering until TTL.
