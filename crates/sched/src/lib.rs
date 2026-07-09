@@ -177,6 +177,10 @@ struct Inner {
     recent: Mutex<VecDeque<JobRecord>>,
     /// Optional resource gauge; when wired the dispatcher gates on pressure.
     gauge: std::sync::OnceLock<Arc<ResourceGauge>>,
+    /// Dynamic concurrency clamp (<= `concurrency`): boot convergence runs the
+    /// queue nearly one-at-a-time (same discipline as the health-scan delay
+    /// queue), then opens to full width once the node reaches stable state.
+    active_cap: std::sync::atomic::AtomicUsize,
 }
 
 /// A cheaply-cloneable handle to the coordinator.
@@ -199,6 +203,7 @@ impl JobCoordinator {
             concurrency: concurrency.max(1),
             recent: Mutex::new(VecDeque::new()),
             gauge: std::sync::OnceLock::new(),
+            active_cap: std::sync::atomic::AtomicUsize::new(concurrency.max(1)),
         });
         let dispatch = inner.clone();
         tokio::spawn(dispatcher(dispatch));
@@ -270,6 +275,13 @@ impl JobCoordinator {
         let _ = self.inner.gauge.set(gauge);
     }
 
+    /// Clamp effective concurrency to `n` (restored by calling again with the
+    /// full width). The dispatcher stops starting jobs while `in_flight >= n`.
+    pub fn set_active_cap(&self, n: usize) {
+        self.inner.active_cap.store(n.max(1), AtomicOrd::Relaxed);
+        self.inner.notify.notify_one();
+    }
+
     /// The most recent finished jobs, newest first (bounded history).
     pub fn recent_jobs(&self) -> Vec<JobRecord> {
         self.inner
@@ -291,6 +303,17 @@ async fn dispatcher(inner: Arc<Inner>) {
         // (pressure recedes without any new submit to wake us).
         let job = loop {
             let popped = {
+                // Respect the dynamic clamp: during boot convergence the queue
+                // drains nearly one-at-a-time (user directive — same queue
+                // discipline as the health-scan drip).
+                let cap = inner.active_cap.load(AtomicOrd::Relaxed);
+                if inner.counters.in_flight.load(AtomicOrd::Relaxed) >= cap as u64 {
+                    tokio::select! {
+                        _ = inner.notify.notified() => {}
+                        _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+                    }
+                    continue;
+                }
                 let mut q = inner.queue.lock().unwrap();
                 let allowed = match inner.gauge.get() {
                     Some(g) if g.critical() => None,

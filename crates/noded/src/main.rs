@@ -1256,6 +1256,10 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // job (re-announce, which grows with held content) perpetually starved the lowest
     // priority — HealthScan, the durability-maintenance pass — so it never ran (scanned=0).
     let jobs = zeph_sched::JobCoordinator::new(8);
+    // BOOT CONVERGENCE runs the queue nearly one-at-a-time (user directive:
+    // establish and converge sequentially, never storm) — restored to full
+    // width once the post-boot wave drains (see the scan feeder phases).
+    jobs.set_active_cap(2);
 
     // Demand-driven scaling: the serve path fires a CID here the instant its served-pull count
     // crosses scale_threshold; a bounded worker recruits one more provider right then. Scaling
@@ -1762,7 +1766,11 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
-            tracing::info!("boot phase: registry wave drained — scan feed starting (dripped)");
+            // Stable state reached: open the queue to full width.
+            feeder_jobs.set_active_cap(8);
+            tracing::info!(
+                "boot phase: converged — full concurrency restored, scan feed starting (dripped)"
+            );
             // Phase 3: DRIP the initial scan backlog over ~2 minutes instead
             // of dumping thousands of due-now jobs.
             let mut first_pass = true;
