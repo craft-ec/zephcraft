@@ -1884,6 +1884,9 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                                 r.surplus,
                             )
                             .await;
+                            if r.moved > 0 {
+                                st.set_flow(r.moved as u64, 0).await;
+                            }
                             if r.repaired > 0 || r.degraded > 0 || r.offloaded > 0 {
                                 tracing::info!(
                                     at_risk = r.at_risk,
@@ -1933,66 +1936,31 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         });
     }
 
-    // Distribute / scale: the heavier per-cid piece movement, on its own periodic cadence as a
-    // separate coordinator job (deduped by key), so it never stalls the health scan.
-    //
-    // `distribute()` is CENSUS-GATED (the migrate_round pattern): its sweep resolves providers
-    // for EVERY held >2-piece cid — an unconditional per-tick run was O(held) concurrent DHT
-    // lookups every 30s whether or not anything changed (the same background-churn class as the
-    // governance-tick congestion). Distribution's job is to equalize on MEMBERSHIP change, so it
-    // fires once the census has settled after a change (stable 2 ticks — never during a join
-    // storm, when moves would target a shifting peer set), plus a slow heartbeat (every 20th
-    // tick, ~10 min) to catch drift. `scale()` (drains the local demand map) and
-    // `enforce_quota()` (local) stay every tick — both are no-ops when idle.
-    let dist_membership = membership.clone();
+    // Scale (demand-map drain) + quota enforcement on a steady tick — both are
+    // cheap no-ops when idle. The census-gated distribute() SWEEP that lived here
+    // is DELETED (Transfer Plane v2 S3): membership-change rebalancing now rides
+    // each cid's scan (`rebalance_cid`, lazy, paced, zero extra lookups) — the
+    // sweep held coordinator slots for 30-44s per node on every census change and
+    // re-ballooned rejoining nodes (the measured self-sustaining loop). This also
+    // retires the fired-before-submit dedup bug the harness review found.
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(health_scan_secs));
         interval.tick().await; // skip immediate tick at startup
-        let mut last_digest: Option<[u8; 32]> = None;
-        let mut stable_ticks: u32 = 0;
-        let mut fired_for_digest = false;
-        let mut ticks_since_run: u32 = 0;
         loop {
             interval.tick().await;
-            let mut ids: Vec<[u8; 32]> = dist_membership
-                .census()
-                .await
-                .into_iter()
-                .map(|(n, _)| n.0)
-                .collect();
-            ids.sort();
-            let digest = zeph_core::Cid::of(&ids.concat()).0;
-            if last_digest != Some(digest) {
-                last_digest = Some(digest);
-                stable_ticks = 0;
-                fired_for_digest = false;
-            } else {
-                stable_ticks = stable_ticks.saturating_add(1);
-            }
-            ticks_since_run = ticks_since_run.saturating_add(1);
-            let run_distribute = (!fired_for_digest && stable_ticks >= 2) || ticks_since_run >= 20;
-            if run_distribute {
-                fired_for_digest = true;
-                ticks_since_run = 0;
-            }
             let (e, st) = (health_engine.clone(), health_state.clone());
             health_jobs.submit(
-                "distribute",
+                "scale_quota",
                 zeph_sched::Priority::Distribution,
                 1,
                 move || {
                     let (e, st) = (e.clone(), st.clone());
                     async move {
-                        let moved = if run_distribute {
-                            e.distribute().await.moved
-                        } else {
-                            0
-                        };
                         let sc = e.scale().await;
                         e.enforce_quota().await;
-                        st.set_flow(moved as u64, sc.scaled as u64).await;
-                        if moved > 0 || sc.scaled > 0 {
-                            tracing::info!(moved, scaled = sc.scaled, "distribute / scale");
+                        st.set_flow(0, sc.scaled as u64).await;
+                        if sc.scaled > 0 {
+                            tracing::info!(scaled = sc.scaled, "demand scale");
                         }
                         Ok(())
                     }

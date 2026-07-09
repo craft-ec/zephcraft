@@ -122,6 +122,8 @@ pub struct HealthReport {
     pub at_risk: usize,
     /// Pieces this node minted + pushed this pass (repair actions taken).
     pub repaired: usize,
+    /// Pieces MOVED to less-full peers by lazy rebalance during this pass.
+    pub moved: usize,
     /// Surplus pieces shed this pass (degradation actions taken).
     pub degraded: usize,
     /// At-risk CIDs left to FADE this pass (nothing wants them — no repair).
@@ -168,6 +170,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Max pieces a single repair pass mints for one cid (bounded burst).
 const REPAIR_BATCH: usize = 8;
+
+/// Max pieces one scan pass MOVES for one cid (lazy rebalance trickle).
+const MOVE_BATCH: usize = 2;
 
 /// Max streams served concurrently per inbound connection (pipelining bound).
 /// 4, not 8: on memory-capped receivers 8 concurrent ingests (each a vtag
@@ -1454,15 +1459,29 @@ impl ObjEngine {
             // repair/shed flap — small wobble around the floor no longer flips the decision.
             let recovering = self.is_at_risk(&cid) && effective < floor;
             if effective >= low && !recovering {
+                // LAZY REBALANCE (v2 S3): the join-populate move rides the
+                // stable path of the per-cid scan — no census-triggered sweep.
+                let mut action = "none — stable";
+                if self.store.piece_count(&cid) > 2
+                    && self
+                        .is_alive(&cid, providers.iter().any(|p| p.pinned))
+                        .await
+                {
+                    let n = self.rebalance_cid(&cid, &gen, &providers).await;
+                    if n > 0 {
+                        report.moved += n;
+                        action = "rebalanced — moved piece(s) to least-full peer";
+                    }
+                }
                 self.record_health(
                     &cid,
                     have,
                     floor,
                     live.len(),
                     "within durability band (floor ± Δ)",
-                    "none — stable",
+                    action,
                 );
-                continue; // inside the deadband — nothing to do
+                continue; // inside the deadband — nothing else to do
             }
 
             // FADE: content nothing wants — no pin, no want, no live demand — is
@@ -1774,7 +1793,87 @@ impl ObjEngine {
         self.pending.lock().expect("pending").clone()
     }
 
-    /// One Distribution pass — the spin-up / spread behavior. For each CID
+    /// LAZY REBALANCE for one cid (Transfer Plane v2, S3): if this node is
+    /// over-concentrated (> 2 pieces) move up to [`MOVE_BATCH`] pieces to the
+    /// least-full LIVE peers — push, delete locally only on ack, belief
+    /// updated per move. Rides the health scan's already-resolved provider
+    /// records, so membership changes converge item-by-item at scan pace with
+    /// ZERO extra lookups — replacing the census-triggered O(held) sweep that
+    /// held coordinator slots for 30-44s per node and re-ballooned rejoining
+    /// nodes (the measured self-sustaining production loop).
+    async fn rebalance_cid(
+        &self,
+        cid: &Cid,
+        gen: &Generation,
+        providers: &[zeph_routing::ProviderRecord],
+    ) -> usize {
+        let me = self.transport.node_id();
+        let mut mine = self.store.piece_count(cid);
+        if mine <= 2 {
+            return 0;
+        }
+        let peers: Vec<(NodeId, PeerAddr)> = self
+            .peer_source
+            .peers()
+            .await
+            .into_iter()
+            .filter(|(id, _)| *id != me)
+            .collect();
+        if peers.is_empty() {
+            return 0;
+        }
+        // Seed belief from records; track our own moves so stale records
+        // can't pile pieces onto one host (same convergence rule the sweep used).
+        let mut belief: HashMap<NodeId, u32> = peers
+            .iter()
+            .map(|(id, _)| {
+                let c = providers
+                    .iter()
+                    .find(|p| p.node_id == *id)
+                    .map_or(0, |p| p.piece_count);
+                (*id, c)
+            })
+            .collect();
+        let mut moved = 0usize;
+        while moved < MOVE_BATCH {
+            let Some((tid, taddr, tcount)) = peers
+                .iter()
+                .map(|(id, addr)| (*id, addr, *belief.get(id).unwrap_or(&0)))
+                .min_by_key(|(_, _, c)| *c)
+            else {
+                break;
+            };
+            // Only when a move STRICTLY improves balance; always retain >= 2.
+            if tcount as usize + 1 >= mine || mine <= 2 {
+                break;
+            }
+            let Ok(held) = self.store.serve_pieces(cid, &HashSet::new(), 1) else {
+                break;
+            };
+            let Some(piece) = held.into_iter().next() else {
+                break;
+            };
+            let pid = piece.piece_id();
+            if self
+                .push_piece(taddr, *cid, gen, &piece, PUSH_TIMEOUT)
+                .await
+                .is_ok()
+            {
+                let _ = self.store.remove_piece(cid, &pid);
+                *belief.entry(tid).or_insert(0) += 1;
+                mine -= 1;
+                moved += 1;
+            } else {
+                break;
+            }
+        }
+        moved
+    }
+
+    /// One Distribution pass — the spin-up / spread behavior (TEST-ONLY since
+    /// Transfer Plane v2 S3: production converges lazily via `rebalance_cid`
+    /// on the per-cid scan; a census-triggered O(held) sweep is a defect by
+    /// the S5 invariant). For each CID
     /// this node is over-concentrated on (holds > 2 coded pieces), find the
     /// least-full LIVE peer and MOVE one piece to it: push, then delete our
     /// copy only after the receiver acks. Unlike Repair, this creates no new
