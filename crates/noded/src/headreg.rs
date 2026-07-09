@@ -281,6 +281,14 @@ pub struct HeadRegistry {
     /// Membership — the active set feeds the election AND locates a writer's dialable
     /// [`PeerAddr`]. Wired after open.
     membership: RwLock<Option<Arc<Membership>>>,
+    /// JobCoordinator + weak self-handle for job factories (see [`Self::set_jobs`]).
+    /// Unwired (tests), replication falls back to the direct spawn.
+    jobs: RwLock<Option<(zeph_sched::JobCoordinator, std::sync::Weak<HeadRegistry>)>>,
+    /// Per-shard replication dirty counter: bumped on EVERY `replicate` call
+    /// (even when the pushstate job submit is dedup-dropped), re-checked by the
+    /// running job after each push round — a write landing mid-push is carried
+    /// by an extra round instead of silently lost (review finding).
+    push_dirty: std::sync::Mutex<HashMap<ShardKey, u64>>,
     /// This node's own id.
     self_id: [u8; 32],
     /// Per `(rtype, shard)`: the last effective epoch for which this node (as that account's
@@ -379,6 +387,8 @@ impl HeadRegistry {
             clock,
             transport,
             membership: RwLock::new(None),
+            jobs: RwLock::new(None),
+            push_dirty: std::sync::Mutex::new(HashMap::new()),
             self_id,
             last_epoch: RwLock::new(std::collections::HashMap::new()),
             last_census: RwLock::new(None),
@@ -857,6 +867,13 @@ impl HeadRegistry {
         *self.membership.write().await = Some(membership);
     }
 
+    /// Wire the JobCoordinator (and a self-handle for job factories) so shard-state
+    /// replication runs as deduped Distribution jobs instead of a raw spawn per write.
+    pub async fn set_jobs(self: Arc<Self>, jobs: zeph_sched::JobCoordinator) {
+        let weak = Arc::downgrade(&self);
+        *self.jobs.write().await = Some((jobs, weak));
+    }
+
     /// The current registry epoch = `clock.now().millis() / EPOCH_MILLIS`, adjusted for the
     /// boundary-race grace window: during the first `GRACE_MILLIS` of an epoch the PREVIOUS
     /// epoch is returned, so the previous writer stays authoritative across the boundary. This
@@ -1075,6 +1092,33 @@ impl HeadRegistry {
     /// old behaviour) made every write as slow as the slowest replica — a relay-only peer could
     /// stall a register for seconds. Best-effort: push errors are swallowed, never failing the write.
     async fn replicate(&self, sk: ShardKey, state: &[u8]) {
+        // WIRED: schedule a deduped Distribution job that pushes the FULL current
+        // shard state at RUN time. Full-state (not the caller's possibly 1-row
+        // delta) is what makes the dedup safe: rapid writes to one shard coalesce
+        // into a single push that carries every row (receiver merge is LWW), so a
+        // migrate storm collapses to one job per shard instead of a spawn per write.
+        if let Some((jobs, weak)) = self.jobs.read().await.clone() {
+            // Bump the dirty counter BEFORE submitting: if the submit is
+            // dedup-dropped (a pushstate job for this shard is in flight),
+            // the running job sees the bump after its push round and re-runs
+            // with fresh state — no write's replication is silently lost.
+            {
+                let mut d = self.push_dirty.lock().expect("push_dirty");
+                *d.entry(sk).or_insert(0) += 1;
+            }
+            let key = format!("pushstate:{}:{}:{}", sk.rtype, sk.bits, sk.shard);
+            jobs.submit(key, zeph_sched::Priority::Distribution, 1, move || {
+                let weak = weak.clone();
+                async move {
+                    if let Some(reg) = weak.upgrade() {
+                        reg.push_shard_state(sk).await;
+                    }
+                    Ok(())
+                }
+            });
+            return;
+        }
+        // UNWIRED (tests): push the caller's snapshot directly.
         let elig = self.eligible().await;
         let mut targets = Vec::new();
         for id in Self::replicas(sk, &elig) {
@@ -1106,6 +1150,59 @@ impl HeadRegistry {
                 .await;
             }
         });
+    }
+
+    /// The body of a `pushstate:{shard}` Distribution job: read the shard's FULL
+    /// current state and push it to the current replica set (minus self). Loops
+    /// while writes keep dirtying the shard mid-push (their submits are
+    /// dedup-dropped against this in-flight job, so this job must carry them);
+    /// each round pushes the LATEST full state, so rounds converge as soon as
+    /// writes pause. The round cap only guards a pathological sustained-write
+    /// storm — the next write past the cap submits a fresh job anyway.
+    async fn push_shard_state(&self, sk: ShardKey) {
+        for round in 0..16u32 {
+            let version = {
+                let d = self.push_dirty.lock().expect("push_dirty");
+                d.get(&sk).copied().unwrap_or(0)
+            };
+            let state = self.sql_state(sk).await;
+            if !state.is_empty() {
+                let encoded = state.encode();
+                let elig = self.eligible().await;
+                for id in Self::replicas(sk, &elig) {
+                    if id == self.self_id {
+                        continue;
+                    }
+                    let Some(addr) = self.addr_of(id).await else {
+                        continue;
+                    };
+                    let _ = request_registry(
+                        &self.transport,
+                        &addr,
+                        &RegistryReq::PushState {
+                            rtype: sk.rtype,
+                            bits: sk.bits,
+                            shard: sk.shard,
+                            state: encoded.clone(),
+                        },
+                    )
+                    .await;
+                }
+            }
+            let now = {
+                let d = self.push_dirty.lock().expect("push_dirty");
+                d.get(&sk).copied().unwrap_or(0)
+            };
+            if now == version {
+                return;
+            }
+            if round == 15 {
+                tracing::warn!(
+                    shard = sk.shard,
+                    "pushstate rounds exhausted with shard still dirty — next write re-replicates"
+                );
+            }
+        }
     }
 
     /// Local resolve against this node's own copy of `sk`'s registry account. Returns the head

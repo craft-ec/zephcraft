@@ -329,6 +329,13 @@ impl State {
         h.8 = surplus;
     }
 
+    /// One repair completed by a standalone Repair-priority job (repairs no
+    /// longer run inside the scan job in production, so the scan's
+    /// `repaired_delta` is 0 there and this keeps the cumulative count right).
+    pub async fn add_repaired(&self, n: u64) {
+        self.health.write().await.2 += n;
+    }
+
     /// Health-scan delay-queue depth (total scheduled) + due-now backlog.
     pub fn set_scan_queue(&self, total: usize, due: usize) {
         self.scan_queue

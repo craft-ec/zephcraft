@@ -166,6 +166,19 @@ const PUSH_TIMEOUT: Duration = Duration::from_secs(3);
 /// evict always runs (see [`request`]).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Heavy engine work routed to the node's JobCoordinator when wired (see
+/// `work_trigger`): the engine detects the need, the coordinator schedules it
+/// with the right priority, dedup key, and bounded concurrency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineWork {
+    /// Initial post-publish distribution: encode n pieces, push to peers
+    /// (Encoding priority — new data needs redundancy quickly).
+    PublishDistribute(Cid),
+    /// Durability repair for one at-risk cid (Repair priority — preempts all
+    /// routine work; found by the health scan, executed by the coordinator).
+    Repair(Cid),
+}
+
 /// Outcome of publishing a file (content + its manifest).
 #[derive(Debug, Clone)]
 /// Result of publishing a PRIVATE file (ENCRYPTION_DESIGN.md phase 2). The
@@ -270,6 +283,11 @@ pub struct ObjEngine {
     /// scale_threshold the serve path sends the cid here, and a worker recruits another provider
     /// immediately — scaling reacts to access, not to any scan/distribute cadence.
     scale_trigger: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<Cid>>,
+    /// Set by the node: the channel that routes the engine's HEAVY work (initial
+    /// publish distribution, durability repair) to the JobCoordinator — the engine
+    /// DETECTS, the coordinator SCHEDULES (priority, dedup, bounded concurrency).
+    /// Unwired (tests/library use), the work runs directly as before.
+    work_trigger: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<EngineWork>>,
     /// Liveness source (set by the node = membership; a test source in tests). The health scan
     /// filters provider records by this so a DIED holder — whose record lingers until TTL — stops
     /// inflating a cid's effective count, and repair fires. None → no filtering (legacy).
@@ -307,6 +325,7 @@ impl ObjEngine {
             fading_ids: Mutex::new(HashSet::new()),
             surplus_ids: Mutex::new(HashSet::new()),
             scale_trigger: std::sync::OnceLock::new(),
+            work_trigger: std::sync::OnceLock::new(),
             liveness: Mutex::new(None),
             alive_cache: Mutex::new(None),
             node_liveness: Mutex::new(HashMap::new()),
@@ -528,78 +547,25 @@ impl ObjEngine {
             self.store.set_want(cid)?;
         }
 
-        // DISTRIBUTION — fire-and-forget. A publish must NOT block on spreading pieces to
-        // peers: spread is only for durability, reached asynchronously (these direct pushes
-        // now — NOT deferred to the health scan — plus the health scan later). Clone the
-        // Arc handles and move the owned data into the task: resolve candidates, encode the
-        // n pieces, push them CONCURRENTLY under PUSH_TIMEOUT (a stalled peer times out
-        // instead of hanging distribution), then mark DISTRIBUTED once the erasure set has
-        // reached the network so re-publishes stop re-pushing (no unbounded piece growth).
-        let me = self.transport.node_id();
-        let transport = self.transport.clone();
-        let store = self.store.clone();
-        let peer_source = self.peer_source.clone();
-        let routing = self.routing.clone();
-        let threshold = self.config.durability_threshold;
-        let n = target_pieces(k);
-        tokio::spawn(async move {
-            let candidates: Vec<PeerAddr> = peer_source
-                .peers()
-                .await
-                .into_iter()
-                .filter(|(id, _)| *id != me)
-                .map(|(_, addr)| addr)
-                .collect();
-            if !candidates.is_empty() {
-                let mut rng = OsRng;
-                let is_system = store.is_system(&cid);
-                let jobs: anyhow::Result<Vec<(PeerAddr, CodedPiece)>> = (0..n)
-                    .map(|i| {
-                        Ok((
-                            candidates[i % candidates.len()].clone(),
-                            encode(&sources, &mut rng)?,
-                        ))
-                    })
-                    .collect();
-                if let Ok(jobs) = jobs {
-                    let gen_ref = &gen;
-                    let transport_ref = &transport;
-                    let results =
-                        futures::future::join_all(jobs.iter().map(|(peer, piece)| async move {
-                            // Timeout lives INSIDE push_piece/request — an external
-                            // wrap would drop the future before its pool-evict runs.
-                            match push_piece(
-                                transport_ref,
-                                is_system,
-                                peer,
-                                cid,
-                                gen_ref,
-                                piece,
-                                PUSH_TIMEOUT,
-                            )
-                            .await
-                            {
-                                Ok(()) => Some(peer.node_id()),
-                                _ => None,
-                            }
-                        }))
-                        .await;
-                    let mut distinct: HashSet<_> = HashSet::new();
-                    let mut pushed = 0usize;
-                    for id in results.into_iter().flatten() {
-                        distinct.insert(id);
-                        pushed += 1;
-                    }
-                    let target = threshold.min(candidates.len());
-                    if pushed >= n || distinct.len() >= target {
-                        let _ = store.set_distributed(cid);
-                    }
-                }
-            }
-            if pin {
-                let _ = routing.announce(cid, 0, true).await;
-            }
-        });
+        // DISTRIBUTION — never inline in publish: spread is only for durability and is
+        // reached asynchronously (distribute_pending + health scan back it up). WIRED
+        // (production): route to the JobCoordinator as an Encoding-priority job, so a
+        // publish BURST (a deploy run, a migrate wave) gets bounded concurrency and a
+        // per-cid dedup key instead of a raw spawn per publish — the spawn-per-publish
+        // pattern was one of the mass-rejoin storm engines. UNWIRED (tests/library):
+        // spawn the same body directly.
+        if let Some(tx) = self.work_trigger.get() {
+            let _ = tx.send(EngineWork::PublishDistribute(cid));
+        } else {
+            let transport = self.transport.clone();
+            let store = self.store.clone();
+            let peer_source = self.peer_source.clone();
+            let routing = self.routing.clone();
+            let threshold = self.config.durability_threshold;
+            tokio::spawn(async move {
+                distribute_initial(transport, store, peer_source, routing, threshold, cid).await;
+            });
+        }
 
         // Return the cid IMMEDIATELY: distribution is pending in the background and the
         // publisher holds its copy, so durability metrics are 0/false at return.
@@ -1538,7 +1504,22 @@ impl ObjEngine {
             // most needs it (fewest pieces). Falls back to a non-holder peer if
             // no other live holder exists (sole survivor recruiting a new one).
             self.emit(zeph_events::Event::RepairNeeded(cid));
-            if self.repair_one(&cid, &gen, &live).await {
+            if let Some(tx) = self.work_trigger.get() {
+                // Detection only: the coordinator runs the repair as a
+                // Repair-PRIORITY job (preempts all routine work) with a
+                // per-cid dedup key — inline repair here executed at the
+                // scan's own HealthScan priority, leaving the Repair tier
+                // unused (audit finding).
+                let _ = tx.send(EngineWork::Repair(cid));
+                self.record_health(
+                    &cid,
+                    have,
+                    floor,
+                    live.len(),
+                    "below band — under-replicated",
+                    "repair queued (Repair-priority job)",
+                );
+            } else if self.repair_one(&cid, &gen, &live).await {
                 report.repaired += 1;
                 self.record_health(
                     &cid,
@@ -1877,6 +1858,87 @@ impl ObjEngine {
         let _ = self.scale_trigger.set(tx);
     }
 
+    /// Wire the engine's heavy work (publish distribution, repair) to the node's
+    /// JobCoordinator. Unwired, that work runs directly (tests/library use).
+    pub fn set_work_trigger(&self, tx: tokio::sync::mpsc::UnboundedSender<EngineWork>) {
+        let _ = self.work_trigger.set(tx);
+    }
+
+    /// The body of a PublishDistribute coordinator job: run the initial
+    /// post-publish distribution for `cid`, re-derived from the store.
+    pub async fn distribute_initial(&self, cid: Cid) {
+        distribute_initial(
+            self.transport.clone(),
+            self.store.clone(),
+            self.peer_source.clone(),
+            self.routing.clone(),
+            self.config.durability_threshold,
+            cid,
+        )
+        .await
+    }
+
+    /// The body of a Repair coordinator job: re-detect and (if this node is
+    /// still the elected repairer) repair ONE at-risk cid. Re-derives the NEED
+    /// (durability floor + want/Fade gate) AND the election from scratch — the
+    /// scan that queued this ran earlier, and the world may have moved: another
+    /// holder may already have restored the floor, or the content may have
+    /// faded to unwanted, and repairing then mints exactly the surplus pieces
+    /// the Fade design exists to prevent (review finding). Returns true if a
+    /// piece was minted and pushed.
+    pub async fn repair_cid(&self, cid: Cid) -> bool {
+        if self.store.is_tombstoned(&cid) {
+            return false;
+        }
+        let Some(gen) = self.store.generation(&cid) else {
+            return false;
+        };
+        let me = self.transport.node_id();
+        let epoch = self.transport.clock().now().0 / HEALTH_EPOCH_MS;
+        let providers = self.routing.resolve(cid).await.unwrap_or_default();
+        let alive_set = self.alive_peers().await;
+        let mut have = self.store.piece_count(&cid);
+        let mut any_pinned = false;
+        let mut capable: Vec<NodeId> = Vec::new();
+        let mut live: Vec<(NodeId, PeerAddr, u32, bool)> = Vec::new();
+        for p in &providers {
+            if p.node_id == me {
+                continue;
+            }
+            let is_alive = match &alive_set {
+                Some(set) => set.contains(&p.node_id),
+                None => self.probe_alive(p.node_id, &p.addr).await,
+            };
+            if !is_alive {
+                continue;
+            }
+            have += p.piece_count as usize;
+            any_pinned |= p.pinned;
+            if p.piece_count >= 2 || p.pinned {
+                capable.push(p.node_id);
+            }
+            live.push((p.node_id, p.addr.clone(), p.piece_count, p.pinned));
+        }
+        // Still NEEDED? Below the durability floor AND still wanted (Fade gate)
+        // — the mirror of the scan's own gating, re-run at execution time.
+        if have >= target_pieces(gen.k as usize) || !self.is_alive(&cid, any_pinned).await {
+            return false;
+        }
+        let can_i = self.store.piece_count(&cid) >= 2
+            || (self.store.has_content(&cid) && self.store.is_pinned(&cid));
+        if !can_i {
+            return false;
+        }
+        capable.push(me);
+        let winner = capable
+            .iter()
+            .max_by_key(|id| rendezvous_score(id, &cid, epoch));
+        if winner != Some(&me) {
+            return false;
+        }
+        self.repair_one(&cid, &gen, &live).await
+    }
+
     /// Periodic backstop + demand-window reset: snapshot & clear the pull window, recruit for
     /// anything still hot. The INSTANT path is demand-driven (scale_one, fired on the serve path
     /// the moment a pull crosses scale_threshold) — this just resets the window and mops up any
@@ -2195,6 +2257,95 @@ impl ObjEngine {
             ok: true,
             reason: String::new(),
         }
+    }
+}
+
+/// Initial post-publish distribution for one cid: re-derive the erasure sources from the
+/// locally-retained content (the generation carries k / piece_len / total_len, and
+/// `split_sources` padding is deterministic), encode n fresh pieces, push them
+/// concurrently, and mark DISTRIBUTED once the erasure set has reached the network so
+/// re-publishes never re-push. A free fn over cloned Arc handles so the coordinator job
+/// (wired) and the direct fallback task (unwired) share one body.
+async fn distribute_initial(
+    transport: Arc<Transport>,
+    store: Arc<Store>,
+    peer_source: Arc<dyn PeerSource>,
+    routing: Arc<dyn ContentRouting>,
+    threshold: usize,
+    cid: Cid,
+) {
+    let pinned = store.is_pinned(&cid);
+    if !store.is_distributed(&cid) {
+        let (Some(content), Some(gen)) = (store.content(&cid), store.generation(&cid)) else {
+            return;
+        };
+        let piece_len = (gen.piece_len as usize).max(1);
+        let k = (gen.k as usize).max(1);
+        let mut sources: Vec<Vec<u8>> = content.chunks(piece_len).map(|c| c.to_vec()).collect();
+        while sources.len() < k {
+            sources.push(vec![0u8; piece_len]);
+        }
+        for s in &mut sources {
+            s.resize(piece_len, 0);
+        }
+        let n = target_pieces(k);
+        let me = transport.node_id();
+        let candidates: Vec<PeerAddr> = peer_source
+            .peers()
+            .await
+            .into_iter()
+            .filter(|(id, _)| *id != me)
+            .map(|(_, addr)| addr)
+            .collect();
+        if !candidates.is_empty() {
+            let mut rng = OsRng;
+            let is_system = store.is_system(&cid);
+            let jobs: anyhow::Result<Vec<(PeerAddr, CodedPiece)>> = (0..n)
+                .map(|i| {
+                    Ok((
+                        candidates[i % candidates.len()].clone(),
+                        encode(&sources, &mut rng)?,
+                    ))
+                })
+                .collect();
+            if let Ok(jobs) = jobs {
+                let gen_ref = &gen;
+                let transport_ref = &transport;
+                let results =
+                    futures::future::join_all(jobs.iter().map(|(peer, piece)| async move {
+                        // Timeout lives INSIDE push_piece/request — an external
+                        // wrap would drop the future before its pool-evict runs.
+                        match push_piece(
+                            transport_ref,
+                            is_system,
+                            peer,
+                            cid,
+                            gen_ref,
+                            piece,
+                            PUSH_TIMEOUT,
+                        )
+                        .await
+                        {
+                            Ok(()) => Some(peer.node_id()),
+                            _ => None,
+                        }
+                    }))
+                    .await;
+                let mut distinct: HashSet<_> = HashSet::new();
+                let mut pushed = 0usize;
+                for id in results.into_iter().flatten() {
+                    distinct.insert(id);
+                    pushed += 1;
+                }
+                let target = threshold.min(candidates.len());
+                if pushed >= n || distinct.len() >= target {
+                    let _ = store.set_distributed(cid);
+                }
+            }
+        }
+    }
+    if pinned {
+        let _ = routing.announce(cid, 0, true).await;
     }
 }
 

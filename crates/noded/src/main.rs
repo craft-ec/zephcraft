@@ -1336,6 +1336,61 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         },
     });
 
+    // Engine heavy-work router: publish distribution and durability repair are
+    // DETECTED by the engine but SCHEDULED here through the coordinator — publish
+    // bursts become bounded, deduped Encoding jobs instead of a spawn per publish,
+    // and repair finally runs at Repair priority (it used to execute inline inside
+    // the HealthScan job, leaving the top priority tier unused).
+    {
+        let (work_tx, mut work_rx) = tokio::sync::mpsc::unbounded_channel::<zeph_obj::EngineWork>();
+        engine.set_work_trigger(work_tx);
+        let work_engine = engine.clone();
+        let work_jobs = jobs.clone();
+        let work_state = state.clone();
+        tokio::spawn(async move {
+            while let Some(item) = work_rx.recv().await {
+                match item {
+                    zeph_obj::EngineWork::PublishDistribute(cid) => {
+                        let eng = work_engine.clone();
+                        work_jobs.submit(
+                            format!("publish:{}", cid.to_hex()),
+                            zeph_sched::Priority::Encoding,
+                            1,
+                            move || {
+                                let eng = eng.clone();
+                                async move {
+                                    eng.distribute_initial(cid).await;
+                                    Ok(())
+                                }
+                            },
+                        );
+                    }
+                    zeph_obj::EngineWork::Repair(cid) => {
+                        let eng = work_engine.clone();
+                        let st = work_state.clone();
+                        // max_attempts=1: repair_cid returning false is a valid
+                        // outcome (another holder won the election), not an error
+                        // to retry; the next scan pass re-detects if still at risk.
+                        work_jobs.submit(
+                            format!("repair:{}", cid.to_hex()),
+                            zeph_sched::Priority::Repair,
+                            1,
+                            move || {
+                                let (eng, st) = (eng.clone(), st.clone());
+                                async move {
+                                    if eng.repair_cid(cid).await {
+                                        st.add_repaired(1).await;
+                                    }
+                                    Ok(())
+                                }
+                            },
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     // Activity feed: drain the event bus into the bounded recent-events buffer
     // (foundation §52 consumer). Any other subscriber — or the control API — can
     // subscribe independently for its own reactive logic.
@@ -1397,14 +1452,30 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     tokio::spawn(zeph_com::serve_invocations(invoke_rx, com_service.clone()));
     // Serve cross-node registry requests (writer path advances; queries resolve).
     tokio::spawn(head_registry.clone().serve(registry_rx));
-    // Cheap "pending distribution" refresh (provider records, no probing) — independent
-    // of the verified health scan so the dashboard stays fresh.
+    // "Pending distribution" completion (per-incomplete-cid DHT resolve + deficit pushes)
+    // — network fan-out, so it runs THROUGH the coordinator (Distribution priority,
+    // deduped: a slow pass coalesces with the next tick instead of stacking). This loop
+    // only ticks the schedule. It was an inline loop before — the one distribution path
+    // that bypassed the coordinator entirely (audit finding).
     let pending_engine = engine.clone();
+    let pending_jobs = jobs.clone();
     tokio::spawn(async move {
         let mut iv = tokio::time::interval(std::time::Duration::from_secs(12));
         loop {
             iv.tick().await;
-            pending_engine.distribute_pending().await;
+            let eng = pending_engine.clone();
+            pending_jobs.submit(
+                "distribute_pending",
+                zeph_sched::Priority::Distribution,
+                1,
+                move || {
+                    let eng = eng.clone();
+                    async move {
+                        eng.distribute_pending().await;
+                        Ok(())
+                    }
+                },
+            );
         }
     });
     // Governance anti-entropy: 30s cadence. Governance changes are rare and human-initiated, so
@@ -1475,6 +1546,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     governance_store.set_membership(membership.clone()).await;
     head_registry.set_membership(membership.clone()).await;
     head_registry.set_programs(governance_store.clone()).await;
+    head_registry.clone().set_jobs(jobs.clone()).await;
     mem_peers.set(membership.clone()).await;
     // PUBLIC stats endpoint (0 = disabled): token-free counts for the website's live-network
     // section, served from the converged census + this node's store/DHT — the retired tracker's
