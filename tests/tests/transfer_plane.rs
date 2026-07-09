@@ -8,12 +8,51 @@
 //! ```text
 //! cargo test -p zeph-tests --test transfer_plane -- --ignored --test-threads=1
 //! ```
+//!
+//! Measurement caveats (public-API limits, noted so the numbers are read
+//! honestly): the >10s-job bar samples `recent_jobs()`, a 20-entry ring, every
+//! 5s — a poll interval in which a node completes >20 jobs can evict a slow
+//! record unseen (the monitor prints an UNDERSAMPLED warning when it detects
+//! that); a job that never completes never lands in the ring at all, which is
+//! why the no-forward-progress check below exists. Per-class slot occupancy,
+//! connection counts, and dial attempts (doc instrumentation wishlist) are not
+//! exposed by the coordinator/transport public APIs yet.
 
 use std::time::{Duration, Instant};
 
 use rand::prelude::*;
 use zeph_core::Cid;
 use zeph_tests::TestNode;
+
+// ── The operator's bars (docs/TRANSFER_PLANE_V2.md, "Acceptance harness").
+// Used in both the checks and the failure messages so they cannot drift.
+/// Scenario A: per-cid scan latency p50 bar.
+const BAR_SCAN_P50_MS: u128 = 250;
+/// Scenario A: per-cid scan latency p99 bar.
+const BAR_SCAN_P99_MS: u128 = 1000;
+/// Scenario B: full census must be observed on every node within this.
+const BAR_CENSUS: Duration = Duration::from_secs(30);
+/// Scenario B: no completed job may exceed this wall-clock.
+const BAR_JOB_MS: u64 = 10_000;
+/// Scenario B: queues must end below this depth on every node.
+const BAR_QUEUE_DEPTH: u64 = 10;
+/// Scenario B (doc bar): no node's queue may sit at/above BAR_QUEUE_DEPTH —
+/// and no node's coordinator may go progress-free with slots occupied — for
+/// longer than this ("queue drains monotonically, no plateau > 60s").
+const BAR_PLATEAU: Duration = Duration::from_secs(60);
+/// Both scenarios: publish-side distribution must settle within this
+/// (the doc's "published and converged" premise).
+const SETTLE_BUDGET: Duration = Duration::from_secs(120);
+/// Scenario B: total drain observation window.
+const DRAIN_WINDOW: Duration = Duration::from_secs(180);
+const DRAIN_POLL: Duration = Duration::from_secs(5);
+/// Scenario B: "eventually drained" = this many consecutive final polls with
+/// every node below BAR_QUEUE_DEPTH.
+const DRAINED_STREAK: usize = 3;
+
+/// The scenarios must never share the process concurrently (wall-clock bars);
+/// this guard enforces what `--test-threads=1` requests.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Distinct ~4KB payloads (index stamped in so contents can never collide).
 fn payloads(n: usize) -> Vec<Vec<u8>> {
@@ -29,38 +68,98 @@ fn payloads(n: usize) -> Vec<Vec<u8>> {
 }
 
 /// Spawn `n` nodes bootstrapping from `seed` — concurrently, like a real
-/// (re)join wave.
+/// (re)join wave. On partial failure the successfully-spawned nodes are shut
+/// down before panicking (they would otherwise be unreachable forever).
 async fn spawn_wave(seed: &zeph_dht::Contact, n: usize) -> Vec<TestNode> {
-    futures::future::join_all((0..n).map(|_| TestNode::spawn(std::slice::from_ref(seed))))
-        .await
-        .into_iter()
-        .map(|r| r.expect("spawn node"))
-        .collect()
+    let results =
+        futures::future::join_all((0..n).map(|_| TestNode::spawn(std::slice::from_ref(seed))))
+            .await;
+    let mut nodes = Vec::with_capacity(n);
+    let mut first_err = None;
+    for r in results {
+        match r {
+            Ok(node) => nodes.push(node),
+            Err(e) => first_err = Some(e),
+        }
+    }
+    if let Some(e) = first_err {
+        for node in &mut nodes {
+            node.shutdown().await;
+        }
+        panic!("spawn wave failed: {e:#}");
+    }
+    nodes
 }
 
-/// Wait for the publisher's initial distribution to settle: every published
-/// cid marked distributed AND the pending-durability snapshot empty. Returns
-/// (settled, elapsed, undistributed_left, pending_left).
-async fn wait_for_distribution(
+/// Publish `n` distinct objects from `publisher`, then wait (bounded) for its
+/// initial distribution to settle: every cid marked distributed AND the
+/// pending-durability snapshot empty. Not settling breaks the doc's
+/// "published and converged" scenario premise → recorded as a violation.
+async fn publish_and_settle(
     publisher: &TestNode,
-    cids: &[Cid],
-    budget: Duration,
-) -> (bool, Duration, usize, usize) {
+    n: usize,
+    label: &str,
+    violations: &mut Vec<String>,
+) -> Vec<Cid> {
+    let data = payloads(n);
+    let mut cids = Vec::with_capacity(n);
+    for d in &data {
+        cids.push(
+            publisher
+                .engine
+                .publish(d, false)
+                .await
+                .expect("publish")
+                .cid,
+        );
+    }
     let start = Instant::now();
-    loop {
+    let (took, undist, pending) = loop {
         let undistributed = cids
             .iter()
             .filter(|c| !publisher.engine.store().is_distributed(c))
             .count();
         let pending = publisher.engine.pending_durability().len();
-        if undistributed == 0 && pending == 0 {
-            return (true, start.elapsed(), 0, 0);
-        }
-        if start.elapsed() >= budget {
-            return (false, start.elapsed(), undistributed, pending);
+        if (undistributed == 0 && pending == 0) || start.elapsed() >= SETTLE_BUDGET {
+            break (start.elapsed(), undistributed, pending);
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
+    };
+    let settled = undist == 0 && pending == 0;
+    println!(
+        "{label}: published {n} objects; distribution settled={settled} after {took:?} \
+         (undistributed={undist}, pending_durability={pending})"
+    );
+    if !settled {
+        violations.push(format!(
+            "{label}: distribution did not settle within {SETTLE_BUDGET:?} \
+             (doc premise \"published and converged\"): {undist}/{n} cids undistributed, \
+             {pending} pending durability"
+        ));
     }
+    cids
+}
+
+/// Every node's census size, sampled concurrently (a sequential sweep across
+/// 20 nodes takes long enough to skew the census-bar timing).
+async fn census_counts(nodes: &[TestNode]) -> Vec<usize> {
+    futures::future::join_all(
+        nodes
+            .iter()
+            .map(|n| async { n.membership.census().await.len() }),
+    )
+    .await
+}
+
+/// Every node's global at-risk count (an empty scan chunk reads the engine's
+/// aggregated sets without scanning anything).
+async fn at_risk_counts(nodes: &[TestNode]) -> Vec<usize> {
+    futures::future::join_all(
+        nodes
+            .iter()
+            .map(|n| async { n.engine.health_scan_chunk(&[]).await.at_risk }),
+    )
+    .await
 }
 
 /// Nearest-rank percentile over a sorted slice.
@@ -70,17 +169,25 @@ fn percentile(sorted: &[u128], p: f64) -> u128 {
     sorted[rank.clamp(1, sorted.len()) - 1]
 }
 
-fn dump_cluster(nodes: &[TestNode]) {
+async fn dump_cluster(nodes: &[TestNode]) {
     for (i, n) in nodes.iter().enumerate() {
         println!(
-            "node{i} ({}): held_cids={} jobs={:?}",
+            "node{i} ({}): held_cids={} census={} at_risk={} jobs={:?}",
             n.node_id.to_hex(),
             n.engine.store().cids().len(),
+            n.membership.census().await.len(),
+            n.engine.health_scan_chunk(&[]).await.at_risk,
             n.jobs.stats()
         );
         for r in n.jobs.recent_jobs() {
             println!("  recent job: {} ok={} {}ms", r.key, r.ok, r.ms);
         }
+    }
+}
+
+async fn shutdown_all(nodes: &mut [TestNode]) {
+    for n in nodes {
+        n.shutdown().await;
     }
 }
 
@@ -90,6 +197,9 @@ fn dump_cluster(nodes: &[TestNode]) {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "heavy: real 8-node in-process cluster — run explicitly (see module doc)"]
 async fn scenario_a_steady_state() {
+    let _serial = SERIAL.lock().await;
+    let mut violations: Vec<String> = Vec::new();
+
     let mut nodes = vec![TestNode::spawn(&[]).await.expect("seed node")];
     let seed = nodes[0].contact.clone();
     nodes.extend(spawn_wave(&seed, 7).await);
@@ -98,37 +208,28 @@ async fn scenario_a_steady_state() {
         nodes[0].node_id.to_hex()
     );
 
-    // Publish 200 small distinct objects from node 0.
-    let data = payloads(200);
-    let mut cids = Vec::with_capacity(data.len());
-    for d in &data {
-        cids.push(
-            nodes[0]
-                .engine
-                .publish(d, false)
-                .await
-                .expect("publish")
-                .cid,
-        );
-    }
-    println!("scenario A: published {} objects from node 0", cids.len());
+    publish_and_settle(&nodes[0], 200, "scenario A", &mut violations).await;
 
-    let (settled, took, undist, pending) =
-        wait_for_distribution(&nodes[0], &cids, Duration::from_secs(120)).await;
-    println!(
-        "scenario A: distribution settled={settled} after {took:?} \
-         (undistributed={undist}, pending_durability={pending})"
-    );
-
-    // Measure: health_scan_chunk wall-clock for 50 random held cids on 3 nodes.
+    // Measure: health_scan_chunk wall-clock for 50 random held cids on 3
+    // nodes. Sampling is sequential (one probe in flight at a time) so each
+    // sample isolates one scan against the live background load; the cluster
+    // keeps converging underneath, so late samples see a later epoch — the
+    // aggregate is a mixed-epoch distribution, read it as such.
     let mut samples: Vec<(usize, String, u128)> = Vec::new();
-    for &ni in &[1usize, 4, 7] {
+    // Scan from the three nodes holding the MOST cids: v1 placement is
+    // piece-floor-based, not coverage-based, so some nodes may legally hold
+    // nothing (observed: node 1 with zero — a finding, not a harness bug).
+    let mut by_held: Vec<usize> = (0..nodes.len()).collect();
+    by_held.sort_by_key(|&i| std::cmp::Reverse(nodes[i].engine.store().cids().len()));
+    for &ni in by_held.iter().take(3) {
         let node = &nodes[ni];
         let mut held: Vec<Cid> = node.engine.store().cids();
-        assert!(
-            !held.is_empty(),
-            "node {ni} holds nothing to scan — distribution never reached it"
-        );
+        if held.is_empty() {
+            violations.push(format!(
+                "top-holder node {ni} holds nothing to scan — distribution failed entirely"
+            ));
+            continue;
+        }
         {
             let mut rng = rand::thread_rng();
             held.shuffle(&mut rng);
@@ -136,53 +237,64 @@ async fn scenario_a_steady_state() {
         held.truncate(50);
         for cid in held {
             let t0 = Instant::now();
-            let _ = node.engine.health_scan_chunk(&[cid]).await;
+            node.engine.health_scan_chunk(&[cid]).await;
             samples.push((ni, cid.to_hex(), t0.elapsed().as_millis()));
         }
     }
 
     let mut ms: Vec<u128> = samples.iter().map(|s| s.2).collect();
     ms.sort_unstable();
-    let (p50, p90, p99) = (
-        percentile(&ms, 50.0),
-        percentile(&ms, 90.0),
-        percentile(&ms, 99.0),
-    );
-    let max = *ms.last().expect("samples");
-    println!(
-        "scenario A: scan latency over {} samples: p50={p50}ms p90={p90}ms \
-         p99={p99}ms max={max}ms",
-        ms.len()
-    );
+    if ms.is_empty() {
+        violations.push("no scan samples collected".to_string());
+    } else {
+        let (p50, p90, p99) = (
+            percentile(&ms, 50.0),
+            percentile(&ms, 90.0),
+            percentile(&ms, 99.0),
+        );
+        let max = *ms.last().expect("samples");
+        println!(
+            "scenario A: scan latency over {} samples: p50={p50}ms p90={p90}ms \
+             p99={p99}ms max={max}ms",
+            ms.len()
+        );
+        if p50 >= BAR_SCAN_P50_MS || p99 >= BAR_SCAN_P99_MS {
+            violations.push(format!(
+                "scan latency bar broken: p50={p50}ms (bar < {BAR_SCAN_P50_MS}ms), \
+                 p99={p99}ms (bar < {BAR_SCAN_P99_MS}ms), max={max}ms over {} samples",
+                ms.len()
+            ));
+        }
+    }
 
-    let pass = p50 < 250 && p99 < 1000;
-    if !pass {
+    if !violations.is_empty() {
         println!("--- scenario A FAILURE diagnostics ---");
         println!("full latency distribution (ms, sorted): {ms:?}");
         println!("per-sample (node, cid, ms):");
         for (ni, cid, m) in &samples {
             println!("  node{ni} {cid} {m}ms");
         }
-        dump_cluster(&nodes);
+        dump_cluster(&nodes).await;
     }
-    for n in &mut nodes {
-        n.shutdown().await;
-    }
+    shutdown_all(&mut nodes).await;
     assert!(
-        pass,
-        "scenario A bar failed: p50={p50}ms (bar < 250ms), p99={p99}ms (bar < 1000ms), \
-         max={max}ms over {} samples",
-        ms.len()
+        violations.is_empty(),
+        "scenario A bars failed:\n{}",
+        violations.join("\n")
     );
 }
 
 /// Scenario B — mass rejoin: 5 nodes with 100 published objects, then 15 more
 /// nodes join at once. Bars: every node's census reaches 20 within 30s; every
-/// node's job queue is eventually (< 180s) below depth 10 and STAYS there; no
-/// completed job observed above 10s wall-clock.
+/// node's job queue is eventually (< 180s) below depth 10 and STAYS there —
+/// with no >60s plateau and no progress-free coordinator on the way; no
+/// completed job above 10s wall-clock; at-risk drains to 0 (doc bar).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "heavy: real 20-node in-process cluster — run explicitly (see module doc)"]
 async fn scenario_b_mass_rejoin() {
+    let _serial = SERIAL.lock().await;
+    let mut violations: Vec<String> = Vec::new();
+
     let mut nodes = vec![TestNode::spawn(&[]).await.expect("seed node")];
     let seed = nodes[0].contact.clone();
     nodes.extend(spawn_wave(&seed, 4).await);
@@ -191,142 +303,196 @@ async fn scenario_b_mass_rejoin() {
         nodes[0].node_id.to_hex()
     );
 
-    let data = payloads(100);
-    let mut cids = Vec::with_capacity(data.len());
-    for d in &data {
-        cids.push(
-            nodes[0]
-                .engine
-                .publish(d, false)
-                .await
-                .expect("publish")
-                .cid,
-        );
-    }
-    let (settled, took, undist, pending) =
-        wait_for_distribution(&nodes[0], &cids, Duration::from_secs(120)).await;
-    println!(
-        "scenario B: initial distribution settled={settled} after {took:?} \
-         (undistributed={undist}, pending_durability={pending})"
-    );
+    publish_and_settle(&nodes[0], 100, "scenario B", &mut violations).await;
 
     // Mass rejoin: 15 more nodes in one wave.
     let t_join = Instant::now();
     nodes.extend(spawn_wave(&seed, 15).await);
+    let full_census = nodes.len();
     println!(
         "scenario B: 15-node join wave spawned in {:?}",
         t_join.elapsed()
     );
 
-    // Bar 1: census reaches 20 on EVERY node within 30s of the wave.
+    // Jobs completed BEFORE the wave (still visible in the 20-entry recent
+    // ring) must not be attributed to the rejoin window. Snapshot now;
+    // identical (node, key, ms, ok) records are excluded below.
+    let pre_wave: std::collections::BTreeSet<(usize, String, u64, bool)> = nodes
+        .iter()
+        .enumerate()
+        .flat_map(|(i, n)| {
+            n.jobs
+                .recent_jobs()
+                .into_iter()
+                .map(move |r| (i, r.key, r.ms, r.ok))
+        })
+        .collect();
+
+    // Bar 1: census reaches `full_census` on EVERY node within BAR_CENSUS of
+    // the wave. Sampled concurrently; the stamp is the sample's completion
+    // time and is compared against the bar as a duration (not just "observed
+    // inside the loop").
     let mut census_full_at: Option<Duration> = None;
-    let mut last_census: Vec<usize> = vec![0; nodes.len()];
-    while t_join.elapsed() < Duration::from_secs(30) {
-        for (i, n) in nodes.iter().enumerate() {
-            last_census[i] = n.membership.census().await.len();
-        }
-        if last_census.iter().all(|&c| c >= 20) {
+    let mut last_census: Vec<usize>;
+    loop {
+        last_census = census_counts(&nodes).await;
+        if last_census.iter().all(|&c| c >= full_census) {
             census_full_at = Some(t_join.elapsed());
+            break;
+        }
+        if t_join.elapsed() >= BAR_CENSUS {
             break;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     println!(
-        "scenario B: census-20 within 30s: {census_full_at:?} (counts at 30s: {last_census:?})"
+        "scenario B: census-{full_census} observed at {census_full_at:?} \
+         (bar {BAR_CENSUS:?}; counts at cutoff: {last_census:?})"
     );
 
-    // Bar 2: monitor every node's coordinator for the FULL 180s window (no
+    // Bars 2-4: monitor every node's coordinator for the FULL window (no
     // early exit — the rejoin storm takes ~a minute to form; an instant green
-    // poll must not mask it). "Eventually drained" = the final 3 polls (15s)
-    // all show queue_depth < 10 on every node.
+    // poll must not mask it). "Eventually drained" = the final DRAINED_STREAK
+    // polls all show queue_depth < BAR_QUEUE_DEPTH on every node. On the way,
+    // track per-node queue plateaus (depth >= bar sustained > BAR_PLATEAU),
+    // no-progress stretches (in-flight slots occupied, zero completions —
+    // catches wedged jobs that never reach recent_jobs), and at-risk counts.
     let mut census_full_late = census_full_at;
     let mut depth_timeline: Vec<(u64, u64, usize)> = Vec::new(); // (t_secs, max_depth, node)
     let mut worst_depths: Vec<u64> = vec![0; nodes.len()];
-    let mut all_below_history: Vec<bool> = Vec::new();
+    let mut ok_streak = 0usize;
     let mut max_job: (u64, String, usize) = (0, String::new(), 0); // (ms, key, node)
-    let mut slow_jobs: std::collections::BTreeMap<(usize, String, u64), bool> =
-        std::collections::BTreeMap::new();
+    let mut slow_jobs: std::collections::BTreeSet<(usize, String, u64)> =
+        std::collections::BTreeSet::new();
+    // Plateau tracking: when each node's depth first crossed the bar (None =
+    // currently below), and the longest plateau seen.
+    let mut high_since: Vec<Option<Instant>> = vec![None; nodes.len()];
+    let mut max_plateau: Vec<Duration> = vec![Duration::ZERO; nodes.len()];
+    // Progress tracking: last (completed+failed) count, when it last moved,
+    // and the longest progress-free stretch with slots occupied.
+    let mut last_done: Vec<(u64, Instant)> = vec![(0, Instant::now()); nodes.len()];
+    let mut max_stall: Vec<Duration> = vec![Duration::ZERO; nodes.len()];
+    // Ring-eviction visibility: polls where a node completed more jobs than
+    // the recent ring holds (slow-job records may have been evicted unseen).
+    let mut undersampled_polls: Vec<u32> = vec![0; nodes.len()];
+    let mut at_risk: Vec<usize> = vec![0; nodes.len()];
     let drain_start = Instant::now();
     loop {
         let t = drain_start.elapsed();
+        let now = Instant::now();
         let mut all_below = true;
         let mut poll_max = (0u64, 0usize);
         for (i, n) in nodes.iter().enumerate() {
             let s = n.jobs.stats();
             worst_depths[i] = worst_depths[i].max(s.queue_depth);
-            if s.queue_depth >= 10 {
+            if s.queue_depth >= BAR_QUEUE_DEPTH {
                 all_below = false;
+                let since = *high_since[i].get_or_insert(now);
+                max_plateau[i] = max_plateau[i].max(now - since);
+            } else {
+                high_since[i] = None;
             }
             if s.queue_depth > poll_max.0 {
                 poll_max = (s.queue_depth, i);
             }
+            let done = s.completed + s.failed;
+            if done != last_done[i].0 {
+                if done.saturating_sub(last_done[i].0) > 20 {
+                    undersampled_polls[i] += 1;
+                }
+                last_done[i] = (done, now);
+            } else if s.in_flight > 0 {
+                max_stall[i] = max_stall[i].max(now - last_done[i].1);
+            }
             for r in n.jobs.recent_jobs() {
+                if pre_wave.contains(&(i, r.key.clone(), r.ms, r.ok)) {
+                    continue;
+                }
                 if r.ms > max_job.0 {
                     max_job = (r.ms, r.key.clone(), i);
                 }
-                if r.ms > 10_000 {
-                    slow_jobs.insert((i, r.key.clone(), r.ms), r.ok);
+                if r.ms > BAR_JOB_MS {
+                    slow_jobs.insert((i, r.key, r.ms));
                 }
             }
         }
-        all_below_history.push(all_below);
+        ok_streak = if all_below { ok_streak + 1 } else { 0 };
         depth_timeline.push((t.as_secs(), poll_max.0, poll_max.1));
+        at_risk = at_risk_counts(&nodes).await;
         if census_full_late.is_none() {
-            for (i, n) in nodes.iter().enumerate() {
-                last_census[i] = n.membership.census().await.len();
-            }
-            if last_census.iter().all(|&c| c >= 20) {
+            last_census = census_counts(&nodes).await;
+            if last_census.iter().all(|&c| c >= full_census) {
                 census_full_late = Some(t_join.elapsed());
             }
         }
-        if t >= Duration::from_secs(180) {
+        if t >= DRAIN_WINDOW {
             break;
         }
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(DRAIN_POLL).await;
     }
-    let drained = all_below_history.len() >= 3
-        && all_below_history[all_below_history.len() - 3..]
-            .iter()
-            .all(|&b| b);
+    let drained = ok_streak >= DRAINED_STREAK;
 
-    let mut violations: Vec<String> = Vec::new();
-    if census_full_at.is_none() {
+    if census_full_at.is_none_or(|d| d > BAR_CENSUS) {
         violations.push(format!(
-            "census did not reach 20 on every node within 30s \
-             (reached at {census_full_late:?}; latest counts {last_census:?})"
+            "census did not reach {full_census} on every node within {BAR_CENSUS:?} \
+             (observed at {census_full_late:?}; latest counts {last_census:?})"
         ));
     }
     if !drained {
         violations.push(format!(
-            "queues not drained: final polls still had nodes at queue_depth >= 10 \
-             (worst depths per node: {worst_depths:?})"
+            "queues not drained: the final {DRAINED_STREAK} polls did not all show every node \
+             below queue_depth {BAR_QUEUE_DEPTH} (worst depths per node: {worst_depths:?})"
         ));
     }
-    if max_job.0 > 10_000 {
+    for (i, p) in max_plateau.iter().enumerate() {
+        if *p > BAR_PLATEAU {
+            violations.push(format!(
+                "queue plateau on node{i}: depth >= {BAR_QUEUE_DEPTH} sustained {p:?} \
+                 (doc bar: no plateau > {BAR_PLATEAU:?})"
+            ));
+        }
+    }
+    for (i, s) in max_stall.iter().enumerate() {
+        if *s > BAR_PLATEAU {
+            violations.push(format!(
+                "no forward progress on node{i}: slots occupied with zero job completions \
+                 for {s:?} (wedged jobs never reach recent_jobs — this is the >10s bar's \
+                 blind spot check)"
+            ));
+        }
+    }
+    if max_job.0 > BAR_JOB_MS {
         violations.push(format!(
-            "job wall-clock bar broken: max completed job {}ms (key={}, node{}) — bar 10000ms; \
-             all observed >10s jobs: {:?}",
-            max_job.0,
-            max_job.1,
-            max_job.2,
-            slow_jobs.keys().collect::<Vec<_>>()
+            "job wall-clock bar broken: max completed job {}ms (key={}, node{}) — \
+             bar {BAR_JOB_MS}ms; all observed >{BAR_JOB_MS}ms jobs (node, key, ms): {:?}",
+            max_job.0, max_job.1, max_job.2, slow_jobs
+        ));
+    }
+    if at_risk.iter().any(|&n| n > 0) {
+        violations.push(format!(
+            "at-risk did not drain to 0 within the window (doc bar): per-node counts {at_risk:?}"
         ));
     }
     println!(
-        "scenario B: census20_at={census_full_late:?} drained={drained} \
-         max_job={}ms ({} on node{})",
+        "scenario B: census{full_census}_at={census_full_late:?} drained={drained} \
+         max_job={}ms ({} on node{}) at_risk={at_risk:?}",
         max_job.0, max_job.1, max_job.2
     );
     println!(
         "scenario B: cluster max queue_depth timeline (t_secs, depth, node): {depth_timeline:?}"
     );
+    if undersampled_polls.iter().any(|&c| c > 0) {
+        println!(
+            "scenario B: WARNING — recent-jobs ring UNDERSAMPLED (polls with >20 completions, \
+             per node): {undersampled_polls:?}; the >{BAR_JOB_MS}ms job bar may have missed \
+             evicted records"
+        );
+    }
     if !violations.is_empty() {
         println!("--- scenario B FAILURE diagnostics ---");
-        dump_cluster(&nodes);
+        dump_cluster(&nodes).await;
     }
-    for n in &mut nodes {
-        n.shutdown().await;
-    }
+    shutdown_all(&mut nodes).await;
     assert!(
         violations.is_empty(),
         "scenario B bars failed:\n{}",

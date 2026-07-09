@@ -10,10 +10,17 @@
 //! harness").
 //!
 //! Deliberately NOT assembled (not part of the transfer plane): the head
-//! registry, governance, CraftSQL, CraftCOM, the control socket/dashboard,
-//! and the public stats server. Where `cmd_run` gates boot phases on the
-//! registry's census-stability readiness flag, the harness gates on census
-//! stability directly (same 10s-stable shape, same 20s bounded wait).
+//! registry (NOTE: in production its replicate/migrate jobs run on the SAME
+//! JobCoordinator being baselined — a known load-fidelity gap), governance
+//! (its 30s anti-entropy tick's census-many DHT gets likewise), CraftSQL,
+//! CraftCOM, the control socket/dashboard, the public stats server, the DHT
+//! record/table persistence checkpoints + hourly expire loop (fresh tempdirs;
+//! nothing fires inside a test window), the resource gauge / shed gates
+//! (no cgroup budget on dev boxes; REQUIRED for a future Scenario C capped
+//! receiver), and the engine event bus / PRE keypair (no consumers here).
+//! Where `cmd_run` gates boot phases on the registry's census-stability
+//! readiness flag, the harness gates on census stability directly (same
+//! 10s-stable shape, same 20s bounded caller wait as `wait_ready`).
 
 use std::cmp::Reverse;
 use std::sync::Arc;
@@ -38,6 +45,10 @@ const HEARTBEAT_SECS: u64 = 5;
 const HEALTH_SCAN_SECS: u64 = 30;
 const REANNOUNCE_SECS: u64 = 120;
 const DHT_RECORD_TTL_MS: u64 = 48 * 3600 * 1000;
+// noded/src/headreg.rs readiness-gate constants (READY_STABLE_SECS /
+// READY_WAIT_SECS), mirrored by `wait_census_settled`.
+const READY_STABLE_SECS: u64 = 10;
+const READY_WAIT_SECS: u64 = 20;
 
 /// `MembershipPeers` — a [`PeerSource`] backed by SWIM membership; candidate
 /// peers for piece placement come from real-time in-network liveness. The
@@ -117,7 +128,15 @@ impl TestNode {
         );
 
         // Storage engine: persistent store + DHT routing + obj (cmd_run order).
-        let store = Arc::new(Store::open(data_dir.path().join("store"))?);
+        // The transport is already bound: close it gracefully on failure so a
+        // partially-built node never leaks a live endpoint into the cluster.
+        let store = match Store::open(data_dir.path().join("store")) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                transport.close().await;
+                return Err(e.into());
+            }
+        };
         let dht = DhtNode::new(identity.clone(), transport.clone(), DHT_RECORD_TTL_MS);
         let routing: Arc<dyn zeph_routing::ContentRouting> =
             Arc::new(zeph_routing::DhtRouting::new(dht.clone()));
@@ -446,7 +465,7 @@ impl TestNode {
                         move || {
                             let (eng, q, seen) = (e2.clone(), q2.clone(), seen2.clone());
                             async move {
-                                let _r = eng.health_scan_chunk(&[cid]).await;
+                                eng.health_scan_chunk(&[cid]).await;
                                 // Re-enqueue for the next check if still held;
                                 // else stop tracking it.
                                 if eng.store().piece_count(&cid) > 0
@@ -551,22 +570,30 @@ impl TestNode {
         })
     }
 
-    /// Tear the node down: abort the harness tasks and close the transport
-    /// (internally-spawned membership/DHT/coordinator loops die with it).
+    /// Tear the node down: abort the harness tasks (awaiting each so the
+    /// cancellations have landed before returning), then close the transport.
+    ///
+    /// Residual (no stop APIs exist; contained by the per-test runtime
+    /// teardown): Membership's internally-spawned probe/shuffle loops, the
+    /// JobCoordinator dispatcher, and any in-flight coordinator jobs keep
+    /// running against the closed transport. Do NOT reuse a shut-down node's
+    /// `contact` as a bootstrap seed — DHT seeds are evict/tombstone-exempt,
+    /// so a dead seed would be redialed forever.
     pub async fn shutdown(&mut self) {
         for t in self.tasks.drain(..) {
             t.abort();
+            let _ = t.await;
         }
         self.transport.close().await;
     }
 }
 
-/// Wait (bounded, 20s — cmd_run's `READY_WAIT_SECS`) for the census to have
-/// been stable for 10s (`READY_STABLE_SECS`) — the harness stand-in for the
-/// skipped registry's readiness gate.
+/// Wait (bounded, `READY_WAIT_SECS` — the `wait_ready` caller bound) for the
+/// census to have been stable for `READY_STABLE_SECS` — the harness stand-in
+/// for the skipped registry's readiness gate (noded/src/headreg.rs).
 async fn wait_census_settled(membership: &Arc<Membership>) {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let mut last = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(READY_WAIT_SECS);
+    let mut last = usize::MAX;
     let mut stable_since = Instant::now();
     loop {
         let n = membership.census().await.len();
@@ -574,7 +601,9 @@ async fn wait_census_settled(membership: &Arc<Membership>) {
             last = n;
             stable_since = Instant::now();
         }
-        if stable_since.elapsed() >= Duration::from_secs(10) || Instant::now() >= deadline {
+        if stable_since.elapsed() >= Duration::from_secs(READY_STABLE_SECS)
+            || Instant::now() >= deadline
+        {
             return;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
