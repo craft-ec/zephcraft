@@ -568,9 +568,15 @@ mod tests {
             Message::Shuffle(Shuffle {
                 origin: info("dd@8.8.8.8:1"),
                 sample: vec![info("ee@7.7.7.7:2"), info("ff@6.6.6.6:3")],
+                members: vec![MemberEntry {
+                    id: [3u8; 32],
+                    addr: "jj@2.2.2.2:7".into(),
+                    last_heard_ms: 789,
+                }],
             }),
             Message::ShuffleReply(ShuffleReply {
                 sample: vec![info("gg@5.5.5.5:4")],
+                members: Vec::new(),
             }),
             Message::MemberSync(MemberSync {
                 members: vec![

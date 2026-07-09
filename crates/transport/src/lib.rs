@@ -126,9 +126,33 @@ pub struct PingReport {
     pub peer_skew_ms: u64,
 }
 
+/// Everything needed to rebuild the endpoint identically on [`Transport::rebind`].
+struct BindCfg {
+    secret: [u8; 32],
+    reach: Reach,
+    alpns: Vec<Vec<u8>>,
+    port: u16,
+    relay_urls: Vec<RelayUrl>,
+    fallback_relays: bool,
+}
+
 /// The zeph transport: one iroh endpoint carrying all protocols via ALPN.
+///
+/// The endpoint handle lives behind a lock so [`Self::rebind`] can swap in a
+/// fresh one: a long-lived endpoint can wedge after uplink path churn (stale
+/// QUIC path state — every dial fails while the raw network is fine), and the
+/// only recovery is a rebuild. Methods clone the handle out of the lock and
+/// never hold it across an await.
 pub struct Transport {
-    endpoint: Endpoint,
+    cfg: BindCfg,
+    endpoint: std::sync::RwLock<Endpoint>,
+    /// Bumped on every successful rebind — [`Self::serve`] loops watch it to
+    /// re-attach their accept loop to the new endpoint.
+    epoch: std::sync::atomic::AtomicU64,
+    /// Set by [`Self::close`] so serve loops exit instead of awaiting a swap.
+    closed: std::sync::atomic::AtomicBool,
+    /// Serializes rebinds; a concurrent caller waits, then finds a fresh epoch.
+    rebind_lock: tokio::sync::Mutex<()>,
     clock: std::sync::Arc<hlc::Clock>,
 }
 
@@ -161,18 +185,40 @@ impl Transport {
         relay_urls: Vec<RelayUrl>,
         fallback_relays: bool,
     ) -> Result<Self> {
-        let secret_key = SecretKey::from_bytes(&secret);
-        let mut builder = match reach {
+        let cfg = BindCfg {
+            secret,
+            reach,
+            alpns,
+            port,
+            relay_urls,
+            fallback_relays,
+        };
+        let endpoint = Self::build_endpoint(&cfg).await?;
+        Ok(Self {
+            cfg,
+            endpoint: std::sync::RwLock::new(endpoint),
+            epoch: std::sync::atomic::AtomicU64::new(0),
+            closed: std::sync::atomic::AtomicBool::new(false),
+            rebind_lock: tokio::sync::Mutex::new(()),
+            clock: std::sync::Arc::new(hlc::Clock::new()),
+        })
+    }
+
+    /// Construct and bind one endpoint from a saved config (initial bind and
+    /// every rebind go through here so they are guaranteed identical).
+    async fn build_endpoint(cfg: &BindCfg) -> Result<Endpoint> {
+        let secret_key = SecretKey::from_bytes(&cfg.secret);
+        let mut builder = match cfg.reach {
             // Minimal: local sockets only — no relays, no address lookup.
             Reach::LocalOnly => Endpoint::builder(presets::Minimal),
             // N0 preset (discovery etc.); relay map possibly overridden below.
             Reach::Relayed => {
                 let builder = Endpoint::builder(presets::N0);
-                if relay_urls.is_empty() {
+                if cfg.relay_urls.is_empty() {
                     builder
                 } else {
-                    let mut urls = relay_urls;
-                    if fallback_relays {
+                    let mut urls = cfg.relay_urls.clone();
+                    if cfg.fallback_relays {
                         for host in [
                             iroh::defaults::prod::NA_EAST_RELAY_HOSTNAME,
                             iroh::defaults::prod::NA_WEST_RELAY_HOSTNAME,
@@ -191,20 +237,79 @@ impl Transport {
             }
         }
         .secret_key(secret_key)
-        .alpns(alpns);
-        if port != 0 {
+        .alpns(cfg.alpns.clone());
+        if cfg.port != 0 {
             builder = builder
-                .bind_addr(std::net::SocketAddr::from(([0, 0, 0, 0], port)))
+                .bind_addr(std::net::SocketAddr::from(([0, 0, 0, 0], cfg.port)))
                 .map_err(|e| TransportError::Bind(e.to_string()))?;
         }
-        let endpoint = builder
+        builder
             .bind()
             .await
-            .map_err(|e| TransportError::Bind(e.to_string()))?;
-        Ok(Self {
-            endpoint,
-            clock: std::sync::Arc::new(hlc::Clock::new()),
-        })
+            .map_err(|e| TransportError::Bind(e.to_string()))
+    }
+
+    /// Clone the live endpoint handle out of the lock (cheap: `Endpoint` is an
+    /// `Arc` handle). Never hold the lock itself across an await.
+    fn current(&self) -> Endpoint {
+        self.endpoint.read().expect("endpoint lock").clone()
+    }
+
+    /// How many times the endpoint has been rebuilt (0 = the original bind).
+    pub fn rebinds(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Tear the endpoint down and bind a fresh one with the identical config
+    /// (same identity, port, relays, ALPNs). All existing connections die;
+    /// [`Self::serve`] accept loops re-attach automatically; peers see the
+    /// same NodeId. This is the recovery for a WEDGED endpoint: after uplink
+    /// path churn the old endpoint's QUIC path state can go permanently stale
+    /// — every dial fails in seconds while ICMP on the same path is clean —
+    /// and only a rebuild (identical to a process restart, minus the process)
+    /// gets it dialing again.
+    pub async fn rebind(&self) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let _guard = self.rebind_lock.lock().await;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(TransportError::Bind("transport closed".into()));
+        }
+        // Close the old endpoint FIRST: with a fixed listen port the fresh
+        // socket can only bind once the old one is released. Cap the graceful
+        // close — a wedged endpoint may not close cleanly.
+        let old = self.current();
+        let _ = tokio::time::timeout(Duration::from_secs(5), old.close()).await;
+        let mut last_err = String::new();
+        for _ in 0..10 {
+            match Self::build_endpoint(&self.cfg).await {
+                Ok(endpoint) => {
+                    // close() may have run while we were building: it closed
+                    // the OLD endpoint and returned, and the serve loops have
+                    // exited — installing now would leave a live endpoint
+                    // nobody owns. Close the fresh one and bail instead.
+                    if self.closed.load(Ordering::Acquire) {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), endpoint.close()).await;
+                        return Err(TransportError::Bind(
+                            "transport closed during rebind".into(),
+                        ));
+                    }
+                    *self.endpoint.write().expect("endpoint lock") = endpoint;
+                    self.epoch.fetch_add(1, Ordering::AcqRel);
+                    return Ok(());
+                }
+                Err(err) => {
+                    // Likely the freed port lagging; brief backoff and retry.
+                    last_err = err.to_string();
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        }
+        // The old endpoint is closed and no new one bound: the node stays
+        // dark until the caller (the isolation watchdog) retries.
+        Err(TransportError::Bind(format!(
+            "rebind failed after retries: {last_err}"
+        )))
     }
 
     /// The node's hybrid logical clock (shared across protocols).
@@ -212,26 +317,21 @@ impl Transport {
         self.clock.clone()
     }
 
-    /// This node's identity on the wire.
+    /// This node's identity on the wire (stable across rebinds — the secret
+    /// key is part of the saved bind config).
     pub fn node_id(&self) -> NodeId {
-        NodeId(*self.endpoint.id().as_bytes())
+        NodeId(*self.current().id().as_bytes())
     }
 
     /// This endpoint's current dialable address (direct socket addresses are
     /// available immediately after bind; relay info arrives asynchronously).
     pub fn addr(&self) -> PeerAddr {
-        PeerAddr(self.endpoint.addr())
-    }
-
-    /// Access the underlying iroh endpoint (used by upper layers to register
-    /// more protocols / accept loops).
-    pub fn endpoint(&self) -> &Endpoint {
-        &self.endpoint
+        PeerAddr(self.current().addr())
     }
 
     /// Connect to a peer for a given ALPN.
     pub async fn connect(&self, peer: &PeerAddr, alpn: &[u8]) -> Result<Connection> {
-        self.endpoint
+        self.current()
             .connect(peer.0.clone(), alpn)
             .await
             .map_err(|e| TransportError::Connect(e.to_string()))
@@ -285,24 +385,41 @@ impl Transport {
     }
 
     /// Accept loop: route incoming connections to per-ALPN handlers.
-    /// Connections with an unregistered ALPN are closed. Runs until the
-    /// endpoint closes. Spawn this on the runtime.
+    /// Connections with an unregistered ALPN are closed. Survives
+    /// [`Self::rebind`] by re-attaching to the fresh endpoint; runs until
+    /// [`Self::close`]. Spawn this on the runtime.
     pub async fn serve(&self, handlers: Vec<(Vec<u8>, tokio::sync::mpsc::Sender<Connection>)>) {
+        use std::sync::atomic::Ordering;
         let handlers = std::sync::Arc::new(handlers);
-        while let Some(incoming) = self.endpoint.accept().await {
-            let handlers = handlers.clone();
-            tokio::spawn(async move {
-                let Ok(conn) = incoming.await else { return };
-                let alpn = conn.alpn().to_vec();
-                match handlers.iter().find(|(a, _)| *a == alpn) {
-                    Some((_, tx)) => {
-                        if tx.send(conn).await.is_err() {
-                            // handler gone; nothing to do
+        loop {
+            let epoch = self.epoch.load(Ordering::Acquire);
+            let endpoint = self.current();
+            while let Some(incoming) = endpoint.accept().await {
+                let handlers = handlers.clone();
+                tokio::spawn(async move {
+                    let Ok(conn) = incoming.await else { return };
+                    let alpn = conn.alpn().to_vec();
+                    match handlers.iter().find(|(a, _)| *a == alpn) {
+                        Some((_, tx)) => {
+                            if tx.send(conn).await.is_err() {
+                                // handler gone; nothing to do
+                            }
                         }
+                        None => conn.close(1u32.into(), b"unknown alpn"),
                     }
-                    None => conn.close(1u32.into(), b"unknown alpn"),
-                }
-            });
+                });
+            }
+            // accept() drained: the endpoint closed — final shutdown, or a
+            // rebind swapping in a replacement. Wait out the swap window and
+            // re-attach; exit only on a real close.
+            while self.epoch.load(Ordering::Acquire) == epoch
+                && !self.closed.load(Ordering::Acquire)
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            if self.closed.load(Ordering::Acquire) {
+                return;
+            }
         }
     }
 
@@ -355,9 +472,11 @@ impl Transport {
         }
     }
 
-    /// Gracefully close all connections.
+    /// Gracefully close all connections and end the serve loops.
     pub async fn close(&self) {
-        self.endpoint.close().await;
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.current().close().await;
     }
 }
 
@@ -431,6 +550,62 @@ mod tests {
             .await
             .unwrap();
         assert!(report.rtt > Duration::ZERO);
+
+        client.close().await;
+        server.close().await;
+        serve.abort();
+    }
+
+    /// Isolation-watchdog support: after a rebind the identity is unchanged,
+    /// the serve loop re-attaches to the fresh endpoint, and both inbound
+    /// (ping to the rebound server) and outbound (ping from a rebound client)
+    /// traffic work again.
+    #[tokio::test]
+    async fn rebind_preserves_identity_and_keeps_serving() {
+        let server_id = NodeIdentity::generate();
+        let server = std::sync::Arc::new(
+            Transport::bind(
+                server_id.secret_key_bytes(),
+                Reach::LocalOnly,
+                vec![alpn::PING.to_vec()],
+                0,
+            )
+            .await
+            .unwrap(),
+        );
+        let serve = {
+            let server = server.clone();
+            tokio::spawn(async move { server.serve_ping().await })
+        };
+
+        let client_id = NodeIdentity::generate();
+        let client = Transport::bind(client_id.secret_key_bytes(), Reach::LocalOnly, vec![], 0)
+            .await
+            .unwrap();
+
+        // Healthy before the rebind.
+        client
+            .ping(&server.addr(), Duration::from_secs(10))
+            .await
+            .unwrap();
+
+        // Server rebinds: same NodeId, new socket (port 0 → fresh OS port).
+        server.rebind().await.unwrap();
+        assert_eq!(server.rebinds(), 1);
+        assert_eq!(server.node_id(), server_id.node_id(), "identity survives");
+
+        // The serve loop must have re-attached: a ping to the NEW address works.
+        client
+            .ping(&server.addr(), Duration::from_secs(10))
+            .await
+            .unwrap();
+
+        // Client-side rebind: outbound dialing works from a fresh endpoint too.
+        client.rebind().await.unwrap();
+        client
+            .ping(&server.addr(), Duration::from_secs(10))
+            .await
+            .unwrap();
 
         client.close().await;
         server.close().await;

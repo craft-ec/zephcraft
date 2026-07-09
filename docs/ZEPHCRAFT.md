@@ -120,6 +120,8 @@ Frame v1 (big-endian): `[type_tag:u32 | version:u8=1 | hlc_ts:u64 | payload_len:
 
 A single iroh (QUIC) endpoint carries every protocol via ALPN; no per-protocol sockets. Reach modes: `local` (direct sockets only; tests/LAN) and `relayed` (discovery + relays; production). Relay composition: configured `relay_urls` first (default `https://relay1.zeph.craft.ec`), n0's four public relays appended as lowest-priority fallback unless `fallback_relays=false`. Peer addresses are `<node_id_hex>@<ip:port>[,…]` (relay URLs accepted inline).
 
+**Endpoint lifecycle:** the endpoint is *rebindable* — `Transport::rebind()` tears it down and rebuilds it from the saved bind config (same identity, port, relays, ALPNs); accept loops re-attach via an epoch counter and upper layers never hold the raw endpoint. Exists because a long-lived endpoint can wedge after uplink path churn (stale QUIC path state; dials fail forever while the network is fine) — membership's isolation watchdog (§4.1) is the caller.
+
 **ALPN inventory (complete, exact strings):**
 
 | ALPN | Purpose |
@@ -148,6 +150,7 @@ Defaults: `active_size=5`, `passive_size=30`, ARWL=6, PRWL=3, probe 5 s interval
 Hard-won operational semantics (each a fixed regression):
 - **`fill_active` drains**: a failed promotion **drops** the candidate — self-cleaning the passive view of dead addresses. The cap+re-queue "self-heal" variant polluted passive and broke active-view fill (commit c3f99c9).
 - **Isolation recovery is gentle and additive**: an isolated node dials ONE random retained bootstrap seed at most every 15 s, *alongside* `fill_active` (skipping fill_active while isolated was itself a bug). Membership bootstrap = `cfg.peers ∪ cfg.dht_seeds` — a dht_seeds-only config can still re-bootstrap.
+- **Wedge watchdog — isolation that outlasts `wedge_rebind` (120 s) triggers a transport rebind**: a long-lived iroh endpoint can wedge after uplink path churn (stale QUIC path state — every dial to known-alive seeds dies in seconds while ICMP on the same path is clean; measured on the hotspot Mac, where a process restart reconnected in 15 s). Seed re-dials can't fix this (they dial *through* the wedged endpoint), so membership asks the transport to tear down and rebuild the endpoint with identical config (same identity/port/relays/ALPNs; serve loops re-attach via an epoch counter), then re-arms seed recovery. Guarded: never fires on a node with no bootstrap seeds (solo nodes are expectedly isolated), and re-arms a full window between attempts.
 
 ### 4.2 The converged census (the election substrate)
 

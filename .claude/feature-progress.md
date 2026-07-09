@@ -1,3 +1,42 @@
+# ISOLATION WATCHDOG: ENDPOINT REBIND (2026-07-09) — REVIEWED+COMMITTED, DEPLOY NEXT
+Review verdict: design sound; 1 CRITICAL found+fixed — close()/rebind() race (SIGTERM during a
+wedge-recovery rebind could install a fresh open endpoint AFTER close() returned, orphaned forever);
+fix = re-check `closed` before installing, close the just-built endpoint and bail. Reviewer caveat
+(accepted, below threshold): dht/main cache transport.addr() once at startup — only matters on
+port=0 nodes, and the Mac (the only port-0 node) is relay-dialed so its usable addr survives rebinds.
+Incident (during the 19-node stress test + box freeze): the Mac's long-lived iroh endpoint WEDGED —
+after the all-peers outage every recovery dial to known-alive seeds died in 3s for 10+ min while ICMP
+on the same path was clean; `noq` errors `MultipathNotNegotiated` + `PTO expired while unset` (all ~5
+conns died in the SAME millisecond = local/uplink path event, e.g. hotspot NAT churn). Process restart
+reconnected in 15-20s, three times. Membership-level recovery can't fix it (dials go THROUGH the
+wedged endpoint). FIX: (1) transport — endpoint behind RwLock + saved BindCfg; `rebind()` closes old
+FIRST (frees fixed port), rebuilds identical (identity/port/relays/ALPNs), 10×500ms retries; `serve()`
+re-attaches via epoch counter, exits only on `close()`; removed dead `endpoint()` accessor. (2)
+membership — `wedge_rebind` (default 120s) + `isolated_since_ms`; when active view empty AND bootstrap
+seeds exist AND isolation outlasts the window → transport.rebind() + re-arm seed recovery; full window
+between attempts. Solo nodes (no seeds) never rebind. Also fixed pre-existing broken wire test
+(Shuffle/ShuffleReply `members` field missing in roundtrip initializers). Gates: fmt/build/clippy(0)/
+workspace tests green (transport 5/5 incl rebind roundtrip; membership 4/4 incl watchdog test;
+healthscan 15/15 on rerun — earlier fail was parallel-load flake). Docs: ZEPHCRAFT.md §3.4+§4.1.
+Memory: zeph-iroh-endpoint-wedge. NEXT: commit, then fleet roll (4 Hetzner + Mac) together with the
+census-UI commit e183de4 (still undeployed). Edge accepted: a seed node with no peers of its own never
+arms the watchdog (nothing to dial; wedge only ever observed on churn-prone uplinks).
+
+# BACKGROUND-LOOP AUDIT + COMMENT-HYGIENE SWEEP (2026-07-09, commits f7e2a28 + d420794) — DONE
+Follow-up to the churn incident: audited ALL 13 periodic loops for unconditional per-tick network
+work. 12 clean (TTL-gated / change-gated / local-only / event-drained / bounded+cached / by-design
+liveness / steady-state-empty). ONE offender: `distribute()` — an unconditional O(held) concurrent
+DHT-lookup sweep every 30s (hundreds of lookups/tick on a loaded node). FIX (f7e2a28): census-gated
+via the migrate_round pattern — fires once the census digest is stable 2 ticks after a change (never
+during a join storm) + a ~10min heartbeat; scale()/enforce_quota() stay per-tick (no-ops when idle).
+COMMENT SWEEP (d420794): purged every verifier-flagged stale comment — headreg module/field docs
+(deleted shard_seed fn, WASM-validator prose → SQL/native reality), registry_net blob-era seed
+formula, dead REGISTRY_SEED const REMOVED (com), sql KIND_ROOT/tracker/CAS prose, obj publish
+`durable` overclaim, dht Phase-1/2 framing + tracker census claim, membership tracker-registry
+docstring, noded routing_dht comment / CLI "via tracker" / "Poll the tracker" / committee mentions,
+account.rs as-built note, gov.rs committee analogy. No behavior change except the distribute gate.
+Deployed to all 5 nodes. Tier-0 comment debt: CLOSED.
+
 # PEER-FLAPPING ROOT CAUSE: SELF-INFLICTED CONNECTION CHURN (2026-07-09, commit a846723) — FIXED + MEASURED
 User reported consistent peer disconnect/reconnect on the Mac and (correctly, again) rejected my
 packet-loss theory. CONTROLLED TEST proved it: ICMP to Hetzner = 0% loss/≤380ms WITH the node running,

@@ -46,6 +46,10 @@ pub struct Config {
     /// Also the age at which a member is fully forgotten from the converged
     /// member set (a live member re-asserts itself every sync round).
     pub dead_retention: Duration,
+    /// How long the node tolerates FULL isolation (empty active view with
+    /// seed-recovery dials failing) before suspecting a wedged endpoint and
+    /// asking the transport to rebind it. See the transport's `rebind` doc.
+    pub wedge_rebind: Duration,
 }
 
 impl Default for Config {
@@ -61,6 +65,7 @@ impl Default for Config {
             shuffle_interval: Duration::from_secs(30),
             shuffle_sample: 8,
             dead_retention: Duration::from_secs(600),
+            wedge_rebind: Duration::from_secs(120),
         }
     }
 }
@@ -147,6 +152,11 @@ pub struct Membership {
     /// Last time isolation recovery dialed a seed (ms) — rate-limits it so a hiccup doesn't
     /// storm the relay every probe round.
     last_recover_ms: RwLock<u64>,
+    /// When FULL isolation began (ms; 0 = not isolated). Feeds the wedge
+    /// watchdog: isolation that outlasts `cfg.wedge_rebind` despite ongoing
+    /// seed recovery means the dials themselves are broken — a wedged
+    /// endpoint — and the transport is asked to rebind.
+    isolated_since_ms: RwLock<u64>,
 }
 
 impl Membership {
@@ -157,6 +167,7 @@ impl Membership {
             views: RwLock::new(Views::default()),
             bootstrap: RwLock::new(Vec::new()),
             last_recover_ms: RwLock::new(0),
+            isolated_since_ms: RwLock::new(0),
         })
     }
 
@@ -405,6 +416,46 @@ impl Membership {
         }
     }
 
+    /// The wedge watchdog (called only while the active view is empty): when
+    /// isolation outlasts `cfg.wedge_rebind` even though `recover_isolated`
+    /// keeps dialing seeds, the dials themselves are broken — a wedged
+    /// endpoint (stale QUIC path state after uplink churn; measured incident:
+    /// every dial to known-alive seeds died in 3s for 10+ minutes while ICMP
+    /// on the same path was clean, and a fresh endpoint joined in 15s). Ask
+    /// the transport to rebind, then re-arm seed recovery so the next probe
+    /// round dials immediately from the fresh endpoint.
+    async fn maybe_rebind_wedged(&self) {
+        // Nobody to dial ⇒ isolation is expected (solo/dev node) and a
+        // rebind can't help; don't churn the endpoint.
+        if self.bootstrap.read().await.is_empty() {
+            return;
+        }
+        let now = now_ms();
+        let mut since = self.isolated_since_ms.write().await;
+        if *since == 0 {
+            *since = now;
+            return;
+        }
+        let isolated_ms = now.saturating_sub(*since);
+        if isolated_ms < self.cfg.wedge_rebind.as_millis() as u64 {
+            return;
+        }
+        // Re-arm a full window either way — a failed rebind (port lag,
+        // transport closed) retries on the next window, not every round.
+        *since = now;
+        tracing::warn!(
+            isolated_secs = isolated_ms / 1000,
+            "isolated past wedge window — rebinding endpoint"
+        );
+        match self.transport.rebind().await {
+            Ok(()) => {
+                tracing::info!("endpoint rebound — re-running seed recovery");
+                *self.last_recover_ms.write().await = 0;
+            }
+            Err(err) => tracing::warn!(%err, "endpoint rebind failed"),
+        }
+    }
+
     // ── periodic tasks ────────────────────────────────────────────────────
 
     async fn probe_round(&self) {
@@ -413,9 +464,13 @@ impl Membership {
         // when isolated was a bug that left the node stuck.
         self.fill_active().await;
         // ADDITIONALLY, when fully isolated, gently re-bootstrap from a seed (rate-limited) so a
-        // node that has lost its whole overlay can rediscover the network.
+        // node that has lost its whole overlay can rediscover the network — and if isolation
+        // outlasts the wedge window despite those dials, rebind the endpoint itself.
         if self.views.read().await.active.is_empty() {
             self.recover_isolated().await;
+            self.maybe_rebind_wedged().await;
+        } else {
+            *self.isolated_since_ms.write().await = 0;
         }
         let targets: Vec<(NodeId, PeerAddr)> = {
             let views = self.views.read().await;
@@ -950,6 +1005,61 @@ mod tests {
             0,
             "tombstone expired after retention"
         );
+    }
+
+    /// Wedge watchdog: a node whose seeds are unreachable stays isolated; once
+    /// isolation outlasts `wedge_rebind` the transport must be rebound — and a
+    /// node with NO seeds must never rebind (isolation is expected there).
+    #[tokio::test]
+    async fn isolation_watchdog_rebinds_endpoint() {
+        let transport = Arc::new(
+            Transport::bind(
+                zeph_crypto_test_identity(),
+                zeph_transport::Reach::LocalOnly,
+                vec![],
+                0,
+            )
+            .await
+            .unwrap(),
+        );
+        let cfg = Config {
+            probe_timeout: Duration::from_millis(200),
+            wedge_rebind: Duration::from_millis(1),
+            ..Default::default()
+        };
+        let membership = Membership::new(transport.clone(), cfg);
+
+        // A dead seed: bind an endpoint for its address, then close it.
+        let dead_seed = {
+            let t = Transport::bind(
+                zeph_crypto_test_identity(),
+                zeph_transport::Reach::LocalOnly,
+                vec![],
+                0,
+            )
+            .await
+            .unwrap();
+            let addr = t.addr();
+            t.close().await;
+            addr
+        };
+
+        // No seeds configured → isolated, but must NOT rebind.
+        membership.probe_round().await;
+        membership.probe_round().await;
+        assert_eq!(transport.rebinds(), 0, "no seeds: rebind can't help");
+
+        // With a (dead) seed: first isolated round arms the timer, a later
+        // round past the wedge window triggers the rebind.
+        *membership.bootstrap.write().await = vec![dead_seed];
+        membership.probe_round().await; // arms isolated_since
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        membership.probe_round().await; // past the window → rebind
+        assert_eq!(transport.rebinds(), 1, "wedge window elapsed → rebound");
+
+        // Identity is stable across the rebind.
+        assert_eq!(membership.my_id(), transport.node_id());
+        transport.close().await;
     }
 
     fn zeph_crypto_test_identity() -> [u8; 32] {
