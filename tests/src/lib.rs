@@ -79,7 +79,7 @@ impl PeerSource for MembershipPeers {
         // (the active view capped liveness filtering + placement at ~5 peers:
         // the seed at_risk=100 anomaly and the placement skew).
         match self.membership.read().await.as_ref() {
-            Some(m) => m.census().await,
+            Some(m) => m.liveness_census().await,
             None => Vec::new(),
         }
     }

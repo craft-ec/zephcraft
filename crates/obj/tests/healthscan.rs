@@ -972,3 +972,79 @@ async fn content_spreads_to_newly_joined_nodes() {
     let got = fetcher.engine.get(cid, ConsumeMode::Drop).await.unwrap();
     assert_eq!(got, payload, "content still fetchable after redistribution");
 }
+
+/// DEPLOY-GATE regression (workflow-confirmed critical): a WANTED, unpinned
+/// whole-content holder with no piece-capable live peer (every provider holds
+/// exactly 1 piece) must still trigger repair — the sole-content fallback. The
+/// pre-fix scan ran its repairer election over an EMPTY `capable` vec, elected
+/// None, and skipped the enqueue, so the deadlock the fallback targets stayed
+/// permanent (publisher effective≪floor forever). Scenarios A/B never hold
+/// passive under-replicated whole content, so they masked this.
+#[tokio::test]
+async fn sole_content_holder_enqueues_repair_when_no_peer_is_capable() {
+    use zeph_core::Cid;
+    use zeph_obj::EngineWork;
+    use zeph_store::Generation;
+
+    let net = MemNet::new();
+    let dir = tempfile::tempdir().unwrap();
+
+    let pid = Arc::new(NodeIdentity::generate());
+    let pt = Arc::new(
+        Transport::bind(
+            pid.secret_key_bytes(),
+            Reach::LocalOnly,
+            vec![zeph_obj::ALPN.to_vec()],
+            0,
+        )
+        .await
+        .unwrap(),
+    );
+    let store = Arc::new(Store::open(dir.path()).unwrap());
+    let routing = net.routing(pid.clone(), pt.addr());
+    let engine = ObjEngine::with_peer_source(
+        pt.clone(),
+        store.clone(),
+        routing.clone(),
+        Arc::new(net.peers()),
+        ObjConfig::default(),
+    );
+    engine.set_liveness(Arc::new(net.peers())); // deterministic census liveness
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    engine.set_work_trigger(tx);
+
+    // Publisher holds WHOLE content, WANTED, NOT pinned, 0 coded pieces.
+    let payload: Vec<u8> = (0..64_000u32).map(|i| i as u8).collect();
+    let cid = Cid::of(&payload);
+    let k = 8u32;
+    let gen = Generation {
+        k,
+        piece_len: (payload.len() as u64).div_ceil(k as u64),
+        total_len: payload.len() as u64,
+        vtags: Vec::new(), // enqueue path does not verify vtags
+    };
+    store.put_generation(cid, gen).unwrap();
+    store.put_content(cid, &payload, false).unwrap();
+    store.set_want(cid).unwrap();
+
+    // 3 LIVE holders, each a 1-piece provider — under floor, NONE capable (<2).
+    for _ in 0..3 {
+        let hid = Arc::new(NodeIdentity::generate());
+        let ht = Arc::new(
+            Transport::bind(hid.secret_key_bytes(), Reach::LocalOnly, vec![], 0)
+                .await
+                .unwrap(),
+        );
+        let hr = net.routing(hid.clone(), ht.addr());
+        hr.announce_node(0, 0).await.unwrap();
+        hr.announce(cid, 1, false).await.unwrap();
+    }
+
+    let report = engine.health_scan_chunk(&[cid]).await;
+    assert_eq!(report.scanned, 1, "scanned the cid");
+    let work = rx.try_recv();
+    assert!(
+        matches!(work, Ok(EngineWork::Repair(c)) if c == cid),
+        "sole content holder must enqueue Repair (pre-fix: dead code enqueued nothing); got {work:?}"
+    );
+}

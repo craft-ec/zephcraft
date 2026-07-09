@@ -1363,6 +1363,10 @@ impl ObjEngine {
         }))
         .await;
         let alive_set = self.alive_peers().await;
+        // S5: fetch the liveness census ONCE per chunk (not per cid) for the
+        // lazy rebalance move-target selection — a per-cid clone was O(census)
+        // inside the paced scan.
+        let rebalance_peers = self.peer_source.peers().await;
 
         for (cid, providers) in resolved {
             if self.store.is_tombstoned(&cid) {
@@ -1522,7 +1526,9 @@ impl ObjEngine {
                         .is_alive(&cid, providers.iter().any(|p| p.pinned))
                         .await
                 {
-                    let n = self.rebalance_cid(&cid, &gen, &providers).await;
+                    let n = self
+                        .rebalance_cid(&cid, &gen, &providers, &rebalance_peers)
+                        .await;
                     if n > 0 {
                         report.moved += n;
                         action = "rebalanced — moved piece(s) to least-full peer";
@@ -1591,6 +1597,13 @@ impl ObjEngine {
                     "none — we can't repair (retained/passive copy)",
                 );
                 continue;
+            }
+            // In the sole-content fallback `capable` is empty (that's the
+            // trigger), so the election below would yield None and skip the
+            // enqueue — self must be a candidate for the fallback to fire.
+            // Mirrors repair_cid's unconditional `capable.push(me)`.
+            if sole_content_fallback {
+                capable.push(me);
             }
             let winner = capable
                 .iter()
@@ -1866,31 +1879,29 @@ impl ObjEngine {
     /// ZERO extra lookups — replacing the census-triggered O(held) sweep that
     /// held coordinator slots for 30-44s per node and re-ballooned rejoining
     /// nodes (the measured self-sustaining production loop).
+    /// `peers` is the LIVENESS census fetched ONCE per scan chunk by the caller
+    /// (S5: never re-clone the census per cid). A push that fails excludes that
+    /// target for the rest of this pass and continues — a dead/unreachable
+    /// "least-full" candidate must not stall the move or get re-picked every
+    /// scan (review finding: unfiltered census + belief-0 made a dead node the
+    /// perpetual target, 3s timeout then break, sheds nothing for ~120s).
     async fn rebalance_cid(
         &self,
         cid: &Cid,
         gen: &Generation,
         providers: &[zeph_routing::ProviderRecord],
+        peers: &[(NodeId, PeerAddr)],
     ) -> usize {
         let me = self.transport.node_id();
         let mut mine = self.store.piece_count(cid);
-        if mine <= 2 {
-            return 0;
-        }
-        let peers: Vec<(NodeId, PeerAddr)> = self
-            .peer_source
-            .peers()
-            .await
-            .into_iter()
-            .filter(|(id, _)| *id != me)
-            .collect();
-        if peers.is_empty() {
+        if mine <= 2 || peers.is_empty() {
             return 0;
         }
         // Seed belief from records; track our own moves so stale records
         // can't pile pieces onto one host (same convergence rule the sweep used).
         let mut belief: HashMap<NodeId, u32> = peers
             .iter()
+            .filter(|(id, _)| *id != me)
             .map(|(id, _)| {
                 let c = providers
                     .iter()
@@ -1899,14 +1910,16 @@ impl ObjEngine {
                 (*id, c)
             })
             .collect();
+        let mut unreachable: HashSet<NodeId> = HashSet::new();
         let mut moved = 0usize;
         while moved < MOVE_BATCH {
             let Some((tid, taddr, tcount)) = peers
                 .iter()
+                .filter(|(id, _)| *id != me && !unreachable.contains(id))
                 .map(|(id, addr)| (*id, addr, *belief.get(id).unwrap_or(&0)))
                 .min_by_key(|(_, _, c)| *c)
             else {
-                break;
+                break; // every candidate excluded
             };
             // Only when a move STRICTLY improves balance; always retain >= 2.
             if tcount as usize + 1 >= mine || mine <= 2 {
@@ -1929,7 +1942,9 @@ impl ObjEngine {
                 mine -= 1;
                 moved += 1;
             } else {
-                break;
+                // Dead/unreachable target — drop it for this pass and retry
+                // another (the piece was NOT removed locally; no loss).
+                unreachable.insert(tid);
             }
         }
         moved

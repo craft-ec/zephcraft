@@ -1,6 +1,8 @@
-//! `MembershipPeers` — a `PeerSource` backed by membership's CONVERGED CENSUS
-//! (not the size-5 active view). The census is the designed substrate for the
-//! health scan's liveness filter and for placement candidates (ZEPHCRAFT §4.2);
+//! `MembershipPeers` — a `PeerSource` backed by membership's LIVENESS census
+//! (converged members heard within a tight window, minus local dead — NOT the
+//! size-5 active view, and NOT the wide 120s election census which would count
+//! SWIM-dead holders alive and suppress repair). The census is the designed
+//! substrate for the health scan's liveness filter and placement (ZEPHCRAFT §4.2);
 //! using the active view here capped both at ~5 peers — providers outside the
 //! view were filtered as "dead" (the seed read at_risk=100 for every cid while
 //! its peers read ~0, because its true low local count wasn't padded by its own
@@ -38,7 +40,7 @@ impl MembershipPeers {
 impl PeerSource for MembershipPeers {
     async fn peers(&self) -> Vec<(NodeId, PeerAddr)> {
         match self.membership.read().await.as_ref() {
-            Some(m) => m.census().await,
+            Some(m) => m.liveness_census().await,
             None => Vec::new(),
         }
     }

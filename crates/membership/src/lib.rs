@@ -79,6 +79,14 @@ impl Default for Config {
 // exceed that diffusion time or transitively-known peers flap in and out of the census.
 const CENSUS_TTL_MS: u64 = 120_000;
 
+/// Tighter freshness window for the REAL-TIME liveness census used by content
+/// placement/repair (vs the 120s election-consistency census). The wide window
+/// keeps registry-writer election consistent, but reusing it as liveness let a
+/// SWIM-dead holder's stale piece_count inflate `have` and SUPPRESS repair for
+/// up to 120s after a death (review finding). 30s > the 30s shuffle interval's
+/// worst-case gossip lag yet ~4x faster death-visibility than the old reuse.
+const LIVENESS_TTL_MS: u64 = 30_000;
+
 /// Minimum interval (ms) between isolation-recovery seed dials — keeps recovery gentle so a
 /// transient loss doesn't storm a fragile relay every probe round.
 const RECOVER_INTERVAL_MS: u64 = 15_000;
@@ -833,6 +841,26 @@ impl Membership {
         out
     }
 
+    /// The REAL-TIME liveness census for content placement/repair: members
+    /// heard within [`LIVENESS_TTL_MS`] AND not locally tombstoned-dead. Tighter
+    /// than [`Self::census`] so a dead holder stops counting toward durability
+    /// quickly; the 120s census stays for registry-writer election consistency.
+    pub async fn liveness_census(&self) -> Vec<(NodeId, PeerAddr)> {
+        let now = now_ms();
+        let me = self.my_id();
+        let views = self.views.read().await;
+        let mut out = vec![(me, self.transport.addr())];
+        for (id, m) in &views.members {
+            if *id == me || views.dead.contains_key(id) {
+                continue;
+            }
+            if now.saturating_sub(m.last_heard_ms) < LIVENESS_TTL_MS {
+                out.push((*id, m.addr.clone()));
+            }
+        }
+        out
+    }
+
     /// Look up a member's dialable address from the converged set (used by
     /// consumers that elect over the census and must then reach the winner).
     pub async fn member_addr(&self, id: NodeId) -> Option<PeerAddr> {
@@ -1304,6 +1332,79 @@ mod tests {
         assert!(
             !ids.contains(&stale.node_id()),
             "stale member aged out of the census"
+        );
+    }
+
+    /// Deploy-gate regression (review finding): the LIVENESS census used for
+    /// content placement must drop a SWIM-dead holder AND a member heard only
+    /// within the wide 120s election window but past the tight liveness TTL —
+    /// otherwise a dead holder's stale piece_count inflates `have` and
+    /// suppresses repair for up to 120s after a death.
+    #[tokio::test]
+    async fn liveness_census_drops_dead_and_beyond_liveness_ttl() {
+        let transport = Arc::new(
+            Transport::bind(
+                zeph_crypto_test_identity(),
+                zeph_transport::Reach::LocalOnly,
+                vec![],
+                0,
+            )
+            .await
+            .unwrap(),
+        );
+        let me = transport.node_id();
+        let membership = Membership::new(transport, Config::default());
+
+        let fresh = test_addr().await;
+        let dead = test_addr().await;
+        // Heard within the wide 120s census window but PAST the 30s liveness TTL.
+        let stale_but_in_census = test_addr().await;
+        {
+            let mut views = membership.views.write().await;
+            for (a, heard) in [
+                (&fresh, now_ms()),
+                (&dead, now_ms()),
+                (
+                    &stale_but_in_census,
+                    now_ms().saturating_sub(LIVENESS_TTL_MS + 5_000),
+                ),
+            ] {
+                views.members.insert(
+                    a.node_id(),
+                    Member {
+                        addr: a.clone(),
+                        last_heard_ms: heard,
+                    },
+                );
+            }
+            // `dead` is fresh in members but locally tombstoned-dead.
+            views.dead.insert(
+                dead.node_id(),
+                (PeerState::new(dead.clone()), std::time::Instant::now()),
+            );
+        }
+
+        let wide: Vec<NodeId> = membership.census().await.iter().map(|(i, _)| *i).collect();
+        let live: Vec<NodeId> = membership
+            .liveness_census()
+            .await
+            .iter()
+            .map(|(i, _)| *i)
+            .collect();
+
+        // The wide census keeps all three (election consistency).
+        assert!(wide.contains(&dead.node_id()));
+        assert!(wide.contains(&stale_but_in_census.node_id()));
+        // The liveness census keeps only self + genuinely-fresh, drops the
+        // dead holder and the beyond-TTL one — the durability fix.
+        assert!(live.contains(&me) && live.contains(&fresh.node_id()));
+        assert!(
+            !live.contains(&dead.node_id()),
+            "SWIM-dead holder excluded from liveness"
+        );
+        assert!(
+            !live.contains(&stale_but_in_census.node_id()),
+            "beyond-liveness-TTL member excluded"
         );
     }
 }
