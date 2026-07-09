@@ -502,51 +502,21 @@ impl TestNode {
             }));
         }
 
-        // Distribute / scale: census-gated distribute (fires when the census
-        // digest has been stable 2 ticks, plus a ~10min heartbeat), scale +
-        // enforce_quota every tick — cmd_run's exact loop.
+        // Scale + quota tick — mirrors cmd_run POST-S3: the census-gated
+        // distribute() sweep is DELETED in production (lazy rebalance rides
+        // each cid's scan), so the harness must not run it either.
         {
-            let dist_membership = membership.clone();
             let dist_engine = engine.clone();
             let dist_jobs = jobs.clone();
             tasks.push(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(HEALTH_SCAN_SECS));
                 interval.tick().await; // skip immediate tick at startup
-                let mut last_digest: Option<[u8; 32]> = None;
-                let mut stable_ticks: u32 = 0;
-                let mut fired_for_digest = false;
-                let mut ticks_since_run: u32 = 0;
                 loop {
                     interval.tick().await;
-                    let mut ids: Vec<[u8; 32]> = dist_membership
-                        .census()
-                        .await
-                        .into_iter()
-                        .map(|(n, _)| n.0)
-                        .collect();
-                    ids.sort();
-                    let digest = Cid::of(&ids.concat()).0;
-                    if last_digest != Some(digest) {
-                        last_digest = Some(digest);
-                        stable_ticks = 0;
-                        fired_for_digest = false;
-                    } else {
-                        stable_ticks = stable_ticks.saturating_add(1);
-                    }
-                    ticks_since_run = ticks_since_run.saturating_add(1);
-                    let run_distribute =
-                        (!fired_for_digest && stable_ticks >= 2) || ticks_since_run >= 20;
-                    if run_distribute {
-                        fired_for_digest = true;
-                        ticks_since_run = 0;
-                    }
                     let e = dist_engine.clone();
-                    dist_jobs.submit("distribute", Priority::Distribution, 1, move || {
+                    dist_jobs.submit("scale_quota", Priority::Distribution, 1, move || {
                         let e = e.clone();
                         async move {
-                            if run_distribute {
-                                let _ = e.distribute().await;
-                            }
                             let _ = e.scale().await;
                             e.enforce_quota().await;
                             Ok(())

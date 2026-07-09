@@ -157,7 +157,14 @@ pub struct Membership {
     /// seed recovery means the dials themselves are broken — a wedged
     /// endpoint — and the transport is asked to rebind.
     isolated_since_ms: RwLock<u64>,
+    /// Last epidemic-shuffle fire (ms) — debounces the new-member fast path.
+    last_epidemic_ms: RwLock<u64>,
+    /// Wakes the shuffle task for an immediate epidemic round (new members).
+    epidemic: tokio::sync::Notify,
 }
+
+/// Min interval between epidemic (new-member-triggered) shuffles.
+const EPIDEMIC_DEBOUNCE_MS: u64 = 2_000;
 
 impl Membership {
     pub fn new(transport: Arc<Transport>, cfg: Config) -> Arc<Self> {
@@ -168,6 +175,8 @@ impl Membership {
             bootstrap: RwLock::new(Vec::new()),
             last_recover_ms: RwLock::new(0),
             isolated_since_ms: RwLock::new(0),
+            last_epidemic_ms: RwLock::new(0),
+            epidemic: tokio::sync::Notify::new(),
         })
     }
 
@@ -216,13 +225,19 @@ impl Membership {
         let this = self.clone();
         tokio::spawn(async move {
             // First shuffle EARLY (after the bootstrap joins land) so a fresh
-            // node's view diffuses in seconds, then the steady cadence.
+            // node's view diffuses in seconds, then the steady cadence — with
+            // an EPIDEMIC fast path: learning new members wakes an immediate
+            // extra round (debounced), so a join wave diffuses in ~seconds-hops
+            // instead of 30s cycles.
             tokio::time::sleep(Duration::from_secs(3)).await;
             this.shuffle_round().await;
             let mut interval = tokio::time::interval(this.cfg.shuffle_interval);
             interval.tick().await; // consumes the immediate tick
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = this.epidemic.notified() => {}
+                }
                 this.shuffle_round().await;
             }
         });
@@ -676,12 +691,36 @@ impl Membership {
     /// [`Self::refresh_self`]). Idempotent + commutative → convergence.
     async fn merge_members(&self, entries: &[wire::MemberEntry]) {
         let me = self.my_id().0;
-        let mut views = self.views.write().await;
-        for e in entries {
-            if e.id == me {
-                continue;
+        let new_members = {
+            let mut views = self.views.write().await;
+            let before = views.members.len();
+            for e in entries {
+                if e.id == me {
+                    continue;
+                }
+                merge_one(&mut views.members, e);
             }
-            merge_one(&mut views.members, e);
+            views.members.len() - before
+        };
+        // EPIDEMIC DIFFUSION (v2 census bar): learning NEW members triggers one
+        // immediate extra shuffle toward a random active peer (debounced), so
+        // new-member knowledge doubles per ~seconds-hop instead of per 30s
+        // cycle — a 20-node join wave converges in ~5 hops. Zero steady-state
+        // cost: no new information, no extra shuffle.
+        if new_members > 0 {
+            let now = now_ms();
+            let fire = {
+                let mut last = self.last_epidemic_ms.write().await;
+                if now.saturating_sub(*last) >= EPIDEMIC_DEBOUNCE_MS {
+                    *last = now;
+                    true
+                } else {
+                    false
+                }
+            };
+            if fire {
+                self.epidemic.notify_one();
+            }
         }
     }
 
