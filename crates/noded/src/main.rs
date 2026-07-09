@@ -1404,9 +1404,14 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
             pending_engine.distribute_pending().await;
         }
     });
+    // Governance anti-entropy: 30s cadence. Governance changes are rare and human-initiated, so
+    // 5s adoption latency bought nothing — and the per-tick resolve+fetch across the census was a
+    // constant stream of QUIC handshakes that congested slow links (membership pings timed out on
+    // the relay-Mac while ICMP on the same path was clean). Fetches are also version-gated now, so
+    // a steady-state tick is census-many DHT gets and NO content fetches.
     let gov_tick = governance_store.clone();
     tokio::spawn(async move {
-        let mut iv = tokio::time::interval(std::time::Duration::from_secs(5));
+        let mut iv = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
             iv.tick().await;
             gov_tick.tick().await;

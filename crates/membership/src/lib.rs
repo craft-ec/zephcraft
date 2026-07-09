@@ -427,7 +427,17 @@ impl Membership {
                 .collect()
         };
         for (id, addr) in targets {
-            match self.transport.ping(&addr, self.cfg.probe_timeout).await {
+            // One immediate retry before a failure COUNTS: a fresh QUIC handshake can transiently
+            // exceed the timeout under connection churn even on a HEALTHY path (measured on the
+            // relay-Mac: membership pings timing out while ICMP on the same path was 0% loss —
+            // self-inflicted handshake congestion, not packet loss). The retry rides the path the
+            // first attempt warmed, so a handshake hiccup doesn't become a consecutive-failure;
+            // a genuinely dead peer just costs one extra timeout per round.
+            let outcome = match self.transport.ping(&addr, self.cfg.probe_timeout).await {
+                Ok(r) => Ok(r),
+                Err(_first) => self.transport.ping(&addr, self.cfg.probe_timeout).await,
+            };
+            match outcome {
                 Ok(report) => {
                     let mut views = self.views.write().await;
                     if let Some(state) = views.active.get_mut(&id) {

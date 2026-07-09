@@ -87,9 +87,10 @@ const MIGRATE_STABLE_TICKS: u32 = 3;
 
 /// After a reshard, how many loop ticks to keep DRAINING the old generation (re-sweeping it
 /// forward to catch writes that landed on it during the governance-propagation window) before
-/// GC-ing its accounts. The loop ticks every 10s and propagation is ~20s, so 6 (~60s) generously
-/// covers the window in which a straggler node still writes the old count.
-const DRAIN_TICKS: u32 = 6;
+/// GC-ing its accounts. The loop ticks every 10s. Governance anti-entropy runs every 30s (with
+/// multi-hop diffusion), so propagation can take ~30–90s; 18 ticks (~180s) generously covers the
+/// window in which a straggler node still writes the old count.
+const DRAIN_TICKS: u32 = 18;
 
 /// READINESS GATE (mirrors the health-scan restart gate). After (re)start a node's census is still
 /// converging, so its registry writer election differs from the settled cluster and it would route

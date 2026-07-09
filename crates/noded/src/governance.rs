@@ -33,7 +33,15 @@ pub struct GovernanceChainStore {
     self_id: [u8; 32],
     chain: RwLock<GovernanceChain>,
     path: PathBuf,
+    /// `(seq, when)` of the last announce — gates [`Self::publish`] to on-change + a periodic
+    /// heartbeat instead of every tick (an unconditional announce every tick was constant DHT-put
+    /// chatter that, with the unversioned fetches, congested slow links; see `tick`).
+    last_announce: tokio::sync::Mutex<Option<(u64, std::time::Instant)>>,
 }
+
+/// Re-announce the chain head at least this often even when unchanged (keeps the DHT record fresh
+/// well inside its 48 h TTL). Announces also fire immediately on any seq change.
+const ANNOUNCE_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(600);
 
 impl GovernanceChainStore {
     /// Open the store: load the persisted chain (only if its genesis matches config and it
@@ -68,6 +76,7 @@ impl GovernanceChainStore {
             self_id,
             chain: RwLock::new(chain),
             path,
+            last_announce: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -176,16 +185,41 @@ impl GovernanceChainStore {
         };
         if let Ok(cid) = self.obj.publish_system(&bytes).await {
             let _ = self.routing.announce_app(GOV_HEAD_NAME, cid, seq + 1).await;
+            *self.last_announce.lock().await = Some((seq, std::time::Instant::now()));
         }
     }
 
-    /// Fetch a peer's published governance chain (by its announced head).
-    async fn fetch(&self, from: [u8; 32]) -> Option<GovernanceChain> {
+    /// Publish only when the chain seq CHANGED since the last announce, or the
+    /// [`ANNOUNCE_HEARTBEAT`] elapsed (record freshness). The old unconditional
+    /// publish-every-tick was a DHT put per node per tick — pure churn, since governance
+    /// changes are rare and human-initiated.
+    async fn publish_if_due(&self) {
+        let seq = self.chain.read().await.seq();
+        let due = match *self.last_announce.lock().await {
+            Some((last_seq, at)) => last_seq != seq || at.elapsed() >= ANNOUNCE_HEARTBEAT,
+            None => true,
+        };
+        if due {
+            self.publish().await;
+        }
+    }
+
+    /// Fetch a peer's published governance chain — but ONLY if its announced version says the
+    /// peer's chain is LONGER than ours (announce version = seq + 1). The announce resolve is one
+    /// DHT get; the content fetch (provider resolve + piece requests, possibly twice through a
+    /// manifest) is the expensive part and is skipped when there is nothing to adopt. The old
+    /// unconditional fetch-every-peer-every-tick was a constant stream of QUIC handshakes that
+    /// congested slow links — measured on the relay-Mac as membership ping timeouts (3 s) while
+    /// ICMP on the same path was 0 % loss: self-inflicted churn, not packet loss.
+    async fn fetch_if_newer(&self, from: [u8; 32], local_seq: u64) -> Option<GovernanceChain> {
         let rec = self
             .routing
             .resolve_app(NodeId(from), GOV_HEAD_NAME)
             .await
             .ok()??;
+        if rec.version <= local_seq + 1 {
+            return None; // peer's chain is not longer than ours — nothing to adopt
+        }
         let raw = self.obj.get(rec.wasm_cid, ConsumeMode::Drop).await.ok()?;
         let bytes = match zeph_obj::Manifest::decode(&raw) {
             Some(zeph_obj::Manifest::File { content, .. }) => {
@@ -215,7 +249,7 @@ impl GovernanceChainStore {
     /// Cost is O(targets) `fetch`es per tick — fine at 10s–100s of nodes (governance is tiny and
     /// changes rarely); a digest/sampled pull is the scale follow-up (mirrors the membership note).
     pub async fn tick(&self) {
-        self.publish().await;
+        self.publish_if_due().await;
         let mut targets: Vec<[u8; 32]> = Vec::new();
         {
             let guard = self.membership.read().await;
@@ -235,7 +269,10 @@ impl GovernanceChainStore {
         }
         let genesis = self.chain.read().await.genesis.clone();
         for p in targets {
-            let Some(fetched) = self.fetch(p).await else {
+            // Re-read the local seq each iteration — an adoption earlier in the loop raises the
+            // bar for the remaining peers (their equal-length chains no longer warrant a fetch).
+            let local_seq = self.chain.read().await.seq();
+            let Some(fetched) = self.fetch_if_newer(p, local_seq).await else {
                 continue;
             };
             if fetched.genesis != genesis || fetched.current().is_none() {
