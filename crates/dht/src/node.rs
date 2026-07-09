@@ -265,18 +265,32 @@ impl DhtNode {
             while let Some(conn) = conns.recv().await {
                 let node = self.clone();
                 tokio::spawn(async move {
+                    // Bounded PIPELINING — the handler is cheap, but SERIAL
+                    // stream handling on the POOLED per-peer connection made
+                    // every peer's lookups line up single-file (a convoy):
+                    // with conn-per-request each request was served in
+                    // parallel; pooling serialized the DHT server per peer
+                    // and scans ballooned from <1s to minutes (measured).
+                    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
                     while let Ok((mut send, mut recv)) = conn.accept_bi().await {
-                        let Ok(bytes) = recv.read_to_end(MAX_FRAME).await else {
+                        let Ok(permit) = permits.clone().acquire_owned().await else {
                             break;
                         };
-                        let Some(msg) = DhtMessage::decode(&bytes) else {
-                            break;
-                        };
-                        let reply = node.handle(msg);
-                        if send.write_all(&reply.encode()).await.is_err() {
-                            break;
-                        }
-                        let _ = send.finish();
+                        let node = node.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            let Ok(bytes) = recv.read_to_end(MAX_FRAME).await else {
+                                return;
+                            };
+                            let Some(msg) = DhtMessage::decode(&bytes) else {
+                                return;
+                            };
+                            let reply = node.handle(msg);
+                            if send.write_all(&reply.encode()).await.is_err() {
+                                return;
+                            }
+                            let _ = send.finish();
+                        });
                     }
                 });
             }

@@ -1757,6 +1757,10 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
             // Phase 2: let the registry replication / reannounce wave DRAIN
             // (they own the queue right after settle) before scans compete
             // for the same slots and dial lanes. Bounded wait.
+            // Let the wave FORM before waiting for it to drain — checking
+            // instantly after settle trivially passed (queue still empty)
+            // and the boot clamp never applied.
+            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
             let phase2 = tokio::time::Instant::now();
             loop {
                 if feeder_jobs.stats().queue_depth < 32
