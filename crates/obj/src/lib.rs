@@ -166,6 +166,12 @@ const PUSH_TIMEOUT: Duration = Duration::from_secs(3);
 /// evict always runs (see [`request`]).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Max pieces a single repair pass mints for one cid (bounded burst).
+const REPAIR_BATCH: usize = 8;
+
+/// Max streams served concurrently per inbound connection (pipelining bound).
+const PIPELINE_STREAMS: usize = 8;
+
 /// Heavy engine work routed to the node's JobCoordinator when wired (see
 /// `work_trigger`): the engine detects the need, the coordinator schedules it
 /// with the right priority, dedup key, and bounded concurrency.
@@ -1525,17 +1531,22 @@ impl ObjEngine {
                     "below band — under-replicated",
                     "repair queued (Repair-priority job)",
                 );
-            } else if self.repair_one(&cid, &gen, &live).await {
-                report.repaired += 1;
-                self.record_health(
-                    &cid,
-                    have,
-                    floor,
-                    live.len(),
-                    "below band — under-replicated",
-                    "repaired — minted + pushed 1 piece",
-                );
             } else {
+                let landed = self
+                    .repair_one(&cid, &gen, &live, floor.saturating_sub(have))
+                    .await;
+                report.repaired += landed;
+                if landed > 0 {
+                    self.record_health(
+                        &cid,
+                        have,
+                        floor,
+                        live.len(),
+                        "below band — under-replicated",
+                        "repaired — minted + pushed pieces (batched)",
+                    );
+                    continue;
+                }
                 self.record_health(
                     &cid,
                     have,
@@ -1605,6 +1616,15 @@ impl ObjEngine {
             .lock()
             .expect("surplus_ids")
             .contains(&cid.0)
+    }
+
+    /// Distinct LIVE providers this cid had at its last scan (0 if never scanned).
+    /// Drives provider-aware scan backoff: every HOLDER runs its own re-check
+    /// clock, so a cid's effective cluster-wide check rate is holders x the
+    /// per-node rate — well-replicated cids can back off per node without
+    /// losing coverage.
+    pub fn live_providers(&self, cid: &Cid) -> u32 {
+        self.cid_health(cid).map(|h| h.live_providers).unwrap_or(0)
     }
 
     /// Is this cid actively CONVERGING toward the floor and so worth re-scanning frequently?
@@ -1896,13 +1916,13 @@ impl ObjEngine {
     /// holder may already have restored the floor, or the content may have
     /// faded to unwanted, and repairing then mints exactly the surplus pieces
     /// the Fade design exists to prevent (review finding). Returns true if a
-    /// piece was minted and pushed.
-    pub async fn repair_cid(&self, cid: Cid) -> bool {
+    /// pieces were minted and pushed (returns the count landed).
+    pub async fn repair_cid(&self, cid: Cid) -> usize {
         if self.store.is_tombstoned(&cid) {
-            return false;
+            return 0;
         }
         let Some(gen) = self.store.generation(&cid) else {
-            return false;
+            return 0;
         };
         let me = self.transport.node_id();
         let epoch = self.transport.clock().now().0 / HEALTH_EPOCH_MS;
@@ -1932,22 +1952,24 @@ impl ObjEngine {
         }
         // Still NEEDED? Below the durability floor AND still wanted (Fade gate)
         // — the mirror of the scan's own gating, re-run at execution time.
-        if have >= target_pieces(gen.k as usize) || !self.is_alive(&cid, any_pinned).await {
-            return false;
+        let floor = target_pieces(gen.k as usize);
+        if have >= floor || !self.is_alive(&cid, any_pinned).await {
+            return 0;
         }
         let can_i = self.store.piece_count(&cid) >= 2
             || (self.store.has_content(&cid) && self.store.is_pinned(&cid));
         if !can_i {
-            return false;
+            return 0;
         }
         capable.push(me);
         let winner = capable
             .iter()
             .max_by_key(|id| rendezvous_score(id, &cid, epoch));
         if winner != Some(&me) {
-            return false;
+            return 0;
         }
-        self.repair_one(&cid, &gen, &live).await
+        self.repair_one(&cid, &gen, &live, floor.saturating_sub(have))
+            .await
     }
 
     /// Periodic backstop + demand-window reset: snapshot & clear the pull window, recruit for
@@ -2052,62 +2074,91 @@ impl ObjEngine {
     /// holder — sole survivor): recruit a fresh non-holder peer from the node
     /// registry. Dead peers never answer probes, so a piece is never wasted on
     /// a vanished node.
+    /// Repair one cid by minting up to `min(deficit, REPAIR_BATCH)` fresh
+    /// pieces and pushing them CONCURRENTLY to distinct targets — live holders
+    /// fewest-first, then brand-new recruits. Returns pieces landed.
+    ///
+    /// One-piece-per-pass was the original anti-storm guard, but the single
+    /// elected repairer (rendezvous) already prevents the thundering herd, and
+    /// at one piece per scan round a storm's debris (measured: ~2,100 cids
+    /// each ~90 pieces below floor) heals over DAYS. A bounded batch heals 8×
+    /// faster with a burst capped at REPAIR_BATCH pushes of PUSH_TIMEOUT each.
     async fn repair_one(
         &self,
         cid: &Cid,
         gen: &Generation,
         live: &[(NodeId, PeerAddr, u32, bool)],
-    ) -> bool {
-        let Some(piece) = self.mint_piece(cid, gen) else {
-            return false;
-        };
+        deficit: usize,
+    ) -> usize {
+        let want = deficit.clamp(1, REPAIR_BATCH);
         let me = self.transport.node_id();
-        // Fewest-piece live holder other than self.
-        if let Some((_, addr, _, _)) = live
+        // Distinct targets: live holders (fewest pieces first), then recruits.
+        let mut holders: Vec<(u32, PeerAddr)> = live
             .iter()
             .filter(|(id, _, _, _)| *id != me)
-            .min_by_key(|(_, _, c, _)| *c)
-        {
-            return self
-                .push_piece(addr, *cid, gen, &piece, REQUEST_TIMEOUT)
-                .await
-                .is_ok();
-        }
-        // Sole survivor: recruit a brand-new holder from the node registry.
-        let holder_ids: HashSet<NodeId> = live.iter().map(|(id, _, _, _)| *id).collect();
-        for (id, addr) in self.peer_source.peers().await {
-            if id == me || holder_ids.contains(&id) {
-                continue;
-            }
-            if self
-                .push_piece(&addr, *cid, gen, &piece, REQUEST_TIMEOUT)
-                .await
-                .is_ok()
-            {
-                return true;
+            .map(|(_, addr, c, _)| (*c, addr.clone()))
+            .collect();
+        holders.sort_by_key(|(c, _)| *c);
+        let mut targets: Vec<PeerAddr> = holders.into_iter().map(|(_, a)| a).collect();
+        if targets.len() < want {
+            let holder_ids: HashSet<NodeId> = live.iter().map(|(id, _, _, _)| *id).collect();
+            for (id, addr) in self.peer_source.peers().await {
+                if id == me || holder_ids.contains(&id) {
+                    continue;
+                }
+                targets.push(addr);
+                if targets.len() >= want {
+                    break;
+                }
             }
         }
-        false
+        targets.truncate(want);
+        let pushes = targets.into_iter().filter_map(|addr| {
+            let piece = self.mint_piece(cid, gen)?;
+            Some(async move {
+                self.push_piece(&addr, *cid, gen, &piece, PUSH_TIMEOUT)
+                    .await
+                    .is_ok()
+            })
+        });
+        futures::future::join_all(pushes)
+            .await
+            .into_iter()
+            .filter(|ok| *ok)
+            .count()
     }
 
     /// Serve the piece ALPN: ingest pushes (vtag-verify → store → announce)
-    /// and answer requests from the store.
+    /// and answer requests from the store. Streams on a peer's pooled
+    /// connection are handled with BOUNDED PIPELINING (up to
+    /// [`PIPELINE_STREAMS`] concurrently) — serial handling capped each
+    /// peer-pair at one request in flight and let queued requests time out at
+    /// the sender. At saturation we stop accepting new streams, so QUIC flow
+    /// control backpressures the peer naturally.
     pub async fn serve(self: Arc<Self>, mut conns: tokio::sync::mpsc::Receiver<Connection>) {
         while let Some(conn) = conns.recv().await {
             let engine = self.clone();
             tokio::spawn(async move {
+                let permits = Arc::new(tokio::sync::Semaphore::new(PIPELINE_STREAMS));
                 while let Ok((mut send, mut recv)) = conn.accept_bi().await {
-                    let Ok(bytes) = recv.read_to_end(MAX_FRAME).await else {
+                    let Ok(permit) = permits.clone().acquire_owned().await else {
                         return;
                     };
-                    let Ok(frame) = wire::decode(&bytes) else {
-                        return;
-                    };
-                    let reply = engine.handle(frame.message).await;
-                    let _ = send
-                        .write_all(&wire::encode(&reply, engine.transport.clock().now().0))
-                        .await;
-                    let _ = send.finish();
+                    let engine = engine.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let Ok(bytes) = recv.read_to_end(MAX_FRAME).await else {
+                            return;
+                        };
+                        let Ok(frame) = wire::decode(&bytes) else {
+                            return;
+                        };
+                        let reply = engine.handle(frame.message).await;
+                        let _ = send
+                            .write_all(&wire::encode(&reply, engine.transport.clock().now().0))
+                            .await;
+                        let _ = send.finish();
+                    });
                 }
             });
         }

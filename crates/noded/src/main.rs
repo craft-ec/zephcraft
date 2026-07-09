@@ -1409,8 +1409,9 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                             move || {
                                 let (eng, st) = (eng.clone(), st.clone());
                                 async move {
-                                    if eng.repair_cid(cid).await {
-                                        st.add_repaired(1).await;
+                                    let landed = eng.repair_cid(cid).await;
+                                    if landed > 0 {
+                                        st.add_repaired(landed as u64).await;
                                     }
                                     Ok(())
                                 }
@@ -1834,11 +1835,18 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                             // Re-enqueue for the next check if still held; else stop tracking it.
                             if eng.store().piece_count(&cid) > 0 || eng.store().has_content(&cid) {
                                 // Adaptive backoff: an at-risk/converging cid stays HOT
-                                // (recheck_min); a stable cid backs OFF up to recheck_max.
+                                // (recheck_min) — repair fires only when the epoch winner
+                                // scans, so slowing any node's at-risk cadence slows healing.
+                                // A HEALTHY cid backs off PROVIDER-AWARE: every holder runs
+                                // its own clock, so effective check rate = holders x per-node
+                                // rate — a well-replicated cid skips the early backoff rungs
+                                // (post-restart scan storms live there) while its effective
+                                // cluster-wide interval stays ~recheck_min.
                                 let next = if eng.converging(&cid) {
                                     recheck_min
                                 } else {
-                                    (delay * 2).min(recheck_max)
+                                    let holders = eng.live_providers(&cid).clamp(1, 16);
+                                    (delay * 2).max(recheck_min * holders).min(recheck_max)
                                 };
                                 q.lock().expect("q").push(std::cmp::Reverse((
                                     std::time::Instant::now() + next,

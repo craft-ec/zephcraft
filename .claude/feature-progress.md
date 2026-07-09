@@ -32,14 +32,39 @@ scan job at HealthScan priority — the Repair tier is unused!).
       sheds (obj ingest + headreg PushState answer "busy"; senders' next pass retries). deferred
       + mem_load_pct in JobStats. Gauge off when no cgroup limit / non-Linux (Mac). Gated
       dispatch re-checks on 500ms tick. Test: gauge_gates_routine_work_but_not_repair.
-- [ ] Phase 5 (user-directed design, after Phase 4): PUSH ADMISSION NEGOTIATION — keep push, but
-      (1) receivers indicate free intake slots, (2) senders negotiate BEFORE shipping bytes:
-      new wire msgs PushOffer{cid,pieces,bytes} → PushGrant{accept,retry_after_ms}; receiver
-      grants from gauge state (critical=0, high=1, else 4 per offer); (3) on busy/partial grant:
-      REDIRECT remainder to another candidate when target-fungible (coded pieces — any candidate
-      works), REQUEUE with backoff when target-fixed (registry shard replicas — election-bound;
-      dirty-counter rounds already approximate this). Wire change → version-consistent full roll.
-      Do AFTER the dial-bound acceptance rerun so each layer's effect is measured separately.
+- [ ] Phase 5 — TRANSFER PLANE v2 (LOCKED by user 2026-07-09): stability achieved (run 2),
+      throughput nowhere near hardware — queue ~2200 flat, jobs timeout-bound. ONE wire roll:
+      (a) PUSH ADMISSION NEGOTIATION — receivers advertise free intake slots; senders offer
+          BEFORE shipping bytes (PushOffer{cid,pieces,bytes} → PushGrant{accept,retry_after_ms},
+          grants from gauge state); on busy/partial: REDIRECT remainder to another candidate
+          when target-fungible (coded pieces), REQUEUE with backoff when target-fixed (registry
+          shard replicas). Kills timeout-as-failure-signal (3-8s → ~1 RTT busy answer).
+      (b) SINGLE-CONN-PER-PEER MULTIPLEXING — one connection per peer, protocol tag per stream
+          (~190 conns → ~19 per node); makes per-peer accounting natural.
+      Companions (no wire change, ship alongside or before):
+      (c) bounded per-connection stream PIPELINING (~8 concurrent streams served per conn,
+          replacing serial accept_bi handling) — kills the per-peer-pair serialization;
+      (d) gauge-modulated JOB CONCURRENCY (8 under pressure → 16-32 healthy);
+      (e) per-peer ACTIVE-SET budget (BitTorrent choke model): actively transfer with K peers,
+          queue the rest as cheap candidates.
+      (f) HOLDER-ELECTED HEALTHSCAN (user design: elect FIRST, only the elected node scans,
+          then it directly repairs/degrades — scanner = actor by construction). Electorate =
+          last-known CAPABLE holder set from the previous scan's provider records (ids+counts
+          must be stored per cid, ~1.5MB) ∪ self; rendezvous per (cid, epoch); non-winners just
+          reschedule locally (zero network). NO wire change needed (supersedes the RepairHint
+          idea). ~20x aggregate scan-traffic cut at 20 nodes AND faster healing (today repair
+          waits for the winner to coincidentally be the scanner). Divergent views → occasional
+          benign double-scan; dead winner ages out via membership-filtered records; fresh
+          holder bootstraps with one unconditional scan. Composes with provider-aware backoff.
+          Implement as its own reviewed change AFTER the batch-repair batch lands.
+      Shipped early (no wire change, commit pending review): REPAIR BATCHING — repair_one mints
+      min(deficit, 8) pieces per pass to distinct targets concurrently (was 1/pass; ~2,100
+      debris cids × ~90 missing pieces healed at ~30 pieces/min cluster-wide = days; batching
+      ≈8×) + PIPELINING (obj/registry/sql serve 8 concurrent streams per conn).
+- [x] Phase 4 ATTEMPT 2 (binary ec4356b8, dial dedup+caps): STABILITY PASS — census 20 EVERY
+      minute for 13+ min, extras restarts 0 (was 32/5min), OOM kills 0 (was +17), churn 2-4
+      lines/min (was ~1500), Mac 5/5 solid, node1 19-42% of 12G budget. The thrash class is
+      closed. Throughput bar NOT met (queue ~2200 static, timeout-bound drain) → Phase 5.
 - [ ] Phase 4 (acceptance): deploy fleet, rerun 20-node rejoin — PASS = census 20 converges, no
       OOM kills, churn lines near-zero, deploys fast. THEN the original stress measurements
       (writer spread, held-DB counts, remote resolve latency, reshard 8→9 under load).

@@ -99,6 +99,9 @@ const DRAIN_TICKS: u32 = 18;
 /// node is "registry-ready" only once its census (member count) has been UNCHANGED for
 /// `READY_STABLE_SECS`, bounded by `READY_MAX_SECS` (a genuinely-alone/slow node still proceeds).
 const READY_STABLE_SECS: u64 = 10;
+/// Max registry streams served concurrently per inbound connection.
+const REGISTRY_PIPELINE_STREAMS: usize = 8;
+
 const READY_MAX_SECS: u64 = 90;
 /// How long a register/resolve will WAIT for readiness before proceeding best-effort. Bounds the
 /// startup-window latency; in steady state the node is already ready, so there is no wait.
@@ -1481,100 +1484,111 @@ impl HeadRegistry {
         while let Some(conn) = conns.recv().await {
             let this = self.clone();
             tokio::spawn(async move {
+                // Bounded pipelining: registry streams on this peer's pooled
+                // connection are handled concurrently — serial handling made
+                // senders' pushstate rounds eat full timeouts while queued.
+                let permits = Arc::new(tokio::sync::Semaphore::new(REGISTRY_PIPELINE_STREAMS));
                 while let Ok((mut send, mut recv)) = conn.accept_bi().await {
-                    let Ok(bytes) = recv.read_to_end(MAX_FRAME).await else {
-                        break;
+                    let Ok(permit) = permits.clone().acquire_owned().await else {
+                        return;
                     };
-                    let resp = match postcard::from_bytes::<RegistryReq>(&bytes) {
-                        // Route with the SUBMITTER's `bits` (from the wire), not this node's, so a
-                        // `shard_bits` change in flight can't split-route the key.
-                        Ok(RegistryReq::Submit { rtype, bits, sub }) => {
-                            match HeadSubmission::decode(&sub) {
-                                Some(s) => {
-                                    let sk = ShardKey {
-                                        rtype,
-                                        bits,
-                                        shard: shard_of(&s.owner, &s.name, bits),
-                                    };
-                                    match this.advance_local(sk, &sub).await {
-                                        Ok(root) => RegistryResp::SubmitAck(root),
-                                        Err(e) => RegistryResp::Err(e.to_string()),
+                    let this = this.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let Ok(bytes) = recv.read_to_end(MAX_FRAME).await else {
+                            return;
+                        };
+                        let resp = match postcard::from_bytes::<RegistryReq>(&bytes) {
+                            // Route with the SUBMITTER's `bits` (from the wire), not this node's, so a
+                            // `shard_bits` change in flight can't split-route the key.
+                            Ok(RegistryReq::Submit { rtype, bits, sub }) => {
+                                match HeadSubmission::decode(&sub) {
+                                    Some(s) => {
+                                        let sk = ShardKey {
+                                            rtype,
+                                            bits,
+                                            shard: shard_of(&s.owner, &s.name, bits),
+                                        };
+                                        match this.advance_local(sk, &sub).await {
+                                            Ok(root) => RegistryResp::SubmitAck(root),
+                                            Err(e) => RegistryResp::Err(e.to_string()),
+                                        }
                                     }
+                                    None => RegistryResp::Err("bad submission".into()),
                                 }
-                                None => RegistryResp::Err("bad submission".into()),
                             }
-                        }
-                        // Route with the querier's `bits` (from the wire).
-                        Ok(RegistryReq::Resolve {
-                            rtype,
-                            bits,
-                            owner,
-                            name,
-                        }) => {
-                            let sk = ShardKey {
+                            // Route with the querier's `bits` (from the wire).
+                            Ok(RegistryReq::Resolve {
                                 rtype,
                                 bits,
-                                shard: shard_of(&owner, &name, bits),
-                            };
-                            RegistryResp::Resolved(this.resolve_local(sk, owner, &name).await)
-                        }
-                        // Serve the full shard state (at the requested generation) as the wire DTO
-                        // (`SELECT *` → RegistryState) for the takeover merge.
-                        Ok(RegistryReq::GetState { rtype, bits, shard }) => {
-                            let sk = ShardKey { rtype, bits, shard };
-                            RegistryResp::State(this.sql_state(sk).await.encode())
-                        }
-                        // Report the current version of a key from its shard DB (0 if none).
-                        // Route with the querier's `bits` (from the wire).
-                        Ok(RegistryReq::CurrentVersion {
-                            rtype,
-                            bits,
-                            owner,
-                            name,
-                        }) => {
-                            let sk = ShardKey {
-                                rtype,
-                                bits,
-                                shard: shard_of(&owner, &name, bits),
-                            };
-                            let v = this
-                                .sql_resolve(sk, &owner, &name)
-                                .await
-                                .map(|(_, v)| v)
-                                .unwrap_or(0);
-                            RegistryResp::Version(v)
-                        }
-                        // A pushed replica state (at its generation) — MERGE (LWW) each row into our
-                        // shard DB. Normal writes push a 1-row state; takeover/migrate push many.
-                        Ok(RegistryReq::PushState {
-                            rtype,
-                            bits,
-                            shard,
-                            state,
-                        }) => {
-                            // Shed at CRITICAL memory pressure. Accepted gap:
-                            // the state reaches this replica again on the next
-                            // write to the shard (dirty rounds), a migrate, or
-                            // the takeover merge — not instantly.
-                            if this.shed_gate.get().is_some_and(|gate| gate()) {
-                                RegistryResp::Err("busy — memory pressure".into())
-                            } else {
+                                owner,
+                                name,
+                            }) => {
+                                let sk = ShardKey {
+                                    rtype,
+                                    bits,
+                                    shard: shard_of(&owner, &name, bits),
+                                };
+                                RegistryResp::Resolved(this.resolve_local(sk, owner, &name).await)
+                            }
+                            // Serve the full shard state (at the requested generation) as the wire DTO
+                            // (`SELECT *` → RegistryState) for the takeover merge.
+                            Ok(RegistryReq::GetState { rtype, bits, shard }) => {
                                 let sk = ShardKey { rtype, bits, shard };
-                                if let Some(pushed) = RegistryState::decode(&state) {
-                                    let _ = this.sql_merge(sk, &pushed).await;
-                                }
-                                RegistryResp::Ack
+                                RegistryResp::State(this.sql_state(sk).await.encode())
                             }
-                        }
-                        // Return ALL of this node's local heads for the global dashboard union.
-                        Ok(RegistryReq::ListEntries) => {
-                            RegistryResp::Entries(this.local_head_rows().await)
-                        }
-                        Err(e) => RegistryResp::Err(format!("bad registry request: {e}")),
-                    };
-                    let out = postcard::to_allocvec(&resp).unwrap_or_default();
-                    let _ = send.write_all(&out).await;
-                    let _ = send.finish();
+                            // Report the current version of a key from its shard DB (0 if none).
+                            // Route with the querier's `bits` (from the wire).
+                            Ok(RegistryReq::CurrentVersion {
+                                rtype,
+                                bits,
+                                owner,
+                                name,
+                            }) => {
+                                let sk = ShardKey {
+                                    rtype,
+                                    bits,
+                                    shard: shard_of(&owner, &name, bits),
+                                };
+                                let v = this
+                                    .sql_resolve(sk, &owner, &name)
+                                    .await
+                                    .map(|(_, v)| v)
+                                    .unwrap_or(0);
+                                RegistryResp::Version(v)
+                            }
+                            // A pushed replica state (at its generation) — MERGE (LWW) each row into our
+                            // shard DB. Normal writes push a 1-row state; takeover/migrate push many.
+                            Ok(RegistryReq::PushState {
+                                rtype,
+                                bits,
+                                shard,
+                                state,
+                            }) => {
+                                // Shed at CRITICAL memory pressure. Accepted gap:
+                                // the state reaches this replica again on the next
+                                // write to the shard (dirty rounds), a migrate, or
+                                // the takeover merge — not instantly.
+                                if this.shed_gate.get().is_some_and(|gate| gate()) {
+                                    RegistryResp::Err("busy — memory pressure".into())
+                                } else {
+                                    let sk = ShardKey { rtype, bits, shard };
+                                    if let Some(pushed) = RegistryState::decode(&state) {
+                                        let _ = this.sql_merge(sk, &pushed).await;
+                                    }
+                                    RegistryResp::Ack
+                                }
+                            }
+                            // Return ALL of this node's local heads for the global dashboard union.
+                            Ok(RegistryReq::ListEntries) => {
+                                RegistryResp::Entries(this.local_head_rows().await)
+                            }
+                            Err(e) => RegistryResp::Err(format!("bad registry request: {e}")),
+                        };
+                        let out = postcard::to_allocvec(&resp).unwrap_or_default();
+                        let _ = send.write_all(&out).await;
+                        let _ = send.finish();
+                    });
                 }
             });
         }

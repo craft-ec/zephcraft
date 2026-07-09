@@ -20,7 +20,10 @@ pub const ALPN: &[u8] = b"/craftec/sqlpage/1";
 const MAX_OBJECT: usize = 16 * 1024 * 1024;
 
 /// Serve CraftSQL page objects from `store_dir` to requesters. Protocol: read a
-/// 32-byte CID, reply with the object bytes (empty if not held).
+/// 32-byte CID, reply with the object bytes (empty if not held). Streams on a
+/// peer's pooled connection are served with bounded pipelining — a recovering
+/// DB fetches many pages back-to-back and serial handling made that N round
+/// trips instead of a pipeline.
 pub async fn serve_pages(store_dir: PathBuf, mut conns: mpsc::Receiver<Connection>) {
     while let Some(conn) = conns.recv().await {
         let dir = store_dir.clone();
@@ -28,17 +31,26 @@ pub async fn serve_pages(store_dir: PathBuf, mut conns: mpsc::Receiver<Connectio
             let Ok(store) = ObjectStore::open(&dir) else {
                 return;
             };
+            let store = std::sync::Arc::new(store);
+            let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
             while let Ok((mut send, mut recv)) = conn.accept_bi().await {
-                let Ok(req) = recv.read_to_end(64).await else {
+                let Ok(permit) = permits.clone().acquire_owned().await else {
                     return;
                 };
-                if req.len() == 32 {
-                    let mut cid = [0u8; 32];
-                    cid.copy_from_slice(&req);
-                    let data = store.get(&Cid(cid)).unwrap_or_default();
-                    let _ = send.write_all(&data).await;
-                }
-                let _ = send.finish();
+                let store = store.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let Ok(req) = recv.read_to_end(64).await else {
+                        return;
+                    };
+                    if req.len() == 32 {
+                        let mut cid = [0u8; 32];
+                        cid.copy_from_slice(&req);
+                        let data = store.get(&Cid(cid)).unwrap_or_default();
+                        let _ = send.write_all(&data).await;
+                    }
+                    let _ = send.finish();
+                });
             }
         });
     }
