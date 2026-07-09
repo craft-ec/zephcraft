@@ -163,8 +163,12 @@ pub struct Membership {
     epidemic: tokio::sync::Notify,
 }
 
-/// Min interval between epidemic (new-member-triggered) shuffles.
-const EPIDEMIC_DEBOUNCE_MS: u64 = 2_000;
+/// Min interval between epidemic (new-member-triggered) diffusion rounds.
+const EPIDEMIC_DEBOUNCE_MS: u64 = 1_000;
+/// Active peers a single epidemic round pushes the member map to (gossip
+/// fan-out). One target diffused a join wave through the tail in ~40s;
+/// fan-out spreads new-member knowledge in log-fanout hops.
+const EPIDEMIC_FANOUT: usize = 3;
 
 impl Membership {
     pub fn new(transport: Arc<Transport>, cfg: Config) -> Arc<Self> {
@@ -235,10 +239,16 @@ impl Membership {
             interval.tick().await; // consumes the immediate tick
             loop {
                 tokio::select! {
-                    _ = interval.tick() => {}
-                    _ = this.epidemic.notified() => {}
+                    _ = interval.tick() => {
+                        this.shuffle_round().await;
+                    }
+                    _ = this.epidemic.notified() => {
+                        // Epidemic: fan the member map to several active peers
+                        // at once (not one shuffle target) so a join wave
+                        // diffuses in log-fanout hops, not one-hop-per-30s.
+                        this.epidemic_push().await;
+                    }
                 }
-                this.shuffle_round().await;
             }
         });
     }
@@ -286,6 +296,35 @@ impl Membership {
         } else {
             tracing::warn!(peer = %short(&contact.node_id()), "bootstrap contact unreachable");
         }
+    }
+
+    /// Epidemic fan-out: push the converged member map to up to
+    /// [`EPIDEMIC_FANOUT`] random active peers concurrently (fire-and-forget).
+    /// Triggered by learning NEW members; the receivers merge and re-fire,
+    /// giving log-fanout diffusion of a join wave.
+    async fn epidemic_push(self: &Arc<Self>) {
+        self.refresh_self().await;
+        let msg = wire::Message::MemberSync(wire::MemberSync {
+            members: self.member_entries().await,
+        });
+        let mut targets: Vec<PeerAddr> = {
+            let views = self.views.read().await;
+            views.active.values().map(|s| s.addr.clone()).collect()
+        };
+        targets.shuffle(&mut rand::thread_rng());
+        targets.truncate(EPIDEMIC_FANOUT);
+        let sends = targets.into_iter().map(|peer| {
+            let this = self.clone();
+            let msg = msg.clone();
+            async move {
+                if let Some(frame) = this.request(&peer, &msg, true).await {
+                    if let wire::Message::MemberSync(sync) = frame.message {
+                        this.merge_members(&sync.members).await;
+                    }
+                }
+            }
+        });
+        futures::future::join_all(sends).await;
     }
 
     /// One immediate MemberSync exchange with `peer`: send our converged map,
@@ -616,7 +655,20 @@ impl Membership {
         let (target, sample) = {
             let views = self.views.read().await;
             let actives: Vec<PeerAddr> = views.active.values().map(|s| s.addr.clone()).collect();
-            let Some(target) = actives.choose(&mut rand::thread_rng()).cloned() else {
+            // TARGET MIXING (census-tail fix): the active view is a small clique
+            // around the bootstrap graph; the full member map rides every
+            // shuffle, so one exchange with any well-informed peer completes a
+            // node. Every ~3rd shuffle targets a random PASSIVE peer, reaching
+            // beyond the clique (active-only left the last nodes' members
+            // trickling 40s+; mixing → ~35s).
+            let mix_passive =
+                !views.passive.is_empty() && rand::Rng::gen_ratio(&mut rand::thread_rng(), 1, 3);
+            let target = if mix_passive {
+                views.passive.choose(&mut rand::thread_rng()).cloned()
+            } else {
+                actives.choose(&mut rand::thread_rng()).cloned()
+            };
+            let Some(target) = target else {
                 return;
             };
             let mut pool: Vec<PeerAddr> = actives
