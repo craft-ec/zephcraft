@@ -5989,17 +5989,24 @@ dependencies = [
 name = "zeph-tests"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures",
  "rand 0.8.6",
  "tempfile",
  "tokio",
  "zeph-core",
  "zeph-crypto",
+ "zeph-dht",
+ "zeph-membership",
  "zeph-obj",
  "zeph-routing",
+ "zeph-sched",
  "zeph-sql",
  "zeph-store",
  "zeph-testkit",
  "zeph-transport",
+ "zeph-wire",
 ]
 
 [[package]]

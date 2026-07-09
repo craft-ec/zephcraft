@@ -7,16 +7,26 @@ license.workspace = true
 publish = false
 
 [dependencies]
+# `TestNode` (src/lib.rs) assembles a full in-process node from the REAL
+# production components (docs/TRANSFER_PLANE_V2.md, "Acceptance harness").
+# These are lib deps — dev-dependencies are invisible to the lib target.
 zeph-core.workspace = true
-zeph-routing.workspace = true
-
-[dev-dependencies]
-tokio.workspace = true
-tempfile.workspace = true
-rand.workspace = true
 zeph-crypto.workspace = true
+zeph-dht.workspace = true
+zeph-membership.workspace = true
+zeph-obj.workspace = true
+zeph-routing.workspace = true
+zeph-sched.workspace = true
 zeph-store.workspace = true
 zeph-transport.workspace = true
-zeph-obj.workspace = true
+zeph-wire.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+futures.workspace = true
+rand.workspace = true
 zeph-sql.workspace = true
 zeph-testkit.workspace = true
