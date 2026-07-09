@@ -215,8 +215,12 @@ impl Membership {
 
         let this = self.clone();
         tokio::spawn(async move {
+            // First shuffle EARLY (after the bootstrap joins land) so a fresh
+            // node's view diffuses in seconds, then the steady cadence.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            this.shuffle_round().await;
             let mut interval = tokio::time::interval(this.cfg.shuffle_interval);
-            interval.tick().await; // skip the immediate first tick
+            interval.tick().await; // consumes the immediate tick
             loop {
                 interval.tick().await;
                 this.shuffle_round().await;
@@ -259,8 +263,28 @@ impl Membership {
         let msg = wire::Message::Join(wire::Join { origin: self.me() });
         if self.send_oneway(contact, &msg).await {
             self.add_active(contact.clone()).await;
+            // FAST BOOT: pull the full member map over the fresh link NOW
+            // instead of waiting shuffle-hops (30s rounds) — a joiner reached
+            // full census in 1-3 MINUTES before, and the readiness gate kept
+            // settling on a partial view.
+            self.sync_members_with(contact).await;
         } else {
             tracing::warn!(peer = %short(&contact.node_id()), "bootstrap contact unreachable");
+        }
+    }
+
+    /// One immediate MemberSync exchange with `peer`: send our converged map,
+    /// merge theirs from the reply. Rides the pooled connection; failures are
+    /// benign (the shuffle-piggybacked gossip converges regardless).
+    async fn sync_members_with(&self, peer: &PeerAddr) {
+        self.refresh_self().await;
+        let msg = wire::Message::MemberSync(wire::MemberSync {
+            members: self.member_entries().await,
+        });
+        if let Some(frame) = self.request(peer, &msg, true).await {
+            if let wire::Message::MemberSync(sync) = frame.message {
+                self.merge_members(&sync.members).await;
+            }
         }
     }
 
@@ -388,7 +412,9 @@ impl Membership {
         if let Some(frame) = self.request(&candidate, &msg, true).await {
             if let wire::Message::NeighborReply(reply) = frame.message {
                 if reply.accepted {
-                    self.add_active(candidate).await;
+                    self.add_active(candidate.clone()).await;
+                    // Fast boot: full member map over the fresh link (see join).
+                    self.sync_members_with(&candidate).await;
                     return true;
                 }
             }

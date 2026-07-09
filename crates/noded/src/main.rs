@@ -915,10 +915,11 @@ async fn cmd_status(data_dir: &Path) -> anyhow::Result<()> {
     println!("node   {}", status.node_id);
     let alive = status.peers.iter().filter(|p| p.alive).count();
     println!(
-        "reach  {}   wire v{}   uptime {}s   peers {}/{} active · {} passive",
+        "reach  {}   wire v{}   uptime {}s   boot {}   peers {}/{} active · {} passive",
         status.reach,
         status.wire_version,
         status.uptime_secs,
+        status.boot_stage,
         alive,
         status.peers.len(),
         status.passive_peers
@@ -1303,6 +1304,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     ));
     let state = Arc::new(control::State {
         clock: transport.clock(),
+        boot_stage: tokio::sync::RwLock::new("booting".to_string()),
         node_id: identity.node_id().to_hex(),
         reach: cfg.reach.clone(),
         relays: if matches!(reach, Reach::LocalOnly) {
@@ -1580,6 +1582,14 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         },
     );
     membership.start(peers, member_rx);
+    state.set_boot_stage("census-settling").await;
+    {
+        let (st, reg) = (state.clone(), head_registry.clone());
+        tokio::spawn(async move {
+            reg.wait_ready().await;
+            st.set_boot_stage("lifecycle-running").await;
+        });
+    }
     governance_store.set_membership(membership.clone()).await;
     head_registry.set_membership(membership.clone()).await;
     head_registry.set_programs(governance_store.clone()).await;
@@ -1733,19 +1743,47 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     {
         let (eng, q, seen) = (engine.clone(), hs_queue.clone(), hs_seen.clone());
         let feeder_ready = head_registry.clone();
+        let feeder_jobs = jobs.clone();
         tokio::spawn(async move {
-            // Boot ordering: no scan feeding until the node has settled.
+            // ONE THING AT A TIME (user directive): boot phases run
+            // SEQUENTIALLY, each to completion, instead of storming every
+            // work class into the same 8 job slots at once.
+            // Phase 1: census settle (readiness gate).
             feeder_ready.wait_ready().await;
+            // Phase 2: let the registry replication / reannounce wave DRAIN
+            // (they own the queue right after settle) before scans compete
+            // for the same slots and dial lanes. Bounded wait.
+            let phase2 = tokio::time::Instant::now();
+            loop {
+                if feeder_jobs.stats().queue_depth < 32
+                    || phase2.elapsed() > std::time::Duration::from_secs(300)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            tracing::info!("boot phase: registry wave drained — scan feed starting (dripped)");
+            // Phase 3: DRIP the initial scan backlog over ~2 minutes instead
+            // of dumping thousands of due-now jobs.
+            let mut first_pass = true;
             loop {
                 let now = std::time::Instant::now();
+                let mut i: u64 = 0;
                 for cid in eng.store().cids() {
                     let is_new = seen.lock().expect("seen").insert(cid);
                     if is_new {
+                        let due = if first_pass {
+                            i += 1;
+                            now + std::time::Duration::from_millis((i % 1200) * 100)
+                        } else {
+                            now
+                        };
                         q.lock()
                             .expect("q")
-                            .push(std::cmp::Reverse((now, cid, recheck_min)));
+                            .push(std::cmp::Reverse((due, cid, recheck_min)));
                     }
                 }
+                first_pass = false;
                 tokio::time::sleep(Duration::from_secs(10)).await;
             }
         });

@@ -104,6 +104,9 @@ pub struct EventStats {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Status {
     pub node_id: String,
+    /// Init-sequence stage: "booting" -> "census-settling" -> "lifecycle-running".
+    #[serde(default)]
+    pub boot_stage: String,
     pub reach: String,
     pub relays: String,
     pub listen: String,
@@ -157,6 +160,8 @@ type HealthCounters = (usize, usize, u64, u64, u64, u64, u64, u64, usize);
 
 pub struct State {
     pub clock: std::sync::Arc<zeph_core::hlc::Clock>,
+    /// Init-sequence stage (status page): booting -> census-settling -> lifecycle-running.
+    pub boot_stage: tokio::sync::RwLock<String>,
     pub node_id: String,
     pub reach: String,
     pub relays: String,
@@ -205,6 +210,11 @@ pub struct State {
 }
 
 impl State {
+    /// Advance the init-sequence stage shown on the status page.
+    pub async fn set_boot_stage(&self, stage: &str) {
+        *self.boot_stage.write().await = stage.to_string();
+    }
+
     pub async fn snapshot(&self) -> Status {
         let hlc = self.clock.now();
         Status {
@@ -214,6 +224,7 @@ impl State {
             reach: self.reach.clone(),
             relays: self.relays.clone(),
             listen: self.listen.clone(),
+            boot_stage: self.boot_stage.read().await.clone(),
             uptime_secs: self.started.elapsed().as_secs(),
             wire_version: zeph_wire::VERSION,
             erasure: format!(

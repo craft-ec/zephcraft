@@ -1121,15 +1121,20 @@ impl HeadRegistry {
                 *d.entry(sk).or_insert(0) += 1;
             }
             let key = format!("pushstate:{}:{}:{}", sk.rtype, sk.bits, sk.shard);
-            jobs.submit(key, zeph_sched::Priority::Distribution, 1, move || {
+            let (jobs2, weak2) = (jobs.clone(), weak.clone());
+            let submitted = jobs.submit(key, zeph_sched::Priority::Distribution, 1, move || {
                 let weak = weak.clone();
+                let (jobs, resched) = (jobs2.clone(), weak2.clone());
                 async move {
                     if let Some(reg) = weak.upgrade() {
-                        reg.push_shard_state(sk).await;
+                        if reg.push_shard_state_once(sk).await {
+                            Self::schedule_pushstate(jobs, resched, sk, 200);
+                        }
                     }
                     Ok(())
                 }
             });
+            let _ = submitted; // dedup-drop is fine: the dirty bump re-runs the in-flight job
             return;
         }
         // UNWIRED (tests): push the caller's snapshot directly.
@@ -1166,59 +1171,84 @@ impl HeadRegistry {
         });
     }
 
-    /// The body of a `pushstate:{shard}` Distribution job: read the shard's FULL
-    /// current state and push it to the current replica set (minus self). Loops
-    /// while writes keep dirtying the shard mid-push (their submits are
-    /// dedup-dropped against this in-flight job, so this job must carry them);
-    /// each round pushes the LATEST full state, so rounds converge as soon as
-    /// writes pause. The round cap only guards a pathological sustained-write
-    /// storm — the next write past the cap submits a fresh job anyway.
-    async fn push_shard_state(&self, sk: ShardKey) {
-        for round in 0..16u32 {
-            let version = {
-                let d = self.push_dirty.lock().expect("push_dirty");
-                d.get(&sk).copied().unwrap_or(0)
-            };
-            let state = self.sql_state(sk).await;
-            if !state.is_empty() {
-                let encoded = state.encode();
-                let elig = self.eligible().await;
-                for id in Self::replicas(sk, &elig) {
-                    if id == self.self_id {
-                        continue;
-                    }
-                    let Some(addr) = self.addr_of(id).await else {
-                        continue;
-                    };
-                    let _ = request_registry(
-                        &self.transport,
-                        &addr,
-                        &RegistryReq::PushState {
-                            rtype: sk.rtype,
-                            bits: sk.bits,
-                            shard: sk.shard,
-                            state: encoded.clone(),
-                        },
-                    )
-                    .await;
+    /// One `pushstate:{shard}` round: read the shard's FULL current state and
+    /// push it to the current replica set (minus self). Returns true if a write
+    /// dirtied the shard DURING the push (its submit was dedup-dropped against
+    /// this in-flight job) — the caller then re-schedules a fresh job instead
+    /// of looping in place: an in-job dirty loop held a coordinator slot for
+    /// minutes during boot migration storms (each round = replicas x 8s
+    /// timeouts, shards re-dirtied continuously) and starved every other job.
+    async fn push_shard_state_once(&self, sk: ShardKey) -> bool {
+        let version = {
+            let d = self.push_dirty.lock().expect("push_dirty");
+            d.get(&sk).copied().unwrap_or(0)
+        };
+        let state = self.sql_state(sk).await;
+        if !state.is_empty() {
+            let encoded = state.encode();
+            let elig = self.eligible().await;
+            for id in Self::replicas(sk, &elig) {
+                if id == self.self_id {
+                    continue;
                 }
-            }
-            let now = {
-                let d = self.push_dirty.lock().expect("push_dirty");
-                d.get(&sk).copied().unwrap_or(0)
-            };
-            if now == version {
-                return;
-            }
-            if round == 15 {
-                tracing::warn!(
-                    shard = sk.shard,
-                    "pushstate rounds exhausted with shard still dirty — next write re-replicates"
-                );
+                let Some(addr) = self.addr_of(id).await else {
+                    continue;
+                };
+                let _ = request_registry(
+                    &self.transport,
+                    &addr,
+                    &RegistryReq::PushState {
+                        rtype: sk.rtype,
+                        bits: sk.bits,
+                        shard: sk.shard,
+                        state: encoded.clone(),
+                    },
+                )
+                .await;
             }
         }
+        let now = {
+            let d = self.push_dirty.lock().expect("push_dirty");
+            d.get(&sk).copied().unwrap_or(0)
+        };
+        now != version
     }
 
+    /// Queue a pushstate job for `sk` (Distribution priority, deduped). Used
+    /// by `replicate` for fresh writes and by a finished round that found its
+    /// shard re-dirtied — the sync boundary here (spawn, not await) also
+    /// breaks the async-recursion type cycle. Retries briefly when the
+    /// previous job's dedup key hasn't freed yet.
+    fn schedule_pushstate(
+        jobs: zeph_sched::JobCoordinator,
+        weak: std::sync::Weak<HeadRegistry>,
+        sk: ShardKey,
+        delay_ms: u64,
+    ) {
+        tokio::spawn(async move {
+            for _ in 0..25 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                let weak2 = weak.clone();
+                let (jobs2, weak3) = (jobs.clone(), weak.clone());
+                let key = format!("pushstate:{}:{}:{}", sk.rtype, sk.bits, sk.shard);
+                let ok = jobs.submit(key, zeph_sched::Priority::Distribution, 1, move || {
+                    let weak = weak2.clone();
+                    let (jobs, resched) = (jobs2.clone(), weak3.clone());
+                    async move {
+                        if let Some(reg) = weak.upgrade() {
+                            if reg.push_shard_state_once(sk).await {
+                                Self::schedule_pushstate(jobs, resched, sk, 200);
+                            }
+                        }
+                        Ok(())
+                    }
+                });
+                if ok {
+                    return;
+                }
+            }
+        });
+    }
     /// Local resolve against this node's own copy of `sk`'s registry account. Returns the head
     /// `(cid, version)` so a version-aware caller gets the seq.
     async fn resolve_local(

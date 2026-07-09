@@ -134,6 +134,8 @@
       <dt>jobs</dt><dd id="jobs" class="muted">…</dd>
       <dt>listen</dt><dd id="listen" class="muted">…</dd>
       <dt>uptime</dt><dd id="uptime">…</dd>
+      <dt>init</dt><dd id="bootstage">…</dd>
+      <dt>init</dt><dd id="bootstage">…</dd>
     </dl>
   </div>
   <div class="card">
@@ -336,6 +338,8 @@ function render(s){
     " · in-flight " + (j.in_flight||0) + " · deduped " + (j.deduped||0) + " · retried " + (j.retried||0) + " · failed " + (j.failed||0);
   $("listen").textContent = s.listen;
   $("uptime").textContent = fmtUptime(s.uptime_secs);
+  $("bootstage").textContent = s.boot_stage || "—";
+  $("bootstage").textContent = s.boot_stage || "—";
   renderContent(s);
   renderStatus(s);
   renderSettings(s);
