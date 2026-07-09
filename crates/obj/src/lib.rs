@@ -1514,9 +1514,19 @@ impl ObjEngine {
             // system generation makes us mint + push fresh coded pieces each pass, and the
             // cluster accumulates pieces without bound. Only pinned content (or a real
             // piece-holder) repairs; the retained copy just waits, safe.
-            let can_i = self.store.piece_count(&cid) >= 2
+            // SOLE-CAPABLE FALLBACK: a 1-piece holder cannot mint an
+            // independent RLNC piece, so wide spreading (one piece per node)
+            // can leave NO piece-capable repairer anywhere — permanent
+            // under-replication with the WANTED whole content sitting passive
+            // on the publisher (measured: publisher effective=4 vs floor=32,
+            // "can't repair (retained/passive copy)", forever). Passivity is
+            // right while someone else can act; it must yield when nobody can.
+            // Need re-check, batch bound, and election still contain minting.
+            let self_capable = self.store.piece_count(&cid) >= 2
                 || (self.store.has_content(&cid) && self.store.is_pinned(&cid));
-            if !can_i {
+            let sole_content_fallback =
+                !self_capable && capable.is_empty() && self.store.has_content(&cid);
+            if !self_capable && !sole_content_fallback {
                 self.record_health(
                     &cid,
                     have,
@@ -2065,9 +2075,14 @@ impl ObjEngine {
         if have >= floor || !self.is_alive(&cid, any_pinned).await {
             return 0;
         }
-        let can_i = self.store.piece_count(&cid) >= 2
+        let self_capable = self.store.piece_count(&cid) >= 2
             || (self.store.has_content(&cid) && self.store.is_pinned(&cid));
-        if !can_i {
+        // Sole-capable fallback (see the scan path): a wanted whole-content
+        // holder repairs when NO piece-capable holder exists among live
+        // providers — otherwise thin spreading deadlocks repair permanently.
+        let sole_content_fallback =
+            !self_capable && capable.is_empty() && self.store.has_content(&cid);
+        if !self_capable && !sole_content_fallback {
             return 0;
         }
         capable.push(me);

@@ -1,7 +1,13 @@
-//! `MembershipPeers` — a `PeerSource` backed by SWIM membership. When content routing moves
-//! to the DHT, candidate peers for piece placement come from real-time in-network liveness
-//! (the membership active view) instead of the tracker's node registry. The membership
-//! handle is injected after construction, since membership is built later than the obj engine.
+//! `MembershipPeers` — a `PeerSource` backed by membership's CONVERGED CENSUS
+//! (not the size-5 active view). The census is the designed substrate for the
+//! health scan's liveness filter and for placement candidates (ZEPHCRAFT §4.2);
+//! using the active view here capped both at ~5 peers — providers outside the
+//! view were filtered as "dead" (the seed read at_risk=100 for every cid while
+//! its peers read ~0, because its true low local count wasn't padded by its own
+//! stale high record the way others saw it) and publish/rebalance round-robined
+//! over 5 targets in a 20-node cluster (the node-holds-nothing placement skew).
+//! Same defect class as the registry's old active-view election ceiling.
+//! The membership handle is injected after construction.
 
 use std::sync::Arc;
 
@@ -32,14 +38,7 @@ impl MembershipPeers {
 impl PeerSource for MembershipPeers {
     async fn peers(&self) -> Vec<(NodeId, PeerAddr)> {
         match self.membership.read().await.as_ref() {
-            Some(m) => m
-                .snapshot()
-                .await
-                .active
-                .into_iter()
-                .filter(|(_, ps)| ps.alive)
-                .map(|(id, ps)| (id, ps.addr))
-                .collect(),
+            Some(m) => m.census().await,
             None => Vec::new(),
         }
     }

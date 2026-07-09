@@ -478,6 +478,34 @@ async fn scenario_b_mass_rejoin() {
          max_job={}ms ({} on node{}) at_risk={at_risk:?}",
         max_job.0, max_job.1, max_job.2
     );
+    // Anomaly probe: the node with the MOST at-risk cids — dump its recorded
+    // per-cid verdicts (effective/floor/live_providers) for a sample, so a
+    // counting deficit is distinguishable from stuck hysteresis.
+    if let Some((wi, _)) = at_risk.iter().enumerate().max_by_key(|(_, n)| **n) {
+        let node = &nodes[wi];
+        let mut shown = 0;
+        for cid in node.engine.store().cids() {
+            if !node.engine.is_at_risk(&cid) {
+                continue;
+            }
+            if let Some(h) = node.engine.cid_health(&cid) {
+                println!(
+                    "node{wi} at-risk sample {}: effective={} floor={} live_providers={} decision={:?} action={:?}",
+                    cid.to_hex(),
+                    h.effective,
+                    h.floor,
+                    h.live_providers,
+                    h.decision,
+                    h.action
+                );
+            }
+            shown += 1;
+            if shown >= 3 {
+                break;
+            }
+        }
+    }
+
     println!(
         "scenario B: cluster max queue_depth timeline (t_secs, depth, node): {depth_timeline:?}"
     );

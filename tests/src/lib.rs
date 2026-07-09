@@ -75,15 +75,11 @@ impl MembershipPeers {
 #[async_trait::async_trait]
 impl PeerSource for MembershipPeers {
     async fn peers(&self) -> Vec<(NodeId, PeerAddr)> {
+        // CENSUS, not the size-5 active view — mirrors noded/src/peers.rs
+        // (the active view capped liveness filtering + placement at ~5 peers:
+        // the seed at_risk=100 anomaly and the placement skew).
         match self.membership.read().await.as_ref() {
-            Some(m) => m
-                .snapshot()
-                .await
-                .active
-                .into_iter()
-                .filter(|(_, ps)| ps.alive)
-                .map(|(id, ps)| (id, ps.addr))
-                .collect(),
+            Some(m) => m.census().await,
             None => Vec::new(),
         }
     }
