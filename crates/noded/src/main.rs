@@ -1535,10 +1535,14 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         }
     });
 
-    // Re-announce provider records for everything we hold (pins + pieces),
-    // immediately (first tick) and periodically — so held content stays
-    // discoverable across restart and churn. Interval well inside the provider
-    // TTL and short enough to recover quickly.
+    // Re-announce provider records for everything we hold (pins + pieces) —
+    // CHUNKED: the due list becomes ~25-cid coordinator jobs that interleave
+    // with scans/repairs, instead of one O(held) job holding a slot through
+    // the startup burst (measured 22s — every run's max_job once the
+    // distribute sweep died). Steady-state due lists are near-zero.
+    // NOTE: CraftSQL DB heads + durability manifests are NOT re-announced
+    // here — they ride the owner-signed registry substrate (RT_DBROOT /
+    // RT_MANIFEST); `CraftSql::reannounce_heads` is retained but unused.
     let announce_engine = engine.clone();
     let announce_jobs = jobs.clone();
     let reannounce_secs = cfg.reannounce_secs.max(1);
@@ -1546,24 +1550,36 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         let mut interval = tokio::time::interval(Duration::from_secs(reannounce_secs));
         loop {
             interval.tick().await;
+            let due = announce_engine.due_announcements();
+            let total = due.len();
+            for (i, chunk) in due.chunks(25).enumerate() {
+                let e = announce_engine.clone();
+                let batch: Vec<_> = chunk.to_vec();
+                announce_jobs.submit(
+                    format!("reannounce:{i}"),
+                    zeph_sched::Priority::Distribution,
+                    1,
+                    move || {
+                        let (e, batch) = (e.clone(), batch.clone());
+                        async move {
+                            e.announce_batch(&batch).await;
+                            Ok(())
+                        }
+                    },
+                );
+            }
+            if total > 0 {
+                tracing::info!(cids = total, "re-announce scheduled (chunked)");
+            }
             let e = announce_engine.clone();
-            // Distribution priority: getting records to peers matters, but yields
-            // to Repair. Deduped so a slow re-announce can't stack.
             announce_jobs.submit(
-                "reannounce",
+                "reannounce_wants",
                 zeph_sched::Priority::Distribution,
                 1,
                 move || {
                     let e = e.clone();
                     async move {
-                        let n = e.reannounce_providers().await;
-                        if n > 0 {
-                            tracing::info!(cids = n, "re-announced provider records");
-                        }
-                        // NOTE: CraftSQL DB heads + durability manifests are NO LONGER re-announced
-                        // here — they ride the owner-signed registry substrate now (RT_DBROOT /
-                        // RT_MANIFEST), which persists + replicates them, so a DHT re-announce is
-                        // redundant. `CraftSql::reannounce_heads` is retained (phase 2) but unused.
+                        e.reannounce_wants().await;
                         Ok(())
                     }
                 },

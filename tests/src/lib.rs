@@ -327,8 +327,9 @@ impl TestNode {
             }));
         }
 
-        // Re-announce provider records for everything held, immediately (first
-        // tick) and periodically.
+        // Re-announce provider records — CHUNKED coordinator jobs (mirrors
+        // cmd_run post-chunking: the due list becomes ~25-cid jobs instead of
+        // one O(held) slot-hogging walk).
         {
             let announce_engine = engine.clone();
             let announce_jobs = jobs.clone();
@@ -336,14 +337,36 @@ impl TestNode {
                 let mut interval = tokio::time::interval(Duration::from_secs(REANNOUNCE_SECS));
                 loop {
                     interval.tick().await;
+                    let due = announce_engine.due_announcements();
+                    for (i, chunk) in due.chunks(25).enumerate() {
+                        let e = announce_engine.clone();
+                        let batch: Vec<_> = chunk.to_vec();
+                        announce_jobs.submit(
+                            format!("reannounce:{i}"),
+                            Priority::Distribution,
+                            1,
+                            move || {
+                                let (e, batch) = (e.clone(), batch.clone());
+                                async move {
+                                    e.announce_batch(&batch).await;
+                                    Ok(())
+                                }
+                            },
+                        );
+                    }
                     let e = announce_engine.clone();
-                    announce_jobs.submit("reannounce", Priority::Distribution, 1, move || {
-                        let e = e.clone();
-                        async move {
-                            let _ = e.reannounce_providers().await;
-                            Ok(())
-                        }
-                    });
+                    announce_jobs.submit(
+                        "reannounce_wants",
+                        Priority::Distribution,
+                        1,
+                        move || {
+                            let e = e.clone();
+                            async move {
+                                e.reannounce_wants().await;
+                                Ok(())
+                            }
+                        },
+                    );
                 }
             }));
         }

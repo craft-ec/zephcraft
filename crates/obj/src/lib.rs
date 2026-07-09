@@ -1165,6 +1165,61 @@ impl ObjEngine {
     /// provider-record TTL). Without this, a restarted node's holdings —
     /// pinned or not — silently become unreachable once their records
     /// expire, even though the bytes are on disk. Returns the count announced.
+    /// The provider records currently DUE for re-announce (past the republish
+    /// window), plus this node's WANT cids — collected without announcing, so
+    /// the node can submit the refresh as CHUNKED coordinator jobs instead of
+    /// one O(held) slot-hogging walk (the startup burst measured 22s/job).
+    pub fn due_announcements(&self) -> Vec<(Cid, u32, bool)> {
+        let now = self.now_millis();
+        let sched = self.announced_at.lock().expect("announced_at");
+        self.store
+            .cids()
+            .into_iter()
+            .filter_map(|cid| {
+                let due = sched
+                    .get(&cid.0)
+                    .is_none_or(|t| now.saturating_sub(*t) >= REPUBLISH_MS);
+                if !due {
+                    return None;
+                }
+                let count = self.store.piece_count(&cid) as u32;
+                let pinned = self.store.is_pinned(&cid);
+                (count > 0 || self.store.has_content(&cid)).then_some((cid, count, pinned))
+            })
+            .collect()
+    }
+
+    /// Announce one batch of provider records (a chunked-reannounce job body).
+    /// No internal pacing — the chunk size and the coordinator ARE the pacing.
+    pub async fn announce_batch(&self, batch: &[(Cid, u32, bool)]) -> usize {
+        let now = self.now_millis();
+        let results = futures::future::join_all(batch.iter().map(|(cid, count, pinned)| {
+            let (cid, count, pinned) = (*cid, *count, *pinned);
+            async move { self.routing.announce(cid, count, pinned).await.is_ok() }
+        }))
+        .await;
+        let mut announced = 0usize;
+        let mut sched = self.announced_at.lock().expect("announced_at");
+        for ((cid, _, _), ok) in batch.iter().zip(&results) {
+            if *ok {
+                sched.insert(cid.0, now);
+                announced += 1;
+            }
+        }
+        announced
+    }
+
+    /// Re-announce this node's WANT interest records (few; cheap each cycle).
+    pub async fn reannounce_wants(&self) {
+        futures::future::join_all(
+            self.store
+                .wanted_cids()
+                .into_iter()
+                .map(|cid| async move { self.routing.announce_want(cid).await }),
+        )
+        .await;
+    }
+
     pub async fn reannounce_providers(&self) -> usize {
         // TTL-aware PER-CID scheduling: re-announce a record only when it is DUE (past the
         // republish window for its DHT TTL), not every cycle. Steady-state → near-zero
