@@ -1,3 +1,83 @@
+# TRANSFER PLANE V2 — SCOREBOARD (updated 2026-07-10, ultracode)
+DEPLOY-GATE ADVERSARIAL REVIEW (workflow wf_92b52e18, 24 agents, 11 confirmed findings) found the
+GREEN HARNESS WAS MASKING 3 REAL DEFECTS (no scenario held passive under-replicated whole content
+or killed a live holder). All 3 FIXED + gated (commit 536d90a):
+  1. [CRIT] sole-capable repair fallback was DEAD CODE (election over empty `capable` → None →
+     skipped enqueue; the e61f252 deadlock fix never ran). Fix: push self in fallback. Gated by
+     obj test VERIFIED to fail pre-fix (got Err(Empty)).
+  2. [DURABILITY] census-as-liveness counted SWIM-dead holders alive 120s → repair suppressed ~2min
+     post-death. New liveness_census() (excl. dead, 30s TTL); 120s census kept for registry election.
+  3. [LIVE] rebalance stalled forever on a dead least-full target. Skip-set + no-loss-on-fail.
+  + S5 interim: hoisted liveness fetch out of the per-cid rebalance loop.
+POST-FIX HARNESS: A PASS (17ms scans); B census-20 30→21s, distribution 17s, max_job 1.2s — all
+IMPROVED. Only red = at-risk bar (heal-rate-bound SHAPE issue, P3 reshape).
+STILL REQUIRED BEFORE FLEET DEPLOY (P3): scenario C (kill live multi-cid holder → repair fires
+within a small multiple of scan interval) + scenario D (restart-rejoin, FULL store) + rejoin
+memory check. Do-NOT-SCALE gate: S5 O(census)-per-item in scale_one/repair_one recruit still open
+(benign N=20, hard ceiling at 1000s — needs bounded K-subset accessor before any scale-out).
+PRIORITIZED PLAN (from workflow synthesis): P1 element5 class-fairness (sched per-class caps) ·
+P2 element4 elected-scan · P3 restart-rejoin harness + in-flight-jobs visibility + at-risk bar
+reshape · THEN deploy gate · THEN wire roll (offer/grant+mux) + scenario C-capped · THEN scale
+S4/S1/S2. Blueprints for all in workflow result (tasks/w8tyvqane.output).
+
+# TRANSFER PLANE V2 — SCOREBOARD (updated end of 2026-07-09)
+Harness-gated progress (tests/tests/transfer_plane.rs; run: cargo test -p zeph-tests --test
+transfer_plane -- --ignored --test-threads=1 --nocapture):
+- Scenario A (steady state): PASS since clean baseline — scan p50 12-15ms, full convergence ~80s.
+- Scenario B (5→20 mass rejoin), baseline → now:
+    census-20: 105s → 45s (bar 30s — NEAR; tail = last nodes' final members)
+    max_job: 43.8s distribute → 22s reannounce (distribute CLASS DELETED by S3)
+    at-risk drain: 78-100 all nodes → 3-13 on 19/20 nodes
+    queues: plateau → drained
+- SHIPPED (committed, NOT yet deployed to fleet): e501d17 S3 lazy rebalance (sweep deleted,
+  rebalance_cid rides the scan, fired_for_digest bug retired) · 1df361e epidemic census diffusion
+  (new-member merge wakes an immediate debounced shuffle) + TestNode synced to post-S3 wiring
+  (harness fidelity MUST track cmd_run — its stale driver contaminated one run).
+- SEED ANOMALY RESOLVED (e61f252, dug 2026-07-10): TWO stacked causes + one non-bug.
+  (a) MembershipPeers returned the size-5 ACTIVE VIEW not the census (doc violation; same class
+  as the old registry election ceiling) → scan liveness filtered 14/19 providers as dead AND
+  placement round-robined over 5 targets (scenario A skew). Census-backed now → scenario A
+  distribution 78s→22s, scenario B initial 46s→14s. (b) REPAIR DEADLOCK: 1-piece holders can't
+  mint independent RLNC pieces, so thin spreading left NO capable repairer while the publisher's
+  wanted whole content sat passive by rule → sole-capable fallback (content-holder repairs iff
+  no piece-capable live holder; need/batch/election contain minting). (c) Residual high seed
+  count = VISIBILITY not sickness: it scans all 100 held cids mid-heal; joiners hold few.
+- REANNOUNCE CHUNKED (7baef74): due list → ~25-cid coordinator batch jobs; max_job 22s → 1.0s —
+  the >10s JOB BAR IS GREEN, no O(held) single jobs remain anywhere.
+- SCOREBOARD vs baseline: max_job 43.8s→1.0s ✓ · initial distribution 46s→12s · scenario A
+  distribution 78s→19s, scans 17ms ✓ · census-20 105s→~45s (bar 30s — LAST structural red) ·
+  at-risk stuck-forever→heal-rate-bound mid-drain.
+- CENSUS TAIL CLOSED (d4fa9d1): epidemic FAN-OUT (push member map to 3 active peers per round,
+  not 1) + passive-mixed shuffle targets → census-20 105s→30.4s (at the bar; ~5s run noise).
+- SCOREBOARD vs baseline: census-20 105→30s ✓ · max_job 43.8→1-2s ✓ · distribution A 78→17-19s,
+  B 46→12s · scenario A PASS (17ms scans) · at-risk = only remaining red (heal-rate-bound; a
+  bar-SHAPE question — reshape to trend+rate-floor, per the design workflow).
+- UNDEPLOYED v2 diff = a70204c..HEAD (5 crates). Fleet still on old quiet-config binary.
+- IN FLIGHT (ultracode workflow wf_92b52e18): deploy-gate adversarial review of the undeployed
+  diff (4 dims × verify) + design blueprints for element 5 (class fairness), element 4 (elected
+  scan), restart-rejoin harness scenario, at-risk bar reshape + in-flight-jobs visibility →
+  synthesized deploy-gate verdict + prioritized plan. Implement sequentially through the harness
+  after; DEPLOY only after findings fixed + a rejoin memory check.
+- Fleet: extras zeph5-19 STOPPED+DISABLED (production was a permanent scenario-B loop; caps can't
+  cure the balloon — 3.1G kill on a 3G cap). Core-4 quiet config running binary f81fbe66. Deploy
+  of S3+epidemic happens only after the remaining scenario-B bars are green or user green-lights.
+
+# TRANSFER PLANE V2 (2026-07-09, ACTIVE — supersedes further v1 patching)
+User verdict after the patch-regress cycle: the problem is STRUCTURAL — stop building around the
+current design. docs/TRANSFER_PLANE_V2.md (commit 9b3e7c9) is the spec: 5 structural elements
+(mux single-conn/peer · choke active-set · offer/grant admission with redirect/requeue · elected
+healthscan (scanner=actor, electorate=last-known capable holders) · class-fair scheduling) + 5
+SCALE elements (S1 digest membership O(Δ) · S2 DHT-native registry placement (removes the census
+ceiling — sharded SQL was built on an O(N²) substrate) · S3 lazy-only convergence, reactive sweeps
+DELETED · S4 version beacons on gossip · S5 invariant: per-node work = O(held+active_set), never
+O(census)). Build order in the doc; NOTHING deploys without passing the offline acceptance harness
+(tests/tests/transfer_plane.rs: scenario A steady-state scan p50<250ms; B mass-rejoin census 20<30s,
+no job >10s, queue drains; C capped receiver sheds via grants). Harness construction delegated
+(subagent, tests/ crate only) — baseline numbers against current code expected to FAIL = the
+reproduction. Live cluster: STABLE (census 20, no OOM) but slow; last deployed binary 82d22719
+(DHT serve pipelining — fixes the pooling-induced per-peer serialization convoy). NO further live
+patching; v1 patch train ends here.
+
 # SCALE CONVERGENCE: CONN POOL + JOB COORDINATOR EXTENSION + RESOURCE MANAGER (2026-07-09, in progress)
 Root cause chain proven by the capped 20-node redo + single/5-node rejoin experiments:
 conn-per-request architecture → under concurrency handshakes stack (each holds MBs of QUIC state)
@@ -57,6 +137,12 @@ scan job at HealthScan priority — the Repair tier is unused!).
           benign double-scan; dead winner ages out via membership-filtered records; fresh
           holder bootstraps with one unconditional scan. Composes with provider-aware backoff.
           Implement as its own reviewed change AFTER the batch-repair batch lands.
+      (g) FAST BOOT (user report: boot still slow): census diffusion is shuffle-paced (30s
+          rounds, first tick skipped → 1-3 min to learn all members) and the readiness gates'
+          stability clock resets on each arrival → rides the 90s cap. Fix: send a full
+          MemberSync IMMEDIATELY on join/neighbor connection establishment (message already
+          exists — no wire change) + fire the first shuffle right after bootstrap join. Census
+          completes in ~1 RTT; ready gates settle at the 10s floor. Boot-to-ready ~2-3min → ~15-20s.
       Shipped early (no wire change, commit pending review): REPAIR BATCHING — repair_one mints
       min(deficit, 8) pieces per pass to distinct targets concurrently (was 1/pass; ~2,100
       debris cids × ~90 missing pieces healed at ~30 pieces/min cluster-wide = days; batching
