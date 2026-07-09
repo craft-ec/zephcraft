@@ -115,15 +115,23 @@ pub async fn request_registry(
     addr: &PeerAddr,
     req: &RegistryReq,
 ) -> anyhow::Result<RegistryResp> {
-    tokio::time::timeout(REQUEST_TIMEOUT, async {
-        let conn = transport.connect(addr, REGISTRY_ALPN).await?;
+    // Pooled per-peer connection: shared with other requests, never closed
+    // here. A failed round-trip evicts the entry so the next one re-dials.
+    let conn = tokio::time::timeout(REQUEST_TIMEOUT, transport.connect(addr, REGISTRY_ALPN))
+        .await
+        .map_err(|_| anyhow::anyhow!("registry connect timed out after {REQUEST_TIMEOUT:?}"))??;
+    let out = tokio::time::timeout(REQUEST_TIMEOUT, async {
         let (mut send, mut recv) = conn.open_bi().await?;
         send.write_all(&postcard::to_allocvec(req)?).await?;
         send.finish()?;
         let resp = recv.read_to_end(MAX_FRAME).await?;
-        conn.close(0u32.into(), b"done");
-        Ok(postcard::from_bytes(&resp)?)
+        anyhow::Ok(postcard::from_bytes::<RegistryResp>(&resp)?)
     })
     .await
-    .map_err(|_| anyhow::anyhow!("registry request timed out after {REQUEST_TIMEOUT:?}"))?
+    .map_err(|_| anyhow::anyhow!("registry request timed out after {REQUEST_TIMEOUT:?}"))
+    .and_then(|r| r);
+    if out.is_err() {
+        transport.evict(addr, REGISTRY_ALPN, &conn);
+    }
+    out
 }

@@ -32,10 +32,6 @@ pub struct DhtNode {
     table: Mutex<RoutingTable>,
     store: RecordStore,
     transport: Arc<Transport>,
-    /// Cached outbound DHT connections keyed by peer NodeId. Reused across requests (a fresh
-    /// stream per request) instead of connect+close per op — the per-op teardown re-ran the
-    /// QUIC/multipath handshake every time and stormed the network during the cutover.
-    conns: Mutex<HashMap<[u8; 32], Connection>>,
     /// Consecutive failed-request count per peer; crossing `EVICT_AFTER` evicts it.
     failures: Mutex<HashMap<[u8; 32], u32>>,
     /// Evicted-dead peers → expiry millis. `learn` refuses to re-add a live tombstone, so a
@@ -62,7 +58,6 @@ impl DhtNode {
             identity,
             me,
             transport,
-            conns: Mutex::new(HashMap::new()),
             failures: Mutex::new(HashMap::new()),
             tombstones: Mutex::new(HashMap::new()),
             seeds: Mutex::new(HashSet::new()),
@@ -90,7 +85,7 @@ impl DhtNode {
             failures.remove(&id);
             drop(failures);
             self.table.lock().expect("table").remove(&peer.id);
-            self.conns.lock().expect("conns").remove(&id);
+            self.transport.evict_peer(&peer.id);
             self.tombstones
                 .lock()
                 .expect("tombstones")
@@ -293,36 +288,25 @@ impl DhtNode {
     /// One request → one reply over the DHT ALPN. `None` on any failure (dead peer, bad
     /// reply) — callers treat that as "no answer", never an error to propagate.
     async fn request(&self, peer: &Contact, msg: &DhtMessage) -> Option<DhtMessage> {
-        // Reuse a cached connection (a fresh stream per request); if the cached one is dead,
-        // drop it and reconnect once. No per-request close → no handshake/multipath churn.
+        // The TRANSPORT pools one connection per (peer, ALPN) — this was the DHT's private
+        // cache pattern, promoted stack-wide. A fresh stream per request; if the pooled
+        // connection is dead, evict and reconnect once (connect_fresh bypasses the pool).
         for attempt in 0..2 {
-            if let Some(conn) = self.conn_for(peer, attempt == 1).await {
+            let conn = if attempt == 0 {
+                self.transport.connect(&peer.addr, ALPN).await.ok()
+            } else {
+                self.transport.connect_fresh(&peer.addr, ALPN).await.ok()
+            };
+            if let Some(conn) = conn {
                 if let Some(reply) = Self::request_on(&conn, msg).await {
                     self.note_alive(&peer.id.0);
                     return Some(reply);
                 }
-                self.conns.lock().expect("conns").remove(&peer.id.0);
+                self.transport.evict(&peer.addr, ALPN, &conn);
             }
         }
         self.note_dead(peer);
         None
-    }
-
-    /// A live connection to `peer` — cached, or freshly dialed and cached. `force_new` bypasses
-    /// the cache to recover from a connection that just failed a request.
-    async fn conn_for(&self, peer: &Contact, force_new: bool) -> Option<Connection> {
-        if !force_new {
-            let cached = self.conns.lock().expect("conns").get(&peer.id.0).cloned();
-            if let Some(c) = cached {
-                return Some(c);
-            }
-        }
-        let conn = self.transport.connect(&peer.addr, ALPN).await.ok()?;
-        self.conns
-            .lock()
-            .expect("conns")
-            .insert(peer.id.0, conn.clone());
-        Some(conn)
     }
 
     /// One request/response over an existing connection (opens a fresh bi-stream; the

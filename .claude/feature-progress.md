@@ -1,3 +1,34 @@
+# SCALE CONVERGENCE: CONN POOL + JOB COORDINATOR EXTENSION + RESOURCE MANAGER (2026-07-09, in progress)
+Root cause chain proven by the capped 20-node redo + single/5-node rejoin experiments:
+conn-per-request architecture → under concurrency handshakes stack (each holds MBs of QUIC state)
+→ RSS balloons (zeph5: flat 240MB alone; 965MB with 4 co-rejoiners, −800MB freed in ONE 5s sample
+when attempts aborted = pending-conn state, not data) → OOM cap kills → deaths re-trigger dials →
+thrash. Churn↔death correlation: zeph9 3432 churn lines/8min → 3 kills; zeph6 2190 → 3; zeph7 766 → 2.
+Same root as Mac flapping + noq PTO wedges. DHT already has the right pattern (conn_for cache).
+User also directed: (a) resource manager to supplement the job coordinator, (b) extend coordinator
+to cover ALL node jobs (today only distribute ×2 + healthscan go through it; repair runs INSIDE the
+scan job at HealthScan priority — the Repair tier is unused!).
+
+- [x] Phase 1: per-peer connection pool in Transport — DONE. Pool keyed (peer, ALPN) with
+      close_reason validity + stable_id-checked evict + connect_fresh + evict_peer; cleared on
+      rebind/close. All 6 request paths converted (per-request conn.close removed); DHT's private
+      conns cache DELETED (delegates to the pool; attempt-1 = connect_fresh). Review found 2 real
+      issues, both fixed: (1) external tokio::timeout wrapping push_piece dropped the future
+      before its internal evict ran → stuck-but-open conn pooled forever; fix = timeout param
+      runs INSIDE request(), evicts on timeout too (data-plane contract; pings still tolerate
+      timeouts); (2) membership oneway branch swallowed the delivery-read error → now fails the
+      request and evicts. headreg 3s-drain site documented as self-healing. Gates: clippy 0,
+      164/164 tests. NOTE for reviewers: never wrap pooled-conn requests in external timeouts.
+- [ ] Phase 2: job coordinator audit + extension — enumerate all background work (13 loops + inline
+      repair + announce/migrate/reshard/gov ticks), route through JobCoordinator with correct
+      priorities (repair at Repair!), keep event-driven triggers. Gates + review + commit.
+- [ ] Phase 3: resource manager supplementing the coordinator — track RSS + pending-work gauges;
+      admission-gate new jobs / shed load when above budget (mechanism only, minimal-kernel).
+      Design-check before building. Gates + review + commit.
+- [ ] Phase 4 (acceptance): deploy fleet, rerun 20-node rejoin — PASS = census 20 converges, no
+      OOM kills, churn lines near-zero, deploys fast. THEN the original stress measurements
+      (writer spread, held-DB counts, remote resolve latency, reshard 8→9 under load).
+
 # ISOLATION WATCHDOG: ENDPOINT REBIND (2026-07-09, commit 29f9ce1) — DEPLOYED to all 5 nodes
 Fleet roll (binary b9f74279, watchdog string verified in binary on both server + Mac): staggered
 restart zeph..zeph4, Mac binary swap + launchd bounce (transient bootstrap IO-error-5, retry OK).

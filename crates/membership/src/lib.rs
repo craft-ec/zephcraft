@@ -269,15 +269,21 @@ impl Membership {
         self.request(peer, msg, false).await.is_some() || matches!(msg, _ if false)
     }
 
-    /// Send a frame; optionally read a single reply frame.
+    /// Send a frame; optionally read a single reply frame. Rides the pooled
+    /// per-peer connection (streams multiplex; the connection is shared and
+    /// must not be closed here). A failed request evicts the pooled entry so
+    /// the next one re-dials.
     async fn request(
         &self,
         peer: &PeerAddr,
         msg: &wire::Message,
         expect_reply: bool,
     ) -> Option<wire::Frame> {
+        let conn = tokio::time::timeout(self.cfg.probe_timeout, self.transport.connect(peer, ALPN))
+            .await
+            .ok()?
+            .ok()?;
         let fut = async {
-            let conn = self.transport.connect(peer, ALPN).await.ok()?;
             let (mut send, mut recv) = conn.open_bi().await.ok()?;
             send.write_all(&wire::encode(msg, self.transport.clock().now().0))
                 .await
@@ -287,16 +293,21 @@ impl Membership {
                 let bytes = recv.read_to_end(MAX_FRAME).await.ok()?;
                 wire::decode(&bytes).ok()
             } else {
-                // Wait for the peer to close so the frame is delivered.
-                let _ = recv.read_to_end(1).await;
+                // Wait for the peer to finish the reply stream so the frame is
+                // delivered. A stream-level failure here must fail the request
+                // (and evict the pooled conn below) — swallowing it would leave
+                // a broken connection pooled as healthy (review finding).
+                recv.read_to_end(1).await.ok()?;
                 None
             };
-            conn.close(0u32.into(), b"done");
             Some(reply)
         };
         match tokio::time::timeout(self.cfg.probe_timeout, fut).await {
             Ok(Some(reply)) => reply.or(Some(dummy_ok_frame())),
-            _ => None,
+            _ => {
+                self.transport.evict(peer, ALPN, &conn);
+                None
+            }
         }
     }
 

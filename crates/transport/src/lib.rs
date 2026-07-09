@@ -153,8 +153,19 @@ pub struct Transport {
     closed: std::sync::atomic::AtomicBool,
     /// Serializes rebinds; a concurrent caller waits, then finds a fresh epoch.
     rebind_lock: tokio::sync::Mutex<()>,
+    /// Pooled connections: ONE live QUIC connection per (peer, ALPN), shared
+    /// by every caller — streams multiplex over it. Reuse keeps handshake
+    /// volume and connection-state memory bounded by PEER COUNT instead of
+    /// request rate: conn-per-request ballooned rejoining nodes to their OOM
+    /// cap under churn (~1 GB of pending-connection state on one node, freed
+    /// in a single instant when the stacked attempts aborted — measured).
+    /// Closed entries re-dial lazily; cleared on rebind.
+    pool: std::sync::Mutex<std::collections::HashMap<PoolKey, Connection>>,
     clock: std::sync::Arc<hlc::Clock>,
 }
+
+/// Pool key: remote node + ALPN (one connection per protocol per peer).
+type PoolKey = ([u8; 32], Vec<u8>);
 
 impl Transport {
     /// Bind an endpoint using the node's Ed25519 identity as the QUIC secret
@@ -200,6 +211,7 @@ impl Transport {
             epoch: std::sync::atomic::AtomicU64::new(0),
             closed: std::sync::atomic::AtomicBool::new(false),
             rebind_lock: tokio::sync::Mutex::new(()),
+            pool: std::sync::Mutex::new(std::collections::HashMap::new()),
             clock: std::sync::Arc::new(hlc::Clock::new()),
         })
     }
@@ -276,8 +288,10 @@ impl Transport {
         }
         // Close the old endpoint FIRST: with a fixed listen port the fresh
         // socket can only bind once the old one is released. Cap the graceful
-        // close — a wedged endpoint may not close cleanly.
+        // close — a wedged endpoint may not close cleanly. Every pooled
+        // connection belongs to the old endpoint, so flush the pool with it.
         let old = self.current();
+        self.pool.lock().expect("conn pool").clear();
         let _ = tokio::time::timeout(Duration::from_secs(5), old.close()).await;
         let mut last_err = String::new();
         for _ in 0..10 {
@@ -329,18 +343,76 @@ impl Transport {
         PeerAddr(self.current().addr())
     }
 
-    /// Connect to a peer for a given ALPN.
+    /// A live connection to `peer` for `alpn` — pooled, or freshly dialed and
+    /// pooled. Callers open streams on it (`open_bi`) and MUST NOT close it:
+    /// the connection is shared and long-lived; iroh's idle timeout reclaims
+    /// unused ones (a closed entry re-dials lazily on the next call). After a
+    /// request on it fails, call [`Self::evict`] so the next request re-dials.
     pub async fn connect(&self, peer: &PeerAddr, alpn: &[u8]) -> Result<Connection> {
-        self.current()
+        let key = (peer.node_id().0, alpn.to_vec());
+        if let Some(conn) = self.pool.lock().expect("conn pool").get(&key) {
+            // Closed (idle-timeout, peer restart, error) → fall through and re-dial.
+            if conn.close_reason().is_none() {
+                return Ok(conn.clone());
+            }
+        }
+        self.connect_fresh(peer, alpn).await
+    }
+
+    /// Dial a NEW connection and pool it, replacing any existing entry —
+    /// the recovery path when a pooled connection is broken in a way
+    /// `close_reason` cannot see yet. A replaced connection is only dropped
+    /// from the pool, never closed here: a concurrent caller may still be
+    /// mid-request on it, and iroh's idle timeout reclaims it shortly after.
+    pub async fn connect_fresh(&self, peer: &PeerAddr, alpn: &[u8]) -> Result<Connection> {
+        let conn = self
+            .current()
             .connect(peer.0.clone(), alpn)
             .await
-            .map_err(|e| TransportError::Connect(e.to_string()))
+            .map_err(|e| TransportError::Connect(e.to_string()))?;
+        let key = (peer.node_id().0, alpn.to_vec());
+        self.pool
+            .lock()
+            .expect("conn pool")
+            .insert(key, conn.clone());
+        Ok(conn)
+    }
+
+    /// Drop the pooled connection for (peer, alpn) if it is still `failed` —
+    /// callers report a request failure here so the next request re-dials.
+    /// The identity check keeps a stale caller from evicting a healthy
+    /// replacement that another task already dialed.
+    pub fn evict(&self, peer: &PeerAddr, alpn: &[u8], failed: &Connection) {
+        let key = (peer.node_id().0, alpn.to_vec());
+        let mut pool = self.pool.lock().expect("conn pool");
+        if pool
+            .get(&key)
+            .is_some_and(|c| c.stable_id() == failed.stable_id())
+        {
+            pool.remove(&key);
+        }
+    }
+
+    /// Drop every pooled connection to `peer` (all ALPNs) — for callers that
+    /// declared the peer dead and want no lingering entries for it.
+    pub fn evict_peer(&self, peer: &NodeId) {
+        self.pool
+            .lock()
+            .expect("conn pool")
+            .retain(|(id, _), _| id != &peer.0);
     }
 
     /// Round-trip a ping to `peer` over wire frames (M1.4); returns RTT + skew.
+    /// Rides the POOLED connection (no handshake in the steady state, so the
+    /// RTT measures the path, not connection setup). A stream-level failure
+    /// evicts the pooled connection so the next ping re-dials; a TIMEOUT does
+    /// not — a slow peer's connection is likely fine, and QUIC's own loss
+    /// detection closes a truly dead one (which `connect` then replaces).
     pub async fn ping(&self, peer: &PeerAddr, timeout: Duration) -> Result<PingReport> {
+        let conn = tokio::time::timeout(timeout, self.connect(peer, alpn::PING))
+            .await
+            .map_err(|_| TransportError::Timeout(timeout))??;
         let fut = async {
-            let conn = self.connect(peer, alpn::PING).await?;
             let (mut send, mut recv) = conn
                 .open_bi()
                 .await
@@ -376,12 +448,15 @@ impl Transport {
                 tracing::warn!(skew_ms = merge.skew_ms, "peer clock far ahead (clamped)");
             }
             let rtt = started.elapsed();
-            conn.close(0u32.into(), b"done");
             Ok(PingReport { rtt, peer_skew_ms })
         };
-        tokio::time::timeout(timeout, fut)
+        let out = tokio::time::timeout(timeout, fut)
             .await
-            .map_err(|_| TransportError::Timeout(timeout))?
+            .map_err(|_| TransportError::Timeout(timeout))?;
+        if matches!(out, Err(TransportError::Stream(_))) {
+            self.evict(peer, alpn::PING, &conn);
+        }
+        out
     }
 
     /// Accept loop: route incoming connections to per-ALPN handlers.
@@ -476,6 +551,7 @@ impl Transport {
     pub async fn close(&self) {
         self.closed
             .store(true, std::sync::atomic::Ordering::Release);
+        self.pool.lock().expect("conn pool").clear();
         self.current().close().await;
     }
 }
@@ -606,6 +682,62 @@ mod tests {
             .ping(&server.addr(), Duration::from_secs(10))
             .await
             .unwrap();
+
+        client.close().await;
+        server.close().await;
+        serve.abort();
+    }
+
+    /// Connection pool: repeated connects to the same (peer, ALPN) return the
+    /// SAME connection; evict forces a re-dial; rebind clears the pool.
+    #[tokio::test]
+    async fn pool_reuses_evicts_and_clears_on_rebind() {
+        let server_id = NodeIdentity::generate();
+        let server = std::sync::Arc::new(
+            Transport::bind(
+                server_id.secret_key_bytes(),
+                Reach::LocalOnly,
+                vec![alpn::PING.to_vec()],
+                0,
+            )
+            .await
+            .unwrap(),
+        );
+        let serve = {
+            let server = server.clone();
+            tokio::spawn(async move { server.serve_ping().await })
+        };
+
+        let client_id = NodeIdentity::generate();
+        let client = Transport::bind(client_id.secret_key_bytes(), Reach::LocalOnly, vec![], 0)
+            .await
+            .unwrap();
+        let addr = server.addr();
+
+        // Reuse: same underlying connection both times.
+        let c1 = client.connect(&addr, alpn::PING).await.unwrap();
+        let c2 = client.connect(&addr, alpn::PING).await.unwrap();
+        assert_eq!(c1.stable_id(), c2.stable_id(), "pooled connection reused");
+
+        // Two pings ride the pool (no per-request close teardown).
+        client.ping(&addr, Duration::from_secs(10)).await.unwrap();
+        client.ping(&addr, Duration::from_secs(10)).await.unwrap();
+
+        // Evict: next connect dials a NEW connection.
+        client.evict(&addr, alpn::PING, &c2);
+        let c3 = client.connect(&addr, alpn::PING).await.unwrap();
+        assert_ne!(c2.stable_id(), c3.stable_id(), "evicted → re-dialed");
+
+        // A stale evict (old connection) must NOT drop the current entry.
+        client.evict(&addr, alpn::PING, &c2);
+        let c4 = client.connect(&addr, alpn::PING).await.unwrap();
+        assert_eq!(c3.stable_id(), c4.stable_id(), "stale evict ignored");
+
+        // Rebind clears the pool; connects and pings work from the fresh endpoint.
+        client.rebind().await.unwrap();
+        let c5 = client.connect(&addr, alpn::PING).await.unwrap();
+        assert_ne!(c4.stable_id(), c5.stable_id(), "pool cleared on rebind");
+        client.ping(&addr, Duration::from_secs(10)).await.unwrap();
 
         client.close().await;
         server.close().await;

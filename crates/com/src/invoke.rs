@@ -137,12 +137,22 @@ pub async fn invoke_remote(
     addr: &PeerAddr,
     req: &InvokeRequest,
 ) -> anyhow::Result<Vec<u8>> {
+    // Pooled connection: shared, never closed here; evict on failure so the
+    // next invocation re-dials.
     let conn = transport.connect(addr, INVOKE_ALPN).await?;
-    let (mut send, mut recv) = conn.open_bi().await?;
-    send.write_all(&postcard::to_allocvec(req)?).await?;
-    send.finish()?;
-    let resp = recv.read_to_end(64 * 1024).await?;
-    conn.close(0u32.into(), b"done");
+    let fut = async {
+        let (mut send, mut recv) = conn.open_bi().await?;
+        send.write_all(&postcard::to_allocvec(req)?).await?;
+        send.finish()?;
+        anyhow::Ok(recv.read_to_end(64 * 1024).await?)
+    };
+    let resp = match fut.await {
+        Ok(resp) => resp,
+        Err(err) => {
+            transport.evict(addr, INVOKE_ALPN, &conn);
+            return Err(err);
+        }
+    };
     match resp.split_first() {
         Some((0x01, out)) => Ok(out.to_vec()),
         _ => anyhow::bail!("remote invocation failed"),

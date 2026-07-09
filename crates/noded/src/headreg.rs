@@ -1686,6 +1686,11 @@ impl HeadRegistry {
                 }
             });
         }
+        // NOTE: this 3s drain deadline can drop a request_registry future
+        // before its internal (8s) timeout evicts a stuck pooled connection.
+        // Acceptable here: every OTHER registry caller runs the internal
+        // timeout unwrapped, so a stuck conn is evicted within one normal
+        // request cycle — a laggard costs one slow listing, not a stall loop.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
         while let Ok(Some(res)) = tokio::time::timeout_at(deadline, futs.next()).await {
             if let Some(rows) = res {

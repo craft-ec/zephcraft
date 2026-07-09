@@ -77,20 +77,28 @@ impl PageSource for TransportPageSource {
             .connect(&addr, ALPN)
             .await
             .map_err(|e| SqlError::Sqlite(format!("connect: {e}")))?;
-        let (mut send, mut recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| SqlError::Sqlite(format!("open_bi: {e}")))?;
-        send.write_all(&cid.0)
-            .await
-            .map_err(|e| SqlError::Sqlite(e.to_string()))?;
-        send.finish().map_err(|e| SqlError::Sqlite(e.to_string()))?;
-        let data = recv
-            .read_to_end(MAX_OBJECT)
-            .await
-            .map_err(|e| SqlError::Sqlite(e.to_string()))?;
-        conn.close(0u32.into(), b"done");
-        Ok(if data.is_empty() { None } else { Some(data) })
+        // Pooled connection: shared, never closed here; evict on failure so
+        // the next fetch re-dials.
+        let fut = async {
+            let (mut send, mut recv) = conn
+                .open_bi()
+                .await
+                .map_err(|e| SqlError::Sqlite(format!("open_bi: {e}")))?;
+            send.write_all(&cid.0)
+                .await
+                .map_err(|e| SqlError::Sqlite(e.to_string()))?;
+            send.finish().map_err(|e| SqlError::Sqlite(e.to_string()))?;
+            recv.read_to_end(MAX_OBJECT)
+                .await
+                .map_err(|e| SqlError::Sqlite(e.to_string()))
+        };
+        match fut.await {
+            Ok(data) => Ok(if data.is_empty() { None } else { Some(data) }),
+            Err(err) => {
+                self.transport.evict(&addr, ALPN, &conn);
+                Err(err)
+            }
+        }
     }
 }
 

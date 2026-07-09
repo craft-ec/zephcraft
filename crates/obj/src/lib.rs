@@ -160,6 +160,12 @@ const HEALTH_EPOCH_MS: u64 = 30_000;
 /// holding an interactive publish/deploy hostage.
 const PUSH_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Bound on a single request round-trip for non-bulk traffic (piece fetch,
+/// want/release signals) and one-off repair/scale pushes — preserves the old
+/// per-read bound, now covering the whole interaction so the pooled-connection
+/// evict always runs (see [`request`]).
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Outcome of publishing a file (content + its manifest).
 #[derive(Debug, Clone)]
 /// Result of publishing a PRIVATE file (ENCRYPTION_DESIGN.md phase 2). The
@@ -560,13 +566,20 @@ impl ObjEngine {
                     let transport_ref = &transport;
                     let results =
                         futures::future::join_all(jobs.iter().map(|(peer, piece)| async move {
-                            match tokio::time::timeout(
+                            // Timeout lives INSIDE push_piece/request — an external
+                            // wrap would drop the future before its pool-evict runs.
+                            match push_piece(
+                                transport_ref,
+                                is_system,
+                                peer,
+                                cid,
+                                gen_ref,
+                                piece,
                                 PUSH_TIMEOUT,
-                                push_piece(transport_ref, is_system, peer, cid, gen_ref, piece),
                             )
                             .await
                             {
-                                Ok(Ok(())) => Some(peer.node_id()),
+                                Ok(()) => Some(peer.node_id()),
                                 _ => None,
                             }
                         }))
@@ -710,6 +723,7 @@ impl ObjEngine {
         cid: Cid,
         gen: &Generation,
         piece: &CodedPiece,
+        timeout: Duration,
     ) -> anyhow::Result<()> {
         push_piece(
             &self.transport,
@@ -718,12 +732,13 @@ impl ObjEngine {
             cid,
             gen,
             piece,
+            timeout,
         )
         .await
     }
 
     async fn request(&self, peer: &PeerAddr, msg: &wire::Message) -> anyhow::Result<wire::Message> {
-        request(&self.transport, peer, msg).await
+        request(&self.transport, peer, msg, REQUEST_TIMEOUT).await
     }
 
     /// Fetch content by CID alone: resolve providers, fetch + verify + decode.
@@ -1718,10 +1733,11 @@ impl ObjEngine {
             let mut distinct = HashSet::new();
             for (i, piece) in pieces.iter().enumerate() {
                 let peer = &candidates[i % candidates.len()];
-                if tokio::time::timeout(PUSH_TIMEOUT, self.push_piece(peer, cid, &gen, piece))
+                // Timeout lives INSIDE push_piece — see request()'s contract.
+                if self
+                    .push_piece(peer, cid, &gen, piece, PUSH_TIMEOUT)
                     .await
-                    .map(|r| r.is_ok())
-                    .unwrap_or(false)
+                    .is_ok()
                 {
                     distinct.insert(peer.node_id());
                 }
@@ -1830,7 +1846,11 @@ impl ObjEngine {
                     break;
                 };
                 let pid = piece.piece_id();
-                if self.push_piece(taddr, cid, &gen, &piece).await.is_ok() {
+                if self
+                    .push_piece(taddr, cid, &gen, &piece, REQUEST_TIMEOUT)
+                    .await
+                    .is_ok()
+                {
                     let _ = self.store.remove_piece(&cid, &pid);
                     *belief.entry(tid).or_insert(0) += 1;
                     mine -= 1;
@@ -1909,7 +1929,11 @@ impl ObjEngine {
             if id == me || provider_ids.contains(&id) {
                 continue;
             }
-            if self.push_piece(&addr, cid, &gen, &piece).await.is_ok() {
+            if self
+                .push_piece(&addr, cid, &gen, &piece, REQUEST_TIMEOUT)
+                .await
+                .is_ok()
+            {
                 return true;
             }
         }
@@ -1971,7 +1995,10 @@ impl ObjEngine {
             .filter(|(id, _, _, _)| *id != me)
             .min_by_key(|(_, _, c, _)| *c)
         {
-            return self.push_piece(addr, *cid, gen, &piece).await.is_ok();
+            return self
+                .push_piece(addr, *cid, gen, &piece, REQUEST_TIMEOUT)
+                .await
+                .is_ok();
         }
         // Sole survivor: recruit a brand-new holder from the node registry.
         let holder_ids: HashSet<NodeId> = live.iter().map(|(id, _, _, _)| *id).collect();
@@ -1979,7 +2006,11 @@ impl ObjEngine {
             if id == me || holder_ids.contains(&id) {
                 continue;
             }
-            if self.push_piece(&addr, *cid, gen, &piece).await.is_ok() {
+            if self
+                .push_piece(&addr, *cid, gen, &piece, REQUEST_TIMEOUT)
+                .await
+                .is_ok()
+            {
                 return true;
             }
         }
@@ -2177,6 +2208,7 @@ async fn push_piece(
     cid: Cid,
     gen: &Generation,
     piece: &CodedPiece,
+    timeout: Duration,
 ) -> anyhow::Result<()> {
     let msg = wire::Message::PiecePush(wire::PiecePush {
         cid: cid.0,
@@ -2192,7 +2224,7 @@ async fn push_piece(
         // so each holder treats it as DB data locally.
         system: is_system,
     });
-    match request(transport, peer, &msg).await? {
+    match request(transport, peer, &msg, timeout).await? {
         wire::Message::PiecePushAck(ack) if ack.ok => Ok(()),
         wire::Message::PiecePushAck(ack) => anyhow::bail!("push rejected: {}", ack.reason),
         _ => anyhow::bail!("unexpected push reply"),
@@ -2201,21 +2233,45 @@ async fn push_piece(
 
 /// Open a bi-stream to a peer, send `msg`, and return the reply. A free fn over
 /// `&Arc<Transport>` so the spawned distribution task can call it without `&self`.
+/// Rides the pooled per-peer connection (never closed here — it is shared).
+///
+/// The WHOLE interaction (connect + streams + read) is bounded by `timeout`
+/// INTERNALLY, and any failure — including the timeout — evicts the pooled
+/// entry so the next request re-dials. Callers must NOT wrap this in their own
+/// shorter `tokio::time::timeout`: dropping the future from outside skips the
+/// evict, leaving a stuck-but-open connection pooled forever (review finding).
+/// Data-plane pushes evict on timeout (unlike liveness pings, which tolerate a
+/// slow peer): a peer that can't ack within the push budget is unavailable for
+/// distribution, and a re-dial next push is the cheaper failure mode.
 async fn request(
     transport: &Arc<Transport>,
     peer: &PeerAddr,
     msg: &wire::Message,
+    timeout: Duration,
 ) -> anyhow::Result<wire::Message> {
-    let conn = transport.connect(peer, ALPN).await?;
-    let (mut send, mut recv) = conn.open_bi().await?;
-    send.write_all(&wire::encode(msg, transport.clock().now().0))
-        .await?;
-    send.finish()?;
-    let bytes =
-        tokio::time::timeout(Duration::from_secs(30), recv.read_to_end(MAX_FRAME)).await??;
-    let frame = wire::decode(&bytes)?;
-    conn.close(0u32.into(), b"done");
-    Ok(frame.message)
+    let conn = tokio::time::timeout(timeout, transport.connect(peer, ALPN))
+        .await
+        .map_err(|_| anyhow::anyhow!("connect timed out after {timeout:?}"))??;
+    let fut = async {
+        let (mut send, mut recv) = conn.open_bi().await?;
+        send.write_all(&wire::encode(msg, transport.clock().now().0))
+            .await?;
+        send.finish()?;
+        let bytes = recv.read_to_end(MAX_FRAME).await?;
+        let frame = wire::decode(&bytes)?;
+        anyhow::Ok(frame.message)
+    };
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(Ok(msg)) => Ok(msg),
+        Ok(Err(err)) => {
+            transport.evict(peer, ALPN, &conn);
+            Err(err)
+        }
+        Err(_) => {
+            transport.evict(peer, ALPN, &conn);
+            anyhow::bail!("request timed out after {timeout:?}")
+        }
+    }
 }
 
 /// Refuse a user lifecycle operation on a CraftSQL system object (DB generation).
