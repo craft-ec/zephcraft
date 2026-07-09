@@ -289,6 +289,11 @@ pub struct HeadRegistry {
     /// running job after each push round — a write landing mid-push is carried
     /// by an extra round instead of silently lost (review finding).
     push_dirty: std::sync::Mutex<HashMap<ShardKey, u64>>,
+    /// Inbound-intake shed gate (true = CRITICAL memory pressure): a shedding
+    /// node answers PushState with Err("busy…"). Replication pushes are
+    /// fire-and-forget; a shed state reaches the replica again on the shard's
+    /// next write, a migrate round, or the epoch-takeover merge.
+    shed_gate: std::sync::OnceLock<Arc<dyn Fn() -> bool + Send + Sync>>,
     /// This node's own id.
     self_id: [u8; 32],
     /// Per `(rtype, shard)`: the last effective epoch for which this node (as that account's
@@ -389,6 +394,7 @@ impl HeadRegistry {
             membership: RwLock::new(None),
             jobs: RwLock::new(None),
             push_dirty: std::sync::Mutex::new(HashMap::new()),
+            shed_gate: std::sync::OnceLock::new(),
             self_id,
             last_epoch: RwLock::new(std::collections::HashMap::new()),
             last_census: RwLock::new(None),
@@ -872,6 +878,11 @@ impl HeadRegistry {
     pub async fn set_jobs(self: Arc<Self>, jobs: zeph_sched::JobCoordinator) {
         let weak = Arc::downgrade(&self);
         *self.jobs.write().await = Some((jobs, weak));
+    }
+
+    /// Wire the inbound-intake shed gate (typically `ResourceGauge::critical`).
+    pub fn set_shed_gate(&self, gate: Arc<dyn Fn() -> bool + Send + Sync>) {
+        let _ = self.shed_gate.set(gate);
     }
 
     /// The current registry epoch = `clock.now().millis() / EPOCH_MILLIS`, adjusted for the
@@ -1541,11 +1552,19 @@ impl HeadRegistry {
                             shard,
                             state,
                         }) => {
-                            let sk = ShardKey { rtype, bits, shard };
-                            if let Some(pushed) = RegistryState::decode(&state) {
-                                let _ = this.sql_merge(sk, &pushed).await;
+                            // Shed at CRITICAL memory pressure. Accepted gap:
+                            // the state reaches this replica again on the next
+                            // write to the shard (dirty rounds), a migrate, or
+                            // the takeover merge — not instantly.
+                            if this.shed_gate.get().is_some_and(|gate| gate()) {
+                                RegistryResp::Err("busy — memory pressure".into())
+                            } else {
+                                let sk = ShardKey { rtype, bits, shard };
+                                if let Some(pushed) = RegistryState::decode(&state) {
+                                    let _ = this.sql_merge(sk, &pushed).await;
+                                }
+                                RegistryResp::Ack
                             }
-                            RegistryResp::Ack
                         }
                         // Return ALL of this node's local heads for the global dashboard union.
                         Ok(RegistryReq::ListEntries) => {

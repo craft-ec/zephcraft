@@ -288,6 +288,11 @@ pub struct ObjEngine {
     /// DETECTS, the coordinator SCHEDULES (priority, dedup, bounded concurrency).
     /// Unwired (tests/library use), the work runs directly as before.
     work_trigger: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<EngineWork>>,
+    /// Set by the node: inbound-intake shed gate (true = memory pressure is
+    /// CRITICAL). A shedding node acks piece pushes `ok:false("busy…")` — the
+    /// sender's next distribute/repair pass retries; nothing is lost. Unwired,
+    /// intake is never shed.
+    shed_gate: std::sync::OnceLock<Arc<dyn Fn() -> bool + Send + Sync>>,
     /// Liveness source (set by the node = membership; a test source in tests). The health scan
     /// filters provider records by this so a DIED holder — whose record lingers until TTL — stops
     /// inflating a cid's effective count, and repair fires. None → no filtering (legacy).
@@ -326,6 +331,7 @@ impl ObjEngine {
             surplus_ids: Mutex::new(HashSet::new()),
             scale_trigger: std::sync::OnceLock::new(),
             work_trigger: std::sync::OnceLock::new(),
+            shed_gate: std::sync::OnceLock::new(),
             liveness: Mutex::new(None),
             alive_cache: Mutex::new(None),
             node_liveness: Mutex::new(HashMap::new()),
@@ -1864,6 +1870,11 @@ impl ObjEngine {
         let _ = self.work_trigger.set(tx);
     }
 
+    /// Wire the inbound-intake shed gate (typically `ResourceGauge::critical`).
+    pub fn set_shed_gate(&self, gate: Arc<dyn Fn() -> bool + Send + Sync>) {
+        let _ = self.shed_gate.set(gate);
+    }
+
     /// The body of a PublishDistribute coordinator job: run the initial
     /// post-publish distribution for `cid`, re-derived from the store.
     pub async fn distribute_initial(&self, cid: Cid) {
@@ -2192,6 +2203,12 @@ impl ObjEngine {
             ok: false,
             reason: reason.to_string(),
         };
+        // Shed intake at CRITICAL memory pressure: a rejected push costs the
+        // sender one retry on its next pass; accepting it costs this node the
+        // vtag verify + store write + announce that OOM-killed rejoining nodes.
+        if self.shed_gate.get().is_some_and(|gate| gate()) {
+            return reject("busy — memory pressure");
+        }
         let cid = Cid(push.cid);
         if self.store.is_tombstoned(&cid) {
             return reject("tombstoned");

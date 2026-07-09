@@ -19,12 +19,19 @@ scan job at HealthScan priority — the Repair tier is unused!).
       timeouts); (2) membership oneway branch swallowed the delivery-read error → now fails the
       request and evicts. headreg 3s-drain site documented as self-healing. Gates: clippy 0,
       164/164 tests. NOTE for reviewers: never wrap pooled-conn requests in external timeouts.
-- [ ] Phase 2: job coordinator audit + extension — enumerate all background work (13 loops + inline
-      repair + announce/migrate/reshard/gov ticks), route through JobCoordinator with correct
-      priorities (repair at Repair!), keep event-driven triggers. Gates + review + commit.
-- [ ] Phase 3: resource manager supplementing the coordinator — track RSS + pending-work gauges;
-      admission-gate new jobs / shed load when above budget (mechanism only, minimal-kernel).
-      Design-check before building. Gates + review + commit.
+- [x] Phase 2: coordinator extension — DONE (commit 17723c8). Audit found: only distribute×2 +
+      healthscan went through the coordinator; repair ran INSIDE scan jobs (Repair tier unused);
+      publish distribution = raw spawn per publish; distribute_pending = inline loop; headreg
+      replicate = spawn per write. All routed: EngineWork trigger → Encoding publish:{cid} /
+      Repair repair:{cid} jobs; distribute_pending deduped Distribution job; pushstate:{shard}
+      full-state-at-run-time + per-shard dirty counter (review fix: mid-push write was dropped);
+      repair_cid re-checks floor + Fade gate at exec time (review fix: TOCTOU minted surplus).
+      Stays direct (deliberate): membership probe/shuffle, gov tick, migrate/reshard rounds.
+- [x] Phase 3: resource manager — DONE pending review. sched::ResourceGauge (budget from own
+      cgroup memory.max, RSS sampler 5s): >85% only Repair dispatches, >95% nothing + inbound
+      sheds (obj ingest + headreg PushState answer "busy"; senders' next pass retries). deferred
+      + mem_load_pct in JobStats. Gauge off when no cgroup limit / non-Linux (Mac). Gated
+      dispatch re-checks on 500ms tick. Test: gauge_gates_routine_work_but_not_repair.
 - [ ] Phase 4 (acceptance): deploy fleet, rerun 20-node rejoin — PASS = census 20 converges, no
       OOM kills, churn lines near-zero, deploys fast. THEN the original stress measurements
       (writer spread, held-DB counts, remote resolve latency, reshard 8→9 under load).

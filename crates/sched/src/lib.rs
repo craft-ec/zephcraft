@@ -64,6 +64,68 @@ impl PartialOrd for QueuedJob {
     }
 }
 
+/// Resource gauge SUPPLEMENTING the coordinator: an external sampler feeds the
+/// process RSS, the environment supplies a memory budget (cgroup limit or
+/// config), and the dispatcher consults the resulting pressure before starting
+/// jobs — above the HIGH mark only Repair (durability-critical) jobs start;
+/// above CRITICAL nothing new starts and inbound intake should shed (callers
+/// poll [`Self::critical`]). Mechanism only: the gauge holds no policy about
+/// what to sample or what the budget is — the node wires both.
+#[derive(Default)]
+pub struct ResourceGauge {
+    /// Current process RSS in bytes (sampler-updated).
+    rss: AtomicU64,
+    /// Budget in bytes; 0 = gauge disabled (never reports pressure).
+    budget: AtomicU64,
+}
+
+/// Start gating routine work above this fraction of the budget.
+const GAUGE_HIGH: f64 = 0.85;
+/// Stop starting ANY new job / shed inbound intake above this fraction.
+const GAUGE_CRITICAL: f64 = 0.95;
+
+impl ResourceGauge {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Set the memory budget (0 disables the gauge).
+    pub fn set_budget(&self, bytes: u64) {
+        self.budget.store(bytes, AtomicOrd::Relaxed);
+    }
+
+    /// Feed the current process RSS (called by the node's sampler).
+    pub fn set_rss(&self, bytes: u64) {
+        self.rss.store(bytes, AtomicOrd::Relaxed);
+    }
+
+    /// Budget used, in percent (0 when the gauge is disabled).
+    pub fn load_pct(&self) -> u8 {
+        let budget = self.budget.load(AtomicOrd::Relaxed);
+        if budget == 0 {
+            return 0;
+        }
+        let rss = self.rss.load(AtomicOrd::Relaxed);
+        ((rss as f64 / budget as f64) * 100.0).min(255.0) as u8
+    }
+
+    fn over(&self, frac: f64) -> bool {
+        let budget = self.budget.load(AtomicOrd::Relaxed);
+        budget != 0 && self.rss.load(AtomicOrd::Relaxed) as f64 > budget as f64 * frac
+    }
+
+    /// Above the high-water mark: only durability-critical work should start.
+    pub fn high(&self) -> bool {
+        self.over(GAUGE_HIGH)
+    }
+
+    /// Above the critical mark: start nothing new; inbound intake should shed
+    /// (reply "busy" and let the sender's next pass retry).
+    pub fn critical(&self) -> bool {
+        self.over(GAUGE_CRITICAL)
+    }
+}
+
 #[derive(Default)]
 struct Counters {
     submitted: AtomicU64,
@@ -72,6 +134,7 @@ struct Counters {
     retried: AtomicU64,
     deduped: AtomicU64,
     in_flight: AtomicU64,
+    deferred: AtomicU64,
 }
 
 /// A snapshot of coordinator activity.
@@ -87,6 +150,12 @@ pub struct JobStats {
     pub queue_depth: u64,
     /// Configured max concurrent jobs.
     pub concurrency: u64,
+    /// Dispatch rounds where memory pressure deferred the queue head.
+    #[serde(default)]
+    pub deferred: u64,
+    /// Memory budget used, percent (0 = gauge disabled).
+    #[serde(default)]
+    pub mem_load_pct: u8,
 }
 
 /// One finished job, for the recent-jobs view.
@@ -106,6 +175,8 @@ struct Inner {
     counters: Counters,
     concurrency: usize,
     recent: Mutex<VecDeque<JobRecord>>,
+    /// Optional resource gauge; when wired the dispatcher gates on pressure.
+    gauge: std::sync::OnceLock<Arc<ResourceGauge>>,
 }
 
 /// A cheaply-cloneable handle to the coordinator.
@@ -127,6 +198,7 @@ impl JobCoordinator {
             counters: Counters::default(),
             concurrency: concurrency.max(1),
             recent: Mutex::new(VecDeque::new()),
+            gauge: std::sync::OnceLock::new(),
         });
         let dispatch = inner.clone();
         tokio::spawn(dispatcher(dispatch));
@@ -182,7 +254,20 @@ impl JobCoordinator {
             in_flight: c.in_flight.load(AtomicOrd::Relaxed),
             queue_depth: self.inner.queue.lock().unwrap().len() as u64,
             concurrency: self.inner.concurrency as u64,
+            deferred: c.deferred.load(AtomicOrd::Relaxed),
+            mem_load_pct: self
+                .inner
+                .gauge
+                .get()
+                .map(|g| g.load_pct())
+                .unwrap_or_default(),
         }
+    }
+
+    /// Wire the resource gauge — the dispatcher then defers routine work above
+    /// the high-water mark and starts nothing above critical.
+    pub fn set_gauge(&self, gauge: Arc<ResourceGauge>) {
+        let _ = self.inner.gauge.set(gauge);
     }
 
     /// The most recent finished jobs, newest first (bounded history).
@@ -200,12 +285,39 @@ impl JobCoordinator {
 
 async fn dispatcher(inner: Arc<Inner>) {
     loop {
-        // Pop the highest-priority job, waiting if the queue is empty.
+        // Pop the highest-priority job, waiting if the queue is empty — or if
+        // memory pressure gates the queue head: above HIGH only Repair starts,
+        // above CRITICAL nothing starts. Gated rounds re-check on a short tick
+        // (pressure recedes without any new submit to wake us).
         let job = loop {
-            let popped = inner.queue.lock().unwrap().pop();
+            let popped = {
+                let mut q = inner.queue.lock().unwrap();
+                let allowed = match inner.gauge.get() {
+                    Some(g) if g.critical() => None,
+                    Some(g) if g.high() => q
+                        .peek()
+                        .filter(|j| j.priority >= Priority::Repair)
+                        .map(|_| ()),
+                    _ => q.peek().map(|_| ()),
+                };
+                match allowed {
+                    Some(()) => q.pop(),
+                    None => {
+                        if q.peek().is_some() {
+                            inner.counters.deferred.fetch_add(1, AtomicOrd::Relaxed);
+                        }
+                        None
+                    }
+                }
+            };
             match popped {
                 Some(j) => break j,
-                None => inner.notify.notified().await,
+                None => {
+                    tokio::select! {
+                        _ = inner.notify.notified() => {}
+                        _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                    }
+                }
             }
         };
         // Bound concurrency: hold a permit for the job's lifetime.
@@ -302,6 +414,69 @@ mod tests {
         assert!(!jc.submit("dup", Priority::HealthScan, 1, || async { Ok(()) }));
         assert_eq!(jc.stats().deduped, 1);
         gate.notify_one();
+    }
+
+    #[tokio::test]
+    async fn gauge_gates_routine_work_but_not_repair() {
+        let jc = JobCoordinator::new(2);
+        let gauge = ResourceGauge::new();
+        gauge.set_budget(100);
+        gauge.set_rss(90); // HIGH (>85%) but not CRITICAL (<95%)
+        jc.set_gauge(gauge.clone());
+
+        let ran_evict = Arc::new(AtomicUsize::new(0));
+        let ran_repair = Arc::new(AtomicUsize::new(0));
+        let (e, r) = (ran_evict.clone(), ran_repair.clone());
+        jc.submit("e", Priority::Eviction, 1, move || {
+            let e = e.clone();
+            async move {
+                e.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        });
+        jc.submit("r", Priority::Repair, 1, move || {
+            let r = r.clone();
+            async move {
+                r.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            ran_repair.load(Ordering::SeqCst),
+            1,
+            "Repair runs under HIGH pressure"
+        );
+        assert_eq!(
+            ran_evict.load(Ordering::SeqCst),
+            0,
+            "routine work deferred under HIGH pressure"
+        );
+        assert!(jc.stats().deferred > 0, "deferral is visible in stats");
+
+        // CRITICAL: even Repair must not start.
+        gauge.set_rss(99);
+        let blocked = Arc::new(AtomicUsize::new(0));
+        let b = blocked.clone();
+        jc.submit("r2", Priority::Repair, 1, move || {
+            let b = b.clone();
+            async move {
+                b.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            blocked.load(Ordering::SeqCst),
+            0,
+            "nothing starts above CRITICAL"
+        );
+
+        // Pressure recedes → deferred jobs dispatch on the re-check tick.
+        gauge.set_rss(10);
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert_eq!(ran_evict.load(Ordering::SeqCst), 1, "deferred job ran");
+        assert_eq!(blocked.load(Ordering::SeqCst), 1, "critical-gated job ran");
     }
 
     #[tokio::test]

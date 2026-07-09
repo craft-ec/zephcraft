@@ -808,6 +808,37 @@ fn human_size(n: u64) -> String {
     }
 }
 
+/// The memory budget this process runs under: its cgroup-v2 `memory.max`
+/// (what systemd `MemoryMax=` writes). None (no limit, "max", non-Linux)
+/// disables the resource gauge.
+fn detect_memory_budget() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let cg = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+        let path = cg.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
+        let max = std::fs::read_to_string(format!("/sys/fs/cgroup{path}/memory.max")).ok()?;
+        max.trim().parse::<u64>().ok() // "max" (no limit) fails the parse → None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Current process RSS in bytes (Linux: /proc/self/statm resident pages).
+fn read_self_rss() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+        Some(pages * 4096)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 async fn cmd_files(data_dir: &Path, owner: Option<&str>) -> anyhow::Result<()> {
     let mut params = serde_json::json!({});
     if let Some(o) = owner {
@@ -1547,6 +1578,37 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     head_registry.set_membership(membership.clone()).await;
     head_registry.set_programs(governance_store.clone()).await;
     head_registry.clone().set_jobs(jobs.clone()).await;
+
+    // Resource manager: the node reads its OWN memory budget from its cgroup
+    // (the systemd MemoryMax it runs under) and samples RSS every 5s. Above
+    // HIGH the coordinator defers routine jobs (only Repair starts); above
+    // CRITICAL nothing new starts and inbound piece/registry intake sheds
+    // ("busy" — senders retry on their next pass). No budget (no cgroup limit,
+    // non-Linux) → gauge off, behavior unchanged. Mechanism only: the budget
+    // comes from the environment, never from the binary.
+    if let Some(budget) = detect_memory_budget() {
+        let gauge = zeph_sched::ResourceGauge::new();
+        gauge.set_budget(budget);
+        jobs.set_gauge(gauge.clone());
+        let g = gauge.clone();
+        engine.set_shed_gate(std::sync::Arc::new(move || g.critical()));
+        let g = gauge.clone();
+        head_registry.set_shed_gate(std::sync::Arc::new(move || g.critical()));
+        let g = gauge.clone();
+        tokio::spawn(async move {
+            let mut iv = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                iv.tick().await;
+                if let Some(rss) = read_self_rss() {
+                    g.set_rss(rss);
+                }
+            }
+        });
+        tracing::info!(
+            budget_mib = budget / (1 << 20),
+            "resource gauge armed from cgroup memory limit"
+        );
+    }
     mem_peers.set(membership.clone()).await;
     // PUBLIC stats endpoint (0 = disabled): token-free counts for the website's live-network
     // section, served from the converged census + this node's store/DHT — the retired tracker's
