@@ -161,8 +161,32 @@ pub struct Transport {
     /// in a single instant when the stacked attempts aborted — measured).
     /// Closed entries re-dial lazily; cleared on rebind.
     pool: std::sync::Mutex<std::collections::HashMap<PoolKey, Connection>>,
+    /// Per-key dial locks: concurrent dials to the SAME (peer, ALPN) collapse
+    /// into one attempt (the winners re-check the pool). During churn every
+    /// subsystem dials the same dead peer at once — probe, DHT, replication —
+    /// and each parallel attempt held its own handshake state for the full
+    /// timeout.
+    dials: std::sync::Mutex<
+        std::collections::HashMap<PoolKey, std::sync::Arc<tokio::sync::Mutex<()>>>,
+    >,
+    /// Global bound on concurrent OUTBOUND bulk dial attempts. In-flight QUIC
+    /// handshake state is what ballooned nodes to their OOM caps during the
+    /// rejoin storms (dead peers: every attempt holds state for its 3-8s
+    /// timeout, is never pooled, and is retried forever). Excess dialers wait
+    /// here as cheap futures instead.
+    dial_permits: std::sync::Arc<tokio::sync::Semaphore>,
+    /// RESERVED dial slots for the liveness ping ALPN: probes must never
+    /// queue behind bulk dials, or a storm's dial backlog starves probe
+    /// rounds past their timeout and healthy peers get falsely marked dead —
+    /// churn feeding churn (review finding).
+    ping_dial_permits: std::sync::Arc<tokio::sync::Semaphore>,
     clock: std::sync::Arc<hlc::Clock>,
 }
+
+/// Max concurrent outbound bulk dial attempts (handshakes in flight).
+const MAX_CONCURRENT_DIALS: usize = 16;
+/// Reserved concurrent dial slots for liveness pings.
+const MAX_CONCURRENT_PING_DIALS: usize = 4;
 
 /// Pool key: remote node + ALPN (one connection per protocol per peer).
 type PoolKey = ([u8; 32], Vec<u8>);
@@ -212,6 +236,11 @@ impl Transport {
             closed: std::sync::atomic::AtomicBool::new(false),
             rebind_lock: tokio::sync::Mutex::new(()),
             pool: std::sync::Mutex::new(std::collections::HashMap::new()),
+            dials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            dial_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DIALS)),
+            ping_dial_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_PING_DIALS,
+            )),
             clock: std::sync::Arc::new(hlc::Clock::new()),
         })
     }
@@ -361,16 +390,51 @@ impl Transport {
 
     /// Dial a NEW connection and pool it, replacing any existing entry —
     /// the recovery path when a pooled connection is broken in a way
-    /// `close_reason` cannot see yet. A replaced connection is only dropped
-    /// from the pool, never closed here: a concurrent caller may still be
-    /// mid-request on it, and iroh's idle timeout reclaims it shortly after.
+    /// `close_reason` cannot see yet (callers evict the broken entry first).
+    /// A replaced connection is only dropped from the pool, never closed
+    /// here: a concurrent caller may still be mid-request on it, and iroh's
+    /// idle timeout reclaims it shortly after.
+    ///
+    /// Two bounds keep dial-attempt state from ballooning during churn (the
+    /// measured OOM driver once per-request conns were pooled): concurrent
+    /// dials to the SAME (peer, ALPN) serialize on a per-key lock — losers
+    /// re-check the pool the winner filled instead of dialing again — and a
+    /// global semaphore caps handshakes in flight; excess dialers wait as
+    /// cheap futures (cancellation-safe: a caller's timeout dropping the
+    /// future releases both without leaking).
     pub async fn connect_fresh(&self, peer: &PeerAddr, alpn: &[u8]) -> Result<Connection> {
+        let key = (peer.node_id().0, alpn.to_vec());
+        let dial_lock = {
+            let mut dials = self.dials.lock().expect("dials");
+            dials
+                .entry(key.clone())
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+            // Entries are tiny and bounded by peers×ALPNs; never pruned.
+        };
+        let _dial_guard = dial_lock.lock().await;
+        // A concurrent dialer may have just filled the pool while we waited —
+        // its connection is as fresh as one we would dial now.
+        if let Some(conn) = self.pool.lock().expect("conn pool").get(&key) {
+            if conn.close_reason().is_none() {
+                return Ok(conn.clone());
+            }
+        }
+        // Liveness pings dial through their own reserved lane.
+        let sem = if alpn == alpn::PING {
+            &self.ping_dial_permits
+        } else {
+            &self.dial_permits
+        };
+        let _permit = sem
+            .acquire()
+            .await
+            .map_err(|_| TransportError::Connect("dial semaphore closed".into()))?;
         let conn = self
             .current()
             .connect(peer.0.clone(), alpn)
             .await
             .map_err(|e| TransportError::Connect(e.to_string()))?;
-        let key = (peer.node_id().0, alpn.to_vec());
         self.pool
             .lock()
             .expect("conn pool")
@@ -738,6 +802,55 @@ mod tests {
         let c5 = client.connect(&addr, alpn::PING).await.unwrap();
         assert_ne!(c4.stable_id(), c5.stable_id(), "pool cleared on rebind");
         client.ping(&addr, Duration::from_secs(10)).await.unwrap();
+
+        client.close().await;
+        server.close().await;
+        serve.abort();
+    }
+
+    /// Dial dedup: concurrent first connects to the same (peer, ALPN) must
+    /// collapse into ONE dial — every caller gets the same connection.
+    #[tokio::test]
+    async fn concurrent_connects_dedup_to_one_dial() {
+        let server_id = NodeIdentity::generate();
+        let server = std::sync::Arc::new(
+            Transport::bind(
+                server_id.secret_key_bytes(),
+                Reach::LocalOnly,
+                vec![alpn::PING.to_vec()],
+                0,
+            )
+            .await
+            .unwrap(),
+        );
+        let serve = {
+            let server = server.clone();
+            tokio::spawn(async move { server.serve_ping().await })
+        };
+        let client = std::sync::Arc::new(
+            Transport::bind(
+                NodeIdentity::generate().secret_key_bytes(),
+                Reach::LocalOnly,
+                vec![],
+                0,
+            )
+            .await
+            .unwrap(),
+        );
+        let addr = server.addr();
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let (c, a) = (client.clone(), addr.clone());
+            tasks.push(tokio::spawn(async move {
+                c.connect(&a, alpn::PING).await.unwrap().stable_id()
+            }));
+        }
+        let mut ids = std::collections::HashSet::new();
+        for t in tasks {
+            ids.insert(t.await.unwrap());
+        }
+        assert_eq!(ids.len(), 1, "8 concurrent connects → 1 dialed connection");
 
         client.close().await;
         server.close().await;

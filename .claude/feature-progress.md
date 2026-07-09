@@ -32,9 +32,25 @@ scan job at HealthScan priority — the Repair tier is unused!).
       sheds (obj ingest + headreg PushState answer "busy"; senders' next pass retries). deferred
       + mem_load_pct in JobStats. Gauge off when no cgroup limit / non-Linux (Mac). Gated
       dispatch re-checks on 500ms tick. Test: gauge_gates_routine_work_but_not_repair.
+- [ ] Phase 5 (user-directed design, after Phase 4): PUSH ADMISSION NEGOTIATION — keep push, but
+      (1) receivers indicate free intake slots, (2) senders negotiate BEFORE shipping bytes:
+      new wire msgs PushOffer{cid,pieces,bytes} → PushGrant{accept,retry_after_ms}; receiver
+      grants from gauge state (critical=0, high=1, else 4 per offer); (3) on busy/partial grant:
+      REDIRECT remainder to another candidate when target-fungible (coded pieces — any candidate
+      works), REQUEUE with backoff when target-fixed (registry shard replicas — election-bound;
+      dirty-counter rounds already approximate this). Wire change → version-consistent full roll.
+      Do AFTER the dial-bound acceptance rerun so each layer's effect is measured separately.
 - [ ] Phase 4 (acceptance): deploy fleet, rerun 20-node rejoin — PASS = census 20 converges, no
       OOM kills, churn lines near-zero, deploys fast. THEN the original stress measurements
       (writer spread, held-DB counts, remote resolve latency, reshard 8→9 under load).
+      ATTEMPT 1 (binary 5fd0fbab): FAILED, slower thrash — cores stable (node1 gauge armed 6G,
+      went critical at a transient 5.9G spike that self-deflated to 118MB; raised to 12G), Mac
+      solid, but extras still OOM-looped (+17 kills/5min, census collapsed to 8). Learned: (a)
+      gauge deferral can freeze the job queue (UI "held jobs") without recovering memory when
+      RSS is serve-side, not job-side; (b) remaining balloon driver = UNBOUNDED CONCURRENT DIAL
+      ATTEMPTS to dead peers (probe+DHT+pushstate all dial the same dead peer in parallel, each
+      holding handshake state 3-8s, never pooled, retried forever). FIX (pending review): per-key
+      dial dedup (losers adopt the winner's fresh conn) + global 16-dial semaphore in Transport.
 
 # ISOLATION WATCHDOG: ENDPOINT REBIND (2026-07-09, commit 29f9ce1) — DEPLOYED to all 5 nodes
 Fleet roll (binary b9f74279, watchdog string verified in binary on both server + Mac): staggered
