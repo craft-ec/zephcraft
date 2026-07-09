@@ -183,8 +183,13 @@ pub struct Transport {
     clock: std::sync::Arc<hlc::Clock>,
 }
 
-/// Max concurrent outbound bulk dial attempts (handshakes in flight).
-const MAX_CONCURRENT_DIALS: usize = 16;
+/// Max concurrent outbound bulk dial attempts (handshakes in flight). Sized
+/// for throughput under legitimate concurrency (pipelined ingest announces,
+/// batched repair pushes, post-roll pool warmup: 16 was a measured choke —
+/// DHT lookups queued minutes behind it and scan jobs ballooned to 90s) while
+/// staying a hard memory bound: 48 in-flight handshakes is ~10MB, vs the
+/// unbounded thousands that OOMed nodes before the cap existed.
+const MAX_CONCURRENT_DIALS: usize = 48;
 /// Reserved concurrent dial slots for liveness pings.
 const MAX_CONCURRENT_PING_DIALS: usize = 4;
 

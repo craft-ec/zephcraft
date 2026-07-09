@@ -1491,7 +1491,12 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // that bypassed the coordinator entirely (audit finding).
     let pending_engine = engine.clone();
     let pending_jobs = jobs.clone();
+    let pending_ready = head_registry.clone();
     tokio::spawn(async move {
+        // Boot ordering (user directive): let the node SETTLE first — census
+        // convergence + connection warmup — before background pushes start.
+        // Scans/pushes during warmup queued minutes behind the dial layer.
+        pending_ready.wait_ready().await;
         let mut iv = tokio::time::interval(std::time::Duration::from_secs(12));
         loop {
             iv.tick().await;
@@ -1597,7 +1602,10 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         head_registry.set_shed_gate(std::sync::Arc::new(move || g.critical()));
         let g = gauge.clone();
         tokio::spawn(async move {
-            let mut iv = tokio::time::interval(std::time::Duration::from_secs(5));
+            // 1s cadence: allocation bursts (pipelined ingest) can blow through
+            // a capped node's headroom between coarser samples before the shed
+            // gates ever see the pressure.
+            let mut iv = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
                 iv.tick().await;
                 if let Some(rss) = read_self_rss() {
@@ -1724,7 +1732,10 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // due immediately. A cheap set-diff (no DHT) — it just FEEDS individual items into the queue.
     {
         let (eng, q, seen) = (engine.clone(), hs_queue.clone(), hs_seen.clone());
+        let feeder_ready = head_registry.clone();
         tokio::spawn(async move {
+            // Boot ordering: no scan feeding until the node has settled.
+            feeder_ready.wait_ready().await;
             loop {
                 let now = std::time::Instant::now();
                 for cid in eng.store().cids() {

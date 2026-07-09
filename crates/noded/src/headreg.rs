@@ -420,7 +420,7 @@ impl HeadRegistry {
     /// steady-state case), else polls until ready or `READY_WAIT_SECS` elapses, then proceeds
     /// best-effort. Called at the top of register/resolve/current_version so a freshly-restarted
     /// node doesn't route against an unconverged writer election.
-    async fn wait_ready(&self) {
+    pub async fn wait_ready(&self) {
         if self.is_ready() {
             return;
         }
@@ -1459,6 +1459,11 @@ impl HeadRegistry {
                     if settled || start.elapsed() >= std::time::Duration::from_secs(READY_MAX_SECS)
                     {
                         this.ready.store(true, std::sync::atomic::Ordering::Relaxed);
+                        tracing::info!(
+                            census = last,
+                            settle_secs = start.elapsed().as_secs(),
+                            "boot settle complete — background lifecycle starting"
+                        );
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;

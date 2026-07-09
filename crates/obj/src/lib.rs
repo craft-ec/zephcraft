@@ -170,7 +170,13 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const REPAIR_BATCH: usize = 8;
 
 /// Max streams served concurrently per inbound connection (pipelining bound).
-const PIPELINE_STREAMS: usize = 8;
+/// 4, not 8: on memory-capped receivers 8 concurrent ingests (each a vtag
+/// verify + store write) burst allocations faster than the pressure gauge
+/// samples — measured as renewed OOM cycling on 1-1.5G nodes.
+const PIPELINE_STREAMS: usize = 4;
+
+/// Concurrent in-flight ingest announces (async, off the ack path).
+const ANNOUNCE_PERMITS: usize = 8;
 
 /// Heavy engine work routed to the node's JobCoordinator when wired (see
 /// `work_trigger`): the engine detects the need, the coordinator schedules it
@@ -278,6 +284,9 @@ pub struct ObjEngine {
     /// Per-cid last-announce time (ms) — drives TTL-aware re-announce scheduling so a record
     /// is refreshed ~every 22h, not every cycle.
     announced_at: Mutex<HashMap<[u8; 32], u64>>,
+    /// Bounds concurrent ASYNC ingest announces (see `ingest`): the announce
+    /// is a DHT put with dials and must never run inline in the ack path.
+    announce_permits: Arc<tokio::sync::Semaphore>,
     /// Persistent GLOBAL durability sets, aggregated across per-chunk scans: cids currently
     /// at-risk / left-to-fade. Each health_scan_chunk updates the chunk's cids in place, so the
     /// dashboard reads accurate global counts without any one job scanning the whole set.
@@ -332,6 +341,7 @@ impl ObjEngine {
             enc: std::sync::OnceLock::new(),
             pending: Mutex::new(Vec::new()),
             announced_at: Mutex::new(HashMap::new()),
+            announce_permits: Arc::new(tokio::sync::Semaphore::new(ANNOUNCE_PERMITS)),
             at_risk_ids: Mutex::new(HashSet::new()),
             fading_ids: Mutex::new(HashSet::new()),
             surplus_ids: Mutex::new(HashSet::new()),
@@ -2314,12 +2324,24 @@ impl ObjEngine {
         if due {
             let count = self.store.piece_count(&cid) as u32;
             let pinned = self.store.is_pinned(&cid);
-            if self.routing.announce(cid, count, pinned).await.is_ok() {
-                self.announced_at
-                    .lock()
-                    .expect("announced_at")
-                    .insert(cid.0, now);
-            }
+            // ASYNC, off the ack path: the announce is a DHT put (dials). Run
+            // inline it made every first-piece ack wait on the DHT — under
+            // pipelined redistribution that inflated push RTTs past their
+            // timeout and amplified dial load 8x. Optimistic debounce insert:
+            // a failed announce just re-announces after the debounce window
+            // (and the periodic reannounce sweep backstops it regardless).
+            self.announced_at
+                .lock()
+                .expect("announced_at")
+                .insert(cid.0, now);
+            let routing = self.routing.clone();
+            let permits = self.announce_permits.clone();
+            tokio::spawn(async move {
+                let Ok(_permit) = permits.acquire_owned().await else {
+                    return;
+                };
+                let _ = routing.announce(cid, count, pinned).await;
+            });
         }
         wire::PiecePushAck {
             ok: true,
