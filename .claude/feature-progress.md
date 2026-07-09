@@ -1,4 +1,9 @@
-# ISOLATION WATCHDOG: ENDPOINT REBIND (2026-07-09) — REVIEWED+COMMITTED, DEPLOY NEXT
+# ISOLATION WATCHDOG: ENDPOINT REBIND (2026-07-09, commit 29f9ce1) — DEPLOYED to all 5 nodes
+Fleet roll (binary b9f74279, watchdog string verified in binary on both server + Mac): staggered
+restart zeph..zeph4, Mac binary swap + launchd bounce (transient bootstrap IO-error-5, retry OK).
+Post-roll: Mac 4/4 active, census eligible=5, shards=256. Census-overview UI (e183de4) shipped in
+the same roll (dashboard is include_str-embedded). Gotcha for next deploy: the release binary is
+`target/release/zeph` (NOT zeph-noded — [[bin]] name); an install of the wrong path no-ops silently.
 Review verdict: design sound; 1 CRITICAL found+fixed — close()/rebind() race (SIGTERM during a
 wedge-recovery rebind could install a fresh open endpoint AFTER close() returned, orphaned forever);
 fix = re-check `closed` before installing, close the just-built endpoint and bail. Reviewer caveat
