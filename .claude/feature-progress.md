@@ -1,3 +1,19 @@
+# PEER-FLAPPING ROOT CAUSE: SELF-INFLICTED CONNECTION CHURN (2026-07-09, commit a846723) — FIXED + MEASURED
+User reported consistent peer disconnect/reconnect on the Mac and (correctly, again) rejected my
+packet-loss theory. CONTROLLED TEST proved it: ICMP to Hetzner = 0% loss/≤380ms WITH the node running,
+while zeph pings on the same path timed out at 3s (2,860/2,915 failures = timeout; 18× "server refused
+to accept a new connection" = connection pressure). Cause: our own QUIC-handshake churn — the
+GOVERNANCE TICK did resolve_app (DHT lookup) + 1-2 obj.get(Drop) content fetches for EVERY census peer
+EVERY 5s (Drop retains nothing → refetch forever) + unconditional publish/announce per tick; plus
+fresh-connection-per-ping probes. Hetzner LAN hides it; the Mac's 260ms RTT amplifies handshakes ~100×
+(the canary, not the cause — 3rd incident of this class after member-sync 10s and DHT per-op conns).
+FIX: fetch_if_newer (version-gated: fetch only if announced version > local seq+1 → steady-state ticks
+do ZERO content fetches), publish_if_due (announce on seq change + 10min heartbeat), tick 5s→30s,
+DRAIN_TICKS 6→18 (~180s, matches slower propagation), membership ping retry-once before a failure
+counts. MEASURED on the fleet (12-min window): Mac unreachable 31-64 → **3** (−95%), mark-dead → **0**
+(the user's symptom eliminated), node1→Mac 23 → **1**, governance intact (seq 6).
+Memory: zeph-connection-churn-flapping (the ICMP-vs-app-ping diagnostic + gate-per-tick-loops rule).
+
 # DOCS CONSOLIDATION + PUBLIC SURFACES (2026-07-09) — DONE
 One consolidated design doc + website + docs-site, all shipped:
 - **`docs/ZEPHCRAFT.md`** (commit 65fcdd6): THE single reconciled design & state document (16 parts,

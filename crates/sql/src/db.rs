@@ -1,11 +1,11 @@
-//! The CraftSQL database handle: a single-writer SQLite DB whose head is a
-//! signed `KIND_ROOT` record.
+//! The CraftSQL database handle: a single-writer SQLite DB whose head `(root, seq)` is
+//! published through a [`RootStore`] (in production: the owner-signed head registry).
 //!
-//! The SQLite VFS is synchronous; publishing/resolving the head is async — so
-//! the split is: the VFS commits locally (yielding a root CID in the in-memory
-//! roots map), while this layer RESOLVES the head before opening a connection
-//! and PUBLISHES the new head (compare-and-swap) after each write. The in-memory
-//! roots map is just a per-process cache; the RootStore is the source of truth.
+//! The SQLite VFS is synchronous; publishing/resolving the head is async — so the split is:
+//! the VFS commits locally (yielding a root CID in the in-memory roots map), while this layer
+//! resolves the head before opening a connection and publishes the new head FIRE-AND-FORGET
+//! after each write (LWW-by-seq — safe under single-writer; see `write()`). For a WRITABLE db
+//! the local `.gens` sidecar is authoritative; the RootStore serves readers and cold starts.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,8 +41,8 @@ struct GenManifest {
 /// Compact after this many generations accumulate, to bound storage growth.
 const COMPACT_THRESHOLD: usize = 16;
 
-/// The DB head: `(owner, namespace) → (root_cid, seq)`. Abstracts `KIND_ROOT`
-/// so CraftSQL can be tested without a live tracker.
+/// The DB head: `(owner, namespace) → (root_cid, seq)`. Abstracts the head store (in
+/// production the owner-signed registry) so CraftSQL is testable in-memory.
 #[async_trait::async_trait]
 pub trait RootStore: Send + Sync {
     /// Current head for `owner`'s DB (None if never published).
@@ -267,9 +267,8 @@ impl CraftSql {
         private_hint: bool,
     ) -> Result<CraftDb> {
         let key = format!("{}_{}", &owner.to_hex()[..16], namespace);
-        // Resolve the authoritative head. If the tracker lost it (restart) and
-        // this is our own DB, recover it from the local sidecar so the owner is
-        // never locked out of its own database by tracker liveness.
+        // Resolve the authoritative head — sidecar-first for our own DB, so the owner is never
+        // locked out of its own database by head-store (registry) liveness.
         let head = if writable {
             // The owner is the single writer of its own DB, so the LOCAL sidecar is authoritative:
             // prefer it and SKIP the registry resolve, which would forward to a possibly-rotating

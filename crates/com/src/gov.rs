@@ -161,8 +161,8 @@ impl GovernanceSet {
 /// set. Every node derives the SAME current governor set + program registry by folding
 /// the approvals from genesis — so governance state is content-addressed and resolvable
 /// cross-node, needing NO gossip. Approvals are seq-ordered, so the chain is totally
-/// ordered (no forks) and the **longest valid chain wins**. This is the governance
-/// analogue of the committee chain (durable state, pulled on demand).
+/// ordered (no forks) and the **longest valid chain wins** (durable state, pulled
+/// on demand — no push protocol).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GovernanceChain {
     pub genesis: GovernanceSet,

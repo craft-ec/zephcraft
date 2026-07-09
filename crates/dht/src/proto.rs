@@ -40,8 +40,8 @@ impl WireContact {
     }
 }
 
-/// DHT request/response messages. Phase 1 covers overlay formation (Ping + FindNode); the
-/// record operations (Store / FindValue / Value) arrive in Phase 2.
+/// DHT request/response messages: overlay formation (Ping + FindNode) and the
+/// record operations (Store / FindValue / Value).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DhtMessage {
     /// Liveness + "here I am" — the sender includes itself so the receiver can learn it.

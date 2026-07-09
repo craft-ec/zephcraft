@@ -13,8 +13,9 @@
 //!
 //! State model (first cut): a current-state blob per account under
 //! `<data_dir>/accounts/<account>.state`, published as durable content (erasure-coded, so it
-//! survives node loss). Local resolve reads the node's own copy. SQL-backed account state and
-//! non-DHT cross-node resolution are the next layers.
+//! survives node loss). Local resolve reads the node's own copy. (The head REGISTRY built its
+//! own SQL-backed shard state + cross-node resolution on top — headreg/registry_net; the
+//! GENERIC account substrate here remains a local blob per account.)
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

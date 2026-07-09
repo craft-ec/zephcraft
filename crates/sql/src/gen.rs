@@ -53,7 +53,8 @@ pub trait DurableStore: Send + Sync {
     /// Drop a generation superseded by compaction — release its system marker
     /// locally and on current holders so it returns to the normal lifecycle and
     /// fades. Idempotent/re-sendable for churn. Returns holders still providing it
-    /// (0 = fully released; compaction re-runs until 0).
+    /// (0 = fully released). NOTE: nothing currently re-sends drops until holders
+    /// drain — the `releasing` churn-cleanup loop is deferred; TTL + fade reclaim.
     async fn drop_generation(&self, cid: Cid) -> Result<usize>;
 }
 

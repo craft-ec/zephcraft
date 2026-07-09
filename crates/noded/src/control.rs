@@ -1031,7 +1031,7 @@ async fn rpc_publish_program(
     let Ok(bytes) = hex::decode(h.trim()) else {
         return rpc_err(id, "bad wasm hex".into());
     };
-    // Content cid = what governance sets + what the committee/coordinator fetch by.
+    // Content cid = what a governance SetProgram would reference (and nodes fetch by).
     let content_cid = hex::encode(zeph_core::Cid::of(&bytes).0);
     match state.engine.publish_system(&bytes).await {
         Ok(_) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":

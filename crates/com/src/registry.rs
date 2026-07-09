@@ -214,10 +214,6 @@ pub fn registry_program_cid() -> [u8; 32] {
 #[cfg(test)]
 const REGISTRY_WASM: &[u8] = include_bytes!("../registry.wasm");
 
-/// The seed for the registry PDA account (so `pda(registry_program_cid(), REGISTRY_SEED)`
-/// is the account whose head advances as the registry).
-pub const REGISTRY_SEED: &[u8] = b"apps";
-
 /// A NATIVE network-owned program run deterministically: `(prev_state, request) →
 /// new_state`. Its code is the node's own (identical on every node), so it needn't run
 /// through the WASM sandbox — the anchor runtime runs it directly (foundation

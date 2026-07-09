@@ -24,7 +24,7 @@ fn ns_of(name: &str) -> String {
 }
 
 /// [`AppBackend`] backed by the node's CraftSQL + CraftOBJ. Bound to ONE identity
-/// (the node's own): `sql_execute` always writes `(own, app/ns)` — the agent never
+/// (the node's own): `sql_execute` always writes `(own, app.<ns>)` — the agent never
 /// chooses the writer.
 pub struct CraftBackend {
     sql: Arc<CraftSql>,

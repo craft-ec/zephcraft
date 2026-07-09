@@ -213,10 +213,9 @@ impl Membership {
         });
     }
 
-    /// Seed the passive view with candidate peers (e.g. discovered from the
-    /// tracker's node registry) and fill the active view from them. This is
-    /// how a node bootstraps membership from the network WITHOUT a hardcoded
-    /// peer — once it's on a tracker, it finds everyone.
+    /// Seed the passive view with candidate peers (in production: the configured
+    /// `dht_seeds`, re-seeded periodically by noded) and fill the active view from
+    /// them — how a node bootstraps membership without a full peer list.
     pub async fn seed(self: &Arc<Self>, peers: Vec<PeerAddr>) {
         let me = self.my_id();
         for peer in peers {

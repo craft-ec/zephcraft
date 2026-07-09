@@ -2,7 +2,7 @@
 //!
 //! `xRead`/`xWrite` map byte offsets onto `Pager` pages; `xSync` commits the
 //! buffered pages to objects and produces a new immutable ROOT CID, stored in a
-//! shared map (the in-memory stand-in for the signed `KIND_ROOT` head). The
+//! shared map (the in-memory stand-in for the published head). The
 //! rollback journal is served from an in-RAM handle (never persisted — commits
 //! are atomic via the root CID, so a hot journal never needs recovery).
 
@@ -17,8 +17,8 @@ use zeph_core::Cid;
 
 use crate::{ObjectStore, Pager, PAGE_SIZE};
 
-/// db name → current root CID (in-memory here; the real head is a signed
-/// `KIND_ROOT` record published via routing).
+/// db name → current root CID (in-memory here; the real head is published
+/// through the `RootStore` — the owner-signed registry in production).
 pub type Roots = Arc<Mutex<HashMap<String, [u8; 32]>>>;
 /// Per-db lazy-read fetchers: a reader registers one so the sync VFS can pull
 /// page contents on demand instead of syncing the whole DB up front.
@@ -47,7 +47,7 @@ impl CraftVfs {
     }
 
     /// Handle to the shared root map — lets callers read the committed root CID
-    /// for a db (and, later, publish it as `KIND_ROOT`).
+    /// for a db (which `CraftDb::write` then publishes as the head).
     pub fn roots(&self) -> Roots {
         self.roots.clone()
     }
@@ -257,7 +257,7 @@ mod tests {
             .unwrap();
         }
 
-        // A root CID was committed (the KIND_ROOT head).
+        // A root CID was committed (the DB head).
         let root = roots.lock().unwrap().get("acct.db").copied();
         assert!(root.is_some(), "commit produced a root CID");
 

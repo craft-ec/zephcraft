@@ -1,28 +1,29 @@
 //! The node's durable owner-signed HEAD registry — program names, CraftSQL DB roots, and
-//! durability manifests (RT_PROGRAM / RT_DBROOT / RT_MANIFEST) — a thin consumer of the
-//! [`ProgramAccountStore`] substrate. `deploy` registers a signed head by advancing a
-//! per-shard registry account (`pda(registry_program_cid(), shard_seed(shard))`); resolution
-//! reads that account's state. The account state itself is persisted + published durably by
-//! the store — this type holds no state of its own.
+//! durability manifests (RT_PROGRAM / RT_DBROOT / RT_MANIFEST). Each shard's heads live in a
+//! per-shard **CraftSQL database** (namespace [`HeadRegistry::ns_of`] =
+//! `reg_<rtype>_<bits>_<shard>`, a `heads(owner, name, cid, version)` table); the shard-DB's
+//! `(root, seq)` pointer is a small [`ProgramAccountStore`] blob via `ShardRootStore` (never
+//! routed back through the registry — that would recurse). `deploy` upserts a signed head into
+//! the shard's DB; resolution is an indexed SELECT.
 //!
 //! Authority: the registry is an **open, owner-signed CRDT** (partition-by-owner,
 //! last-writer-wins per `(owner, name)`) — it converges by construction, so writes need
-//! NO attestation / committee. The store runs the governance-canonical registry program
-//! LOCALLY to validate an owner-signed submission, then merges. See
-//! `docs/VERIFICATION_DESIGN.md` §2 and `docs/REGISTRY_DESIGN.md` §2.1.
+//! NO attestation / committee. Validation is NATIVE on the write path (owner signature +
+//! [`MAX_NAME_LEN`]): hard invariants are kernel mechanism, not governed-WASM policy. See
+//! `docs/SQL_REGISTRY_DESIGN.md`, `docs/VERIFICATION_DESIGN.md` §2, `docs/REGISTRY_DESIGN.md`.
 //!
 //! Sharding: the keyspace is split into `2^shard_bits` shards. `shard_bits` is a GOVERNED value
 //! (a `SetConfig` on the governance chain), so every node agrees on the count. Every `(owner,
 //! name)` key routes to exactly ONE shard via [`shard_of`] (the low `bits` of the key hash); each
-//! `(rtype, generation, shard)` is its own account (seeded by [`shard_seed`]) with its own
-//! independent rotating-writer election, so different shards may be written by different nodes and
-//! the write load spreads across the membership.
+//! `(rtype, generation, shard)` is its own shard DB with its own independent rotating-writer
+//! election, so different shards may be written by different nodes and the write load spreads
+//! across the membership.
 //!
-//! Online resharding: because `shard_seed` encodes the shard-count GENERATION (`bits`), the count
-//! can change on a LIVE cluster with no wipe — [`HeadRegistry::reshard_round`] split/merges each
-//! held shard's heads from the old generation into the new one, and reads fall through to the
-//! adjacent generation during the migration window. Low-bit routing keeps a split LOCAL (a parent
-//! shard's keys go only to its two children).
+//! Online resharding: because the shard-DB namespace encodes the shard-count GENERATION (`bits`),
+//! the count can change on a LIVE cluster with no wipe — [`HeadRegistry::reshard_round`]
+//! split/merges each held shard's heads from the old generation into the new one, and reads fall
+//! through to the adjacent generation during the migration window. Low-bit routing keeps a split
+//! LOCAL (a parent shard's keys go only to its two children).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -103,9 +104,9 @@ const READY_MAX_SECS: u64 = 90;
 /// startup-window latency; in steady state the node is already ready, so there is no wait.
 const READY_WAIT_SECS: u64 = 20;
 
-/// Registry KIND tags — each kind is a SEPARATE account per shard (the tag is folded into
-/// [`shard_seed`], so `(rtype, shard)` addresses distinct state). Lets program heads, database
-/// roots, and manifests share one substrate without colliding.
+/// Registry KIND tags — each kind is a SEPARATE shard DB (the tag is folded into
+/// [`HeadRegistry::ns_of`], so `(rtype, shard)` addresses distinct state). Lets program heads,
+/// database roots, and manifests share one substrate without colliding.
 pub const RT_PROGRAM: u8 = 0;
 /// CraftSQL DB roots (`KIND_ROOT`) and durability manifests (`KIND_MANIFEST`) now ride this same
 /// substrate (type-in-seed): each `(rtype, shard)` is a distinct account, so program heads, DB
@@ -162,7 +163,7 @@ fn shard_of(owner: &[u8; 32], name: &str, bits: u32) -> u64 {
 /// OPERATOR NOTE — changing the count is an ONLINE reshard, no wipe needed. A governance
 /// `SetConfig{"shard_bits", n}` is picked up by every node ([`HeadRegistry::shard_bits`]); each
 /// node's [`HeadRegistry::reshard_round`] then split/merges its held shards from the old
-/// generation into the new one (`shard_seed` encodes the generation, so the two never collide),
+/// generation into the new one (the shard-DB namespace encodes the generation, so they never collide),
 /// and [`HeadRegistry::resolve_entry`] reads through to the adjacent generation during the window.
 /// Change one bit at a time (±1) and let the cluster settle between steps.
 fn resolve_shard_bits(governed: Option<i64>) -> u32 {
@@ -173,9 +174,9 @@ fn resolve_shard_bits(governed: Option<i64>) -> u32 {
 
 /// Seed of the per-node GENERATION MARKER account — records the shard-count `bits` this node
 /// last resharded to, so on the next tick it can detect a governed `shard_bits` change and run the
-/// split/merge exactly once. Deliberately NOT a [`shard_seed`] output (own prefix), so it never
-/// collides with a real `(rtype, bits, shard)` account. Persisted like any account (survives
-/// restart), so a node that was down during a reshard catches up when it returns.
+/// split/merge exactly once. Its own distinct prefix, so it never collides with a shard-DB root
+/// pointer (`regshardroot/…`) or the held index. Persisted like any account (survives restart),
+/// so a node that was down during a reshard catches up when it returns.
 const GEN_MARKER_SEED: &[u8] = b"craftec/registry/shard-generation/1";
 
 /// Seed of the per-node HELD-SHARDS INDEX account — the set of `(rtype, bits, shard)` this node
@@ -267,10 +268,11 @@ impl ResolveCache {
 /// [`Self::replicas`] / [`Self::current_writer`]).
 pub struct HeadRegistry {
     identity: Arc<NodeIdentity>,
-    /// Shared generic program-account store — each shard's state lives in the account
-    /// `pda(registry_program_cid(), shard_seed(shard))` here.
+    /// Shared generic program-account store — holds the small registry marker blobs (the
+    /// generation marker + held-shards index; shard-DB root pointers live here too, via
+    /// `ShardRootStore`). The shard state itself lives in the per-shard CraftSQL DBs.
     store: Arc<ProgramAccountStore>,
-    /// Governance chain — resolves the EXECUTING registry program cid (upgradeable).
+    /// Governance chain — source of the governed `shard_bits` config value.
     programs: RwLock<Option<Arc<crate::governance::GovernanceChainStore>>>,
     /// HLC clock — drives the epoch (`now().millis() / EPOCH_MILLIS`) that elects the writer.
     clock: Arc<zeph_core::hlc::Clock>,
@@ -1119,12 +1121,10 @@ impl HeadRegistry {
         self.sql_resolve(sk, &owner, name).await
     }
 
-    /// Register (or advance) an app head under THIS node's identity. Routes the key to its
-    /// shard; advances that shard's account over its STABLE address (`registry_program_cid()`)
-    /// while executing the governance-resolved registry program (`program_cid()`) — so an
-    /// upgraded WASM program is authoritative without moving the account. The store validates
-    /// the owner-signed submission (open CRDT — no committee), persists + publishes the new
-    /// state. Returns the new root.
+    /// Register (or advance) a head under THIS node's identity. Signs the submission, routes the
+    /// key to its shard, and — as the shard's writer, or by forwarding to it — validates NATIVELY
+    /// (owner signature + name cap; open CRDT, no committee) and upserts the row into the shard's
+    /// CraftSQL DB. Returns the shard-DB's new root.
     pub async fn register(
         &self,
         rtype: u8,

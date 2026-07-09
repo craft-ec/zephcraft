@@ -1,11 +1,11 @@
-//! Cross-node program-registry protocol (`REGISTRY_ALPN`). Closes the offline-owner gap:
-//! the keyspace is split into `2^shard_bits` sharded accounts (a governed, cluster-agreed
-//! count — the key-routed requests carry the submitter's `bits`), each seeded
-//! `REGISTRY_SEED ‖ rtype ‖ shard` (`pda(registry_program_cid(), shard_seed(sk))`), and each
-//! shard's writer ROTATES per shard among its stable replica set. Non-writer nodes forward
-//! registrations and resolution queries to the shard's current writer over this ALPN. Mirrors
-//! the request/serve shape of the (removed) attestation coordinator: the client opens a stream
-//! on the ALPN, postcard-encodes the request, and reads back a postcard-encoded response.
+//! Cross-node head-registry protocol (`REGISTRY_ALPN`). Closes the offline-owner gap:
+//! the keyspace is split into `2^shard_bits` shards (a governed, cluster-agreed count — the
+//! key-routed requests carry the submitter's `bits`), each backed by a per-shard CraftSQL DB
+//! (namespace `reg_<rtype>_<bits>_<shard>`), and each shard's writer ROTATES among its stable
+//! replica set. Non-writer nodes forward registrations and resolution queries to the shard's
+//! current writer over this ALPN; replication is row-level (`PushState` normally carries a
+//! 1-row state). The client opens a stream on the ALPN, postcard-encodes the request, and
+//! reads back a postcard-encoded response.
 
 use serde::{Deserialize, Serialize};
 use zeph_transport::{PeerAddr, Transport};

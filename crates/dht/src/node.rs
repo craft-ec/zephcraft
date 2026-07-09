@@ -1,6 +1,6 @@
 //! `DhtNode` — the Kademlia overlay: serve inbound queries, and run iterative α-parallel
-//! lookups to find the K nodes closest to any key. Phase 1 is overlay formation only
-//! (FIND_NODE + bootstrap); record storage layers on in Phase 2.
+//! lookups to find the K nodes closest to any key, plus the signed record store
+//! (Store / FindValue) that rides on it.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};

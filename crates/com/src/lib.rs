@@ -46,7 +46,7 @@ pub use gov::{
 pub use invoke::{invoke_remote, serve_invocations, InvokeRequest, InvokeService, INVOKE_ALPN};
 pub use registry::{
     registry_program_cid, ConfigRegistryState, HeadEntry, HeadSubmission, NativeProgram,
-    ProgramRegistryState, RegistryProgram, RegistryState, REGISTRY_SEED,
+    ProgramRegistryState, RegistryProgram, RegistryState,
 };
 pub use transition::{pda, TransitionCtx, TransitionRuntime};
 

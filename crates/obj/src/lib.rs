@@ -70,7 +70,8 @@ pub enum ConsumeMode {
 pub struct ObjConfig {
     /// Generation size (single-generation demo path; K=8 default).
     pub k: usize,
-    /// Distinct-peer threshold for `durable` (foundation ≥K rule).
+    /// Distinct-peer threshold at which the background spread marks a cid
+    /// `distributed` (publish stops re-pushing); NOT the publish return value.
     pub durability_threshold: usize,
     /// Storage this node offers to the network (bytes) — announced as
     /// capacity and (later) the eviction ceiling.
@@ -454,8 +455,9 @@ impl ObjEngine {
         sources
     }
 
-    /// Publish content: encode, store locally (pin by default), spread to
-    /// distinct peers, announce providers. `durable` = reached ≥K peers.
+    /// Publish content: encode, retain locally, spread to distinct peers in the
+    /// BACKGROUND, announce providers. Returns immediately with `durable: false`;
+    /// the erasure spread completes async (distribute_pending + health scan).
     pub async fn publish(&self, data: &[u8], pin: bool) -> anyhow::Result<PublishReport> {
         self.publish_impl(data, pin, false).await
     }
