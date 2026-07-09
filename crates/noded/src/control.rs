@@ -115,6 +115,10 @@ pub struct Status {
     pub hlc_ms: u64,
     pub hlc_logical: u16,
     pub passive_peers: u32,
+    /// CONVERGED census size — every member of the network heard (directly or via gossip)
+    /// within the census TTL. Network-wide and consistent across nodes, unlike the size-bounded
+    /// active view; this is the set elections run over.
+    pub census: u32,
     pub store_cids: u64,
     pub store_pieces: u64,
     pub store_pinned: u64,
@@ -161,6 +165,8 @@ pub struct State {
     pub engine: Arc<zeph_obj::ObjEngine>,
     pub peers: RwLock<Vec<PeerStatus>>,
     pub passive_peers: std::sync::atomic::AtomicU32,
+    /// Converged census size (see `Status::census`), synced by the 1s membership loop.
+    pub census: std::sync::atomic::AtomicU32,
     pub storage: RwLock<(u64, u64, u64, u64)>, // (cids, pieces, pinned, bytes)
     pub providing: std::sync::atomic::AtomicU64,
     pub content: RwLock<Vec<ContentInfo>>,
@@ -218,6 +224,7 @@ impl State {
             passive_peers: self
                 .passive_peers
                 .load(std::sync::atomic::Ordering::Relaxed),
+            census: self.census.load(std::sync::atomic::Ordering::Relaxed),
             store_cids: self.storage.read().await.0,
             store_pieces: self.storage.read().await.1,
             store_pinned: self.storage.read().await.2,
@@ -339,7 +346,9 @@ impl State {
 
     /// Replace the peer table wholesale (fed by the membership layer). Emits
     /// PeerConnected/PeerDisconnected events for the delta in the alive set.
-    pub async fn set_peers(&self, peers: Vec<PeerStatus>, passive: u32) {
+    pub async fn set_peers(&self, peers: Vec<PeerStatus>, passive: u32, census: u32) {
+        self.census
+            .store(census, std::sync::atomic::Ordering::Relaxed);
         use std::collections::HashSet;
         let alive = |ps: &[PeerStatus]| -> HashSet<String> {
             ps.iter()

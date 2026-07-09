@@ -1292,6 +1292,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         engine: engine.clone(),
         peers: tokio::sync::RwLock::new(Vec::new()),
         passive_peers: std::sync::atomic::AtomicU32::new(0),
+        census: std::sync::atomic::AtomicU32::new(0),
         storage: tokio::sync::RwLock::new((0, 0, 0, 0)),
         providing: std::sync::atomic::AtomicU64::new(0),
         content: tokio::sync::RwLock::new(Vec::new()),
@@ -2014,7 +2015,10 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                 });
             }
             table.sort_by(|a, b| (!a.alive).cmp(&!b.alive).then(a.id.cmp(&b.id)));
-            sync_state.set_peers(table, snap.passive_count as u32).await;
+            let census = sync_membership.census().await.len() as u32;
+            sync_state
+                .set_peers(table, snap.passive_count as u32, census)
+                .await;
         }
     });
 

@@ -263,7 +263,7 @@
         <tbody id="jc-recent"><tr><td colspan="3" class="muted">no jobs run yet</td></tr></tbody></table>
     </div>
     <div class="card">
-      <div class="cardhead">membership — active view <span class="muted">(peers discovered via join/shuffle, probed for liveness)</span></div>
+      <div class="cardhead">membership — active view <span class="muted">(the small probed-connection set — capped by design; “network” above is the converged census of ALL known-alive members, the set elections run over)</span></div>
       <table>
         <thead><tr><th>peer</th><th>state</th><th>rtt</th><th>skew</th><th>last seen</th><th>addrs</th></tr></thead>
         <tbody id="peers"><tr><td colspan="6" class="muted">no peers in view yet — joining…</td></tr></tbody>
@@ -323,7 +323,7 @@ function render(s){
   $("node-id").textContent = s.node_id; SELF_ID = s.node_id;
   $("reach").textContent = s.reach;
   $("wire").textContent = "v" + s.wire_version + " (framed, postcard)";
-  $("views").textContent = "active " + s.peers.filter(p=>p.alive).length + " · passive " + s.passive_peers;
+  $("views").textContent = "network " + (s.census||0) + " · active " + s.peers.filter(p=>p.alive).length + " · passive " + s.passive_peers;
   $("erasure").textContent = s.erasure;
   $("hlc").textContent = new Date(s.hlc_ms).toISOString().slice(11,23) + " · logical " + s.hlc_logical;
   $("relays").textContent = s.relays;
