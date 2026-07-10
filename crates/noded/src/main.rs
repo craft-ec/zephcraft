@@ -13,6 +13,27 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// jemalloc runtime config, read at allocator init (before main) via the symbol
+// jemalloc looks up. DEFAULT jemalloc does NOT run a purge thread and decays
+// dirty pages lazily (10s), so under the seed's bursty serve+mint churn RSS
+// still climbs to multi-GB (measured 4.4GB in 6min). A dedicated background
+// purge thread + short decay returns freed pages to the OS promptly — RSS then
+// holds flat at ~550MB (measured, matching the true working set). Baked into the
+// binary so it applies on every node with no per-host env config. The &[u8]
+// begins with the data pointer jemalloc reads as `const char *`; NUL-terminated.
+// `background_thread` is Linux/pthread-only (jemalloc warns + ignores it on
+// macOS), so the fleet (Linux) gets the purge thread while the low-churn Mac
+// node gets decay-only — same result there, no startup warning.
+#[cfg(all(not(target_env = "msvc"), target_os = "linux"))]
+#[allow(non_upper_case_globals)]
+#[export_name = "_rjem_malloc_conf"]
+pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0\0";
+
+#[cfg(all(not(target_env = "msvc"), not(target_os = "linux")))]
+#[allow(non_upper_case_globals)]
+#[export_name = "_rjem_malloc_conf"]
+pub static malloc_conf: &[u8] = b"dirty_decay_ms:1000,muzzy_decay_ms:0\0";
+
 mod account;
 mod control;
 mod governance;
