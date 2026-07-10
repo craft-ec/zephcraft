@@ -155,7 +155,13 @@ impl TestNode {
     /// Spawn a full node. `seeds` bootstraps BOTH membership and the DHT
     /// (production's `dht_seeds`, which feed both — see `cmd_run`).
     pub async fn spawn(seeds: &[Contact]) -> Result<Self> {
-        let data_dir = tempfile::tempdir()?;
+        Self::spawn_in(tempfile::tempdir()?, seeds).await
+    }
+
+    /// Spawn into an EXISTING data dir — a restart reloads the same identity
+    /// (keys/) and the full held store from disk, i.e. the same NodeId with
+    /// its content, exactly like a production restart.
+    pub async fn spawn_in(data_dir: tempfile::TempDir, seeds: &[Contact]) -> Result<Self> {
         let identity =
             Arc::new(zeph_crypto::Keystore::new(data_dir.path().join("keys")).init_or_load()?);
 
@@ -183,6 +189,11 @@ impl TestNode {
             }
         };
         let dht = DhtNode::new(identity.clone(), transport.clone(), DHT_RECORD_TTL_MS);
+        // Restore DHT records + routing table if this is a restart (present) —
+        // production persists these, so a restart re-forms from them instead of
+        // cold-bootstrapping. No-op (0 loaded) on a fresh dir.
+        dht.load_records(&data_dir.path().join("dht_records.bin"));
+        dht.load_table(&data_dir.path().join("dht_table.bin"));
         let resolves = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let routing: Arc<dyn zeph_routing::ContentRouting> = Arc::new(CountingRouting {
             inner: Arc::new(zeph_routing::DhtRouting::new(dht.clone())),
@@ -628,6 +639,39 @@ impl TestNode {
         }
         self.transport.close().await;
     }
+
+    /// Shut down but RETAIN the data dir (store/ + keys/ + DHT snapshots) so the
+    /// node can be restarted with the same identity + full store. Persists the
+    /// DHT record store + routing table (production does; the harness otherwise
+    /// cold-starts them) so a restart measures re-announce/re-scan, not DHT
+    /// cold-start. `announced_at` is deliberately NOT persisted — its empty
+    /// state on boot is the re-announce burst under test.
+    pub async fn shutdown_retain(mut self) -> RestartHandle {
+        let dir = self._data_dir.path().to_path_buf();
+        let _ = self.dht.save_records(&dir.join("dht_records.bin"));
+        let _ = self.dht.save_table(&dir.join("dht_table.bin"));
+        for t in self.tasks.drain(..) {
+            t.abort();
+            let _ = t.await;
+        }
+        self.transport.close().await;
+        RestartHandle {
+            node_id: self.node_id,
+            data_dir: self._data_dir,
+        }
+    }
+
+    /// Restart a retained node into its old data dir (same NodeId + store).
+    pub async fn restart(h: RestartHandle, seeds: &[Contact]) -> Result<Self> {
+        Self::spawn_in(h.data_dir, seeds).await
+    }
+}
+
+/// Holds a shut-down node's data dir so store/ + keys/ + DHT snapshots survive
+/// until restart (or drop).
+pub struct RestartHandle {
+    pub node_id: NodeId,
+    data_dir: tempfile::TempDir,
 }
 
 /// Wait (bounded, `READY_WAIT_SECS` — the `wait_ready` caller bound) for the
