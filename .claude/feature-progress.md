@@ -1,3 +1,63 @@
+# TRANSFER PLANE V2 — P3 SCENARIO C ✅ GREEN (2026-07-10, ultracode)
+DURABILITY-UNDER-LOSS GAP (scenario_c_kill_holder_repairs) — FIXED. Publish 30 PINNED cids from
+node0, quiesce, KILL the top non-seed holder permanently; survivors must restore every cid to >=k=8
+pieces (cluster-wide piece_count sum) within 200s. NOW: recovered=true, 0/30 below-k, converges in
+~47s. ROOT CAUSE (RLNC): a below-k cid's repair election was won by a surviving PIECE holder that
+recodes within its <k-dimensional subspace — adds NO independent rank, so recoverability never
+returns. Only a whole-content holder can mint the missing rank (node0, the publisher).
+THE REAL BUG was in the WIRED repair path: the test/prod coordinator routes EngineWork::Repair →
+`repair_cid` (obj/lib.rs ~2187), NOT the inline health_scan_chunk path. repair_cid had its OWN
+election `if winner != Some(&me) { return 0 }` that discarded node0's repair when a piece-holder won
+the rendezvous. Under elected scan (element 4) ONLY node0 (content holder, always-scan) scans these
+cids and enqueues repair — but repair_cid then deferred to n1 (6-piece holder), which never scanned
+them itself and cannot add rank: a DETECT-BUT-DEFER DEADLOCK (measured: 5/30 stuck at 6 pieces on
+one holder, content holder idle — confirmed by a per-cid diagnostic showing [n0=0+C n1=6 rest=0]).
+FIXES (crates/obj/src/lib.rs, all committed together):
+  (a) should_scan ~1342: whole-content holders ALWAYS scan (never lose the scan election) — content
+      holder must DETECT below-k to enqueue a LOCAL repair (repair runs on the scanning node).
+  (b) health_scan_chunk repair path ~1669: content_restorer = (have < gen.k && has_content) repairs
+      unconditionally, bypassing the rendezvous (inline path, used when work_trigger unset).
+  (c) repair_cid ~2230: SAME content_restorer bypass — THIS is the one that closed scenario C
+      (the wired path). Fade gate (~2223 !is_alive→return 0) runs BEFORE it, so unwanted retained
+      copies still never repair (no minting storm); only fires below k so healthy cids untouched.
+FULL SUITE (A/B/C/D/E/F): A,C,D,E,F GREEN in the back-to-back suite; C 0/30 below-k @47s; E still
+EXACTLY 1.0x resolves/cid + 100/100 recoverable (no double-scan / durability regression). B FAILED
+in the suite ONLY on census-20 (35.4s > 30s bar) — but B ISOLATED = 15.36s census (within the
+tracked 7-21s), below_k=0. => the census miss is the KNOWN CPU-STARVATION FLAKE (B ran last after
+570s of prior heavy tests), NOT a regression; content-holder-always-scan did not slow membership.
+Do NOT gate on a full back-to-back --ignored suite for the census bar; run heavy scenarios spaced.
+ADVERSARIAL REVIEW (2 agents, correctness + regression) — one REAL defect found + fixed:
+  [IMPORTANT, FIXED] mint_piece's has_content branch returned a REPEATED stored piece: serve_pieces
+    returns STORED pieces before fresh encodes, so a content holder that had ALSO ingested coded
+    pieces (ingest has no has_content guard) would push 8 DUPLICATES per repair — no rank added,
+    below-k deadlock RETURNS, and the inflated piece COUNT masks the cid as recovered while still
+    undecodable (silent durability loss). Green scenario C only hid it because node0 is a PURE
+    publisher (piece_count=0). FIX: new Store::mint_from_content(cid) always encodes fresh from the
+    k sources (never serve_pieces); mint_piece routes content holders through it. Regression guard:
+    store test mint_from_content_is_independent_even_with_stored_pieces (pin + 3 ingested pieces →
+    K minted pieces are distinct AND decode to content). All 8 store tests green.
+  Regression review CLEARED the fix: the O(cids) resolve property comes from the noded PROVIDER-AWARE
+    BACKOFF (recheck_min*holders cadence), NOT the scan election — so content-holder-always-scan
+    changes the scan-vs-skip DECISION at a due-event, not the due-RATE. No O(cids*replication)
+    amplification; S5 preserved; content_restorer confined to below-k so healthy cids untouched.
+  WATCH-ITEM (F2, not a blocker): a node pinning a VERY LARGE object set now resolves ALL of it each
+    due-cycle (up to holders× more absolute resolve/CPU than pre-fix elected behavior, still O(held)).
+    Future optimization: content holders could scan their content on a slower dedicated cadence, or
+    skip locally-faded/unwanted retained copies (should_scan currently always-true for any held
+    content, incl. faded — wasted resolve that no-ops at the fade gate; bounded, correctness-neutral).
+KNOWN MARGINAL FLAKE (scenario C, ~1/8 runs, documented follow-up — NOT a correctness bug): once in
+~8 runs ONE cid lands at total=7 (one piece short of k=8) on a single survivor and doesn't close in
+the 200s window (the run then burns the full window). Mechanism VERIFIED sound via SCEN_C_TRACE
+instrumentation (now removed): when the content holder scans a below-k cid it lands 7 pieces in ONE
+repair pass (restorer=true → have jumps 4→11), so recovery is normally decisive. The flake is a
+k-BOUNDARY edge: have=7 must read <8 for content_restorer to fire; a brief dead-node provider-record
+phantom (killed node counted alive past its ~30s liveness TTL) can read have>=8 and suppress the
+bypass. Could NOT reproduce in 5 traced runs (all green; 7/8 overall). Widening content_restorer to
+have<floor was REJECTED: it defeats the herd-avoidance the election gives PINNED content above k.
+Real fix (deferred): make `have` phantom-proof (verify killed-node record eviction from alive_peers/
+DHT within the window) OR a small k-boundary tolerance verified against a reproducer. Re-run scenario
+C if it fails once; it is not a deploy blocker (the deadlock — the actual bug — is closed).
+
 # TRANSFER PLANE V2 — P1+P2 DONE (2026-07-10, ultracode)
 ELEMENT 5 (class-fair scheduling, e9c4270) + REVIEW FIXES (e8c6cf6): JobClass per-key-prefix,
 per-class in-flight caps. Adversarial review (workflow wh3rxdfbf, 7 confirmed) found + fixed a

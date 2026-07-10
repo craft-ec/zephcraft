@@ -95,6 +95,56 @@ fn pin_survives_reopen_and_serves_pieces_on_demand() {
 }
 
 #[test]
+fn mint_from_content_is_independent_even_with_stored_pieces() {
+    // Repair correctness (regression guard): a content holder that has ALSO
+    // ingested coded pieces must still mint FRESH INDEPENDENT pieces from the
+    // whole content. serve_pieces returns STORED pieces first, so minting via
+    // it would re-serve the same stored piece every call — repair would push
+    // duplicates that add no rank, leaving a below-k cid stuck while the
+    // inflated count masks it as recovered. mint_from_content must sidestep
+    // that: K minted pieces alone must span the k-dim space and decode.
+    let dir = tempfile::tempdir().unwrap();
+    let mut rng = StdRng::seed_from_u64(7);
+    let content: Vec<u8> = (0..K * PIECE_LEN).map(|_| rng.gen()).collect();
+    let cid = Cid::of(&content);
+    let (gen, sources) = generation(&content, &mut rng);
+
+    let store = Store::open(dir.path()).unwrap();
+    store.put_generation(cid, gen).unwrap();
+    store.pin(cid, &content).unwrap(); // whole content
+                                       // Also ingest a few coded pieces — the exact case the old
+                                       // serve_pieces path mishandled (it re-served a stored piece
+                                       // instead of a fresh encode).
+    for piece in encode_n(&sources, 3, &mut rng).unwrap() {
+        store.put_piece(cid, &piece).unwrap();
+    }
+    assert_eq!(store.piece_count(&cid), 3);
+
+    // Mint K pieces straight from content.
+    let minted: Vec<_> = (0..K)
+        .map(|_| store.mint_from_content(&cid).expect("content present"))
+        .collect();
+    // Not collapsed onto one repeated stored piece: coding vectors are distinct.
+    let distinct: HashSet<Vec<u8>> = minted.iter().map(|p| p.coding_vector.clone()).collect();
+    assert_eq!(
+        distinct.len(),
+        K,
+        "minted pieces must be distinct independent combinations, not a repeated stored piece"
+    );
+    // Strong proof of full rank: the K minted pieces alone decode to content.
+    let mut decoder = Decoder::new(K, PIECE_LEN);
+    for p in &minted {
+        decoder.add_piece(p).unwrap();
+    }
+    let decoded: Vec<u8> = decoder.decode().unwrap().into_iter().flatten().collect();
+    assert_eq!(
+        &decoded[..content.len()],
+        &content[..],
+        "K minted pieces span the k-dim space (independent, full rank)"
+    );
+}
+
+#[test]
 fn eviction_skips_pins() {
     let dir = tempfile::tempdir().unwrap();
     let mut rng = StdRng::seed_from_u64(3);

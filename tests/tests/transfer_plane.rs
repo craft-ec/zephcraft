@@ -140,6 +140,49 @@ async fn publish_and_settle(
     cids
 }
 
+/// Like [`publish_and_settle`] but PINS each object — pinned content is never
+/// faded/offloaded and every holder maintains it to the floor (provider_pinned
+/// keeps their scan's is_alive true), so durability is unambiguous (no
+/// want-propagation / Fade confound). For durability-under-loss tests.
+async fn publish_pinned_and_settle(
+    publisher: &TestNode,
+    n: usize,
+    label: &str,
+    violations: &mut Vec<String>,
+) -> Vec<Cid> {
+    let data = payloads(n);
+    let mut cids = Vec::with_capacity(n);
+    for d in &data {
+        cids.push(
+            publisher
+                .engine
+                .publish(d, true)
+                .await
+                .expect("publish")
+                .cid,
+        );
+    }
+    let start = Instant::now();
+    loop {
+        let undist = cids
+            .iter()
+            .filter(|c| !publisher.engine.store().is_distributed(c))
+            .count();
+        if undist == 0 || start.elapsed() >= SETTLE_BUDGET {
+            println!(
+                "{label}: published {n} PINNED objects; undistributed={undist} after {:?}",
+                start.elapsed()
+            );
+            if undist > 0 {
+                violations.push(format!("{label}: {undist}/{n} pinned cids undistributed"));
+            }
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    cids
+}
+
 /// Every node's census size, sampled concurrently (a sequential sweep across
 /// 20 nodes takes long enough to skew the census-bar timing).
 async fn census_counts(nodes: &[TestNode]) -> Vec<usize> {
@@ -819,6 +862,132 @@ async fn scenario_f_restart_rejoin() {
     assert!(
         violations.is_empty(),
         "scenario F bars failed:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// Scenario C — kill a live holder, cluster repairs (Transfer Plane v2 P3 /
+/// deploy-gate). Gates the liveness fixes: a permanently-killed multi-cid
+/// holder's pieces are lost, and the SURVIVORS must repair the deficit back to
+/// recoverability. This exercises the census-liveness fix (dead holder must
+/// stop counting toward `have` within ~one scan interval so repair fires) AND
+/// elected scan (some survivor must win + repair each affected cid).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "heavy: real 8-node in-process cluster — run explicitly (see module doc)"]
+async fn scenario_c_kill_holder_repairs() {
+    let _serial = SERIAL.lock().await;
+    let mut violations: Vec<String> = Vec::new();
+
+    let mut nodes = vec![TestNode::spawn(&[]).await.expect("seed node")];
+    let seed = nodes[0].contact.clone();
+    nodes.extend(spawn_wave(&seed, 7).await);
+    // Fewer cids so repair can fully converge in the window (distribution
+    // under-delivers under a large burst — pushes time out — so repair must
+    // top up to a robust spread before the kill is a fair durability test).
+    let cids = publish_pinned_and_settle(&nodes[0], 30, "scenario C", &mut violations).await;
+    tokio::time::sleep(Duration::from_secs(40)).await; // quiesce → repaired toward floor
+
+    // Kill the top non-seed holder PERMANENTLY (shutdown, no restart).
+    let victim_idx = (1..nodes.len())
+        .max_by_key(|&i| nodes[i].engine.store().cids().len())
+        .expect("non-seed nodes");
+    let killed = nodes[victim_idx].engine.store().cids().len();
+    println!("scenario C: killing node{victim_idx} (held {killed} cids)");
+    let mut victim = nodes.remove(victim_idx);
+    victim.shutdown().await; // permanent — pieces gone
+
+    // Survivors must repair the deficit back to recoverability within a bounded
+    // window (dead holder ages out of the liveness census ~30s, then repair).
+    let k = 8u64;
+    let mut recovered = false;
+    let start = Instant::now();
+    let mut worst_below = usize::MAX;
+    while start.elapsed() < Duration::from_secs(200) {
+        let below = cids
+            .iter()
+            .filter(|c| {
+                nodes
+                    .iter()
+                    .map(|n| n.engine.store().piece_count(c) as u64)
+                    .sum::<u64>()
+                    < k
+            })
+            .count();
+        worst_below = worst_below.min(below);
+        if below == 0 {
+            recovered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    println!(
+        "scenario C: recovered={recovered} (best below-k = {} of {})",
+        if worst_below == usize::MAX {
+            0
+        } else {
+            worst_below
+        },
+        cids.len()
+    );
+    if !recovered {
+        violations.push(format!(
+            "survivors did not restore recoverability after killing a {killed}-cid holder \
+             ({} cids still below k=8) — repair did not fire for the dead holder's deficit",
+            worst_below
+        ));
+        // DIAGNOSTIC: per below-k cid, show where the pieces live and which node
+        // (if any) still holds whole content — distinguishes target-cap (spread
+        // thin but present), fade (pushed then deleted), and repair-not-firing.
+        for c in cids.iter() {
+            let per_node: Vec<String> = nodes
+                .iter()
+                .enumerate()
+                .map(|(i, n)| {
+                    let pc = n.engine.store().piece_count(c);
+                    let content = if n.engine.store().has_content(c) {
+                        "+C"
+                    } else {
+                        ""
+                    };
+                    format!("n{i}={pc}{content}")
+                })
+                .collect();
+            let total: u64 = nodes
+                .iter()
+                .map(|n| n.engine.store().piece_count(c) as u64)
+                .sum();
+            if total < 8 {
+                println!(
+                    "  BELOW-K cid {} total={total}  [{}]",
+                    &c.to_hex()[..12],
+                    per_node.join(" ")
+                );
+                // The content holder is the unique rank-restorer. Print ITS
+                // health verdict: if effective >= k the content_restorer bypass
+                // was suppressed (phantom/stale provider record inflating `have`);
+                // if effective < k it detected but failed to push.
+                for n in nodes.iter() {
+                    if !n.engine.store().has_content(c) {
+                        continue;
+                    }
+                    if let Some(h) = n.engine.cid_health(c) {
+                        println!(
+                            "    content-holder verdict: effective={} floor={} live_providers={} decision={:?} action={:?}",
+                            h.effective, h.floor, h.live_providers, h.decision, h.action
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if !violations.is_empty() {
+        dump_cluster(&nodes).await;
+    }
+    shutdown_all(&mut nodes).await;
+    assert!(
+        violations.is_empty(),
+        "scenario C bars failed:\n{}",
         violations.join("\n")
     );
 }

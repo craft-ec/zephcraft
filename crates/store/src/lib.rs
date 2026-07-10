@@ -448,6 +448,26 @@ impl Store {
         Ok(out)
     }
 
+    /// Mint ONE fresh independent coded piece from the WHOLE content — a new
+    /// random full-rank combination of all k sources. Unlike [`serve_pieces`],
+    /// this NEVER returns a stored piece: every call is a new independent
+    /// combination, so a content holder can always add rank and restore a cid
+    /// that has fallen below k. Returns None if the whole content is absent.
+    ///
+    /// The distinction matters for repair: `serve_pieces` returns STORED pieces
+    /// first (topping up with fresh encodes only after), so a content holder
+    /// that has ALSO ingested coded pieces would re-serve the same stored piece
+    /// on every call — pushing duplicates that add no independent rank and
+    /// leaving a below-k cid stuck while its inflated piece count masks it as
+    /// recovered. Minting straight from content sidesteps that entirely.
+    pub fn mint_from_content(&self, cid: &Cid) -> Option<CodedPiece> {
+        let gen = self.generation(cid)?;
+        let content = self.content(cid)?;
+        let sources = split_sources(&content, gen.k as usize, gen.piece_len as usize);
+        let mut rng = rand::rngs::OsRng;
+        encode(&sources, &mut rng).ok()
+    }
+
     fn read_piece(&self, cid: &Cid, pid: &[u8; 32]) -> Option<CodedPiece> {
         let bytes = fs::read(self.cid_dir(cid).join("pieces").join(hex::encode(pid))).ok()?;
         if bytes.len() < 4 {

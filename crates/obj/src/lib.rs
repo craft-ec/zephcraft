@@ -1330,6 +1330,18 @@ impl ObjEngine {
     /// Cheap: reads a snapshot + the ~10s-cached alive set, no network.
     pub async fn should_scan(&self, cid: &Cid, max_stale: std::time::Duration) -> bool {
         let me = self.transport.node_id();
+        // WHOLE-CONTENT HOLDERS ALWAYS SCAN. A holder of the whole content is the
+        // UNIQUE node that can repair a cid that has fallen below k pieces —
+        // recoding from < k surviving pieces adds no independent rank, so a
+        // piece-only survivor cannot restore it. If such a content holder could
+        // lose the scan election to a piece-holder, a below-k cid would never be
+        // repaired (durability loss on holder death — measured). Content holders
+        // are rare (~the publisher / Seed fetchers, ~one per cid), so this keeps
+        // aggregate resolves ~O(cids) while guaranteeing the durability backstop
+        // always runs.
+        if self.store.has_content(cid) {
+            return true;
+        }
         let snap = self
             .scan_snapshot
             .lock()
@@ -1645,7 +1657,16 @@ impl ObjEngine {
                 || (self.store.has_content(&cid) && self.store.is_pinned(&cid));
             let sole_content_fallback =
                 !self_capable && capable.is_empty() && self.store.has_content(&cid);
-            if !self_capable && !sole_content_fallback {
+            // BELOW THE DECODE THRESHOLD (have < k), surviving PIECE holders can
+            // only recode within their <k-dimensional subspace — they cannot add
+            // independent rank, so electing one to "repair" recodes forever
+            // without restoring recoverability (measured: killed-holder cids stuck
+            // below k). Only a WHOLE-CONTENT holder (or >=k-piece holder) can mint
+            // the missing rank. So a content holder below k repairs
+            // UNCONDITIONALLY, bypassing the piece-holder rendezvous. Content
+            // holders are rare (~the publisher), so any double-repair is bounded.
+            let content_restorer = have < gen.k as usize && self.store.has_content(&cid);
+            if !self_capable && !sole_content_fallback && !content_restorer {
                 self.record_health(
                     &cid,
                     have,
@@ -1656,17 +1677,15 @@ impl ObjEngine {
                 );
                 continue;
             }
-            // In the sole-content fallback `capable` is empty (that's the
-            // trigger), so the election below would yield None and skip the
-            // enqueue — self must be a candidate for the fallback to fire.
-            // Mirrors repair_cid's unconditional `capable.push(me)`.
-            if sole_content_fallback {
+            // Self must be a candidate for the sole-content / below-k-restorer
+            // paths (mirrors repair_cid's unconditional `capable.push(me)`).
+            if sole_content_fallback || content_restorer {
                 capable.push(me);
             }
             let winner = capable
                 .iter()
                 .max_by_key(|id| rendezvous_score(id, &cid, epoch));
-            if winner != Some(&me) {
+            if winner != Some(&me) && !content_restorer {
                 self.record_health(
                     &cid,
                     have,
@@ -2210,14 +2229,25 @@ impl ObjEngine {
         // providers — otherwise thin spreading deadlocks repair permanently.
         let sole_content_fallback =
             !self_capable && capable.is_empty() && self.store.has_content(&cid);
-        if !self_capable && !sole_content_fallback {
+        // BELOW THE DECODE THRESHOLD (have < k): surviving PIECE holders can only
+        // recode within their <k-dimensional subspace and CANNOT add independent
+        // rank — so electing one to repair recodes forever without restoring
+        // recoverability. Only a whole-content holder can mint the missing rank.
+        // Mirror the scan path (health_scan_chunk): a content holder below k
+        // repairs UNCONDITIONALLY, bypassing the rendezvous. Without this, a
+        // piece-holder wins the election, the content holder returns 0, and the
+        // piece-holder — which never scanned (elected scan) and cannot add rank —
+        // never acts: a detect-but-defer deadlock (measured scenario C: 5/30 cids
+        // stuck at 6 pieces on one holder, content holder idle).
+        let content_restorer = have < gen.k as usize && self.store.has_content(&cid);
+        if !self_capable && !sole_content_fallback && !content_restorer {
             return 0;
         }
         capable.push(me);
         let winner = capable
             .iter()
             .max_by_key(|id| rendezvous_score(id, &cid, epoch));
-        if winner != Some(&me) {
+        if winner != Some(&me) && !content_restorer {
             return 0;
         }
         self.repair_one(&cid, &gen, &live, floor.saturating_sub(have))
@@ -2305,6 +2335,16 @@ impl ObjEngine {
     /// new independent combination), or — if we hold the whole content (pin) —
     /// encode a fresh piece from sources (serve_pieces does this on demand).
     fn mint_piece(&self, cid: &Cid, gen: &Generation) -> Option<CodedPiece> {
+        // A whole-content holder mints a FRESH independent piece straight from
+        // the k sources (full-rank combination). This must NOT go through
+        // serve_pieces: that returns STORED pieces first, so a content holder
+        // that has also ingested coded pieces would re-serve the same stored
+        // piece on every call — repair would push duplicates that add no rank,
+        // leaving a below-k cid stuck while its inflated count masks it as
+        // recovered (correctness review finding). Only piece-only holders recode.
+        if self.store.has_content(cid) {
+            return self.store.mint_from_content(cid);
+        }
         let held = self
             .store
             .serve_pieces(cid, &HashSet::new(), gen.k as usize)
@@ -2312,12 +2352,8 @@ impl ObjEngine {
         if held.is_empty() {
             return None;
         }
-        if self.store.has_content(cid) {
-            held.into_iter().next()
-        } else {
-            let mut rng = OsRng;
-            recode(&held, &mut rng).ok()
-        }
+        let mut rng = OsRng;
+        recode(&held, &mut rng).ok()
     }
 
     /// Push one freshly-minted piece to raise availability toward the floor.
