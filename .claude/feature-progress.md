@@ -24,6 +24,18 @@ KEY FINDINGS from the scenario-E investigation (record for P3):
 CENSUS-20 now ~7-21s (membership fixes compounded). max_job ~1s. Scenario A/D/E green; B red only
 on the stale at-risk bar. Fleet still on old quiet-config binary — nothing deployed since the P0
 set; DEPLOY GATE still pending P3 (kill-holder scenario C, restart-rejoin D, rejoin memory check).
+WORKSPACE: 171/0 clean in isolation. KNOWN FLAKE (pre-existing, not P1/P2): a 60s+ timing test
+(self-heal / DST class) fails ~1/run ONLY under concurrent build+harness CPU starvation; passes
+isolated. Track for a deadline-loosening / #[ignore]-under-load follow-up; not a regression.
+P3 (NEXT, blueprints in tasks/w8tyvqane.output): (1) reshape scenario B at-risk bar → CLUSTER
+recoverability trend (per-node at_risk_ids is stale under elected scan — element-4 finding);
+(2) in-flight-jobs visibility (dedup set → HashMap<key,Option<Instant>>, in_flight_jobs() with
+elapsed, surface in status/CLI/webui); (3) restart-rejoin scenario D (TestNode persist store across
+respawn → full-store rejoin, the real production failure mode) + scenario C (kill live holder →
+repair fires). THEN deploy gate (fix findings + rejoin memory check) → wire roll (offer/grant+mux)
++ scenario C-capped → scale S4/S1/S2.
+DO-NOT-SCALE gate still open: S5 O(census)-per-item in scale_one/repair_one recruit needs a bounded
+K-subset accessor before any scale-out past ~tens of nodes (benign now, hard ceiling at 1000s).
 
 # TRANSFER PLANE V2 — SCOREBOARD (updated 2026-07-10, ultracode)
 DEPLOY-GATE ADVERSARIAL REVIEW (workflow wf_92b52e18, 24 agents, 11 confirmed findings) found the
