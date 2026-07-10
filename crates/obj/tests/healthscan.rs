@@ -46,7 +46,7 @@ async fn node(tracker: &MemNet, dir: &std::path::Path) -> Node {
         Transport::bind(
             id.secret_key_bytes(),
             Reach::LocalOnly,
-            vec![zeph_obj::ALPN.to_vec()],
+            vec![zeph_transport::MUX_ALPN.to_vec()],
             0,
         )
         .await
@@ -68,8 +68,10 @@ async fn node(tracker: &MemNet, dir: &std::path::Path) -> Node {
     );
     let (tx, rx) = tokio::sync::mpsc::channel(64);
     let st = t.clone();
-    let serve_task =
-        tokio::spawn(async move { st.serve(vec![(zeph_obj::ALPN.to_vec(), tx)]).await });
+    let serve_task = tokio::spawn(async move {
+        st.serve(vec![], vec![(zeph_transport::tag::PIECE, tx)])
+            .await
+    });
     let se = engine.clone();
     let engine_task = tokio::spawn(async move { se.serve(rx).await });
     Node {
@@ -994,7 +996,7 @@ async fn sole_content_holder_enqueues_repair_when_no_peer_is_capable() {
         Transport::bind(
             pid.secret_key_bytes(),
             Reach::LocalOnly,
-            vec![zeph_obj::ALPN.to_vec()],
+            vec![zeph_transport::MUX_ALPN.to_vec()],
             0,
         )
         .await

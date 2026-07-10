@@ -22,7 +22,7 @@ async fn node(tracker: &MemNet, dir: &std::path::Path) -> (Arc<ObjEngine>, Arc<M
         Transport::bind(
             id.secret_key_bytes(),
             Reach::LocalOnly,
-            vec![zeph_obj::ALPN.to_vec()],
+            vec![zeph_transport::MUX_ALPN.to_vec()],
             0,
         )
         .await
@@ -39,7 +39,10 @@ async fn node(tracker: &MemNet, dir: &std::path::Path) -> (Arc<ObjEngine>, Arc<M
     );
     let (tx, rx) = tokio::sync::mpsc::channel(64);
     let st = t.clone();
-    tokio::spawn(async move { st.serve(vec![(zeph_obj::ALPN.to_vec(), tx)]).await });
+    tokio::spawn(async move {
+        st.serve(vec![], vec![(zeph_transport::tag::PIECE, tx)])
+            .await
+    });
     let se = engine.clone();
     tokio::spawn(async move { se.serve(rx).await });
     (engine, routing)

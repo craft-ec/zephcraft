@@ -56,7 +56,7 @@ async fn sql_node(tracker: &MemNet, heads: &MemHeads, dir: &Path) -> SqlNode {
         Transport::bind(
             id.secret_key_bytes(),
             Reach::LocalOnly,
-            vec![zeph_obj::ALPN.to_vec(), zeph_sql::PAGE_ALPN.to_vec()],
+            vec![zeph_transport::MUX_ALPN.to_vec()],
             0,
         )
         .await
@@ -90,10 +90,13 @@ async fn sql_node(tracker: &MemNet, heads: &MemHeads, dir: &Path) -> SqlNode {
     let (sql_tx, sql_rx) = tokio::sync::mpsc::channel(64);
     let st = t.clone();
     let serve = tokio::spawn(async move {
-        st.serve(vec![
-            (zeph_obj::ALPN.to_vec(), obj_tx),
-            (zeph_sql::PAGE_ALPN.to_vec(), sql_tx),
-        ])
+        st.serve(
+            vec![],
+            vec![
+                (zeph_transport::tag::PIECE, obj_tx),
+                (zeph_transport::tag::SQLPAGE, sql_tx),
+            ],
+        )
         .await
     });
     let se = engine.clone();

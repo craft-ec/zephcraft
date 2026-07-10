@@ -473,7 +473,7 @@ mod tests {
             Transport::bind(
                 id.secret_key_bytes(),
                 Reach::LocalOnly,
-                vec![ALPN.to_vec()],
+                vec![zeph_transport::MUX_ALPN.to_vec()],
                 0,
             )
             .await
@@ -482,7 +482,7 @@ mod tests {
         let node = DhtNode::new(id, transport.clone(), 3_600_000);
         let (tx, rx) = mpsc::channel(64);
         let t = transport.clone();
-        tokio::spawn(async move { t.serve(vec![(ALPN.to_vec(), tx)]).await });
+        tokio::spawn(async move { t.serve(vec![], vec![(tag::DHT, tx)]).await });
         node.clone().serve(rx);
         node
     }

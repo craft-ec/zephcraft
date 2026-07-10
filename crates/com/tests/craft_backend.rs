@@ -65,8 +65,11 @@ async fn node(tracker: &MemNet, dir: &Path, heads: &MemHeads) -> (Arc<CraftSql>,
     let st = t.clone();
     tokio::spawn(async move {
         st.serve(
-            vec![(zeph_obj::ALPN.to_vec(), obj_tx)],
-            vec![(zeph_transport::tag::SQLPAGE, sql_tx)],
+            vec![],
+            vec![
+                (zeph_transport::tag::PIECE, obj_tx),
+                (zeph_transport::tag::SQLPAGE, sql_tx),
+            ],
         )
         .await
     });

@@ -168,11 +168,7 @@ impl TestNode {
         // ALPNs: the transfer plane's protocols (cmd_run's list minus the
         // skipped planes). Every harness node serves DHT traffic, like fleet
         // data nodes running `routing_dht = true`.
-        let alpns = vec![
-            zeph_transport::MUX_ALPN.to_vec(),
-            alpn::PING.to_vec(),
-            zeph_obj::ALPN.to_vec(),
-        ];
+        let alpns = vec![zeph_transport::MUX_ALPN.to_vec(), alpn::PING.to_vec()];
         let transport = Arc::new(
             Transport::bind(identity.secret_key_bytes(), Reach::LocalOnly, alpns, 0).await?,
         );
@@ -301,25 +297,24 @@ impl TestNode {
         }
 
         // ALPN dispatcher: ping + membership + pieces + dht share the endpoint.
+        // ping is the last legacy per-ALPN connection handler; dht/member/piece
+        // are muxed per-stream-tag handlers.
         let (ping_tx, mut ping_rx) = tokio::sync::mpsc::channel(32);
-        let (piece_tx, piece_rx) = tokio::sync::mpsc::channel(32);
-        let handlers = vec![
-            (alpn::PING.to_vec(), ping_tx),
-            (zeph_obj::ALPN.to_vec(), piece_tx),
-        ];
-        // dht + member are muxed — per-stream-tag handlers.
+        let handlers = vec![(alpn::PING.to_vec(), ping_tx)];
         let (dht_stream_tx, dht_stream_rx) = tokio::sync::mpsc::channel(32);
         let (member_stream_tx, member_stream_rx) = tokio::sync::mpsc::channel(32);
+        let (piece_stream_tx, piece_stream_rx) = tokio::sync::mpsc::channel(32);
         let stream_handlers = vec![
             (zeph_transport::tag::DHT, dht_stream_tx),
             (zeph_transport::tag::MEMBER, member_stream_tx),
+            (zeph_transport::tag::PIECE, piece_stream_tx),
         ];
         dht.clone().serve(dht_stream_rx);
         let server = transport.clone();
         tasks.push(tokio::spawn(async move {
             server.serve(handlers, stream_handlers).await
         }));
-        tasks.push(tokio::spawn(engine.clone().serve(piece_rx)));
+        tasks.push(tokio::spawn(engine.clone().serve(piece_stream_rx)));
         let ping_clock = transport.clock();
         tasks.push(tokio::spawn(async move {
             while let Some(conn) = ping_rx.recv().await {

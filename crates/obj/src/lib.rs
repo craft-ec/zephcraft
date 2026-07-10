@@ -25,7 +25,7 @@ use zeph_core::{Cid, NodeId};
 use zeph_erasure::{encode, recode, target_pieces, vtags, CodedPiece, Decoder};
 use zeph_routing::ContentRouting;
 use zeph_store::{Generation, Store};
-use zeph_transport::{Connection, PeerAddr, Transport};
+use zeph_transport::{tag, PeerAddr, TaggedStream, Transport};
 use zeph_wire as wire;
 
 mod encrypted;
@@ -1397,7 +1397,9 @@ impl ObjEngine {
                 }
             }
         }
-        let alive = tokio::time::timeout(PROBE_TIMEOUT, self.transport.connect(addr, ALPN))
+        // Reachability = a successful mux connection to the peer (dials once,
+        // then pooled per-peer; shared with every protocol).
+        let alive = tokio::time::timeout(PROBE_TIMEOUT, self.transport.mux_conn(addr))
             .await
             .map(|r| r.is_ok())
             .unwrap_or(false);
@@ -2444,31 +2446,32 @@ impl ObjEngine {
     /// peer-pair at one request in flight and let queued requests time out at
     /// the sender. At saturation we stop accepting new streams, so QUIC flow
     /// control backpressures the peer naturally.
-    pub async fn serve(self: Arc<Self>, mut conns: tokio::sync::mpsc::Receiver<Connection>) {
-        while let Some(conn) = conns.recv().await {
+    pub async fn serve(self: Arc<Self>, mut streams: tokio::sync::mpsc::Receiver<TaggedStream>) {
+        // Muxed: one tagged stream per piece request. A global permit pool bounds
+        // concurrent ingest/serve handling (was per-connection pre-mux); when
+        // saturated the recv loop blocks, backpressuring the transport demux.
+        let permits = Arc::new(tokio::sync::Semaphore::new(PIPELINE_STREAMS));
+        while let Some(TaggedStream {
+            mut send, mut recv, ..
+        }) = streams.recv().await
+        {
+            let Ok(permit) = permits.clone().acquire_owned().await else {
+                return;
+            };
             let engine = self.clone();
             tokio::spawn(async move {
-                let permits = Arc::new(tokio::sync::Semaphore::new(PIPELINE_STREAMS));
-                while let Ok((mut send, mut recv)) = conn.accept_bi().await {
-                    let Ok(permit) = permits.clone().acquire_owned().await else {
-                        return;
-                    };
-                    let engine = engine.clone();
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        let Ok(bytes) = recv.read_to_end(MAX_FRAME).await else {
-                            return;
-                        };
-                        let Ok(frame) = wire::decode(&bytes) else {
-                            return;
-                        };
-                        let reply = engine.handle(frame.message).await;
-                        let _ = send
-                            .write_all(&wire::encode(&reply, engine.transport.clock().now().0))
-                            .await;
-                        let _ = send.finish();
-                    });
-                }
+                let _permit = permit;
+                let Ok(bytes) = recv.read_to_end(MAX_FRAME).await else {
+                    return;
+                };
+                let Ok(frame) = wire::decode(&bytes) else {
+                    return;
+                };
+                let reply = engine.handle(frame.message).await;
+                let _ = send
+                    .write_all(&wire::encode(&reply, engine.transport.clock().now().0))
+                    .await;
+                let _ = send.finish();
             });
         }
     }
@@ -2789,29 +2792,21 @@ async fn request(
     msg: &wire::Message,
     timeout: Duration,
 ) -> anyhow::Result<wire::Message> {
-    let conn = tokio::time::timeout(timeout, transport.connect(peer, ALPN))
-        .await
-        .map_err(|_| anyhow::anyhow!("connect timed out after {timeout:?}"))??;
-    let fut = async {
-        let (mut send, mut recv) = conn.open_bi().await?;
-        send.write_all(&wire::encode(msg, transport.clock().now().0))
-            .await?;
-        send.finish()?;
-        let bytes = recv.read_to_end(MAX_FRAME).await?;
-        let frame = wire::decode(&bytes)?;
-        anyhow::Ok(frame.message)
-    };
-    match tokio::time::timeout(timeout, fut).await {
-        Ok(Ok(msg)) => Ok(msg),
-        Ok(Err(err)) => {
-            transport.evict(peer, ALPN, &conn);
-            Err(err)
-        }
-        Err(_) => {
-            transport.evict(peer, ALPN, &conn);
-            anyhow::bail!("request timed out after {timeout:?}")
-        }
-    }
+    // Muxed piece request/reply (tag::PIECE) on the shared per-peer connection.
+    // request_tagged evicts the mux connection on a genuine STREAM failure; a
+    // mere TIMEOUT does NOT evict — the connection is shared with every other
+    // protocol (dht/member/registry/…) and a single slow push must not tear
+    // down their streams to this peer (a pre-mux data-plane behavior that no
+    // longer holds now that one connection carries everything).
+    let req = wire::encode(msg, transport.clock().now().0);
+    let bytes = tokio::time::timeout(
+        timeout,
+        transport.request_tagged(peer, tag::PIECE, &req, MAX_FRAME),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("piece request timed out after {timeout:?}"))?
+    .map_err(|e| anyhow::anyhow!("piece request failed: {e}"))?;
+    Ok(wire::decode(&bytes)?.message)
 }
 
 /// Refuse a user lifecycle operation on a CraftSQL system object (DB generation).

@@ -1098,11 +1098,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // MUX (element 1): one connection per peer carries every protocol via a
     // per-stream tag. Migrated protocols dial/serve MUX_ALPN; the remaining
     // legacy per-ALPN entries drop as each protocol moves over.
-    let alpns = vec![
-        zeph_transport::MUX_ALPN.to_vec(),
-        alpn::PING.to_vec(),
-        zeph_obj::ALPN.to_vec(),
-    ];
+    let alpns = vec![zeph_transport::MUX_ALPN.to_vec(), alpn::PING.to_vec()];
     // dht/registry/sqlpage/invoke/member are muxed (per-stream tag) — no ALPN.
     let transport = Arc::new(
         Transport::bind_with_relays(
@@ -1506,15 +1502,10 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         });
     }
 
-    // ALPN dispatcher: ping + membership + pieces share the endpoint.
+    // Muxed dispatch: ping is the last legacy per-ALPN connection handler; every
+    // other protocol is a per-stream tag on the shared mux connection.
     let (ping_tx, mut ping_rx) = tokio::sync::mpsc::channel(32);
-    let (piece_tx, piece_rx) = tokio::sync::mpsc::channel(32);
-    // Legacy per-ALPN connection handlers (protocols not yet muxed).
-    let handlers = vec![
-        (alpn::PING.to_vec(), ping_tx),
-        (zeph_obj::ALPN.to_vec(), piece_tx),
-    ];
-    // Muxed per-stream-tag handlers (element 1). Grows as protocols migrate.
+    let handlers = vec![(alpn::PING.to_vec(), ping_tx)];
     let mut stream_handlers: Vec<(u8, tokio::sync::mpsc::Sender<zeph_transport::TaggedStream>)> =
         vec![];
     if let Some(dht) = &dht_node {
@@ -1522,6 +1513,8 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         stream_handlers.push((zeph_transport::tag::DHT, dht_stream_tx));
         dht.clone().serve(dht_stream_rx);
     }
+    let (piece_stream_tx, piece_stream_rx) = tokio::sync::mpsc::channel(32);
+    stream_handlers.push((zeph_transport::tag::PIECE, piece_stream_tx));
     let (member_stream_tx, member_stream_rx) = tokio::sync::mpsc::channel(32);
     stream_handlers.push((zeph_transport::tag::MEMBER, member_stream_tx));
     let (registry_stream_tx, registry_stream_rx) = tokio::sync::mpsc::channel(32);
@@ -1532,7 +1525,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     stream_handlers.push((zeph_transport::tag::INVOKE, invoke_stream_tx));
     let server = transport.clone();
     tokio::spawn(async move { server.serve(handlers, stream_handlers).await });
-    tokio::spawn(engine.clone().serve(piece_rx));
+    tokio::spawn(engine.clone().serve(piece_stream_rx));
     tokio::spawn(zeph_sql::serve_pages(sql_dir.clone(), sqlpage_stream_rx));
     tokio::spawn(zeph_com::serve_invocations(
         invoke_stream_rx,
