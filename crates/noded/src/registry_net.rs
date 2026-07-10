@@ -8,10 +8,7 @@
 //! reads back a postcard-encoded response.
 
 use serde::{Deserialize, Serialize};
-use zeph_transport::{PeerAddr, Transport};
-
-/// ALPN for cross-node registry requests (forward-to-writer + query-writer).
-pub const REGISTRY_ALPN: &[u8] = b"/craftec/registry/1";
+use zeph_transport::{tag, PeerAddr, Transport};
 
 /// Max size of a registry request/response frame.
 const MAX_FRAME: usize = 256 * 1024;
@@ -115,23 +112,17 @@ pub async fn request_registry(
     addr: &PeerAddr,
     req: &RegistryReq,
 ) -> anyhow::Result<RegistryResp> {
-    // Pooled per-peer connection: shared with other requests, never closed
-    // here. A failed round-trip evicts the entry so the next one re-dials.
-    let conn = tokio::time::timeout(REQUEST_TIMEOUT, transport.connect(addr, REGISTRY_ALPN))
-        .await
-        .map_err(|_| anyhow::anyhow!("registry connect timed out after {REQUEST_TIMEOUT:?}"))??;
-    let out = tokio::time::timeout(REQUEST_TIMEOUT, async {
-        let (mut send, mut recv) = conn.open_bi().await?;
-        send.write_all(&postcard::to_allocvec(req)?).await?;
-        send.finish()?;
-        let resp = recv.read_to_end(MAX_FRAME).await?;
-        anyhow::Ok(postcard::from_bytes::<RegistryResp>(&resp)?)
-    })
+    // Muxed request/reply (tag::REGISTRY) on the shared per-peer connection.
+    // request_tagged evicts the mux connection on a stream failure; the whole
+    // round-trip is bounded by REQUEST_TIMEOUT so a briefly unreachable peer
+    // never blocks a resolve/register/version query indefinitely.
+    let req_bytes = postcard::to_allocvec(req)?;
+    let resp = tokio::time::timeout(
+        REQUEST_TIMEOUT,
+        transport.request_tagged(addr, tag::REGISTRY, &req_bytes, MAX_FRAME),
+    )
     .await
-    .map_err(|_| anyhow::anyhow!("registry request timed out after {REQUEST_TIMEOUT:?}"))
-    .and_then(|r| r);
-    if out.is_err() {
-        transport.evict(addr, REGISTRY_ALPN, &conn);
-    }
-    out
+    .map_err(|_| anyhow::anyhow!("registry request timed out after {REQUEST_TIMEOUT:?}"))?
+    .map_err(|e| anyhow::anyhow!("registry request failed: {e}"))?;
+    Ok(postcard::from_bytes::<RegistryResp>(&resp)?)
 }

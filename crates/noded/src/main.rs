@@ -1105,9 +1105,8 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         zeph_obj::ALPN.to_vec(),
         zeph_sql::PAGE_ALPN.to_vec(),
         zeph_com::INVOKE_ALPN.to_vec(),
-        registry_net::REGISTRY_ALPN.to_vec(),
     ];
-    // dht is muxed (tag::DHT) — no dedicated ALPN.
+    // dht + registry are muxed (tag::DHT / tag::REGISTRY) — no dedicated ALPN.
     let transport = Arc::new(
         Transport::bind_with_relays(
             identity.secret_key_bytes(),
@@ -1516,7 +1515,6 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let (piece_tx, piece_rx) = tokio::sync::mpsc::channel(32);
     let (sqlpage_tx, sqlpage_rx) = tokio::sync::mpsc::channel(32);
     let (invoke_tx, invoke_rx) = tokio::sync::mpsc::channel(32);
-    let (registry_tx, registry_rx) = tokio::sync::mpsc::channel(32);
     // Legacy per-ALPN connection handlers (protocols not yet muxed).
     let handlers = vec![
         (alpn::PING.to_vec(), ping_tx),
@@ -1524,7 +1522,6 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         (zeph_obj::ALPN.to_vec(), piece_tx),
         (zeph_sql::PAGE_ALPN.to_vec(), sqlpage_tx),
         (zeph_com::INVOKE_ALPN.to_vec(), invoke_tx),
-        (registry_net::REGISTRY_ALPN.to_vec(), registry_tx),
     ];
     // Muxed per-stream-tag handlers (element 1). Grows as protocols migrate.
     let mut stream_handlers: Vec<(u8, tokio::sync::mpsc::Sender<zeph_transport::TaggedStream>)> =
@@ -1534,13 +1531,15 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         stream_handlers.push((zeph_transport::tag::DHT, dht_stream_tx));
         dht.clone().serve(dht_stream_rx);
     }
+    let (registry_stream_tx, registry_stream_rx) = tokio::sync::mpsc::channel(32);
+    stream_handlers.push((zeph_transport::tag::REGISTRY, registry_stream_tx));
     let server = transport.clone();
     tokio::spawn(async move { server.serve(handlers, stream_handlers).await });
     tokio::spawn(engine.clone().serve(piece_rx));
     tokio::spawn(zeph_sql::serve_pages(sql_dir.clone(), sqlpage_rx));
     tokio::spawn(zeph_com::serve_invocations(invoke_rx, com_service.clone()));
     // Serve cross-node registry requests (writer path advances; queries resolve).
-    tokio::spawn(head_registry.clone().serve(registry_rx));
+    tokio::spawn(head_registry.clone().serve(registry_stream_rx));
     // "Pending distribution" completion (per-incomplete-cid DHT resolve + deficit pushes)
     // — network fan-out, so it runs THROUGH the coordinator (Distribution priority,
     // deduped: a slow pass coalesces with the next tick instead of stacking). This loop
