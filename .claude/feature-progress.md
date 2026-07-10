@@ -1,3 +1,35 @@
+# WIRE ROLL — Elements 1+3 (mux + offer/grant) — PLAN (2026-07-11)
+The last STRUCTURAL Transfer Plane v2 pieces. ONE wire migration → version-consistent SIMULTANEOUS
+fleet roll (wire incompatible with old binary; NOT staggered). Design: docs/TRANSFER_PLANE_V2.md §1,§3.
+CURRENT STATE (surveyed by 2 Explore agents):
+- Transport all in crates/transport/src/lib.rs (iroh 1.0.1). Pool keyed (NodeId,ALPN); evict_peer
+  already peer-only. Streams EOF-delimited (open_bi→write→finish→read_to_end), NOT length-prefixed.
+- Dispatch: Transport::serve(handlers: Vec<(ALPN, mpsc::Sender<Connection>)>) routes WHOLE conns by
+  conn.alpn(). 7 live ALPNs → tags: ping, member, piece(obj), sqlpage, invoke, registry, dht.
+  (tracker ALPN is DEAD; control.rs unix-socket + dashboard HTTP are NOT ALPN, out of scope.)
+- Wire framing MIXED: ping/member/piece use zeph_wire::Message; sqlpage(raw 32B cid+bytes),
+  invoke(postcard), registry(postcard RegistryReq/Resp), dht(postcard DhtMessage) are bespoke.
+  Tag byte sits ABOVE all of them (strip before each decoder).
+- ONLY /craftec/piece/1 (PiecePush/PieceRequest) is the offer/grant path. sqlpage is a separate
+  bulk object-fetch (not piece admission). Ping has a reserved dial-slot semaphore that mux collapses
+  (one conn/peer → one dial). AvailabilityProbe/Ack wire msgs exist but have NO live client (dormant).
+PHASES (each passes the offline harness before the next; harness FIRST):
+[ ] P0 HARNESS: (a) connection-count assertion (mux: ~O(peers) not O(peers×7)); (b) Scenario
+    "capped receiver" — one node gauge-forced-high, cluster converges around it, capped node sheds
+    via GRANTS with zero timeouts. Both MUST fail vs current code first (baseline).
+[ ] P1 MUX CORE (transport): mux ALPN /craftec/mux/1 + 1-byte tag; PoolKey→[u8;32]; single-ALPN
+    dial; open_tagged(peer,tag)->(Send,Recv) helper; tag-dispatch serve loop → per-tag
+    mpsc<(SendStream,RecvStream)>. Update testkit LocalOnly transport in lockstep.
+[ ] P2 MIGRATE 7 PROTOCOLS to tagged streams (client writes tag; server consumes tagged streams
+    not Connections): ping, member, piece, sqlpage, invoke, registry, dht — one at a time, node
+    runnable throughout. main.rs wiring: single mux ALPN, handler map keyed by tag.
+[ ] P3 OFFER/GRANT on piece path (obj): wire Offer{class,cid,items,bytes}/Grant{accept,retry_ms};
+    sender pre-push handshake; gauge-based grant (critical=0/high=1/else<=4, ResourceGauge exists);
+    partial/zero → redirect to next candidate (coded pieces fungible) or requeue-backoff.
+[ ] P4 FULL HARNESS GREEN (A-F + new): conn count drops ~7×; capped receiver sheds via grants.
+[ ] P5 SIMULTANEOUS fleet roll (all 5 nodes at once — brief coordinated downtime; wire-incompat).
+RISK: P5 is the one all-or-nothing outward step (no mixed-version interop). De-risked by P0-P4 offline.
+
 # SEED-NODE MEMORY: glibc-arena bloat → jemalloc (2026-07-10, ultracode)
 Post-deploy soak surfaced the seed node ('zeph', primary DHT hub) at ~8GB RSS (OOM-killed a few
 times, auto-recovered, no data loss) while identical-workload peers held <1GB — SAME ~2700 cids,

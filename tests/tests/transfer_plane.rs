@@ -310,6 +310,31 @@ async fn scenario_a_steady_state() {
         }
     }
 
+    // MUX BAR (element 1): one QUIC connection per peer, not one per (peer,
+    // protocol). Under mux a node holds at most (N-1) outbound connections; today
+    // it holds one per (peer, ALPN) — several× more. FAILS against pre-mux code
+    // (records the baseline the migration must beat).
+    let n = nodes.len();
+    let conns: Vec<usize> = nodes
+        .iter()
+        .map(|nd| nd.transport.connection_count())
+        .collect();
+    let total: usize = conns.iter().sum();
+    let worst = conns.iter().copied().max().unwrap_or(0);
+    println!(
+        "scenario A: connections per node = {conns:?} (total {total}, worst {worst}; \
+         mux bar per-node <= {})",
+        n - 1
+    );
+    if worst > n - 1 {
+        violations.push(format!(
+            "connection-count bar broken: a node holds {worst} connections \
+             (mux bar <= {} = one per peer); per-node {conns:?} — pre-mux is \
+             one-conn-per-(peer,ALPN)",
+            n - 1
+        ));
+    }
+
     if !violations.is_empty() {
         println!("--- scenario A FAILURE diagnostics ---");
         println!("full latency distribution (ms, sorted): {ms:?}");

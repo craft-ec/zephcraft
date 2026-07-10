@@ -306,6 +306,14 @@ impl Transport {
         self.epoch.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Number of live pooled connections. Today the pool is keyed by
+    /// (peer, ALPN), so this counts one entry per (peer, protocol) pair — the
+    /// metric the mux migration (element 1) collapses to one per peer. The
+    /// acceptance harness asserts the reduction.
+    pub fn connection_count(&self) -> usize {
+        self.pool.lock().expect("conn pool").len()
+    }
+
     /// Tear the endpoint down and bind a fresh one with the identical config
     /// (same identity, port, relays, ALPNs). All existing connections die;
     /// [`Self::serve`] accept loops re-attach automatically; peers see the
