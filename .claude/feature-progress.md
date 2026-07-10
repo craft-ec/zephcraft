@@ -45,18 +45,23 @@ ADVERSARIAL REVIEW (2 agents, correctness + regression) — one REAL defect foun
     Future optimization: content holders could scan their content on a slower dedicated cadence, or
     skip locally-faded/unwanted retained copies (should_scan currently always-true for any held
     content, incl. faded — wasted resolve that no-ops at the fade gate; bounded, correctness-neutral).
-KNOWN MARGINAL FLAKE (scenario C, ~1/8 runs, documented follow-up — NOT a correctness bug): once in
-~8 runs ONE cid lands at total=7 (one piece short of k=8) on a single survivor and doesn't close in
-the 200s window (the run then burns the full window). Mechanism VERIFIED sound via SCEN_C_TRACE
-instrumentation (now removed): when the content holder scans a below-k cid it lands 7 pieces in ONE
-repair pass (restorer=true → have jumps 4→11), so recovery is normally decisive. The flake is a
-k-BOUNDARY edge: have=7 must read <8 for content_restorer to fire; a brief dead-node provider-record
-phantom (killed node counted alive past its ~30s liveness TTL) can read have>=8 and suppress the
-bypass. Could NOT reproduce in 5 traced runs (all green; 7/8 overall). Widening content_restorer to
-have<floor was REJECTED: it defeats the herd-avoidance the election gives PINNED content above k.
-Real fix (deferred): make `have` phantom-proof (verify killed-node record eviction from alive_peers/
-DHT within the window) OR a small k-boundary tolerance verified against a reproducer. Re-run scenario
-C if it fails once; it is not a deploy blocker (the deadlock — the actual bug — is closed).
+MARGINAL FLAKE — ROOT-CAUSED + FIXED (was ~1/8, now 0/12+0/12 after fix). Reproduced by looping
+scenario C with the committed per-cid content-holder-verdict diagnostic (caught on run 8/20). The
+verdict was DECISIVE: stuck cid total=7 [n0=0+C n1=3 n2=4], but the content holder's health record
+read effective=9, live_providers=3 — a PHANTOM 3rd provider (the killed node, still counted alive via
+HyParView gossip refreshing its last_heard past the 30s liveness TTL, before SWIM tombstones it)
+inflated `have` from the true 7 to 9. have=9 >= k=8 suppressed the `have < k` content_restorer, so
+node0 deferred to the election → a rank-incapable piece-holder (n1=3/n2=4, recode in <k subspace) or
+the dead phantom → detect-but-defer deadlock RETURNS. THE FIX (supersedes the have<k trigger in both
+paths): content_restorer now fires on a phantom-PROOF capability check — a whole-content holder
+repairs a RANK-FRAGILE cid (have < 2k) iff NO LIVE holder has >= k pieces (`!any_live_holder_has_k`).
+A stale phantom holds < k pieces per cid (killed node's pieces were spread thin), so it can neither
+fake a >=k holder NOR lift a true-below-k cid past the 2k ceiling. The 2k (not floor) bound confines
+the bypass to fragile cids: cids at 2k..floor are safely recoverable and left to the normal election,
+so elected-scan efficiency is preserved (floor bound gave E resolves 2.0x; 2k keeps it ~1.x). VERIFY:
+C 12/12 green (2k) [and 12/12 at the floor bound before tightening]; E resolves back toward 1.x,
+100/100 recoverable; A green. Content-holder-always-scan (should_scan) unchanged; mint_from_content
+unchanged. This REPLACES the earlier have<k content_restorer (commit 6aa5812) — amend/new commit.
 
 # TRANSFER PLANE V2 — P1+P2 DONE (2026-07-10, ultracode)
 ELEMENT 5 (class-fair scheduling, e9c4270) + REVIEW FIXES (e8c6cf6): JobClass per-key-prefix,

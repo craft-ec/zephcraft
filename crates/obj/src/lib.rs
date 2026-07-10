@@ -1657,15 +1657,30 @@ impl ObjEngine {
                 || (self.store.has_content(&cid) && self.store.is_pinned(&cid));
             let sole_content_fallback =
                 !self_capable && capable.is_empty() && self.store.has_content(&cid);
-            // BELOW THE DECODE THRESHOLD (have < k), surviving PIECE holders can
-            // only recode within their <k-dimensional subspace — they cannot add
-            // independent rank, so electing one to "repair" recodes forever
-            // without restoring recoverability (measured: killed-holder cids stuck
-            // below k). Only a WHOLE-CONTENT holder (or >=k-piece holder) can mint
-            // the missing rank. So a content holder below k repairs
-            // UNCONDITIONALLY, bypassing the piece-holder rendezvous. Content
-            // holders are rare (~the publisher), so any double-repair is bounded.
-            let content_restorer = have < gen.k as usize && self.store.has_content(&cid);
+            // A WHOLE-CONTENT holder is the durability ANCHOR: uniquely able to
+            // mint fresh INDEPENDENT rank. It must repair a RANK-FRAGILE cid
+            // (near the decode cliff, have < 2k) — bypassing the piece-holder
+            // rendezvous — exactly when it is the ONLY node that can restore rank:
+            // no LIVE holder holds >= k pieces. A >= k holder can recode a
+            // full-rank piece; a < k holder only recodes within its <k-dimensional
+            // subspace and adds nothing, so electing one "repairs" forever without
+            // restoring recoverability (measured: killed-holder cids stuck below
+            // k). Gating on the piece COUNT alone (have < k) is NOT robust: a
+            // stale dead-holder provider record lingers past its liveness TTL
+            // (HyParView gossip keeps refreshing last_heard until SWIM tombstones
+            // it) and inflates `have` past k, suppressing the bypass while the true
+            // live spread is still < k (measured: a killed holder's record read
+            // have=9 with true spread 7, stalling repair). The live >= k check
+            // cannot be faked by such a phantom (its stale count is < k). The 2k
+            // ceiling keeps this to fragile cids (a realistic phantom holds < k, so
+            // it cannot lift a true-below-k cid past 2k) — cids above 2k are safely
+            // recoverable and left to the normal election, preserving elected-scan
+            // efficiency. Content holders are rare (~the publisher), so herd-safe.
+            let any_live_holder_has_k = live
+                .iter()
+                .any(|(_, _, c, _)| *c as usize >= gen.k as usize);
+            let content_restorer =
+                self.store.has_content(&cid) && have < 2 * gen.k as usize && !any_live_holder_has_k;
             if !self_capable && !sole_content_fallback && !content_restorer {
                 self.record_health(
                     &cid,
@@ -2229,17 +2244,23 @@ impl ObjEngine {
         // providers — otherwise thin spreading deadlocks repair permanently.
         let sole_content_fallback =
             !self_capable && capable.is_empty() && self.store.has_content(&cid);
-        // BELOW THE DECODE THRESHOLD (have < k): surviving PIECE holders can only
-        // recode within their <k-dimensional subspace and CANNOT add independent
-        // rank — so electing one to repair recodes forever without restoring
-        // recoverability. Only a whole-content holder can mint the missing rank.
-        // Mirror the scan path (health_scan_chunk): a content holder below k
-        // repairs UNCONDITIONALLY, bypassing the rendezvous. Without this, a
-        // piece-holder wins the election, the content holder returns 0, and the
-        // piece-holder — which never scanned (elected scan) and cannot add rank —
-        // never acts: a detect-but-defer deadlock (measured scenario C: 5/30 cids
-        // stuck at 6 pieces on one holder, content holder idle).
-        let content_restorer = have < gen.k as usize && self.store.has_content(&cid);
+        // Mirrors the scan path: a whole-content holder (the durability ANCHOR,
+        // uniquely able to mint fresh INDEPENDENT rank) repairs a RANK-FRAGILE cid
+        // (have < 2k), bypassing the rendezvous, exactly when no LIVE holder holds
+        // >= k pieces (a < k holder only recodes within its <k subspace and adds
+        // nothing). Gating on the piece COUNT alone (have < k) is NOT phantom-
+        // robust: a stale dead-holder record lingers past its liveness TTL and
+        // inflates `have` past k, suppressing the bypass while the true live spread
+        // is < k — the content holder then defers to a rank-incapable piece-holder
+        // that never restores rank (measured detect-but-defer deadlock:
+        // effective=9 with true spread 7, one cid stuck). The live >= k check
+        // cannot be faked by such a phantom; the 2k ceiling confines this to
+        // fragile cids and preserves elected-scan efficiency above it.
+        let any_live_holder_has_k = live
+            .iter()
+            .any(|(_, _, c, _)| *c as usize >= gen.k as usize);
+        let content_restorer =
+            self.store.has_content(&cid) && have < 2 * gen.k as usize && !any_live_holder_has_k;
         if !self_capable && !sole_content_fallback && !content_restorer {
             return 0;
         }
