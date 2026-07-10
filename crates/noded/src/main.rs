@@ -4,6 +4,15 @@
 //! Boot order (foundation §12, skeleton subset): identity → transport →
 //! control servers → serve loop → heartbeat.
 
+// jemalloc as the global allocator (see Cargo.toml): glibc malloc's per-thread
+// arenas retain freed memory under the seed's bursty serve+mint churn, bloating
+// RSS to multi-GB (measured 8GB on a seed vs <1GB on peers) — a glibc-arena
+// artifact, not a leak. jemalloc returns memory to the OS aggressively. Gated to
+// non-MSVC so the fix ships on Linux (fleet) and macOS (Mac node) alike.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod account;
 mod control;
 mod governance;

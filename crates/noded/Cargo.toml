@@ -43,5 +43,15 @@ dirs.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+# jemalloc as the global allocator: glibc malloc retains freed memory in its
+# per-thread arenas (up to 8×ncpu) under the seed/hub's bursty serve+mint
+# allocation churn, ballooning RSS to many GB of not-returned-to-OS memory (a
+# seed node measured 8GB heap vs <1GB on identical-workload peers; confirmed a
+# glibc-arena artifact, not a leak, by a MALLOC_ARENA_MAX=2 test that cut it
+# ~13×). jemalloc returns memory aggressively and fragments far less, baking the
+# fix into the binary so every node is immune regardless of env. Not MSVC/Windows.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
+
 [dev-dependencies]
 tempfile.workspace = true
