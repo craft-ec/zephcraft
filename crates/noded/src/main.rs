@@ -1529,7 +1529,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         dht.clone().serve(dht_rx);
     }
     let server = transport.clone();
-    tokio::spawn(async move { server.serve(handlers).await });
+    tokio::spawn(async move { server.serve(handlers, vec![]).await });
     tokio::spawn(engine.clone().serve(piece_rx));
     tokio::spawn(zeph_sql::serve_pages(sql_dir.clone(), sqlpage_rx));
     tokio::spawn(zeph_com::serve_invocations(invoke_rx, com_service.clone()));

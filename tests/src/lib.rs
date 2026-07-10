@@ -314,7 +314,9 @@ impl TestNode {
         ];
         dht.clone().serve(dht_rx);
         let server = transport.clone();
-        tasks.push(tokio::spawn(async move { server.serve(handlers).await }));
+        tasks.push(tokio::spawn(
+            async move { server.serve(handlers, vec![]).await },
+        ));
         tasks.push(tokio::spawn(engine.clone().serve(piece_rx)));
         let ping_clock = transport.clock();
         tasks.push(tokio::spawn(async move {

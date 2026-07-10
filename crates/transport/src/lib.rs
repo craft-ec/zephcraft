@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-pub use iroh::endpoint::Connection;
+pub use iroh::endpoint::{Connection, RecvStream, SendStream};
 
 use iroh::endpoint::presets;
 use iroh::endpoint::RelayMode;
@@ -22,6 +22,36 @@ use zeph_wire as wire;
 pub mod alpn {
     /// Heartbeat ping/pong (M1); superseded by wire frames in M1.4.
     pub const PING: &[u8] = b"/craftec/ping/1";
+}
+
+/// Transfer Plane v2 element 1 — MUX: one QUIC connection per peer carries
+/// EVERY protocol; each bi-stream begins with a 1-byte protocol tag instead of
+/// negotiating a per-protocol ALPN at handshake. Collapses ~O(peers×protocols)
+/// connections to O(peers). All muxed peers dial/advertise this single ALPN.
+pub const MUX_ALPN: &[u8] = b"/craftec/mux/1";
+
+/// One-byte protocol tags written as the first byte of every muxed bi-stream;
+/// the accept side reads this byte and routes the stream to the matching
+/// handler (replacing the old per-connection ALPN dispatch). Stable on the
+/// wire — never renumber; only append.
+pub mod tag {
+    pub const PING: u8 = 1;
+    pub const MEMBER: u8 = 2;
+    pub const PIECE: u8 = 3;
+    pub const SQLPAGE: u8 = 4;
+    pub const INVOKE: u8 = 5;
+    pub const REGISTRY: u8 = 6;
+    pub const DHT: u8 = 7;
+}
+
+/// An inbound muxed bi-stream, already tag-dispatched: the remote's NodeId
+/// (QUIC-authenticated) plus the send/recv halves with the tag byte already
+/// consumed, so a handler reads/writes its payload exactly as it did on a
+/// per-ALPN connection's `accept_bi()` stream.
+pub struct TaggedStream {
+    pub remote: NodeId,
+    pub send: SendStream,
+    pub recv: RecvStream,
 }
 
 /// Maximum ping/pong frame size we will read (sanity bound).
@@ -169,6 +199,15 @@ pub struct Transport {
     dials: std::sync::Mutex<
         std::collections::HashMap<PoolKey, std::sync::Arc<tokio::sync::Mutex<()>>>,
     >,
+    /// MUX pool (element 1): ONE live QUIC connection per PEER (keyed by NodeId
+    /// only, ALPN-free), shared by every protocol — streams carry a 1-byte tag.
+    /// Coexists with `pool` during the per-protocol migration; once every
+    /// protocol is muxed, `pool`/`dials` (the per-(peer,ALPN) maps) go away.
+    mux_pool: std::sync::Mutex<std::collections::HashMap<[u8; 32], Connection>>,
+    /// Per-peer dial-collapse locks for the mux connection (mirrors `dials`).
+    mux_dials: std::sync::Mutex<
+        std::collections::HashMap<[u8; 32], std::sync::Arc<tokio::sync::Mutex<()>>>,
+    >,
     /// Global bound on concurrent OUTBOUND bulk dial attempts. In-flight QUIC
     /// handshake state is what ballooned nodes to their OOM caps during the
     /// rejoin storms (dead peers: every attempt holds state for its 3-8s
@@ -192,6 +231,12 @@ pub struct Transport {
 const MAX_CONCURRENT_DIALS: usize = 48;
 /// Reserved concurrent dial slots for liveness pings.
 const MAX_CONCURRENT_PING_DIALS: usize = 4;
+
+/// Max concurrently-dispatching inbound streams per MUX connection (all
+/// protocols share one connection now, so this bounds a single peer's in-flight
+/// requests across every protocol; the permit is held only through the tag read
+/// + hand-off, so slow request HANDLING backpressures via the handler channels).
+const MUX_PIPELINE_STREAMS: usize = 64;
 
 /// Pool key: remote node + ALPN (one connection per protocol per peer).
 type PoolKey = ([u8; 32], Vec<u8>);
@@ -242,6 +287,8 @@ impl Transport {
             rebind_lock: tokio::sync::Mutex::new(()),
             pool: std::sync::Mutex::new(std::collections::HashMap::new()),
             dials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            mux_pool: std::sync::Mutex::new(std::collections::HashMap::new()),
+            mux_dials: std::sync::Mutex::new(std::collections::HashMap::new()),
             dial_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DIALS)),
             ping_dial_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 MAX_CONCURRENT_PING_DIALS,
@@ -306,12 +353,12 @@ impl Transport {
         self.epoch.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Number of live pooled connections. Today the pool is keyed by
-    /// (peer, ALPN), so this counts one entry per (peer, protocol) pair — the
-    /// metric the mux migration (element 1) collapses to one per peer. The
-    /// acceptance harness asserts the reduction.
+    /// Number of live pooled connections — the per-(peer,ALPN) pool plus the
+    /// per-peer mux pool. As protocols migrate to mux this shifts from
+    /// O(peers×protocols) toward O(peers); the acceptance harness asserts the
+    /// reduction.
     pub fn connection_count(&self) -> usize {
-        self.pool.lock().expect("conn pool").len()
+        self.pool.lock().expect("conn pool").len() + self.mux_pool.lock().expect("mux pool").len()
     }
 
     /// Tear the endpoint down and bind a fresh one with the identical config
@@ -334,6 +381,7 @@ impl Transport {
         // connection belongs to the old endpoint, so flush the pool with it.
         let old = self.current();
         self.pool.lock().expect("conn pool").clear();
+        self.mux_pool.lock().expect("mux pool").clear();
         let _ = tokio::time::timeout(Duration::from_secs(5), old.close()).await;
         let mut last_err = String::new();
         for _ in 0..10 {
@@ -470,13 +518,95 @@ impl Transport {
         }
     }
 
-    /// Drop every pooled connection to `peer` (all ALPNs) — for callers that
-    /// declared the peer dead and want no lingering entries for it.
+    /// Drop every pooled connection to `peer` (all ALPNs + mux) — for callers
+    /// that declared the peer dead and want no lingering entries for it.
     pub fn evict_peer(&self, peer: &NodeId) {
         self.pool
             .lock()
             .expect("conn pool")
             .retain(|(id, _), _| id != &peer.0);
+        self.mux_pool.lock().expect("mux pool").remove(&peer.0);
+    }
+
+    // ── MUX (element 1): one connection per peer, protocol chosen per-stream ──
+
+    /// A live MUX connection to `peer` (pooled per-peer, or freshly dialed and
+    /// pooled). Every protocol shares it; callers use [`Self::open_tagged`]
+    /// rather than this directly. Mirrors [`Self::connect`] but keyed by NodeId
+    /// only and dialing the single [`MUX_ALPN`].
+    pub async fn mux_conn(&self, peer: &PeerAddr) -> Result<Connection> {
+        let id = peer.node_id().0;
+        if let Some(conn) = self.mux_pool.lock().expect("mux pool").get(&id) {
+            if conn.close_reason().is_none() {
+                return Ok(conn.clone());
+            }
+        }
+        // Collapse concurrent first-dials to this peer into one handshake.
+        let dial_lock = {
+            let mut dials = self.mux_dials.lock().expect("mux dials");
+            dials
+                .entry(id)
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _guard = dial_lock.lock().await;
+        if let Some(conn) = self.mux_pool.lock().expect("mux pool").get(&id) {
+            if conn.close_reason().is_none() {
+                return Ok(conn.clone());
+            }
+        }
+        let _permit = self
+            .dial_permits
+            .acquire()
+            .await
+            .map_err(|_| TransportError::Connect("dial semaphore closed".into()))?;
+        let conn = self
+            .current()
+            .connect(peer.0.clone(), MUX_ALPN)
+            .await
+            .map_err(|e| TransportError::Connect(e.to_string()))?;
+        self.mux_pool
+            .lock()
+            .expect("mux pool")
+            .insert(id, conn.clone());
+        Ok(conn)
+    }
+
+    /// Open a fresh bi-stream to `peer` for protocol `tag` on the shared mux
+    /// connection: writes the 1-byte tag, then hands back the stream halves for
+    /// the caller to write its request payload + `finish()` and read the reply
+    /// (exactly as on a per-ALPN `open_bi` stream). On any stream-open failure
+    /// the mux connection is evicted so the next call re-dials.
+    pub async fn open_tagged(&self, peer: &PeerAddr, tag: u8) -> Result<(SendStream, RecvStream)> {
+        let conn = self.mux_conn(peer).await?;
+        let opened = async {
+            let (mut send, recv) = conn
+                .open_bi()
+                .await
+                .map_err(|e| TransportError::Stream(e.to_string()))?;
+            send.write_all(&[tag])
+                .await
+                .map_err(|e| TransportError::Stream(e.to_string()))?;
+            Ok::<_, TransportError>((send, recv))
+        }
+        .await;
+        if opened.is_err() {
+            self.evict_mux(peer, &conn);
+        }
+        opened
+    }
+
+    /// Drop the pooled mux connection for `peer` if it is still `failed`
+    /// (identity-checked so a stale caller can't evict a healthy replacement).
+    pub fn evict_mux(&self, peer: &PeerAddr, failed: &Connection) {
+        let id = peer.node_id().0;
+        let mut pool = self.mux_pool.lock().expect("mux pool");
+        if pool
+            .get(&id)
+            .is_some_and(|c| c.stable_id() == failed.stable_id())
+        {
+            pool.remove(&id);
+        }
     }
 
     /// Round-trip a ping to `peer` over wire frames (M1.4); returns RTT + skew.
@@ -536,22 +666,34 @@ impl Transport {
         out
     }
 
-    /// Accept loop: route incoming connections to per-ALPN handlers.
-    /// Connections with an unregistered ALPN are closed. Survives
+    /// Accept loop: route incoming connections to their handlers. A MUX_ALPN
+    /// connection is demultiplexed per-stream by its 1-byte tag into
+    /// `stream_handlers`; any other (legacy per-ALPN) connection is routed whole
+    /// to `conn_handlers` by its negotiated ALPN. Unrecognized → closed. Survives
     /// [`Self::rebind`] by re-attaching to the fresh endpoint; runs until
     /// [`Self::close`]. Spawn this on the runtime.
-    pub async fn serve(&self, handlers: Vec<(Vec<u8>, tokio::sync::mpsc::Sender<Connection>)>) {
+    pub async fn serve(
+        &self,
+        conn_handlers: Vec<(Vec<u8>, tokio::sync::mpsc::Sender<Connection>)>,
+        stream_handlers: Vec<(u8, tokio::sync::mpsc::Sender<TaggedStream>)>,
+    ) {
         use std::sync::atomic::Ordering;
-        let handlers = std::sync::Arc::new(handlers);
+        let conn_handlers = std::sync::Arc::new(conn_handlers);
+        let stream_handlers = std::sync::Arc::new(stream_handlers);
         loop {
             let epoch = self.epoch.load(Ordering::Acquire);
             let endpoint = self.current();
             while let Some(incoming) = endpoint.accept().await {
-                let handlers = handlers.clone();
+                let conn_handlers = conn_handlers.clone();
+                let stream_handlers = stream_handlers.clone();
                 tokio::spawn(async move {
                     let Ok(conn) = incoming.await else { return };
                     let alpn = conn.alpn().to_vec();
-                    match handlers.iter().find(|(a, _)| *a == alpn) {
+                    if alpn == MUX_ALPN {
+                        Self::demux_conn(conn, stream_handlers).await;
+                        return;
+                    }
+                    match conn_handlers.iter().find(|(a, _)| *a == alpn) {
                         Some((_, tx)) => {
                             if tx.send(conn).await.is_err() {
                                 // handler gone; nothing to do
@@ -575,11 +717,42 @@ impl Transport {
         }
     }
 
-    /// Serve ping/pong only (convenience for tests and minimal nodes).
+    /// Demultiplex one inbound MUX connection: for each accepted bi-stream read
+    /// the leading protocol tag and hand the stream to the matching handler.
+    /// Bounded pipelining (a per-connection permit held through the tag read and
+    /// hand-off) backpressures a peer that opens streams faster than handlers
+    /// drain them; an unknown tag drops the stream.
+    async fn demux_conn(
+        conn: Connection,
+        handlers: std::sync::Arc<Vec<(u8, tokio::sync::mpsc::Sender<TaggedStream>)>>,
+    ) {
+        let remote = NodeId(*conn.remote_id().as_bytes());
+        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(MUX_PIPELINE_STREAMS));
+        while let Ok((send, mut recv)) = conn.accept_bi().await {
+            let Ok(permit) = permits.clone().acquire_owned().await else {
+                break;
+            };
+            let handlers = handlers.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                let mut tag = [0u8; 1];
+                if recv.read_exact(&mut tag).await.is_err() {
+                    return;
+                }
+                if let Some((_, tx)) = handlers.iter().find(|(t, _)| *t == tag[0]) {
+                    let _ = tx.send(TaggedStream { remote, send, recv }).await;
+                }
+            });
+        }
+    }
+
+    /// Serve ping/pong only (convenience for tests and minimal nodes). Legacy
+    /// per-ALPN path (pre-mux); the muxed ping is a tagged stream handled in the
+    /// node's dispatch.
     pub async fn serve_ping(&self) {
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let clock = self.clock();
-        let serve = self.serve(vec![(alpn::PING.to_vec(), tx)]);
+        let serve = self.serve(vec![(alpn::PING.to_vec(), tx)], vec![]);
         let dispatch = async move {
             while let Some(conn) = rx.recv().await {
                 tokio::spawn(Self::handle_ping_conn(clock.clone(), conn));
@@ -629,6 +802,7 @@ impl Transport {
         self.closed
             .store(true, std::sync::atomic::Ordering::Release);
         self.pool.lock().expect("conn pool").clear();
+        self.mux_pool.lock().expect("mux pool").clear();
         self.current().close().await;
     }
 }
