@@ -13,7 +13,7 @@
 //! (that's CraftCOM). `concurrency = 1` makes it a serial priority queue.
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrd};
@@ -270,9 +270,20 @@ pub struct JobRecord {
     pub ms: u64,
 }
 
+/// One job RUNNING right now, with how long it has been running — the "what is
+/// the system stuck on" view (a wedged/slow job is otherwise invisible until it
+/// finishes). Sorted longest-first by the accessor so a stuck job floats up.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct InFlightJob {
+    pub key: String,
+    pub elapsed_ms: u64,
+}
+
 struct Inner {
     queue: Mutex<BinaryHeap<QueuedJob>>,
-    inflight: Mutex<HashSet<String>>,
+    /// Coalescing set doubling as the in-flight registry: None = queued/
+    /// reserved, Some(started) = executing. One lock on the dispatch path.
+    inflight: Mutex<std::collections::HashMap<String, Option<Instant>>>,
     notify: Notify,
     sem: Arc<Semaphore>,
     seq: AtomicU64,
@@ -308,7 +319,7 @@ impl JobCoordinator {
     pub fn new(concurrency: usize) -> Self {
         let inner = Arc::new(Inner {
             queue: Mutex::new(BinaryHeap::new()),
-            inflight: Mutex::new(HashSet::new()),
+            inflight: Mutex::new(std::collections::HashMap::new()),
             notify: Notify::new(),
             sem: Arc::new(Semaphore::new(concurrency.max(1))),
             seq: AtomicU64::new(0),
@@ -344,9 +355,17 @@ impl JobCoordinator {
         Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
     {
         let key = key.into();
-        if !self.inner.inflight.lock().unwrap().insert(key.clone()) {
-            self.inner.counters.deduped.fetch_add(1, AtomicOrd::Relaxed);
-            return false;
+        {
+            use std::collections::hash_map::Entry;
+            match self.inner.inflight.lock().unwrap().entry(key.clone()) {
+                Entry::Occupied(_) => {
+                    self.inner.counters.deduped.fetch_add(1, AtomicOrd::Relaxed);
+                    return false;
+                }
+                Entry::Vacant(v) => {
+                    v.insert(None); // queued, not yet running
+                }
+            }
         }
         let seq = self.inner.seq.fetch_add(1, AtomicOrd::Relaxed);
         let class = JobClass::from_key(&key);
@@ -430,6 +449,27 @@ impl JobCoordinator {
     pub fn set_active_cap(&self, n: usize) {
         self.inner.active_cap.store(n.max(1), AtomicOrd::Relaxed);
         self.inner.notify.notify_one();
+    }
+
+    /// Jobs RUNNING right now with their elapsed time, longest-running first
+    /// (a wedged/slow job floats to the top) — the live "stuck on what" view.
+    pub fn in_flight_jobs(&self) -> Vec<InFlightJob> {
+        let now = Instant::now();
+        let mut v: Vec<InFlightJob> = self
+            .inner
+            .inflight
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(k, s)| {
+                s.map(|st| InFlightJob {
+                    key: k.clone(),
+                    elapsed_ms: now.saturating_duration_since(st).as_millis() as u64,
+                })
+            })
+            .collect();
+        v.sort_by(|a, b| b.elapsed_ms.cmp(&a.elapsed_ms));
+        v
     }
 
     /// The most recent finished jobs, newest first (bounded history).
@@ -596,6 +636,13 @@ async fn run_job(inner: Arc<Inner>, job: QueuedJob, _permit: OwnedSemaphorePermi
         key: job.key.clone(),
     };
     let started = Instant::now();
+    // Stamp the in-flight registry with the start time (was None=queued) so
+    // in_flight_jobs() can surface a slow/wedged job's elapsed time live.
+    inner
+        .inflight
+        .lock()
+        .unwrap()
+        .insert(job.key.clone(), Some(started));
     let mut attempt = 0u32;
     let ok = loop {
         attempt += 1;
@@ -798,6 +845,41 @@ mod tests {
         assert_eq!(jc.stats().completed, 1, "eventually succeeds");
         assert_eq!(attempts.load(Ordering::SeqCst), 3, "took three attempts");
         assert_eq!(jc.stats().retried, 2);
+    }
+
+    #[tokio::test]
+    async fn in_flight_jobs_surfaces_running_work_with_elapsed() {
+        let jc = JobCoordinator::new(2);
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let r = released.clone();
+        jc.submit("scan:slow", Priority::HealthScan, 1, move || {
+            let r = r.clone();
+            async move {
+                while !r.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Ok(())
+            }
+        });
+        // Give it time to start + accrue elapsed.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let running = jc.in_flight_jobs();
+        assert_eq!(running.len(), 1, "the running job is visible");
+        assert_eq!(running[0].key, "scan:slow");
+        assert!(
+            running[0].elapsed_ms >= 30,
+            "elapsed accrues, saw {}ms",
+            running[0].elapsed_ms
+        );
+        // Release → registry empties.
+        released.store(true, Ordering::SeqCst);
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if jc.in_flight_jobs().is_empty() {
+                break;
+            }
+        }
+        assert!(jc.in_flight_jobs().is_empty(), "cleared on completion");
     }
 
     #[test]

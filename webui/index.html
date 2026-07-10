@@ -260,6 +260,9 @@
       <div class="kv"><span>deduped (singleflight)</span><b id="jc-dedup">…</b></div>
       <div class="kv"><span>retried</span><b id="jc-retry">…</b></div>
       <div class="kv"><span>failed</span><b id="jc-fail">…</b></div>
+      <div class="grp">in-flight</div>
+      <table><thead><tr><th>job</th><th>elapsed</th></tr></thead>
+        <tbody id="jc-running"><tr><td colspan="2" class="muted">idle</td></tr></tbody></table>
       <div class="grp">recent jobs</div>
       <table><thead><tr><th>job</th><th>result</th><th>duration</th></tr></thead>
         <tbody id="jc-recent"><tr><td colspan="3" class="muted">no jobs run yet</td></tr></tbody></table>
@@ -812,6 +815,10 @@ function renderStatus(s){
   $("jc-dedup").textContent = j.deduped || 0;
   $("jc-retry").textContent = j.retried || 0;
   $("jc-fail").textContent = j.failed || 0;
+  const ifj = s.in_flight_jobs || [];
+  $("jc-running").innerHTML = ifj.length
+    ? ifj.map(r => `<tr><td class="mono">${esc(r.key)}</td><td>${(r.elapsed_ms/1000).toFixed(1)} s</td></tr>`).join("")
+    : '<tr><td colspan="2" class="muted">idle</td></tr>';
   const rj = s.recent_jobs || [];
   $("jc-recent").innerHTML = rj.length
     ? rj.map(r => `<tr><td class="mono">${esc(r.key)}</td><td class="${r.ok?'alive':'down'}">${r.ok?'ok':'failed'}</td><td>${r.ms} ms</td></tr>`).join("")

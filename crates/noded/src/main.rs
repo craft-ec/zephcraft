@@ -942,6 +942,12 @@ async fn cmd_status(data_dir: &Path) -> anyhow::Result<()> {
         status.health_repaired,
         status.health_distributed,
     );
+    if !status.in_flight_jobs.is_empty() {
+        println!("in-flight jobs ({}):", status.in_flight_jobs.len());
+        for j in &status.in_flight_jobs {
+            println!("  {}  {:.1}s", j.key, j.elapsed_ms as f64 / 1000.0);
+        }
+    }
     if !status.content.is_empty() {
         println!("network content ({} cids):", status.content.len());
         for c in status.content.iter().take(10) {

@@ -151,6 +151,9 @@ pub struct Status {
     pub event_stats: EventStats,
     /// Most recent finished jobs (newest first).
     pub recent_jobs: Vec<zeph_sched::JobRecord>,
+    /// Jobs running right now with elapsed time (longest-first) — "stuck on what".
+    #[serde(default)]
+    pub in_flight_jobs: Vec<zeph_sched::InFlightJob>,
     /// Node configuration (read-only Settings view).
     pub settings: NodeSettings,
 }
@@ -271,6 +274,7 @@ impl State {
                 capacity: 256,
             },
             recent_jobs: self.jobs.recent_jobs(),
+            in_flight_jobs: self.jobs.in_flight_jobs(),
             settings: self.settings.clone(),
         }
     }
