@@ -169,10 +169,10 @@ impl TestNode {
         // skipped planes). Every harness node serves DHT traffic, like fleet
         // data nodes running `routing_dht = true`.
         let alpns = vec![
+            zeph_transport::MUX_ALPN.to_vec(),
             alpn::PING.to_vec(),
             zeph_membership::ALPN.to_vec(),
             zeph_obj::ALPN.to_vec(),
-            zeph_dht::ALPN.to_vec(),
         ];
         let transport = Arc::new(
             Transport::bind(identity.secret_key_bytes(), Reach::LocalOnly, alpns, 0).await?,
@@ -305,18 +305,19 @@ impl TestNode {
         let (ping_tx, mut ping_rx) = tokio::sync::mpsc::channel(32);
         let (member_tx, member_rx) = tokio::sync::mpsc::channel(32);
         let (piece_tx, piece_rx) = tokio::sync::mpsc::channel(32);
-        let (dht_tx, dht_rx) = tokio::sync::mpsc::channel(32);
         let handlers = vec![
             (alpn::PING.to_vec(), ping_tx),
             (zeph_membership::ALPN.to_vec(), member_tx),
             (zeph_obj::ALPN.to_vec(), piece_tx),
-            (zeph_dht::ALPN.to_vec(), dht_tx),
         ];
-        dht.clone().serve(dht_rx);
+        // dht is muxed (tag::DHT) — a per-stream-tag handler.
+        let (dht_stream_tx, dht_stream_rx) = tokio::sync::mpsc::channel(32);
+        let stream_handlers = vec![(zeph_transport::tag::DHT, dht_stream_tx)];
+        dht.clone().serve(dht_stream_rx);
         let server = transport.clone();
-        tasks.push(tokio::spawn(
-            async move { server.serve(handlers, vec![]).await },
-        ));
+        tasks.push(tokio::spawn(async move {
+            server.serve(handlers, stream_handlers).await
+        }));
         tasks.push(tokio::spawn(engine.clone().serve(piece_rx)));
         let ping_clock = transport.clock();
         tasks.push(tokio::spawn(async move {

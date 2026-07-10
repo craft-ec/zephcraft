@@ -9,12 +9,12 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use zeph_core::NodeId;
 use zeph_crypto::NodeIdentity;
-use zeph_transport::{Connection, Transport};
+use zeph_transport::{tag, TaggedStream, Transport};
 
 use crate::proto::{DhtMessage, WireContact};
 use crate::record::{RecordStore, StoredRecord};
 use crate::table::{closer_to, Contact, RoutingTable, K};
-use crate::{ALPHA, ALPN};
+use crate::ALPHA;
 
 const MAX_FRAME: usize = 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -258,40 +258,29 @@ impl DhtNode {
         }
     }
 
-    /// Serve inbound DHT connections handed over by the transport's ALPN dispatcher. One
-    /// task per connection; one request→one reply per accepted bi-stream.
-    pub fn serve(self: Arc<Self>, mut conns: mpsc::Receiver<Connection>) {
+    /// Serve inbound DHT requests: one muxed tagged stream per request→reply.
+    /// The transport's demux already tag-dispatches and bounds per-connection
+    /// pipelining, so this just handles each stream (spawned so a slow handler
+    /// can't head-of-line-block the next request).
+    pub fn serve(self: Arc<Self>, mut streams: mpsc::Receiver<TaggedStream>) {
         tokio::spawn(async move {
-            while let Some(conn) = conns.recv().await {
+            while let Some(TaggedStream {
+                mut send, mut recv, ..
+            }) = streams.recv().await
+            {
                 let node = self.clone();
                 tokio::spawn(async move {
-                    // Bounded PIPELINING — the handler is cheap, but SERIAL
-                    // stream handling on the POOLED per-peer connection made
-                    // every peer's lookups line up single-file (a convoy):
-                    // with conn-per-request each request was served in
-                    // parallel; pooling serialized the DHT server per peer
-                    // and scans ballooned from <1s to minutes (measured).
-                    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
-                    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
-                        let Ok(permit) = permits.clone().acquire_owned().await else {
-                            break;
-                        };
-                        let node = node.clone();
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            let Ok(bytes) = recv.read_to_end(MAX_FRAME).await else {
-                                return;
-                            };
-                            let Some(msg) = DhtMessage::decode(&bytes) else {
-                                return;
-                            };
-                            let reply = node.handle(msg);
-                            if send.write_all(&reply.encode()).await.is_err() {
-                                return;
-                            }
-                            let _ = send.finish();
-                        });
+                    let Ok(bytes) = recv.read_to_end(MAX_FRAME).await else {
+                        return;
+                    };
+                    let Some(msg) = DhtMessage::decode(&bytes) else {
+                        return;
+                    };
+                    let reply = node.handle(msg);
+                    if send.write_all(&reply.encode()).await.is_err() {
+                        return;
                     }
+                    let _ = send.finish();
                 });
             }
         });
@@ -302,38 +291,27 @@ impl DhtNode {
     /// One request → one reply over the DHT ALPN. `None` on any failure (dead peer, bad
     /// reply) — callers treat that as "no answer", never an error to propagate.
     async fn request(&self, peer: &Contact, msg: &DhtMessage) -> Option<DhtMessage> {
-        // The TRANSPORT pools one connection per (peer, ALPN) — this was the DHT's private
-        // cache pattern, promoted stack-wide. A fresh stream per request; if the pooled
-        // connection is dead, evict and reconnect once (connect_fresh bypasses the pool).
-        for attempt in 0..2 {
-            let conn = if attempt == 0 {
-                self.transport.connect(&peer.addr, ALPN).await.ok()
-            } else {
-                self.transport.connect_fresh(&peer.addr, ALPN).await.ok()
-            };
-            if let Some(conn) = conn {
-                if let Some(reply) = Self::request_on(&conn, msg).await {
+        // Muxed request/reply: one tagged stream on the shared per-peer
+        // connection. request_tagged evicts the mux connection on a stream
+        // failure, so a second attempt re-dials — preserving the old
+        // evict-and-retry-once behavior against a silently-dead connection.
+        let req = msg.encode();
+        for _ in 0..2 {
+            let round = tokio::time::timeout(
+                REQUEST_TIMEOUT,
+                self.transport
+                    .request_tagged(&peer.addr, tag::DHT, &req, MAX_FRAME),
+            )
+            .await;
+            if let Ok(Ok(bytes)) = round {
+                if let Some(reply) = DhtMessage::decode(&bytes) {
                     self.note_alive(&peer.id.0);
                     return Some(reply);
                 }
-                self.transport.evict(&peer.addr, ALPN, &conn);
             }
         }
         self.note_dead(peer);
         None
-    }
-
-    /// One request/response over an existing connection (opens a fresh bi-stream; the
-    /// connection itself is left open for reuse).
-    async fn request_on(conn: &Connection, msg: &DhtMessage) -> Option<DhtMessage> {
-        let (mut send, mut recv) = conn.open_bi().await.ok()?;
-        send.write_all(&msg.encode()).await.ok()?;
-        send.finish().ok()?;
-        let bytes = tokio::time::timeout(REQUEST_TIMEOUT, recv.read_to_end(MAX_FRAME))
-            .await
-            .ok()?
-            .ok()?;
-        DhtMessage::decode(&bytes)
     }
 
     /// Ask one peer for its K closest to `target`.

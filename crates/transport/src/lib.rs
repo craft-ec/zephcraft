@@ -609,6 +609,70 @@ impl Transport {
         }
     }
 
+    /// One muxed request/reply round-trip: open a `tag` stream, write `req` +
+    /// finish, read the whole reply (≤ `max_reply`). Evicts the mux connection
+    /// on any stream failure so the next call re-dials. This is the client half
+    /// every request/reply protocol uses in place of its old
+    /// `connect(peer, ALPN) → open_bi → write → read_to_end`.
+    pub async fn request_tagged(
+        &self,
+        peer: &PeerAddr,
+        tag: u8,
+        req: &[u8],
+        max_reply: usize,
+    ) -> Result<Vec<u8>> {
+        let conn = self.mux_conn(peer).await?;
+        let round = async {
+            let (mut send, mut recv) = conn
+                .open_bi()
+                .await
+                .map_err(|e| TransportError::Stream(e.to_string()))?;
+            send.write_all(&[tag])
+                .await
+                .map_err(|e| TransportError::Stream(e.to_string()))?;
+            send.write_all(req)
+                .await
+                .map_err(|e| TransportError::Stream(e.to_string()))?;
+            send.finish()
+                .map_err(|e| TransportError::Stream(e.to_string()))?;
+            recv.read_to_end(max_reply)
+                .await
+                .map_err(|e| TransportError::Stream(e.to_string()))
+        }
+        .await;
+        if round.is_err() {
+            self.evict_mux(peer, &conn);
+        }
+        round
+    }
+
+    /// One muxed one-way push (no reply): open a `tag` stream, write `req` +
+    /// finish, drop the recv half. Used by fire-and-forget messages (e.g.
+    /// membership Join/Disconnect). Evicts the mux connection on failure.
+    pub async fn send_tagged(&self, peer: &PeerAddr, tag: u8, req: &[u8]) -> Result<()> {
+        let conn = self.mux_conn(peer).await?;
+        let round = async {
+            let (mut send, _recv) = conn
+                .open_bi()
+                .await
+                .map_err(|e| TransportError::Stream(e.to_string()))?;
+            send.write_all(&[tag])
+                .await
+                .map_err(|e| TransportError::Stream(e.to_string()))?;
+            send.write_all(req)
+                .await
+                .map_err(|e| TransportError::Stream(e.to_string()))?;
+            send.finish()
+                .map_err(|e| TransportError::Stream(e.to_string()))?;
+            Ok::<(), TransportError>(())
+        }
+        .await;
+        if round.is_err() {
+            self.evict_mux(peer, &conn);
+        }
+        round
+    }
+
     /// Round-trip a ping to `peer` over wire frames (M1.4); returns RTT + skew.
     /// Rides the POOLED connection (no handshake in the steady state, so the
     /// RTT measures the path, not connection setup). A stream-level failure
