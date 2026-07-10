@@ -680,12 +680,19 @@ impl Transport {
     /// not — a slow peer's connection is likely fine, and QUIC's own loss
     /// detection closes a truly dead one (which `connect` then replaces).
     pub async fn ping(&self, peer: &PeerAddr, timeout: Duration) -> Result<PingReport> {
-        let conn = tokio::time::timeout(timeout, self.connect(peer, alpn::PING))
+        // Muxed ping: rides the shared per-peer connection as a tag::PING stream
+        // (the reserved per-ALPN dial lane collapses — there is one connection
+        // per peer now). Timing starts AFTER the connection exists so the RTT
+        // measures the path, not a handshake.
+        let conn = tokio::time::timeout(timeout, self.mux_conn(peer))
             .await
             .map_err(|_| TransportError::Timeout(timeout))??;
         let fut = async {
             let (mut send, mut recv) = conn
                 .open_bi()
+                .await
+                .map_err(|e| TransportError::Stream(e.to_string()))?;
+            send.write_all(&[tag::PING])
                 .await
                 .map_err(|e| TransportError::Stream(e.to_string()))?;
 
@@ -725,7 +732,7 @@ impl Transport {
             .await
             .map_err(|_| TransportError::Timeout(timeout))?;
         if matches!(out, Err(TransportError::Stream(_))) {
-            self.evict(peer, alpn::PING, &conn);
+            self.evict_mux(peer, &conn);
         }
         out
     }
@@ -810,55 +817,49 @@ impl Transport {
         }
     }
 
-    /// Serve ping/pong only (convenience for tests and minimal nodes). Legacy
-    /// per-ALPN path (pre-mux); the muxed ping is a tagged stream handled in the
-    /// node's dispatch.
+    /// Serve ping/pong only (convenience for tests and minimal nodes). Muxed:
+    /// ping is a tag::PING stream on the shared connection.
     pub async fn serve_ping(&self) {
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let clock = self.clock();
-        let serve = self.serve(vec![(alpn::PING.to_vec(), tx)], vec![]);
+        let serve = self.serve(vec![], vec![(tag::PING, tx)]);
         let dispatch = async move {
-            while let Some(conn) = rx.recv().await {
-                tokio::spawn(Self::handle_ping_conn(clock.clone(), conn));
+            while let Some(stream) = rx.recv().await {
+                tokio::spawn(Self::handle_ping_stream(clock.clone(), stream));
             }
         };
         tokio::join!(serve, dispatch);
     }
 
-    /// Handle one inbound ping connection: echo framed pings until it closes.
-    pub async fn handle_ping_conn(clock: std::sync::Arc<hlc::Clock>, conn: Connection) {
-        {
-            let peer = NodeId(*conn.remote_id().as_bytes()).to_hex();
-            while let Ok((mut send, mut recv)) = conn.accept_bi().await {
-                let Ok(bytes) = recv.read_to_end(MAX_PING_FRAME).await else {
-                    return;
-                };
-                let frame = match wire::decode(&bytes) {
-                    Ok(frame) => frame,
-                    Err(err) => {
-                        tracing::warn!(peer = %&peer[..12], %err, "bad ping frame");
-                        return;
-                    }
-                };
-                let wire::Message::Ping(ping) = frame.message else {
-                    tracing::warn!(peer = %&peer[..12], "unexpected message on ping alpn");
-                    return;
-                };
-                let merge = clock.merge(hlc::Timestamp(frame.hlc_ts));
-                if merge.clamped {
-                    tracing::warn!(peer = %&peer[..12], skew_ms = merge.skew_ms, "peer clock far ahead (clamped)");
-                }
-                let reply = wire::encode(
-                    &wire::Message::Pong(wire::Pong { nonce: ping.nonce }),
-                    clock.now().0,
-                );
-                if send.write_all(&reply).await.is_err() {
-                    return;
-                }
-                let _ = send.finish();
-                tracing::info!(peer = %&peer[..12], "ping served");
+    /// Handle one inbound ping stream: echo a Pong for the Ping, merging the
+    /// peer's clock (receiving it is liveness evidence for the caller's probe).
+    pub async fn handle_ping_stream(clock: std::sync::Arc<hlc::Clock>, stream: TaggedStream) {
+        let peer = stream.remote.to_hex();
+        let (mut send, mut recv) = (stream.send, stream.recv);
+        let Ok(bytes) = recv.read_to_end(MAX_PING_FRAME).await else {
+            return;
+        };
+        let frame = match wire::decode(&bytes) {
+            Ok(frame) => frame,
+            Err(err) => {
+                tracing::warn!(peer = %&peer[..12], %err, "bad ping frame");
+                return;
             }
+        };
+        let wire::Message::Ping(ping) = frame.message else {
+            tracing::warn!(peer = %&peer[..12], "unexpected message on ping stream");
+            return;
+        };
+        let merge = clock.merge(hlc::Timestamp(frame.hlc_ts));
+        if merge.clamped {
+            tracing::warn!(peer = %&peer[..12], skew_ms = merge.skew_ms, "peer clock far ahead (clamped)");
         }
+        let reply = wire::encode(
+            &wire::Message::Pong(wire::Pong { nonce: ping.nonce }),
+            clock.now().0,
+        );
+        let _ = send.write_all(&reply).await;
+        let _ = send.finish();
     }
 
     /// Gracefully close all connections and end the serve loops.

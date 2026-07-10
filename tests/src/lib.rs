@@ -34,7 +34,7 @@ use zeph_membership::Membership;
 use zeph_obj::{EngineWork, ObjConfig, ObjEngine, PeerSource};
 use zeph_sched::{JobCoordinator, Priority};
 use zeph_store::Store;
-use zeph_transport::{alpn, PeerAddr, Reach, Transport};
+use zeph_transport::{PeerAddr, Reach, Transport};
 
 /// Delay-queue of CIDs due for a health check, ordered by next-due time
 /// (min-heap via `Reverse`) — mirrors noded's `DueQueue`.
@@ -168,7 +168,7 @@ impl TestNode {
         // ALPNs: the transfer plane's protocols (cmd_run's list minus the
         // skipped planes). Every harness node serves DHT traffic, like fleet
         // data nodes running `routing_dht = true`.
-        let alpns = vec![zeph_transport::MUX_ALPN.to_vec(), alpn::PING.to_vec()];
+        let alpns = vec![zeph_transport::MUX_ALPN.to_vec()];
         let transport = Arc::new(
             Transport::bind(identity.secret_key_bytes(), Reach::LocalOnly, alpns, 0).await?,
         );
@@ -299,8 +299,12 @@ impl TestNode {
         // ALPN dispatcher: ping + membership + pieces + dht share the endpoint.
         // ping is the last legacy per-ALPN connection handler; dht/member/piece
         // are muxed per-stream-tag handlers.
-        let (ping_tx, mut ping_rx) = tokio::sync::mpsc::channel(32);
-        let handlers = vec![(alpn::PING.to_vec(), ping_tx)];
+        let (ping_stream_tx, mut ping_rx) = tokio::sync::mpsc::channel(32);
+        // Fully muxed: every protocol is a per-stream tag; no legacy conn handlers.
+        let handlers: Vec<(
+            Vec<u8>,
+            tokio::sync::mpsc::Sender<zeph_transport::Connection>,
+        )> = vec![];
         let (dht_stream_tx, dht_stream_rx) = tokio::sync::mpsc::channel(32);
         let (member_stream_tx, member_stream_rx) = tokio::sync::mpsc::channel(32);
         let (piece_stream_tx, piece_stream_rx) = tokio::sync::mpsc::channel(32);
@@ -308,6 +312,7 @@ impl TestNode {
             (zeph_transport::tag::DHT, dht_stream_tx),
             (zeph_transport::tag::MEMBER, member_stream_tx),
             (zeph_transport::tag::PIECE, piece_stream_tx),
+            (zeph_transport::tag::PING, ping_stream_tx),
         ];
         dht.clone().serve(dht_stream_rx);
         let server = transport.clone();
@@ -317,8 +322,8 @@ impl TestNode {
         tasks.push(tokio::spawn(engine.clone().serve(piece_stream_rx)));
         let ping_clock = transport.clock();
         tasks.push(tokio::spawn(async move {
-            while let Some(conn) = ping_rx.recv().await {
-                tokio::spawn(Transport::handle_ping_conn(ping_clock.clone(), conn));
+            while let Some(stream) = ping_rx.recv().await {
+                tokio::spawn(Transport::handle_ping_stream(ping_clock.clone(), stream));
             }
         }));
 

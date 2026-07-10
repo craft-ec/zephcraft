@@ -59,7 +59,7 @@ use zeph_store::Store;
 type DueQueue = std::sync::Mutex<
     std::collections::BinaryHeap<std::cmp::Reverse<(std::time::Instant, Cid, std::time::Duration)>>,
 >;
-use zeph_transport::{alpn, PeerAddr, Reach, Transport};
+use zeph_transport::{PeerAddr, Reach, Transport};
 
 #[derive(Parser)]
 #[command(
@@ -1098,7 +1098,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // MUX (element 1): one connection per peer carries every protocol via a
     // per-stream tag. Migrated protocols dial/serve MUX_ALPN; the remaining
     // legacy per-ALPN entries drop as each protocol moves over.
-    let alpns = vec![zeph_transport::MUX_ALPN.to_vec(), alpn::PING.to_vec()];
+    let alpns = vec![zeph_transport::MUX_ALPN.to_vec()];
     // dht/registry/sqlpage/invoke/member are muxed (per-stream tag) — no ALPN.
     let transport = Arc::new(
         Transport::bind_with_relays(
@@ -1502,12 +1502,15 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         });
     }
 
-    // Muxed dispatch: ping is the last legacy per-ALPN connection handler; every
-    // other protocol is a per-stream tag on the shared mux connection.
-    let (ping_tx, mut ping_rx) = tokio::sync::mpsc::channel(32);
-    let handlers = vec![(alpn::PING.to_vec(), ping_tx)];
+    // Fully muxed: every protocol is a per-stream tag on the shared per-peer
+    // connection — no legacy per-ALPN connection handlers remain.
+    let (ping_stream_tx, mut ping_rx) = tokio::sync::mpsc::channel(32);
+    let handlers: Vec<(
+        Vec<u8>,
+        tokio::sync::mpsc::Sender<zeph_transport::Connection>,
+    )> = vec![];
     let mut stream_handlers: Vec<(u8, tokio::sync::mpsc::Sender<zeph_transport::TaggedStream>)> =
-        vec![];
+        vec![(zeph_transport::tag::PING, ping_stream_tx)];
     if let Some(dht) = &dht_node {
         let (dht_stream_tx, dht_stream_rx) = tokio::sync::mpsc::channel(32);
         stream_handlers.push((zeph_transport::tag::DHT, dht_stream_tx));
@@ -1631,8 +1634,8 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     });
     let ping_clock = transport.clock();
     tokio::spawn(async move {
-        while let Some(conn) = ping_rx.recv().await {
-            tokio::spawn(Transport::handle_ping_conn(ping_clock.clone(), conn));
+        while let Some(stream) = ping_rx.recv().await {
+            tokio::spawn(Transport::handle_ping_stream(ping_clock.clone(), stream));
         }
     });
 
