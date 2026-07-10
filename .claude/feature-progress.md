@@ -1,3 +1,22 @@
+# TRANSFER PLANE V2 — DEPLOY GATE ✅ PASSED + FLEET ROLLED (2026-07-10, ultracode)
+Deployed the scenario-C durability fix (commits 6aa5812 + e456b3f) to the LIVE fleet. GATE: full
+suite green (A/C/D/E/F + B isolated), C 12/12 flake-free, E 1.1x resolves; deploy-gate adversarial
+review (agent) = NO deploy-blocking findings (converges + stops, no panic/wedge/overflow, wire/DHT/
+ALPN compatible with old binary for a mixed-version roll, scheduler bounded). Rejoin: scenario F +
+persistent /var/lib/zeph stores → restart=full-store rejoin; every node came back to peers=4.
+FLEET = 5 nodes: zeph/zeph2/zeph3/zeph4 (co-located on Hetzner ubuntu-32gb-fsn1-1 @46.224.172.252,
+build tree /opt/zeph-src/zephcraft-standalone — NOT the doc's zephcraft/; rsync target, binary
+byte-identical to /usr/local/bin/zeph) + the Mac launchd node (~/.zeph, ec.craft.zeph, governance
+governor, behind NAT/relayed). zeph5/zeph8 stay failed/stopped (per cluster memory).
+PROCEDURE (done): backup binary (zeph.bak-20260710-0536 on box, zeph.bak-20260710-1345 on Mac) →
+rsync crates/ → build on box (nice -19 -j4, detached, 1m27s, load 21→23.6 fleet survived) →
+install → STAGGERED restart zeph2→zeph3→zeph4→zeph→Mac, verifying each (active, NRestarts=0,
+peers=4, 0 panic/error) before the next. FINAL: all 5 on new binary, full mesh (every node sees 4
+peers incl. cross-checked Mac↔fleet), 0 panics, 0 repair storm (steady-state content >=floor so the
+below-2k rescue correctly idle), box load back to 17. Rollback = cp zeph.bak-* → restart.
+NOTE for future deploys: build tree is zephcraft-standalone (rsync from local crates/), NOT git;
+grep the logs with ANSI stripped (sed 's/\x1b\[[0-9;]*m//g') — tokens render as peer<esc>=<esc>val.
+
 # TRANSFER PLANE V2 — P3 SCENARIO C ✅ GREEN (2026-07-10, ultracode)
 DURABILITY-UNDER-LOSS GAP (scenario_c_kill_holder_repairs) — FIXED. Publish 30 PINNED cids from
 node0, quiesce, KILL the top non-seed holder permanently; survivors must restore every cid to >=k=8
