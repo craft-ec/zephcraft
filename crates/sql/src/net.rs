@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use zeph_core::{Cid, NodeId};
 use zeph_obj::{ConsumeMode, ObjEngine, PeerSource};
-use zeph_transport::{Connection, PeerAddr, Transport};
+use zeph_transport::{tag, PeerAddr, TaggedStream, Transport};
 
 use crate::{DurableStore, ObjectStore, PageSource, Result, SqlError};
 
@@ -24,34 +24,29 @@ const MAX_OBJECT: usize = 16 * 1024 * 1024;
 /// peer's pooled connection are served with bounded pipelining — a recovering
 /// DB fetches many pages back-to-back and serial handling made that N round
 /// trips instead of a pipeline.
-pub async fn serve_pages(store_dir: PathBuf, mut conns: mpsc::Receiver<Connection>) {
-    while let Some(conn) = conns.recv().await {
-        let dir = store_dir.clone();
+pub async fn serve_pages(store_dir: PathBuf, mut streams: mpsc::Receiver<TaggedStream>) {
+    // Muxed: one tagged stream per page fetch. Open the store ONCE (the demux
+    // already bounds per-peer pipelining), then handle each request stream.
+    let Ok(store) = ObjectStore::open(&store_dir) else {
+        return;
+    };
+    let store = std::sync::Arc::new(store);
+    while let Some(TaggedStream {
+        mut send, mut recv, ..
+    }) = streams.recv().await
+    {
+        let store = store.clone();
         tokio::spawn(async move {
-            let Ok(store) = ObjectStore::open(&dir) else {
+            let Ok(req) = recv.read_to_end(64).await else {
                 return;
             };
-            let store = std::sync::Arc::new(store);
-            let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
-            while let Ok((mut send, mut recv)) = conn.accept_bi().await {
-                let Ok(permit) = permits.clone().acquire_owned().await else {
-                    return;
-                };
-                let store = store.clone();
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    let Ok(req) = recv.read_to_end(64).await else {
-                        return;
-                    };
-                    if req.len() == 32 {
-                        let mut cid = [0u8; 32];
-                        cid.copy_from_slice(&req);
-                        let data = store.get(&Cid(cid)).unwrap_or_default();
-                        let _ = send.write_all(&data).await;
-                    }
-                    let _ = send.finish();
-                });
+            if req.len() == 32 {
+                let mut cid = [0u8; 32];
+                cid.copy_from_slice(&req);
+                let data = store.get(&Cid(cid)).unwrap_or_default();
+                let _ = send.write_all(&data).await;
             }
+            let _ = send.finish();
         });
     }
 }
@@ -84,33 +79,15 @@ impl PageSource for TransportPageSource {
         let addr = self.owner_addr(owner).await.ok_or_else(|| {
             SqlError::Sqlite(format!("owner {} not among live peers", owner.to_hex()))
         })?;
-        let conn = self
+        // Muxed page fetch (tag::SQLPAGE): request is the bare 32-byte CID, the
+        // reply is the object bytes (empty = not held). request_tagged evicts
+        // the mux connection on a stream failure so the next fetch re-dials.
+        let data = self
             .transport
-            .connect(&addr, ALPN)
+            .request_tagged(&addr, tag::SQLPAGE, &cid.0, MAX_OBJECT)
             .await
-            .map_err(|e| SqlError::Sqlite(format!("connect: {e}")))?;
-        // Pooled connection: shared, never closed here; evict on failure so
-        // the next fetch re-dials.
-        let fut = async {
-            let (mut send, mut recv) = conn
-                .open_bi()
-                .await
-                .map_err(|e| SqlError::Sqlite(format!("open_bi: {e}")))?;
-            send.write_all(&cid.0)
-                .await
-                .map_err(|e| SqlError::Sqlite(e.to_string()))?;
-            send.finish().map_err(|e| SqlError::Sqlite(e.to_string()))?;
-            recv.read_to_end(MAX_OBJECT)
-                .await
-                .map_err(|e| SqlError::Sqlite(e.to_string()))
-        };
-        match fut.await {
-            Ok(data) => Ok(if data.is_empty() { None } else { Some(data) }),
-            Err(err) => {
-                self.transport.evict(&addr, ALPN, &conn);
-                Err(err)
-            }
-        }
+            .map_err(|e| SqlError::Sqlite(format!("sqlpage fetch: {e}")))?;
+        Ok(if data.is_empty() { None } else { Some(data) })
     }
 }
 

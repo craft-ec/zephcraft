@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use zeph_core::Cid;
 use zeph_obj::{ConsumeMode, ObjEngine};
-use zeph_transport::{Connection, PeerAddr, Transport};
+use zeph_transport::{tag, PeerAddr, TaggedStream, Transport};
 
 use crate::{AppBackend, CapabilityGrant, TransitionCtx, TransitionRuntime, DEFAULT_FUEL};
 
@@ -100,31 +100,37 @@ impl InvokeService {
 /// Wire framing (response): a 1-byte status — `0x01` followed by the app's committed
 /// output bytes on success, or a single `0x00` on error. The status byte makes an
 /// empty-output success distinguishable from a failure.
-pub async fn serve_invocations(mut conns: mpsc::Receiver<Connection>, service: Arc<InvokeService>) {
-    while let Some(conn) = conns.recv().await {
-        // The caller's identity, QUIC-authenticated by the transport (iroh
-        // EndpointId == zeph NodeId — the same 32 bytes).
-        let caller = *conn.remote_id().as_bytes();
+pub async fn serve_invocations(
+    mut streams: mpsc::Receiver<TaggedStream>,
+    service: Arc<InvokeService>,
+) {
+    // Muxed: one tagged stream per invocation. The caller identity is the
+    // stream's QUIC-authenticated remote NodeId (iroh EndpointId == zeph NodeId).
+    while let Some(TaggedStream {
+        remote,
+        mut send,
+        mut recv,
+    }) = streams.recv().await
+    {
+        let caller = remote.0;
         let service = service.clone();
         tokio::spawn(async move {
-            while let Ok((mut send, mut recv)) = conn.accept_bi().await {
-                let Ok(bytes) = recv.read_to_end(64 * 1024).await else {
-                    break;
-                };
-                let mut resp = Vec::new();
-                match postcard::from_bytes::<InvokeRequest>(&bytes) {
-                    Ok(req) => match service.invoke(&req, caller).await {
-                        Ok(out) => {
-                            resp.push(0x01);
-                            resp.extend_from_slice(&out);
-                        }
-                        Err(_) => resp.push(0x00),
-                    },
+            let Ok(bytes) = recv.read_to_end(64 * 1024).await else {
+                return;
+            };
+            let mut resp = Vec::new();
+            match postcard::from_bytes::<InvokeRequest>(&bytes) {
+                Ok(req) => match service.invoke(&req, caller).await {
+                    Ok(out) => {
+                        resp.push(0x01);
+                        resp.extend_from_slice(&out);
+                    }
                     Err(_) => resp.push(0x00),
-                }
-                let _ = send.write_all(&resp).await;
-                let _ = send.finish();
+                },
+                Err(_) => resp.push(0x00),
             }
+            let _ = send.write_all(&resp).await;
+            let _ = send.finish();
         });
     }
 }
@@ -137,22 +143,12 @@ pub async fn invoke_remote(
     addr: &PeerAddr,
     req: &InvokeRequest,
 ) -> anyhow::Result<Vec<u8>> {
-    // Pooled connection: shared, never closed here; evict on failure so the
-    // next invocation re-dials.
-    let conn = transport.connect(addr, INVOKE_ALPN).await?;
-    let fut = async {
-        let (mut send, mut recv) = conn.open_bi().await?;
-        send.write_all(&postcard::to_allocvec(req)?).await?;
-        send.finish()?;
-        anyhow::Ok(recv.read_to_end(64 * 1024).await?)
-    };
-    let resp = match fut.await {
-        Ok(resp) => resp,
-        Err(err) => {
-            transport.evict(addr, INVOKE_ALPN, &conn);
-            return Err(err);
-        }
-    };
+    // Muxed invocation (tag::INVOKE) on the shared per-peer connection;
+    // request_tagged evicts the mux connection on a stream failure.
+    let req_bytes = postcard::to_allocvec(req)?;
+    let resp = transport
+        .request_tagged(addr, tag::INVOKE, &req_bytes, 64 * 1024)
+        .await?;
     match resp.split_first() {
         Some((0x01, out)) => Ok(out.to_vec()),
         _ => anyhow::bail!("remote invocation failed"),

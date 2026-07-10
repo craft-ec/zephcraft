@@ -1103,10 +1103,8 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         alpn::PING.to_vec(),
         zeph_membership::ALPN.to_vec(),
         zeph_obj::ALPN.to_vec(),
-        zeph_sql::PAGE_ALPN.to_vec(),
-        zeph_com::INVOKE_ALPN.to_vec(),
     ];
-    // dht + registry are muxed (tag::DHT / tag::REGISTRY) — no dedicated ALPN.
+    // dht/registry/sqlpage/invoke are muxed (per-stream tag) — no dedicated ALPN.
     let transport = Arc::new(
         Transport::bind_with_relays(
             identity.secret_key_bytes(),
@@ -1513,15 +1511,11 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let (ping_tx, mut ping_rx) = tokio::sync::mpsc::channel(32);
     let (member_tx, member_rx) = tokio::sync::mpsc::channel(32);
     let (piece_tx, piece_rx) = tokio::sync::mpsc::channel(32);
-    let (sqlpage_tx, sqlpage_rx) = tokio::sync::mpsc::channel(32);
-    let (invoke_tx, invoke_rx) = tokio::sync::mpsc::channel(32);
     // Legacy per-ALPN connection handlers (protocols not yet muxed).
     let handlers = vec![
         (alpn::PING.to_vec(), ping_tx),
         (zeph_membership::ALPN.to_vec(), member_tx),
         (zeph_obj::ALPN.to_vec(), piece_tx),
-        (zeph_sql::PAGE_ALPN.to_vec(), sqlpage_tx),
-        (zeph_com::INVOKE_ALPN.to_vec(), invoke_tx),
     ];
     // Muxed per-stream-tag handlers (element 1). Grows as protocols migrate.
     let mut stream_handlers: Vec<(u8, tokio::sync::mpsc::Sender<zeph_transport::TaggedStream>)> =
@@ -1533,11 +1527,18 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     }
     let (registry_stream_tx, registry_stream_rx) = tokio::sync::mpsc::channel(32);
     stream_handlers.push((zeph_transport::tag::REGISTRY, registry_stream_tx));
+    let (sqlpage_stream_tx, sqlpage_stream_rx) = tokio::sync::mpsc::channel(32);
+    stream_handlers.push((zeph_transport::tag::SQLPAGE, sqlpage_stream_tx));
+    let (invoke_stream_tx, invoke_stream_rx) = tokio::sync::mpsc::channel(32);
+    stream_handlers.push((zeph_transport::tag::INVOKE, invoke_stream_tx));
     let server = transport.clone();
     tokio::spawn(async move { server.serve(handlers, stream_handlers).await });
     tokio::spawn(engine.clone().serve(piece_rx));
-    tokio::spawn(zeph_sql::serve_pages(sql_dir.clone(), sqlpage_rx));
-    tokio::spawn(zeph_com::serve_invocations(invoke_rx, com_service.clone()));
+    tokio::spawn(zeph_sql::serve_pages(sql_dir.clone(), sqlpage_stream_rx));
+    tokio::spawn(zeph_com::serve_invocations(
+        invoke_stream_rx,
+        com_service.clone(),
+    ));
     // Serve cross-node registry requests (writer path advances; queries resolve).
     tokio::spawn(head_registry.clone().serve(registry_stream_rx));
     // "Pending distribution" completion (per-incomplete-cid DHT resolve + deficit pushes)
