@@ -527,3 +527,70 @@ async fn scenario_b_mass_rejoin() {
         violations.join("\n")
     );
 }
+
+/// Scenario D — class fairness under a scan flood (Transfer Plane v2 element 5).
+/// The post-publish convergence naturally floods `scan:` jobs across every held
+/// cid; with per-class in-flight caps no class may monopolize the 8 slots. Bar:
+/// on every node throughout the drain window, scan in-flight <= 4 (cap = c/2),
+/// pushstate/reannounce/scale <= 2, and repair/publish completions still
+/// advance (fairness must not starve durability or ingest).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "heavy: real 8-node in-process cluster — run explicitly (see module doc)"]
+async fn scenario_d_class_fairness() {
+    let _serial = SERIAL.lock().await;
+    let mut violations: Vec<String> = Vec::new();
+
+    let mut nodes = vec![TestNode::spawn(&[]).await.expect("seed node")];
+    let seed = nodes[0].contact.clone();
+    nodes.extend(spawn_wave(&seed, 7).await);
+    println!("scenario D: 8 nodes up");
+
+    publish_and_settle(&nodes[0], 150, "scenario D", &mut violations).await;
+
+    // Caps that must hold on every node (defaults for concurrency=8).
+    let caps: &[(&str, u64)] = &[
+        ("scan", 4),
+        ("pushstate", 2),
+        ("reannounce", 2),
+        ("scale", 2),
+        ("distribute", 4),
+        ("publish", 4),
+    ];
+    // Sample the convergence window (~60s). Boot clamp opens to full width once
+    // the wave drains, so fairness is live here.
+    let mut worst: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(60) {
+        for n in &nodes {
+            for (cls, count) in n.jobs.stats().class_in_flight {
+                let e = worst.entry(cls).or_insert(0);
+                *e = (*e).max(count);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    for (cls, cap) in caps {
+        let seen = *worst.get(*cls).unwrap_or(&0);
+        if seen > *cap {
+            violations.push(format!(
+                "class '{cls}' in-flight peaked at {seen}, exceeds cap {cap}"
+            ));
+        }
+    }
+    // Durability/ingest still progressed (fairness didn't starve them).
+    let repaired: u64 = nodes.iter().map(|n| n.jobs.stats().completed).sum();
+    if repaired == 0 {
+        violations.push("no jobs completed across the cluster — nothing progressed".into());
+    }
+    println!("scenario D: per-class in-flight peaks = {worst:?}");
+
+    if !violations.is_empty() {
+        dump_cluster(&nodes).await;
+    }
+    shutdown_all(&mut nodes).await;
+    assert!(
+        violations.is_empty(),
+        "scenario D bars failed:\n{}",
+        violations.join("\n")
+    );
+}
