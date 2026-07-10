@@ -98,8 +98,57 @@ pub struct TestNode {
     pub membership: Arc<Membership>,
     pub dht: Arc<DhtNode>,
     pub transport: Arc<Transport>,
+    /// Cumulative count of DHT `resolve()` calls this node issued — the
+    /// elected-scan proof (element 4): aggregate resolves should be ~O(cids)
+    /// per interval, not O(cids × replication).
+    pub resolves: Arc<std::sync::atomic::AtomicU64>,
     tasks: Vec<JoinHandle<()>>,
     _data_dir: tempfile::TempDir,
+}
+
+/// A `ContentRouting` that counts `resolve()` calls and delegates the rest —
+/// the instrument for the elected-scan proof.
+struct CountingRouting {
+    inner: Arc<dyn zeph_routing::ContentRouting>,
+    resolves: Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[async_trait::async_trait]
+impl zeph_routing::ContentRouting for CountingRouting {
+    async fn announce(&self, cid: Cid, pc: u32, pinned: bool) -> zeph_routing::Result<()> {
+        self.inner.announce(cid, pc, pinned).await
+    }
+    async fn resolve(&self, cid: Cid) -> zeph_routing::Result<Vec<zeph_routing::ProviderRecord>> {
+        self.resolves
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.resolve(cid).await
+    }
+    async fn withdraw(&self, cid: Cid) -> zeph_routing::Result<()> {
+        self.inner.withdraw(cid).await
+    }
+    async fn announce_want(&self, cid: Cid) -> zeph_routing::Result<()> {
+        self.inner.announce_want(cid).await
+    }
+    async fn withdraw_want(&self, cid: Cid) -> zeph_routing::Result<()> {
+        self.inner.withdraw_want(cid).await
+    }
+    async fn is_wanted(&self, cid: Cid) -> zeph_routing::Result<bool> {
+        self.inner.is_wanted(cid).await
+    }
+    async fn announce_meta(
+        &self,
+        cid: Cid,
+        published_at: u64,
+        comment: Option<String>,
+    ) -> zeph_routing::Result<()> {
+        self.inner.announce_meta(cid, published_at, comment).await
+    }
+    async fn withdraw_meta(&self, cid: Cid) -> zeph_routing::Result<()> {
+        self.inner.withdraw_meta(cid).await
+    }
+    async fn metas(&self, cid: Cid) -> zeph_routing::Result<Vec<zeph_routing::MetaRecord>> {
+        self.inner.metas(cid).await
+    }
 }
 
 impl TestNode {
@@ -134,8 +183,11 @@ impl TestNode {
             }
         };
         let dht = DhtNode::new(identity.clone(), transport.clone(), DHT_RECORD_TTL_MS);
-        let routing: Arc<dyn zeph_routing::ContentRouting> =
-            Arc::new(zeph_routing::DhtRouting::new(dht.clone()));
+        let resolves = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let routing: Arc<dyn zeph_routing::ContentRouting> = Arc::new(CountingRouting {
+            inner: Arc::new(zeph_routing::DhtRouting::new(dht.clone())),
+            resolves: resolves.clone(),
+        });
         let mem_peers = MembershipPeers::new();
         let peer_source: Arc<dyn PeerSource> = mem_peers.clone();
         // ObjConfig mirrors noded's Config::default() → ObjConfig mapping.
@@ -554,6 +606,7 @@ impl TestNode {
             membership,
             dht,
             transport,
+            resolves,
             tasks,
             _data_dir: data_dir,
         })

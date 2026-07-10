@@ -243,6 +243,9 @@ pub trait PeerSource: Send + Sync {
     async fn peers(&self) -> Vec<(NodeId, PeerAddr)>;
 }
 
+/// Elected-scan per-cid snapshot: (last_scan_ms, capable holder ids).
+type ScanSnapshot = (u64, Vec<NodeId>);
+
 /// Per-cid diagnostic snapshot from the last health scan (for the dashboard). The verdict is
 /// derived separately from the at-risk / fading sets; this carries the raw numbers.
 #[derive(Clone, Debug)]
@@ -322,6 +325,14 @@ pub struct ObjEngine {
     node_liveness: Mutex<HashMap<NodeId, (Instant, bool)>>,
     /// Per-cid health snapshot from the last scan (dashboard diagnostics).
     cid_health: Mutex<HashMap<[u8; 32], CidHealth>>,
+    /// Per-cid snapshot from the last REAL scan: (last_scan_ms, capable holder
+    /// ids). Feeds elected-scan (v2 element 4) — `should_scan` elects ONE
+    /// scanner per (cid, epoch) over the cached capable set ∪ self, so a
+    /// replicated cid is resolved by ~one node per interval cluster-wide
+    /// instead of every holder (N× duplicated DHT lookups). A skipped
+    /// non-winner leaves the previous snapshot intact; the staleness ceiling
+    /// forces an unconditional refresh so no cid can go unscanned.
+    scan_snapshot: Mutex<HashMap<[u8; 32], ScanSnapshot>>,
 }
 
 impl ObjEngine {
@@ -357,6 +368,7 @@ impl ObjEngine {
             alive_cache: Mutex::new(None),
             node_liveness: Mutex::new(HashMap::new()),
             cid_health: Mutex::new(HashMap::new()),
+            scan_snapshot: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1307,6 +1319,44 @@ impl ObjEngine {
         *self.liveness.lock().expect("liveness") = Some(src);
     }
 
+    /// Elected-scan gate (v2 element 4): should THIS node run the real (DHT-
+    /// resolving) scan for `cid` this epoch? True if it is the FIRST scan (no
+    /// snapshot), if our own snapshot is older than `max_stale` (safety net —
+    /// forces a refresh so a phantom-elected cid can't go unscanned forever),
+    /// or if this node WINS the rendezvous election over {cached capable
+    /// holders that are still alive} ∪ self. Self is always a candidate (the
+    /// correctness anchor); dead cached winners are filtered by the alive set;
+    /// the epoch-keyed score rotates the winner so stale snapshots self-heal.
+    /// Cheap: reads a snapshot + the ~10s-cached alive set, no network.
+    pub async fn should_scan(&self, cid: &Cid, max_stale: std::time::Duration) -> bool {
+        let me = self.transport.node_id();
+        let snap = self
+            .scan_snapshot
+            .lock()
+            .expect("scan_snapshot")
+            .get(&cid.0)
+            .cloned();
+        let Some((last_scan_ms, capable)) = snap else {
+            return true; // first scan — no prior set
+        };
+        let now = self.transport.clock().now();
+        if now.millis().saturating_sub(last_scan_ms) >= max_stale.as_millis() as u64 {
+            return true; // our view is stale — refresh unconditionally
+        }
+        let epoch = now.0 / HEALTH_EPOCH_MS;
+        let alive = self.alive_peers().await;
+        let mut cands: Vec<NodeId> = capable
+            .iter()
+            .copied()
+            .filter(|id| *id != me && alive.as_ref().is_none_or(|s| s.contains(id)))
+            .collect();
+        cands.push(me); // self is ALWAYS a candidate
+        cands
+            .iter()
+            .max_by_key(|id| rendezvous_score(id, cid, epoch))
+            == Some(&me)
+    }
+
     /// Currently-alive peer node-ids (cached ~10s). None if no liveness source is wired (then the
     /// health scan does not filter — legacy behaviour).
     async fn alive_peers(&self) -> Option<HashSet<NodeId>> {
@@ -1429,6 +1479,14 @@ impl ObjEngine {
                     }
                 }
             }
+            // Elected-scan snapshot (v2 element 4): record THIS scan's capable
+            // holder set + timestamp so future ticks can elect one scanner over
+            // it. Written once per real scan, here (capable is complete); a
+            // non-winner skip never reaches this, leaving the prior snapshot.
+            self.scan_snapshot.lock().expect("scan_snapshot").insert(
+                cid.0,
+                (self.transport.clock().now().millis(), capable.clone()),
+            );
 
             // OFFLOAD (tail of the durability gate): a copy we retained for durability —
             // we hold the whole content, but it is NOT user-pinned or user-wanted — may be

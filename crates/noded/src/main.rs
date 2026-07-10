@@ -1753,6 +1753,12 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // healthy cids back off geometrically up to recheck_max (min * 64).
     let recheck_min = Duration::from_secs(health_scan_secs);
     let recheck_max = Duration::from_secs(health_scan_secs.saturating_mul(64));
+    // Elected-scan safety net (v2 element 4): a non-winner's own snapshot older
+    // than this forces an unconditional refresh scan, so a phantom-elected cid
+    // (winner still alive + cached but no longer holds it) can't go unscanned.
+    // 4× recheck_max: negligible aggregate-resolve cost in the steady window,
+    // yet bounds worst-case detection to a few minutes at defaults.
+    let scan_stale_ceiling = recheck_max.saturating_mul(4);
     let hs_queue: Arc<DueQueue> =
         Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new()));
     let hs_seen: Arc<std::sync::Mutex<std::collections::HashSet<Cid>>> =
@@ -1876,6 +1882,23 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                     Some(item) => (item.0 .1, item.0 .2),
                     None => continue,
                 };
+                // ELECTED SCAN (v2 element 4): only the rendezvous-elected
+                // scanner for (cid, epoch) does the real DHT-resolving scan;
+                // every OTHER holder skips it here (no resolve, no job slot) and
+                // reschedules on the provider-aware cadence. This turns N×-holder
+                // duplicated lookups into ~one resolve per cid per interval. A
+                // first scan, a stale snapshot (safety net), or winning the
+                // election all pass. Runs inline (cheap: snapshot + cached alive).
+                if !eng.should_scan(&cid, scan_stale_ceiling).await {
+                    let holders = eng.live_providers(&cid).clamp(1, 16);
+                    let next = (delay * 2).max(recheck_min * holders).min(recheck_max);
+                    q.lock().expect("q").push(std::cmp::Reverse((
+                        std::time::Instant::now() + next,
+                        cid,
+                        next,
+                    )));
+                    continue;
+                }
                 // Hand the WORK to the coordinator — the single job manager (bounded concurrency,
                 // dedup, retries, stats). The delay-queue only SCHEDULES *when* each cid is due;
                 // the scan itself is now a coordinator job, visible in job stats like distribute
