@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use zeph_com::{
     invoke_remote, serve_invocations, AppBackend, CraftBackend, InvokeRequest, InvokeService,
-    TransitionRuntime, INVOKE_ALPN,
+    TransitionRuntime,
 };
 use zeph_core::{hlc::Clock, NodeId};
 use zeph_crypto::NodeIdentity;
@@ -17,7 +17,7 @@ use zeph_obj::{ObjConfig, ObjEngine};
 use zeph_sql::{CraftSql, ObjDurable, TransportPageSource};
 use zeph_store::Store;
 use zeph_testkit::{MemHeads, MemNet};
-use zeph_transport::{Connection, PeerAddr, Reach, Transport};
+use zeph_transport::{PeerAddr, Reach, Transport};
 
 /// Replaces the in-process tracker: one shared in-memory network view.
 fn start_tracker() -> MemNet {
@@ -30,7 +30,7 @@ struct Node {
     craftsql: Arc<CraftSql>,
     engine: Arc<ObjEngine>,
     /// Incoming invocation connections (this node hosting apps for others).
-    invoke_rx: mpsc::Receiver<Connection>,
+    invoke_rx: mpsc::Receiver<zeph_transport::TaggedStream>,
 }
 
 async fn node(tracker: &MemNet, dir: &Path, heads: &MemHeads) -> Node {
@@ -40,11 +40,7 @@ async fn node(tracker: &MemNet, dir: &Path, heads: &MemHeads) -> Node {
         Transport::bind(
             id.secret_key_bytes(),
             Reach::LocalOnly,
-            vec![
-                zeph_obj::ALPN.to_vec(),
-                zeph_sql::PAGE_ALPN.to_vec(),
-                INVOKE_ALPN.to_vec(),
-            ],
+            vec![zeph_transport::MUX_ALPN.to_vec(), zeph_obj::ALPN.to_vec()],
             0,
         )
         .await
@@ -74,11 +70,13 @@ async fn node(tracker: &MemNet, dir: &Path, heads: &MemHeads) -> Node {
     let (invoke_tx, invoke_rx) = mpsc::channel(64);
     let st = t.clone();
     tokio::spawn(async move {
-        st.serve(vec![
-            (zeph_obj::ALPN.to_vec(), obj_tx),
-            (zeph_sql::PAGE_ALPN.to_vec(), sql_tx),
-            (INVOKE_ALPN.to_vec(), invoke_tx),
-        ])
+        st.serve(
+            vec![(zeph_obj::ALPN.to_vec(), obj_tx)],
+            vec![
+                (zeph_transport::tag::SQLPAGE, sql_tx),
+                (zeph_transport::tag::INVOKE, invoke_tx),
+            ],
+        )
         .await
     });
     let se = engine.clone();
