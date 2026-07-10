@@ -23,13 +23,27 @@ PHASES (each passes the offline harness before the next; harness FIRST):
     connections by tag (bounded MUX_PIPELINE_STREAMS). Old per-ALPN path COEXISTS (endpoint
     advertises MUX + remaining legacy ALPNs) so protocols migrate one at a time. VALIDATED: routing
     dht-over-mux test passes.
-[~] P2 MIGRATE 7 PROTOCOLS (client→request_tagged/send_tagged; server→consume TaggedStream; drop
-    ALPN from advertise). DONE + VALIDATED: dht (1468576), registry (dd19faa), sqlpage+invoke
-    (63d5c7e; com feed/invoke tests green over mux), com test wiring (a04b3e8). Each protocol's
-    client + ALL its serve-wirings (main.rs + TestNode + crate tests) move together — that's the
-    per-protocol unit. REMAINING: member, piece(obj), ping. Note obj is the transfer path (P3 builds
-    offer/grant on it); ping has the reserved dial-lane (collapses under mux). TestNode wires
-    ping/member/obj — those 3 also touch tests/src/lib.rs.
+[x] P2 MIGRATE 7 PROTOCOLS — ALL DONE + VALIDATED. dht (1468576), registry (dd19faa), sqlpage+invoke
+    (63d5c7e), com test wiring (a04b3e8), member (fde4715), obj/piece (d397043), ping (last commit).
+    Only MUX_ALPN advertised now; every protocol is a per-stream tag. PAYOFF: scenario A conn-count =
+    [7,7,7,7,7,7,7,7] EXACTLY (one mux conn per peer, total 56) — DOWN from baseline worst 24 / total
+    135; the mux bar (per-node <=7) PASSES. settled 12s, scan p99 360ms. Element 1 = DONE.
+    Per-protocol pattern: client→request_tagged (req/reply) or send_tagged (one-way) / mux_conn
+    (reachability); server→consume TaggedStream; every serve-wiring (main.rs + TestNode + crate tests:
+    com invoke/feed/craft_backend, obj publish_fetch/encrypted/healthscan, craftsql_dst, dht node.rs
+    test) moved with it. Piece-push TIMEOUT no longer evicts (shared conn — a slow push must not tear
+    down other protocols' streams to that peer); only genuine stream failures evict_mux.
+    LEGACY per-ALPN path (connect/connect_fresh/serve conn_handlers/pool/dials/ping_dial_permits)
+    remains as harmless dead code (conn_handlers always empty now) — remove in a cleanup pass.
+[x] FULL SUITE A-F over mux — ALL 6 GREEN (626s): A conns [7×8]; B census-20 17.8s drained (was the
+    census-flake scenario under load — mux's 7-vs-24 conn count eased the churn, incidental fix); C
+    recovered=true; D fair; E resolves 1.1x; F rejoin. NO regression from the mux migration.
+[ ] P3 OFFER/GRANT (next): wire Offer{class,cid,items,bytes}/Grant{accept,retry_ms} on the piece
+    path (obj); gauge-based grant (ResourceGauge exists in sched: critical()/high()/set_budget());
+    partial/zero → redirect (coded pieces fungible) or requeue-backoff. + capped-receiver scenario
+    (force a node's gauge high → cluster converges around it, capped node sheds via grants, zero
+    push-timeouts) — fails vs current (no offer/grant), passes after.
+[ ] P4 full harness green (A-F + capped). [ ] P5 SIMULTANEOUS fleet roll (gate on user go-ahead).
 [ ] P3 OFFER/GRANT on piece path (obj): wire Offer{class,cid,items,bytes}/Grant{accept,retry_ms};
     sender pre-push handshake; gauge-based grant (critical=0/high=1/else<=4, ResourceGauge exists);
     partial/zero → redirect to next candidate (coded pieces fungible) or requeue-backoff.
