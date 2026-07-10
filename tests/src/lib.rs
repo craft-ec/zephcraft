@@ -171,7 +171,6 @@ impl TestNode {
         let alpns = vec![
             zeph_transport::MUX_ALPN.to_vec(),
             alpn::PING.to_vec(),
-            zeph_membership::ALPN.to_vec(),
             zeph_obj::ALPN.to_vec(),
         ];
         let transport = Arc::new(
@@ -303,16 +302,18 @@ impl TestNode {
 
         // ALPN dispatcher: ping + membership + pieces + dht share the endpoint.
         let (ping_tx, mut ping_rx) = tokio::sync::mpsc::channel(32);
-        let (member_tx, member_rx) = tokio::sync::mpsc::channel(32);
         let (piece_tx, piece_rx) = tokio::sync::mpsc::channel(32);
         let handlers = vec![
             (alpn::PING.to_vec(), ping_tx),
-            (zeph_membership::ALPN.to_vec(), member_tx),
             (zeph_obj::ALPN.to_vec(), piece_tx),
         ];
-        // dht is muxed (tag::DHT) — a per-stream-tag handler.
+        // dht + member are muxed — per-stream-tag handlers.
         let (dht_stream_tx, dht_stream_rx) = tokio::sync::mpsc::channel(32);
-        let stream_handlers = vec![(zeph_transport::tag::DHT, dht_stream_tx)];
+        let (member_stream_tx, member_stream_rx) = tokio::sync::mpsc::channel(32);
+        let stream_handlers = vec![
+            (zeph_transport::tag::DHT, dht_stream_tx),
+            (zeph_transport::tag::MEMBER, member_stream_tx),
+        ];
         dht.clone().serve(dht_stream_rx);
         let server = transport.clone();
         tasks.push(tokio::spawn(async move {
@@ -335,7 +336,7 @@ impl TestNode {
             },
         );
         let boot_peers: Vec<PeerAddr> = seeds.iter().map(|c| c.addr.clone()).collect();
-        membership.start(boot_peers.clone(), member_rx);
+        membership.start(boot_peers.clone(), member_stream_rx);
         mem_peers.set(membership.clone()).await;
         // Membership is the health scan's LIVENESS source: a holder SWIM marks
         // dead is excluded from durability counts so repair fires.

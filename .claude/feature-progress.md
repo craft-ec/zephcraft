@@ -14,15 +14,22 @@ CURRENT STATE (surveyed by 2 Explore agents):
   bulk object-fetch (not piece admission). Ping has a reserved dial-slot semaphore that mux collapses
   (one conn/peer → one dial). AvailabilityProbe/Ack wire msgs exist but have NO live client (dormant).
 PHASES (each passes the offline harness before the next; harness FIRST):
-[ ] P0 HARNESS: (a) connection-count assertion (mux: ~O(peers) not O(peers×7)); (b) Scenario
-    "capped receiver" — one node gauge-forced-high, cluster converges around it, capped node sheds
-    via GRANTS with zero timeouts. Both MUST fail vs current code first (baseline).
-[ ] P1 MUX CORE (transport): mux ALPN /craftec/mux/1 + 1-byte tag; PoolKey→[u8;32]; single-ALPN
-    dial; open_tagged(peer,tag)->(Send,Recv) helper; tag-dispatch serve loop → per-tag
-    mpsc<(SendStream,RecvStream)>. Update testkit LocalOnly transport in lockstep.
-[ ] P2 MIGRATE 7 PROTOCOLS to tagged streams (client writes tag; server consumes tagged streams
-    not Connections): ping, member, piece, sqlpage, invoke, registry, dht — one at a time, node
-    runnable throughout. main.rs wiring: single mux ALPN, handler map keyed by tag.
+[x] P0 HARNESS (a): mux connection-count bar added to scenario A (Transport::connection_count) —
+    BASELINE CONFIRMED failing: worst 24 conns/node vs mux bar <=7 (commit dd0b7d1). (b) capped-
+    receiver scenario deferred to P3 (per doc build order — developed WITH offer/grant).
+[x] P1 MUX CORE (transport, commit 3535f63): MUX_ALPN /craftec/mux/1 + `tag` module (1-byte tags) +
+    TaggedStream{remote,send,recv}; per-peer mux_pool ([u8;32] key) + mux_conn/open_tagged/evict_mux;
+    request_tagged/send_tagged client helpers; serve(conn_handlers, stream_handlers) demuxes MUX
+    connections by tag (bounded MUX_PIPELINE_STREAMS). Old per-ALPN path COEXISTS (endpoint
+    advertises MUX + remaining legacy ALPNs) so protocols migrate one at a time. VALIDATED: routing
+    dht-over-mux test passes.
+[~] P2 MIGRATE 7 PROTOCOLS (client→request_tagged/send_tagged; server→consume TaggedStream; drop
+    ALPN from advertise). DONE + VALIDATED: dht (1468576), registry (dd19faa), sqlpage+invoke
+    (63d5c7e; com feed/invoke tests green over mux), com test wiring (a04b3e8). Each protocol's
+    client + ALL its serve-wirings (main.rs + TestNode + crate tests) move together — that's the
+    per-protocol unit. REMAINING: member, piece(obj), ping. Note obj is the transfer path (P3 builds
+    offer/grant on it); ping has the reserved dial-lane (collapses under mux). TestNode wires
+    ping/member/obj — those 3 also touch tests/src/lib.rs.
 [ ] P3 OFFER/GRANT on piece path (obj): wire Offer{class,cid,items,bytes}/Grant{accept,retry_ms};
     sender pre-push handshake; gauge-based grant (critical=0/high=1/else<=4, ResourceGauge exists);
     partial/zero → redirect to next candidate (coded pieces fungible) or requeue-backoff.

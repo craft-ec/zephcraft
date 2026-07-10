@@ -1101,10 +1101,9 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let alpns = vec![
         zeph_transport::MUX_ALPN.to_vec(),
         alpn::PING.to_vec(),
-        zeph_membership::ALPN.to_vec(),
         zeph_obj::ALPN.to_vec(),
     ];
-    // dht/registry/sqlpage/invoke are muxed (per-stream tag) — no dedicated ALPN.
+    // dht/registry/sqlpage/invoke/member are muxed (per-stream tag) — no ALPN.
     let transport = Arc::new(
         Transport::bind_with_relays(
             identity.secret_key_bytes(),
@@ -1509,12 +1508,10 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
 
     // ALPN dispatcher: ping + membership + pieces share the endpoint.
     let (ping_tx, mut ping_rx) = tokio::sync::mpsc::channel(32);
-    let (member_tx, member_rx) = tokio::sync::mpsc::channel(32);
     let (piece_tx, piece_rx) = tokio::sync::mpsc::channel(32);
     // Legacy per-ALPN connection handlers (protocols not yet muxed).
     let handlers = vec![
         (alpn::PING.to_vec(), ping_tx),
-        (zeph_membership::ALPN.to_vec(), member_tx),
         (zeph_obj::ALPN.to_vec(), piece_tx),
     ];
     // Muxed per-stream-tag handlers (element 1). Grows as protocols migrate.
@@ -1525,6 +1522,8 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         stream_handlers.push((zeph_transport::tag::DHT, dht_stream_tx));
         dht.clone().serve(dht_stream_rx);
     }
+    let (member_stream_tx, member_stream_rx) = tokio::sync::mpsc::channel(32);
+    stream_handlers.push((zeph_transport::tag::MEMBER, member_stream_tx));
     let (registry_stream_tx, registry_stream_rx) = tokio::sync::mpsc::channel(32);
     stream_handlers.push((zeph_transport::tag::REGISTRY, registry_stream_tx));
     let (sqlpage_stream_tx, sqlpage_stream_rx) = tokio::sync::mpsc::channel(32);
@@ -1652,7 +1651,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
             ..Default::default()
         },
     );
-    membership.start(peers, member_rx);
+    membership.start(peers, member_stream_rx);
     state.set_boot_stage("census-settling").await;
     {
         let (st, reg) = (state.clone(), head_registry.clone());

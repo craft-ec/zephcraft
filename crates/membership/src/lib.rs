@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rand::seq::SliceRandom;
 use tokio::sync::{mpsc, RwLock};
 use zeph_core::NodeId;
-use zeph_transport::{PeerAddr, Transport};
+use zeph_transport::{tag, PeerAddr, Transport};
 use zeph_wire as wire;
 
 /// ALPN for membership messages.
@@ -207,13 +207,13 @@ impl Membership {
     pub fn start(
         self: &Arc<Self>,
         bootstrap: Vec<PeerAddr>,
-        mut conns: mpsc::Receiver<zeph_transport::Connection>,
+        mut streams: mpsc::Receiver<zeph_transport::TaggedStream>,
     ) {
         let this = self.clone();
         tokio::spawn(async move {
-            while let Some(conn) = conns.recv().await {
+            while let Some(stream) = streams.recv().await {
                 let this = this.clone();
-                tokio::spawn(async move { this.handle_conn(conn).await });
+                tokio::spawn(async move { this.handle_stream(stream).await });
             }
         });
 
@@ -365,35 +365,25 @@ impl Membership {
         msg: &wire::Message,
         expect_reply: bool,
     ) -> Option<wire::Frame> {
-        let conn = tokio::time::timeout(self.cfg.probe_timeout, self.transport.connect(peer, ALPN))
-            .await
-            .ok()?
-            .ok()?;
-        let fut = async {
-            let (mut send, mut recv) = conn.open_bi().await.ok()?;
-            send.write_all(&wire::encode(msg, self.transport.clock().now().0))
-                .await
-                .ok()?;
-            send.finish().ok()?;
-            let reply = if expect_reply {
-                let bytes = recv.read_to_end(MAX_FRAME).await.ok()?;
-                wire::decode(&bytes).ok()
-            } else {
-                // Wait for the peer to finish the reply stream so the frame is
-                // delivered. A stream-level failure here must fail the request
-                // (and evict the pooled conn below) — swallowing it would leave
-                // a broken connection pooled as healthy (review finding).
-                recv.read_to_end(1).await.ok()?;
-                None
-            };
-            Some(reply)
-        };
-        match tokio::time::timeout(self.cfg.probe_timeout, fut).await {
-            Ok(Some(reply)) => reply.or(Some(dummy_ok_frame())),
-            _ => {
-                self.transport.evict(peer, ALPN, &conn);
-                None
-            }
+        // Muxed request/reply (tag::MEMBER) on the shared per-peer connection.
+        // request_tagged writes + finishes + reads the whole reply (waiting for
+        // the peer to finish the stream, so a one-way push is delivered) and
+        // evicts the mux connection on any stream failure.
+        let req = wire::encode(msg, self.transport.clock().now().0);
+        let bytes = tokio::time::timeout(
+            self.cfg.probe_timeout,
+            self.transport
+                .request_tagged(peer, tag::MEMBER, &req, MAX_FRAME),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        if expect_reply {
+            wire::decode(&bytes).ok()
+        } else {
+            // One-way: the round-trip completed (peer received the frame and
+            // finished the empty reply stream); report success.
+            Some(dummy_ok_frame())
         }
     }
 
@@ -877,41 +867,41 @@ impl Membership {
 
     // ── inbound ───────────────────────────────────────────────────────────
 
-    async fn handle_conn(self: Arc<Self>, conn: zeph_transport::Connection) {
-        // The authenticated sender identity for this connection (iroh binds the
-        // QUIC session to the peer's NodeId), used as positive liveness evidence.
-        let sender = NodeId(*conn.remote_id().as_bytes());
-        while let Ok((mut send, mut recv)) = conn.accept_bi().await {
-            let Ok(bytes) = recv.read_to_end(MAX_FRAME).await else {
+    async fn handle_stream(self: Arc<Self>, stream: zeph_transport::TaggedStream) {
+        // The authenticated sender identity (iroh binds the QUIC session to the
+        // peer's NodeId), used as positive liveness evidence. Muxed: one tagged
+        // stream carries one membership message.
+        let sender = stream.remote;
+        let (mut send, mut recv) = (stream.send, stream.recv);
+        let Ok(bytes) = recv.read_to_end(MAX_FRAME).await else {
+            return;
+        };
+        let frame = match wire::decode(&bytes) {
+            Ok(frame) => frame,
+            Err(err) => {
+                tracing::warn!(%err, "bad membership frame");
                 return;
-            };
-            let frame = match wire::decode(&bytes) {
-                Ok(frame) => frame,
-                Err(err) => {
-                    tracing::warn!(%err, "bad membership frame");
-                    return;
-                }
-            };
-            // Receiving ANY message is evidence the sender is alive.
-            self.note_heard(sender).await;
-            let merge = self
-                .transport
-                .clock()
-                .merge(zeph_core::hlc::Timestamp(frame.hlc_ts));
-            if merge.clamped {
-                tracing::warn!(
-                    skew_ms = merge.skew_ms,
-                    "membership peer clock far ahead (clamped)"
-                );
             }
-            let reply = self.handle_message(frame.message).await;
-            if let Some(reply) = reply {
-                let _ = send
-                    .write_all(&wire::encode(&reply, self.transport.clock().now().0))
-                    .await;
-            }
-            let _ = send.finish();
+        };
+        // Receiving ANY message is evidence the sender is alive.
+        self.note_heard(sender).await;
+        let merge = self
+            .transport
+            .clock()
+            .merge(zeph_core::hlc::Timestamp(frame.hlc_ts));
+        if merge.clamped {
+            tracing::warn!(
+                skew_ms = merge.skew_ms,
+                "membership peer clock far ahead (clamped)"
+            );
         }
+        let reply = self.handle_message(frame.message).await;
+        if let Some(reply) = reply {
+            let _ = send
+                .write_all(&wire::encode(&reply, self.transport.clock().now().0))
+                .await;
+        }
+        let _ = send.finish();
     }
 
     async fn handle_message(&self, msg: wire::Message) -> Option<wire::Message> {
