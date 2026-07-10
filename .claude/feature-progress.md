@@ -1,3 +1,30 @@
+# TRANSFER PLANE V2 — P1+P2 DONE (2026-07-10, ultracode)
+ELEMENT 5 (class-fair scheduling, e9c4270) + REVIEW FIXES (e8c6cf6): JobClass per-key-prefix,
+per-class in-flight caps. Adversarial review (workflow wh3rxdfbf, 7 confirmed) found + fixed a
+CRITICAL: factory-panic leaked the class slot → permanent per-class starvation → whole-scheduler
+wedge. Now: SlotGuard RAII release (all counters + coalescing-map + wake on any exit incl panic);
+in_flight reserved in dispatcher (fixes active_cap skew); O(1) HIGH gate (no full-heap drain);
+class_queued eligibility precheck; CAPS ARE CONTENTION BOUNDS + work-conserving (lone class fills
+8, caps bind only when another under-cap class waits). Tests: per_class_cap_prevents_starvation
+(scan+publish both held at 4 under mutual flood) + caps_are_work_conserving + classifier map.
+ELEMENT 4 (elected healthscan, 1d32881): per-cid scan_snapshot (capable holders) + should_scan
+rendezvous-elects ONE scanner per (cid,epoch) over {cached capable ∩ alive} ∪ self; worker skips
+non-winners (no resolve/slot). 3 safety guards (self always candidate, dead-winner filter,
+staleness ceiling → no cid unscanned). PROOF (scenario_e, CountingRouting): resolves = exactly
+1.0x cids/interval (was O(cids×replication)); 100/100 recoverable (>=k); piece totals IDENTICAL
+to elected-scan-OFF baseline → durability-NEUTRAL, efficiency-positive. Scenario A 17ms unchanged.
+KEY FINDINGS from the scenario-E investigation (record for P3):
+  - Elected scan makes the PER-NODE at_risk metric STALE (a non-winner never re-scans a cid, so
+    its at_risk_ids never clears) → scenario B's "at-risk drains to 0" bar is now permanently
+    red for a BENIGN reason. P3 MUST reshape it to measure CLUSTER durability (piece totals /
+    recoverability), not per-node at_risk_ids.
+  - Publisher-only-wanted content plateaus at ~12-22 pieces (below the n=32 margin) in 70s — a
+    repair-RATE + Fade-propagation observation, NOT a bug (recoverable at k=8). Full n-margin
+    convergence is slow; scenario A/B's settle covers the realistic (steady-state) case.
+CENSUS-20 now ~7-21s (membership fixes compounded). max_job ~1s. Scenario A/D/E green; B red only
+on the stale at-risk bar. Fleet still on old quiet-config binary — nothing deployed since the P0
+set; DEPLOY GATE still pending P3 (kill-holder scenario C, restart-rejoin D, rejoin memory check).
+
 # TRANSFER PLANE V2 — SCOREBOARD (updated 2026-07-10, ultracode)
 DEPLOY-GATE ADVERSARIAL REVIEW (workflow wf_92b52e18, 24 agents, 11 confirmed findings) found the
 GREEN HARNESS WAS MASKING 3 REAL DEFECTS (no scenario held passive under-replicated whole content
