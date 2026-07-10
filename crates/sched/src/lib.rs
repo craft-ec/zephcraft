@@ -286,10 +286,14 @@ struct Inner {
     /// queue), then opens to full width once the node reaches stable state.
     active_cap: std::sync::atomic::AtomicUsize,
     /// Per-class in-flight counts, reserved under the queue lock at dispatch and
-    /// released in `run_job` — the fairness bound (element 5).
+    /// released by `SlotGuard::drop` — the fairness bound (element 5).
     class_inflight: [AtomicU64; JobClass::COUNT],
     /// Per-class in-flight caps (index by `JobClass::idx`).
     class_cap: [std::sync::atomic::AtomicUsize; JobClass::COUNT],
+    /// Per-class count of jobs currently WAITING in the heap. Lets the
+    /// dispatcher skip the full-heap walk when no under-cap class has work
+    /// (avoids O(queue) per wake under a single-class storm).
+    class_queued: [AtomicU64; JobClass::COUNT],
 }
 
 /// A cheaply-cloneable handle to the coordinator.
@@ -317,6 +321,7 @@ impl JobCoordinator {
             class_cap: std::array::from_fn(|i| {
                 std::sync::atomic::AtomicUsize::new(JobClass::ALL[i].default_cap(concurrency))
             }),
+            class_queued: std::array::from_fn(|_| AtomicU64::new(0)),
         });
         let dispatch = inner.clone();
         tokio::spawn(dispatcher(dispatch));
@@ -345,6 +350,7 @@ impl JobCoordinator {
         }
         let seq = self.inner.seq.fetch_add(1, AtomicOrd::Relaxed);
         let class = JobClass::from_key(&key);
+        self.inner.class_queued[class.idx()].fetch_add(1, AtomicOrd::Relaxed);
         let factory: JobFactory = Box::new(move || Box::pin(factory()));
         self.inner.queue.lock().unwrap().push(QueuedJob {
             priority,
@@ -459,50 +465,85 @@ async fn dispatcher(inner: Arc<Inner>) {
                     continue;
                 }
                 let mut q = inner.queue.lock().unwrap();
-                if matches!(inner.gauge.get(), Some(g) if g.critical()) {
+                let gauge = inner.gauge.get();
+                if matches!(gauge, Some(g) if g.critical()) {
+                    // CRITICAL memory: nothing starts.
                     if q.peek().is_some() {
                         inner.counters.deferred.fetch_add(1, AtomicOrd::Relaxed);
                     }
                     None
+                } else if q.peek().is_none() {
+                    None // empty — wait
+                } else if matches!(gauge, Some(g) if g.high())
+                    && q.peek().is_some_and(|j| j.priority < Priority::Repair)
+                {
+                    // HIGH memory, O(1): the heap head is the max-priority job, so
+                    // if it is not Repair then no Repair exists — defer everything.
+                    inner.counters.deferred.fetch_add(1, AtomicOrd::Relaxed);
+                    None
                 } else {
-                    // SELECT-UNDER-LOCK (element 5 fairness): walk the heap in
-                    // priority order and take the first job whose CLASS is under
-                    // its in-flight cap; skip (re-push) higher-priority jobs whose
-                    // class is saturated so no class monopolizes the slots. Repair
-                    // is uncapped, so it is never skipped. The class slot is
-                    // RESERVED here (under the lock, single dispatcher) so two
-                    // same-class jobs can't both pass the cap in one round.
-                    let high = matches!(inner.gauge.get(), Some(g) if g.high());
-                    let mut skipped: Vec<QueuedJob> = Vec::new();
-                    let mut chosen = None;
-                    while let Some(j) = q.pop() {
-                        if high && j.priority < Priority::Repair {
-                            inner.counters.deferred.fetch_add(1, AtomicOrd::Relaxed);
-                            skipped.push(j);
-                            continue;
-                        }
+                    // FAIRNESS SELECT (element 5): take the highest-priority job
+                    // whose CLASS is under its in-flight cap. Fast path: the head
+                    // is already under-cap (the common case, O(1)). Otherwise walk
+                    // only if some under-cap class has queued work (`class_queued`
+                    // eligibility precheck — avoids O(queue) drains under a
+                    // single-class storm). Caps are CONTENTION bounds: if nothing
+                    // is under-cap, run the head ANYWAY (work-conserving — never
+                    // idle a slot when no other-class work can use it).
+                    let under_cap = |j: &QueuedJob| {
                         let i = j.class.idx();
-                        let ci = inner.class_inflight[i].load(AtomicOrd::Relaxed);
-                        let cap = inner.class_cap[i].load(AtomicOrd::Relaxed) as u64;
-                        if ci >= cap {
-                            skipped.push(j);
-                            continue;
-                        }
+                        inner.class_inflight[i].load(AtomicOrd::Relaxed)
+                            < inner.class_cap[i].load(AtomicOrd::Relaxed) as u64
+                    };
+                    let reserve = |j: &QueuedJob| {
+                        let i = j.class.idx();
                         inner.class_inflight[i].fetch_add(1, AtomicOrd::Relaxed);
-                        chosen = Some(j);
-                        break;
+                        inner.counters.in_flight.fetch_add(1, AtomicOrd::Relaxed);
+                        inner.class_queued[i].fetch_sub(1, AtomicOrd::Relaxed);
+                    };
+                    // Fast path: head's class is under cap.
+                    if q.peek().is_some_and(under_cap) {
+                        let j = q.pop().expect("peeked");
+                        reserve(&j);
+                        Some(j)
+                    } else {
+                        // Head class saturated. Is any OTHER class both queued and
+                        // under cap? If not, work-conserve (run the head).
+                        let any_eligible = JobClass::ALL.iter().any(|c| {
+                            let i = c.idx();
+                            inner.class_queued[i].load(AtomicOrd::Relaxed) > 0
+                                && inner.class_inflight[i].load(AtomicOrd::Relaxed)
+                                    < inner.class_cap[i].load(AtomicOrd::Relaxed) as u64
+                        });
+                        if !any_eligible {
+                            // Work-conserving: no other-class slot to protect.
+                            let j = q.pop().expect("non-empty");
+                            reserve(&j);
+                            Some(j)
+                        } else {
+                            // Walk to the highest-priority under-cap job.
+                            let mut skipped: Vec<QueuedJob> = Vec::new();
+                            let mut chosen = None;
+                            while let Some(j) = q.pop() {
+                                if under_cap(&j) {
+                                    reserve(&j);
+                                    chosen = Some(j);
+                                    break;
+                                }
+                                skipped.push(j);
+                            }
+                            for j in skipped {
+                                q.push(j);
+                            }
+                            if chosen.is_none() {
+                                inner
+                                    .counters
+                                    .class_deferred
+                                    .fetch_add(1, AtomicOrd::Relaxed);
+                            }
+                            chosen
+                        }
                     }
-                    let deferred_any = chosen.is_none() && !skipped.is_empty();
-                    for j in skipped {
-                        q.push(j);
-                    }
-                    if deferred_any {
-                        inner
-                            .counters
-                            .class_deferred
-                            .fetch_add(1, AtomicOrd::Relaxed);
-                    }
-                    chosen
                 }
             };
             match popped {
@@ -521,8 +562,39 @@ async fn dispatcher(inner: Arc<Inner>) {
     }
 }
 
+/// RAII release of a dispatched job's reservations: the global `in_flight`
+/// count, the per-class `class_inflight` slot, and the coalescing-map entry,
+/// plus a dispatcher wake. Drop runs on EVERY exit path including a factory
+/// PANIC — bare atomic decrements in the body would leak on unwind, pinning a
+/// class at its cap and eventually wedging the whole scheduler (review finding).
+struct SlotGuard {
+    inner: Arc<Inner>,
+    class: JobClass,
+    key: String,
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        self.inner
+            .counters
+            .in_flight
+            .fetch_sub(1, AtomicOrd::Relaxed);
+        self.inner.class_inflight[self.class.idx()].fetch_sub(1, AtomicOrd::Relaxed);
+        self.inner.inflight.lock().unwrap().remove(&self.key);
+        // Wake the dispatcher so a job skipped for this class's cap runs promptly.
+        self.inner.notify.notify_one();
+    }
+}
+
 async fn run_job(inner: Arc<Inner>, job: QueuedJob, _permit: OwnedSemaphorePermit) {
-    inner.counters.in_flight.fetch_add(1, AtomicOrd::Relaxed);
+    // in_flight + class_inflight were RESERVED in the dispatcher (under the queue
+    // lock, before spawn) so the active_cap clamp and class caps see them
+    // immediately. This guard releases all reservations on any exit (incl panic).
+    let _slot = SlotGuard {
+        inner: inner.clone(),
+        class: job.class,
+        key: job.key.clone(),
+    };
     let started = Instant::now();
     let mut attempt = 0u32;
     let ok = loop {
@@ -546,14 +618,6 @@ async fn run_job(inner: Arc<Inner>, job: QueuedJob, _permit: OwnedSemaphorePermi
             }
         }
     };
-    inner.counters.in_flight.fetch_sub(1, AtomicOrd::Relaxed);
-    // Release the class slot in the SAME place as the global in_flight, and wake
-    // the dispatcher so a job skipped for this class's cap runs promptly (not
-    // only on the next timer tick). Decrement here-and-only-here (mirrors
-    // in_flight) so no completion path can leak a class slot.
-    inner.class_inflight[job.class.idx()].fetch_sub(1, AtomicOrd::Relaxed);
-    inner.notify.notify_one();
-    inner.inflight.lock().unwrap().remove(&job.key);
     {
         let mut recent = inner.recent.lock().unwrap();
         recent.push_back(JobRecord {
@@ -565,7 +629,8 @@ async fn run_job(inner: Arc<Inner>, job: QueuedJob, _permit: OwnedSemaphorePermi
             recent.pop_front();
         }
     }
-    // Permit drops here → a concurrency slot frees.
+    // `_slot` and `_permit` drop here → class slot, in_flight, and a concurrency
+    // slot all free, and the dispatcher is woken.
 }
 
 #[cfg(test)]
@@ -769,7 +834,91 @@ mod tests {
         // Poll-a-flag gate (robust vs Notify's single-permit coalescing).
         let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        // Flood 20 blocking scan jobs — Scan cap is 4 of 8.
+        // TWO flooding capped classes CONTEND: 20 blocking scans (cap 4) + 20
+        // blocking publishes (cap 4). Neither may monopolize the 8 slots — the
+        // caps bind precisely because the OTHER class has under-cap work waiting.
+        for i in 0..20 {
+            for cls in ["scan", "publish"] {
+                let r = released.clone();
+                let prio = if cls == "scan" {
+                    Priority::HealthScan
+                } else {
+                    Priority::Encoding
+                };
+                jc.submit(format!("{cls}:{i}"), prio, 1, move || {
+                    let r = r.clone();
+                    async move {
+                        while !r.load(Ordering::SeqCst) {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                        Ok(())
+                    }
+                });
+            }
+        }
+        // A repair (uncapped, top priority) submitted into the flood must NOT be
+        // starved — it completes promptly despite both classes at their caps.
+        let repair_done = Arc::new(AtomicUsize::new(0));
+        {
+            let d = repair_done.clone();
+            jc.submit("repair:x", Priority::Repair, 1, move || {
+                let d = d.clone();
+                async move {
+                    d.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            });
+        }
+
+        // Both floods contend for the whole window: each capped at 4, neither
+        // exceeds its cap, and repair breaks in.
+        let mut max_scan = 0u64;
+        let mut max_publish = 0u64;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            for (c, n) in jc.class_in_flight() {
+                if c == "scan" {
+                    max_scan = max_scan.max(n);
+                }
+                if c == "publish" {
+                    max_publish = max_publish.max(n);
+                }
+            }
+        }
+        assert!(
+            max_scan <= 4,
+            "scan capped at 4 while publish contends, saw {max_scan}"
+        );
+        assert!(
+            max_publish <= 4,
+            "publish capped at 4 while scan contends, saw {max_publish}"
+        );
+        assert_eq!(
+            repair_done.load(Ordering::SeqCst),
+            1,
+            "uncapped repair completed despite both classes flooding (no starvation)"
+        );
+
+        // Release the flood; all 41 drain.
+        released.store(true, Ordering::SeqCst);
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if jc.stats().completed >= 41 {
+                break;
+            }
+        }
+        assert_eq!(jc.stats().completed, 41, "all jobs drain after release");
+        for (c, n) in jc.class_in_flight() {
+            assert_eq!(n, 0, "class {c} in-flight returns to 0");
+        }
+    }
+
+    /// Work-conserving: a SINGLE flooding class with no contender uses ALL slots
+    /// (caps are contention bounds, not hard throttles — no idle slot waste).
+    #[tokio::test]
+    async fn caps_are_work_conserving_without_contention() {
+        let jc = JobCoordinator::new(8);
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
         for i in 0..20 {
             let r = released.clone();
             jc.submit(format!("scan:{i}"), Priority::HealthScan, 1, move || {
@@ -782,57 +931,19 @@ mod tests {
                 }
             });
         }
-        // A repair and a publish that just complete — must NOT be stuck behind
-        // the scan flood (their classes have free slots).
-        let done = Arc::new(AtomicUsize::new(0));
-        for key in ["repair:x", "publish:y"] {
-            let d = done.clone();
-            jc.submit(key, Priority::Repair, 1, move || {
-                let d = d.clone();
-                async move {
-                    d.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                }
-            });
-        }
-
-        // Let the dispatcher settle: scan in-flight caps at 4, repair+publish finish.
         let mut max_scan = 0u64;
-        for _ in 0..40 {
+        for _ in 0..30 {
             tokio::time::sleep(Duration::from_millis(15)).await;
-            let scan = jc
-                .class_in_flight()
-                .into_iter()
-                .find(|(c, _)| *c == "scan")
-                .map(|(_, n)| n)
-                .unwrap_or(0);
-            max_scan = max_scan.max(scan);
-            if done.load(Ordering::SeqCst) == 2 {
-                break;
+            for (c, n) in jc.class_in_flight() {
+                if c == "scan" {
+                    max_scan = max_scan.max(n);
+                }
             }
         }
-        assert!(
-            max_scan <= 4,
-            "scan in-flight must never exceed its cap of 4, saw {max_scan}"
-        );
         assert_eq!(
-            done.load(Ordering::SeqCst),
-            2,
-            "repair + publish completed despite the 20-scan flood (no starvation)"
+            max_scan, 8,
+            "a lone flooding class fills all 8 slots (work-conserving), saw {max_scan}"
         );
-        assert!(jc.stats().class_deferred > 0, "class-cap skips are counted");
-
-        // Release the flood; everything drains.
         released.store(true, Ordering::SeqCst);
-        for _ in 0..100 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            if jc.stats().completed >= 22 {
-                break;
-            }
-        }
-        assert_eq!(jc.stats().completed, 22, "all jobs drain after release");
-        for (c, n) in jc.class_in_flight() {
-            assert_eq!(n, 0, "class {c} in-flight returns to 0");
-        }
     }
 }
