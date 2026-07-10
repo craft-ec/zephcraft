@@ -1,3 +1,46 @@
+# SEED-NODE MEMORY: glibc-arena bloat → jemalloc (2026-07-10, ultracode)
+Post-deploy soak surfaced the seed node ('zeph', primary DHT hub) at ~8GB RSS (OOM-killed a few
+times, auto-recovered, no data loss) while identical-workload peers held <1GB — SAME ~2700 cids,
+SAME 130-220MB on disk, SAME FDs/threads/sockets. NOT a data/connection difference; the 8GB was pure
+heap (VmData). ROOT-CAUSED (not guessed): a 14-agent adversarial workflow (wf_2dc6416d) audited every
+seed-amplified in-memory structure (dht tombstones/failures/record-store/table, transport pool/dials,
+obj scan_snapshot/cid_health/last_served/announced_at/node_liveness, membership members) and REFUTED
+all 10 — each bounded by peer-identity or held-cid cardinality, none can reach GB. => not a code leak.
+The binary used the SYSTEM (glibc) allocator; the seed does the most bursty serve+mint allocation
+across 17 threads; glibc retains freed memory in up to 8xncpu(=128) per-thread arenas instead of
+returning it. CONFIRMED by controlled experiment: a MALLOC_ARENA_MAX=2 + MALLOC_TRIM_THRESHOLD_
+systemd drop-in on zeph → RSS went FLAT at ~550MB (dips to 125 as glibc trims), vs ~7GB at the same
+36-min uptime without it (~13x). Also: the actual OOM churner was cadvisor (Coolify metrics agent),
+56 of 61 post-deploy OOMs; zeph was collateral because its fat glibc heap made it the kill target.
+OOM rate DROPPED ~10x after the transfer-plane deploy (6008 pre / 102 post) — deploy did NOT cause it.
+DURABILITY through all of it: CONVERGED — at-risk roughly HALVED across the fleet (zeph 1959->935),
+repair kept pace, zero data loss. So the transfer-plane deploy itself is a clean success.
+FIX (jemalloc) — took TWO commits because DEFAULT jemalloc is NOT enough:
+  0ed4082: tikv-jemallocator as #[global_allocator] in crates/noded (cfg(not msvc); Linux fleet +
+    macOS). BUT the soak showed DEFAULT jemalloc STILL CLIMBS (zeph 829->4407MB in 6min) — default
+    jemalloc runs NO purge thread and decays dirty pages lazily (10s), so under seed churn RSS grows.
+  be9588b: BAKE jemalloc runtime config via the `_rjem_malloc_conf` symbol (read at allocator init):
+    Linux = `background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0`, macOS = decay-only
+    (background_thread is pthread/Linux-only — jemalloc warns+ignores on macOS, so gated by
+    target_os to avoid the startup warning on the low-churn Mac node). Verified jemalloc READS the
+    symbol: `_RJEM_MALLOC_CONF=stats_print:true ./zeph` showed opt.dirty_decay_ms:1000 (non-default).
+  ENV-CONFIG TEST (proof the values work) on the live seed: `_RJEM_MALLOC_CONF=background_thread:
+    true,dirty_decay_ms:1000,muzzy_decay_ms:0` drop-in → RSS FLAT ~530-577MB (dips to 179 as the
+    purge thread runs). Matches the glibc MALLOC_ARENA_MAX result.
+  THIRD GOTCHA (commit 9779416): baked-config binary ALONE (no env) STILL climbed (zeph 93->3018MB
+    in 4min) even though stats confirmed the symbol was read (opt.dirty_decay_ms:1000). Cause:
+    setting background_thread:true in malloc_conf/the symbol does NOT actually START the purge
+    thread. FIX: start it at RUNTIME — `tikv_jemalloc_ctl::background_thread::write(true)` at top of
+    main() (dep tikv-jemalloc-ctl, Linux-gated). CONFIRMED: zeph on baked-config + runtime-enable,
+    NO env, held FLAT ~540MB (dips to ~110 as the purge thread runs) across an 11-min soak.
+✅ FIX COMPLETE + DEPLOYED to all 5 nodes (runtime-bg-thread binary, commit 9779416): seed zeph
+~8GB -> 539MB, zeph2/3/4 94-101MB, Mac 136MB, all nr=0 full mesh. Env-free (no drop-ins). Rollback =
+zeph.bak-prejemalloc-1549 (box, glibc) / -2355 (Mac). See [[zeph-seed-memory-glibc-arenas]].
+KEY LESSON: the memory fix is THREE pieces, all required — jemalloc allocator + baked short-decay
+symbol + RUNTIME background_thread::write(true). "use jemalloc" alone climbs; symbol-set
+background_thread does not start the thread. Open infra item (NOT ours): cadvisor OOM kill-loop +
+box over-subscription — a Coolify/box-capacity fix (limit cadvisor / MemoryMax / bigger box).
+
 # TRANSFER PLANE V2 — DEPLOY GATE ✅ PASSED + FLEET ROLLED (2026-07-10, ultracode)
 Deployed the scenario-C durability fix (commits 6aa5812 + e456b3f) to the LIVE fleet. GATE: full
 suite green (A/C/D/E/F + B isolated), C 12/12 flake-free, E 1.1x resolves; deploy-gate adversarial
