@@ -52,6 +52,11 @@ tracing-subscriber.workspace = true
 # fix into the binary so every node is immune regardless of env. Not MSVC/Windows.
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.6"
+# jemalloc runtime control: the background purge thread must be started via
+# mallctl at runtime — setting it in malloc_conf/the symbol does NOT reliably
+# start the thread at early init (measured: symbol-only still climbed to 3GB;
+# runtime enable holds ~550MB).
+tikv-jemalloc-ctl = "0.6"
 
 [dev-dependencies]
 tempfile.workspace = true

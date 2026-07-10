@@ -392,6 +392,15 @@ fn resolve_data_dir(cli_dir: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Start jemalloc's background purge thread (Linux). Setting background_thread
+    // via the malloc_conf symbol does NOT reliably start the thread at early init
+    // (measured: symbol-only RSS still climbed to 3GB); enabling it at runtime
+    // here does. Combined with the baked short decay times (_rjem_malloc_conf),
+    // freed pages are returned to the OS promptly and the seed's RSS holds
+    // ~550MB instead of ballooning to 8GB. Best-effort: ignore if unsupported.
+    #[cfg(all(not(target_env = "msvc"), target_os = "linux"))]
+    let _ = tikv_jemalloc_ctl::background_thread::write(true);
+
     let cli = Cli::parse();
     let data_dir = resolve_data_dir(cli.data_dir)?;
 
