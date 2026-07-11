@@ -61,7 +61,14 @@ PHASES (each passes the offline harness before the next; harness FIRST):
     healthy holder → assert (1) recovered (redirect restores floor around the capped node) AND
     (2) repair-window ingest arrivals at capped == 0 (offer/grant saved the payload vs shed-at-
     ingest). Validating alone before the full A-G regression.
-[ ] P4 full harness green (A-G). [ ] P5 SIMULTANEOUS fleet roll (gate on user go-ahead).
+[x] P4 FULL HARNESS GREEN (A-G, 7/7, 646s, commit 8a895f8): A conns [7x8]; B census 16.4s
+    drained=true (regression from distribute-offers gone after revert); C recovered; D fair;
+    E resolves 1.4x; F rejoin; G recovered + capped repair-window arrivals=0. Wire roll (mux +
+    offer/grant on repair) fully built + reviewed (no logic bugs) + validated.
+[ ] P5 SIMULTANEOUS fleet roll — GATED ON USER GO-AHEAD. Wire-incompatible with the old binary, so
+    all 4 Hetzner nodes must restart together (brief full-cluster wire flip, NO old-binary rollback
+    compat). Steps: build linux binary → stage to each node → stop all 4 → swap binary → start all 4
+    → verify peers=4 + census converges + no ALPN/handshake errors. See [[zeph-fleet-deploy]].
 [ ] P3 OFFER/GRANT on piece path (obj): wire Offer{class,cid,items,bytes}/Grant{accept,retry_ms};
     sender pre-push handshake; gauge-based grant (critical=0/high=1/else<=4, ResourceGauge exists);
     partial/zero → redirect to next candidate (coded pieces fungible) or requeue-backoff.
