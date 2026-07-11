@@ -18,6 +18,8 @@
 //! connection counts, and dial attempts (doc instrumentation wishlist) are not
 //! exposed by the coordinator/transport public APIs yet.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rand::prelude::*;
@@ -1013,6 +1015,133 @@ async fn scenario_c_kill_holder_repairs() {
     assert!(
         violations.is_empty(),
         "scenario C bars failed:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// Scenario G — capped receiver / offer-grant admission (Transfer Plane v2
+/// element 3). One node is under permanent CRITICAL pressure: it grants ZERO on
+/// every offer and sheds every push that reaches ingest. Two guarantees:
+///
+/// (1) REDIRECT / durability — killing a healthy holder forces a repair
+///     deficit; the elected repairer must restore every cid to the floor by
+///     REDIRECTING around the capped node onto peers with capacity. Coded
+///     pieces are fungible, so a node refusing all admission must not be able
+///     to stall durability.
+///
+/// (2) ADMISSION / no wasted payload — across the post-kill repair window the
+///     capped node must receive ZERO piece-push payloads at ingest. Repair
+///     OFFERS first, reads grant 0, and never ships the payload — the whole
+///     point of offer/grant over shed-at-ingest (which pays the transfer before
+///     rejecting). A counting shed-gate on the capped node measures arrivals;
+///     offers are answered by `grant()` and never reach it, so the repair-phase
+///     delta is the payload the admission handshake saved.
+///
+/// Baseline (no offer/grant, repair pushes blind): the capped node is a natural
+/// fewest-pieces recruit, so repair ships it payload every cycle only to have
+/// ingest shed it — the delta would climb with each repair pass.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "heavy: real 8-node in-process cluster — run explicitly (see module doc)"]
+async fn scenario_g_capped_receiver() {
+    let _serial = SERIAL.lock().await;
+    let mut violations: Vec<String> = Vec::new();
+
+    let mut nodes = vec![TestNode::spawn(&[]).await.expect("seed node")];
+    let seed = nodes[0].contact.clone();
+    nodes.extend(spawn_wave(&seed, 7).await);
+
+    // Cap node 1 (a non-seed we will NOT kill): grant nothing, shed everything,
+    // and count every push payload that still reaches ingest.
+    const CAPPED: usize = 1;
+    let arrivals = Arc::new(AtomicU64::new(0));
+    let a = arrivals.clone();
+    nodes[CAPPED].engine.set_shed_gate(Arc::new(move || {
+        a.fetch_add(1, Ordering::Relaxed);
+        true
+    }));
+    nodes[CAPPED]
+        .engine
+        .set_grant_gate(Arc::new(|_class, _items| 0));
+
+    let cids = publish_pinned_and_settle(&nodes[0], 20, "scenario G", &mut violations).await;
+    tokio::time::sleep(Duration::from_secs(40)).await; // quiesce → repaired toward floor
+
+    // Arrivals BEFORE the repair phase: the un-offered publish-distribute path
+    // legitimately ships the capped node payload (offer/grant is not on that
+    // path); we measure only the DELTA the offered repair path adds.
+    let arrivals_pre = arrivals.load(Ordering::Relaxed);
+
+    // Kill the top healthy holder (never the seed, never the capped node) to
+    // force a fresh repair deficit that redirect must route around.
+    let victim_idx = (1..nodes.len())
+        .filter(|&i| i != CAPPED)
+        .max_by_key(|&i| nodes[i].engine.store().cids().len())
+        .expect("a healthy non-seed holder");
+    let killed = nodes[victim_idx].engine.store().cids().len();
+    println!("scenario G: capped=node{CAPPED}, killing node{victim_idx} (held {killed} cids)");
+    let mut victim = nodes.remove(victim_idx);
+    victim.shutdown().await; // permanent — pieces gone
+
+    // Survivors (the capped node contributes 0 to the sum — durability must be
+    // met by the peers with capacity) must restore recoverability.
+    let k = 8u64;
+    let mut recovered = false;
+    let start = Instant::now();
+    let mut worst_below = usize::MAX;
+    while start.elapsed() < Duration::from_secs(200) {
+        let below = cids
+            .iter()
+            .filter(|c| {
+                nodes
+                    .iter()
+                    .map(|n| n.engine.store().piece_count(c) as u64)
+                    .sum::<u64>()
+                    < k
+            })
+            .count();
+        worst_below = worst_below.min(below);
+        if below == 0 {
+            recovered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    let repair_arrivals = arrivals
+        .load(Ordering::Relaxed)
+        .saturating_sub(arrivals_pre);
+    println!(
+        "scenario G: recovered={recovered} (best below-k={} of {}); \
+         capped ingest arrivals pre={arrivals_pre} repair-window={repair_arrivals}",
+        if worst_below == usize::MAX {
+            0
+        } else {
+            worst_below
+        },
+        cids.len()
+    );
+
+    if !recovered {
+        violations.push(format!(
+            "durability NOT restored around the capped node ({} cids still below k=8) — \
+             repair did not redirect the deficit onto peers with capacity",
+            worst_below
+        ));
+    }
+    // The offer/grant guarantee: repair never shipped the capped node a payload.
+    if repair_arrivals != 0 {
+        violations.push(format!(
+            "capped node received {repair_arrivals} push payload(s) during the repair window — \
+             repair pushed blind instead of honoring grant=0 (offer/grant admission not enforced)"
+        ));
+    }
+
+    if !violations.is_empty() {
+        dump_cluster(&nodes).await;
+    }
+    shutdown_all(&mut nodes).await;
+    assert!(
+        violations.is_empty(),
+        "scenario G bars failed:\n{}",
         violations.join("\n")
     );
 }

@@ -38,12 +38,21 @@ PHASES (each passes the offline harness before the next; harness FIRST):
 [x] FULL SUITE A-F over mux — ALL 6 GREEN (626s): A conns [7×8]; B census-20 17.8s drained (was the
     census-flake scenario under load — mux's 7-vs-24 conn count eased the churn, incidental fix); C
     recovered=true; D fair; E resolves 1.1x; F rejoin. NO regression from the mux migration.
-[ ] P3 OFFER/GRANT (next): wire Offer{class,cid,items,bytes}/Grant{accept,retry_ms} on the piece
-    path (obj); gauge-based grant (ResourceGauge exists in sched: critical()/high()/set_budget());
-    partial/zero → redirect (coded pieces fungible) or requeue-backoff. + capped-receiver scenario
-    (force a node's gauge high → cluster converges around it, capped node sheds via grants, zero
-    push-timeouts) — fails vs current (no offer/grant), passes after.
-[ ] P4 full harness green (A-F + capped). [ ] P5 SIMULTANEOUS fleet roll (gate on user go-ahead).
+[x] P3 OFFER/GRANT implemented (commit d540134): wire Offer{class,cid,items,bytes}/
+    Grant{accept,retry_after_ms} (tag 0x0014/0x0015, on the muxed tag::PIECE stream). Receiver
+    obj::grant() sizes accept from a graded grant_gate (critical→0, high→1 for CLASS_CRITICAL else
+    0, else min(items,4)); tombstoned/cooldown→0. Sender repair_one offers ONE critical push/piece
+    and on grant-0 (or push fail) redirects to the next candidate via a shared cursor over
+    REDIRECT_MARGIN=8 spare recruits. repair_cid→repair_one so ALL repair traffic is admission-gated
+    (publish-distribute + demand-scale paths still push un-offered — repair is the durability-
+    critical path + backstop). noded wires grant_gate→ResourceGauge.
+    NOTE: distribute path is NOT yet offer-gated — a follow-up if the harness needs it; repair
+    covers the durability guarantee.
+[~] Scenario G (capped-receiver) added + RUNNING: node1 grants 0 + sheds+counts all ingest; kill a
+    healthy holder → assert (1) recovered (redirect restores floor around the capped node) AND
+    (2) repair-window ingest arrivals at capped == 0 (offer/grant saved the payload vs shed-at-
+    ingest). Validating alone before the full A-G regression.
+[ ] P4 full harness green (A-G). [ ] P5 SIMULTANEOUS fleet roll (gate on user go-ahead).
 [ ] P3 OFFER/GRANT on piece path (obj): wire Offer{class,cid,items,bytes}/Grant{accept,retry_ms};
     sender pre-push handshake; gauge-based grant (critical=0/high=1/else<=4, ResourceGauge exists);
     partial/zero → redirect to next candidate (coded pieces fungible) or requeue-backoff.
