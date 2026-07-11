@@ -2955,12 +2955,18 @@ async fn push_piece(
     active: Option<&ActiveSet>,
     timeout: Duration,
 ) -> anyhow::Result<()> {
-    // Element 2 (choke): wait for one of the K active-push slots for this peer
-    // (free if we're already pushing to it). Held for the whole push, so a busy
-    // node's slow ack occupies the slot until it drains/times out — the active
-    // set naturally rotates to the next candidate as pushes complete.
+    // Element 2 (choke): grab one of the K active-push slots for this peer (free
+    // if we're already pushing to it). NON-BLOCKING: if all K slots are taken we
+    // DEFER this push (bail) rather than block — the caller redirects to another
+    // candidate or retries next pass. Blocking here would hold the caller's
+    // JobCoordinator slot while it waited, starving the queue (measured: broke
+    // scenario B's drain bar). The slot is held for the whole push, so a busy
+    // node's slow ack occupies it until it drains/times out and the set rotates.
     let _slot = match active {
-        Some(a) => Some(a.enter(peer.node_id()).await),
+        Some(a) => match a.try_enter(peer.node_id()) {
+            Some(g) => Some(g),
+            None => anyhow::bail!("choked: no active-set slot (deferred to next pass)"),
+        },
         None => None,
     };
     let msg = wire::Message::PiecePush(wire::PiecePush {

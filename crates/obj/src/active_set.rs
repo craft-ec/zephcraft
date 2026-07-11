@@ -99,6 +99,37 @@ impl ActiveSet {
         self.guard(id)
     }
 
+    /// NON-BLOCKING admission: return a guard if `peer` is already active (free)
+    /// or a slot is immediately available; otherwise `None` (the K slots are
+    /// full). Callers on coordinator-driven paths (repair/scale/rebalance) use
+    /// this so a choked push is DEFERRED (skip this peer, retry next pass) rather
+    /// than BLOCKING — a blocked push holds its JobCoordinator slot and starves
+    /// the queue (measured: blocking enter() intermittently broke scenario B's
+    /// drain bar under mass-rejoin). A deferred peer is just a candidate waiting
+    /// its turn, which is exactly the choke model.
+    pub fn try_enter(&self, peer: NodeId) -> Option<ActiveGuard> {
+        let id = peer.0;
+        let mut active = self.active.lock().expect("active set poisoned");
+        if let Some(e) = active.get_mut(&id) {
+            e.refs += 1; // already active — free
+            return Some(self.guard(id));
+        }
+        match self.slots.clone().try_acquire_owned() {
+            Ok(permit) => {
+                active.insert(
+                    id,
+                    Entry {
+                        _permit: permit,
+                        refs: 1,
+                    },
+                );
+                self.peak.fetch_max(active.len(), Ordering::Relaxed);
+                Some(self.guard(id))
+            }
+            Err(_) => None, // K distinct peers already active → defer
+        }
+    }
+
     fn guard(&self, peer: [u8; 32]) -> ActiveGuard {
         ActiveGuard {
             active: self.active.clone(),
@@ -138,6 +169,34 @@ mod tests {
 
     fn peer(b: u8) -> NodeId {
         NodeId([b; 32])
+    }
+
+    #[tokio::test]
+    async fn try_enter_defers_when_full_and_frees_on_drop() {
+        let cs = ActiveSet::new(2);
+        let a = cs.try_enter(peer(1)).expect("first peer admitted");
+        let _b = cs.try_enter(peer(2)).expect("second peer admitted");
+        assert_eq!(cs.active_len(), 2);
+        // Third distinct peer is DEFERRED (non-blocking None), not queued.
+        assert!(cs.try_enter(peer(3)).is_none(), "K=2 full → defer");
+        // The SAME peer is always free (refcount bump, no new slot).
+        let a2 = cs
+            .try_enter(peer(1))
+            .expect("already-active peer admitted free");
+        assert_eq!(cs.active_len(), 2, "same peer did not consume a new slot");
+        // Dropping ONE of peer(1)'s guards keeps it active (refcount 2 → 1).
+        drop(a);
+        assert!(
+            cs.try_enter(peer(3)).is_none(),
+            "peer(1) still active, no slot"
+        );
+        // Dropping its LAST guard frees the slot → a new peer enters.
+        drop(a2);
+        assert!(
+            cs.try_enter(peer(3)).is_some(),
+            "slot freed → peer(3) enters"
+        );
+        assert_eq!(cs.peak_active(), 2, "high-water mark never exceeded K");
     }
 
     #[tokio::test]
