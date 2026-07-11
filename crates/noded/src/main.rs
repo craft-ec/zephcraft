@@ -1674,6 +1674,24 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         jobs.set_gauge(gauge.clone());
         let g = gauge.clone();
         engine.set_shed_gate(std::sync::Arc::new(move || g.critical()));
+        // Graded offer/grant admission (TRANSFER_PLANE_V2 §3): critical → grant
+        // nothing (start no ingest); high → admit only the durability-critical
+        // class, and just one piece; otherwise a bounded healthy batch. Senders
+        // redirect the ungranted remainder to peers with capacity.
+        let g = gauge.clone();
+        engine.set_grant_gate(std::sync::Arc::new(move |class, items| {
+            if g.critical() {
+                0
+            } else if g.high() {
+                if class == zeph_obj::CLASS_CRITICAL {
+                    1.min(items)
+                } else {
+                    0
+                }
+            } else {
+                items.min(zeph_obj::MAX_GRANT_PER_OFFER)
+            }
+        }));
         let g = gauge.clone();
         head_registry.set_shed_gate(std::sync::Arc::new(move || g.critical()));
         let g = gauge.clone();

@@ -38,6 +38,9 @@ pub mod tag {
     pub const PIECE_RESPONSE: u32 = 0x0011;
     pub const PIECE_PUSH: u32 = 0x0012;
     pub const PIECE_PUSH_ACK: u32 = 0x0013;
+    // Transfer-plane admission (TRANSFER_PLANE_V2 §3 offer/grant):
+    pub const OFFER: u32 = 0x0014;
+    pub const GRANT: u32 = 0x0015;
     // Tracker registries (content providers / nodes / relays):
     pub const TRACKER_ANNOUNCE: u32 = 0x0200;
     pub const TRACKER_ANNOUNCE_ACK: u32 = 0x0201;
@@ -133,6 +136,34 @@ pub struct PiecePushAck {
     pub ok: bool,
     /// "vtag-invalid", "quota", ... when !ok.
     pub reason: String,
+}
+
+/// Admission offer (TRANSFER_PLANE_V2 §3): the sender proposes a batch of
+/// pushes for `cid` BEFORE shipping any piece payload. The receiver replies a
+/// [`Grant`] sized by its own resource pressure, so a memory-pressured node
+/// sheds inbound load up front (no wasted payload on the wire) and the sender
+/// can redirect the ungranted remainder to a healthier peer in the same pass —
+/// coded pieces are fungible, so a redirected piece is as good as the original.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Offer {
+    /// Push class (obj policy): 0 = durability-critical (below-floor repair),
+    /// 1 = normal (distribute / scale surplus). The receiver protects the
+    /// critical class first when under pressure.
+    pub class: u8,
+    pub cid: [u8; 32],
+    /// Pieces the sender wants to push in this batch.
+    pub items: u16,
+    /// Total payload bytes the batch would transfer (byte-budget hint).
+    pub bytes: u64,
+}
+
+/// Admission grant: the receiver accepts `accept` of the offered `items`
+/// (0..=items). When `accept < items`, `retry_after_ms` is a backoff hint for
+/// re-offering the ungranted remainder (0 = no hint).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Grant {
+    pub accept: u16,
+    pub retry_after_ms: u32,
 }
 
 /// Request up to `max_pieces` pieces for `cid`, excluding piece_ids the
@@ -257,6 +288,8 @@ pub enum Message {
     MemberSync(MemberSync),
     PiecePush(PiecePush),
     PiecePushAck(PiecePushAck),
+    Offer(Offer),
+    Grant(Grant),
     PieceRequest(PieceRequest),
     PieceResponse(PieceResponse),
     TrackerAnnounce(SignedRecord),
@@ -284,6 +317,8 @@ impl Message {
             Message::MemberSync(_) => tag::MEMBER_SYNC,
             Message::PiecePush(_) => tag::PIECE_PUSH,
             Message::PiecePushAck(_) => tag::PIECE_PUSH_ACK,
+            Message::Offer(_) => tag::OFFER,
+            Message::Grant(_) => tag::GRANT,
             Message::PieceRequest(_) => tag::PIECE_REQUEST,
             Message::PieceResponse(_) => tag::PIECE_RESPONSE,
             Message::TrackerAnnounce(_) => tag::TRACKER_ANNOUNCE,
@@ -337,6 +372,8 @@ pub fn encode(message: &Message, hlc_ts: u64) -> Vec<u8> {
         Message::MemberSync(p) => postcard::to_allocvec(p),
         Message::PiecePush(p) => postcard::to_allocvec(p),
         Message::PiecePushAck(p) => postcard::to_allocvec(p),
+        Message::Offer(p) => postcard::to_allocvec(p),
+        Message::Grant(p) => postcard::to_allocvec(p),
         Message::PieceRequest(p) => postcard::to_allocvec(p),
         Message::PieceResponse(p) => postcard::to_allocvec(p),
         Message::TrackerAnnounce(p) => postcard::to_allocvec(p),
@@ -409,6 +446,8 @@ pub fn decode(bytes: &[u8]) -> Result<Frame, WireError> {
         tag::PIECE_PUSH_ACK => {
             Message::PiecePushAck(postcard::from_bytes(payload).map_err(malformed)?)
         }
+        tag::OFFER => Message::Offer(postcard::from_bytes(payload).map_err(malformed)?),
+        tag::GRANT => Message::Grant(postcard::from_bytes(payload).map_err(malformed)?),
         tag::PIECE_REQUEST => {
             Message::PieceRequest(postcard::from_bytes(payload).map_err(malformed)?)
         }

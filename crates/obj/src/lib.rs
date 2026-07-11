@@ -171,6 +171,26 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Max pieces a single repair pass mints for one cid (bounded burst).
 const REPAIR_BATCH: usize = 8;
 
+/// Offer/grant push classes (TRANSFER_PLANE_V2 §3). A durability-critical push
+/// (restoring a cid below its floor) outranks a normal distribute/scale push
+/// when the receiver is under memory pressure — the grant gate protects the
+/// critical class first.
+pub const CLASS_CRITICAL: u8 = 0;
+pub const CLASS_NORMAL: u8 = 1;
+
+/// Most pieces a healthy receiver grants from a single offer (bounds a burst
+/// from one sender — the sender re-offers or redirects the remainder). The
+/// node's grant policy uses this as the healthy-state cap.
+pub const MAX_GRANT_PER_OFFER: u16 = 4;
+
+/// Backoff hint (ms) returned in a partial/zero grant — the sender re-offers
+/// the ungranted remainder no sooner than this if it can't redirect it.
+const GRANT_RETRY_MS: u32 = 2_000;
+
+/// Spare candidates gathered beyond `want` in a repair pass so a piece declined
+/// by a pressured target has somewhere to redirect (offer/grant, §3).
+const REDIRECT_MARGIN: usize = 8;
+
 /// Max pieces one scan pass MOVES for one cid (lazy rebalance trickle).
 const MOVE_BATCH: usize = 2;
 
@@ -316,6 +336,12 @@ pub struct ObjEngine {
     /// sender's next distribute/repair pass retries; nothing is lost. Unwired,
     /// intake is never shed.
     shed_gate: std::sync::OnceLock<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// Set by the node: graded admission gate for offer/grant (TRANSFER_PLANE_V2
+    /// §3). Given `(class, items)` it returns how many of the offered pieces to
+    /// accept (0..=items) from the node's resource pressure — critical → 0,
+    /// high → only the durability-critical class (and just 1), otherwise a
+    /// bounded batch. Unwired (tests/library), every offer is granted in full.
+    grant_gate: std::sync::OnceLock<Arc<dyn Fn(u8, u16) -> u16 + Send + Sync>>,
     /// Liveness source (set by the node = membership; a test source in tests). The health scan
     /// filters provider records by this so a DIED holder — whose record lingers until TTL — stops
     /// inflating a cid's effective count, and repair fires. None → no filtering (legacy).
@@ -364,6 +390,7 @@ impl ObjEngine {
             scale_trigger: std::sync::OnceLock::new(),
             work_trigger: std::sync::OnceLock::new(),
             shed_gate: std::sync::OnceLock::new(),
+            grant_gate: std::sync::OnceLock::new(),
             liveness: Mutex::new(None),
             alive_cache: Mutex::new(None),
             node_liveness: Mutex::new(HashMap::new()),
@@ -744,6 +771,23 @@ impl ObjEngine {
 
     async fn request(&self, peer: &PeerAddr, msg: &wire::Message) -> anyhow::Result<wire::Message> {
         request(&self.transport, peer, msg, REQUEST_TIMEOUT).await
+    }
+
+    /// Offer a batch of `items` pushes for `cid` to `peer` (TRANSFER_PLANE_V2
+    /// §3) and return how many the peer will accept (0..=items). A transport
+    /// failure or unexpected reply returns 0 — the caller treats a non-grant
+    /// like a declined grant and redirects the piece to another candidate.
+    async fn offer(&self, peer: &PeerAddr, class: u8, cid: Cid, items: u16, bytes: u64) -> u16 {
+        let msg = wire::Message::Offer(wire::Offer {
+            class,
+            cid: cid.0,
+            items,
+            bytes,
+        });
+        match request(&self.transport, peer, &msg, PUSH_TIMEOUT).await {
+            Ok(wire::Message::Grant(g)) => g.accept.min(items),
+            _ => 0,
+        }
     }
 
     /// Fetch content by CID alone: resolve providers, fetch + verify + decode.
@@ -2178,6 +2222,48 @@ impl ObjEngine {
         let _ = self.shed_gate.set(gate);
     }
 
+    /// Wire the graded admission gate for offer/grant (TRANSFER_PLANE_V2 §3):
+    /// `(class, items) -> accept`. Typically closes over the node's
+    /// `ResourceGauge` — critical → 0, high → 1 for the critical class else 0,
+    /// otherwise `min(items, MAX_GRANT_PER_OFFER)`.
+    pub fn set_grant_gate(&self, gate: Arc<dyn Fn(u8, u16) -> u16 + Send + Sync>) {
+        let _ = self.grant_gate.set(gate);
+    }
+
+    /// Answer an [`wire::Offer`] with a [`wire::Grant`] (TRANSFER_PLANE_V2 §3).
+    /// The accept count comes from the wired `grant_gate` (node resource
+    /// pressure); unwired, every offer is granted in full. A tombstoned or
+    /// in-cooldown cid grants 0 — the sender should not push to it — mirroring
+    /// the ingest-time rejections so the sender learns before shipping payload.
+    fn grant(&self, offer: &wire::Offer) -> wire::Grant {
+        let cid = Cid(offer.cid);
+        let no = |retry| wire::Grant {
+            accept: 0,
+            retry_after_ms: retry,
+        };
+        if self.store.is_tombstoned(&cid) {
+            return no(0);
+        }
+        if self
+            .store
+            .is_in_cooldown(&cid, self.config.eviction_cooldown)
+        {
+            return no(GRANT_RETRY_MS);
+        }
+        let accept = match self.grant_gate.get() {
+            Some(gate) => gate(offer.class, offer.items).min(offer.items),
+            None => offer.items,
+        };
+        wire::Grant {
+            accept,
+            retry_after_ms: if accept < offer.items {
+                GRANT_RETRY_MS
+            } else {
+                0
+            },
+        }
+    }
+
     /// The body of a PublishDistribute coordinator job: run the initial
     /// post-publish distribution for `cid`, re-derived from the store.
     pub async fn distribute_initial(&self, cid: Cid) {
@@ -2411,26 +2497,61 @@ impl ObjEngine {
             .collect();
         holders.sort_by_key(|(c, _)| *c);
         let mut targets: Vec<PeerAddr> = holders.into_iter().map(|(_, a)| a).collect();
-        if targets.len() < want {
+        // Gather a REDIRECT_MARGIN of extra recruits beyond `want`: offer/grant
+        // lets a memory-pressured target decline, and the piece then redirects
+        // to one of these — so we need spare candidates, not exactly `want`.
+        let recruit_cap = want.saturating_add(REDIRECT_MARGIN);
+        if targets.len() < recruit_cap {
             let holder_ids: HashSet<NodeId> = live.iter().map(|(id, _, _, _)| *id).collect();
             for (id, addr) in self.peer_source.peers().await {
                 if id == me || holder_ids.contains(&id) {
                     continue;
                 }
                 targets.push(addr);
-                if targets.len() >= want {
+                if targets.len() >= recruit_cap {
                     break;
                 }
             }
         }
-        targets.truncate(want);
-        let pushes = targets.into_iter().filter_map(|addr| {
-            let piece = self.mint_piece(cid, gen)?;
-            Some(async move {
-                self.push_piece(&addr, *cid, gen, &piece, PUSH_TIMEOUT)
-                    .await
-                    .is_ok()
-            })
+        // Offer/grant admission with redirect (TRANSFER_PLANE_V2 §3): each of
+        // `want` pieces claims the next candidate from a shared cursor, offers
+        // ONE critical push, and — if declined (grant 0, e.g. the target is at
+        // critical memory pressure) or the push fails — walks to the next
+        // candidate rather than dropping the piece for a whole repair cycle.
+        // Coded pieces are fungible, so the floor is restored by whoever has
+        // capacity. The cursor keeps the `want` tasks on DISTINCT candidates.
+        let targets = Arc::new(targets);
+        let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pushes = (0..want).map(|_| {
+            let targets = targets.clone();
+            let cursor = cursor.clone();
+            async move {
+                loop {
+                    let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(addr) = targets.get(i) else {
+                        return false;
+                    };
+                    if self
+                        .offer(addr, CLASS_CRITICAL, *cid, 1, gen.piece_len)
+                        .await
+                        == 0
+                    {
+                        continue; // declined — redirect to the next candidate
+                    }
+                    let Some(piece) = self.mint_piece(cid, gen) else {
+                        return false;
+                    };
+                    if self
+                        .push_piece(addr, *cid, gen, &piece, PUSH_TIMEOUT)
+                        .await
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                    // Granted but the push failed (timeout / transport): try the
+                    // next candidate rather than losing this piece.
+                }
+            }
         });
         futures::future::join_all(pushes)
             .await
@@ -2479,6 +2600,7 @@ impl ObjEngine {
     async fn handle(&self, msg: wire::Message) -> wire::Message {
         match msg {
             wire::Message::PiecePush(push) => wire::Message::PiecePushAck(self.ingest(push).await),
+            wire::Message::Offer(offer) => wire::Message::Grant(self.grant(&offer)),
             wire::Message::ReleaseSystem(r) => {
                 // A CraftSQL generation was superseded by compaction: drop the
                 // system marker so it returns to the normal lifecycle and fades.
