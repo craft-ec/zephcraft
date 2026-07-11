@@ -413,6 +413,14 @@ impl HeadRegistry {
         self.ready.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// TEST/BENCH hook: mark the registry ready without waiting for the census-settle latch. A
+    /// single-node bench has no census to converge (self is the writer for every shard), so this
+    /// skips the `wait_ready` gate that would otherwise stall each op for `READY_WAIT_SECS`.
+    #[doc(hidden)]
+    pub fn mark_ready(&self) {
+        self.ready.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Wait (bounded) for the node to become registry-ready. Returns immediately once ready (the
     /// steady-state case), else polls until ready or `READY_WAIT_SECS` elapses, then proceeds
     /// best-effort. Called at the top of register/resolve/current_version so a freshly-restarted
@@ -1883,6 +1891,202 @@ impl HeadRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BENCH — prove the registry scales with ROW COUNT, not just node count. A single node is the
+    /// writer for every shard (`eligible` always includes self), so register = local CraftSQL
+    /// upsert+commit and resolve = local indexed SELECT — no network. We fill the registry to
+    /// increasing row counts and measure register/resolve latency at each: the per-shard SQL DB's
+    /// indexed upsert/select is ~O(log n), so RESOLVE (a pure SELECT) must stay ~flat as rows grow
+    /// (that is the "per-row SQL win" vs the old whole-shard-blob model, which re-encoded O(rows)
+    /// per write). `writer_shards`/`program_heads` from `status()` show the O(held) spread.
+    #[tokio::test]
+    #[ignore = "bench: registers thousands of heads + measures — run explicitly"]
+    async fn bench_register_resolve_latency_vs_row_count() {
+        use std::time::Instant;
+        use zeph_obj::{ObjConfig, ObjEngine};
+        use zeph_routing::{ContentRouting, MetaRecord, ProviderRecord};
+        use zeph_store::Store;
+        use zeph_transport::Reach;
+
+        struct NullRouting;
+        #[async_trait::async_trait]
+        impl ContentRouting for NullRouting {
+            async fn announce(&self, _: Cid, _: u32, _: bool) -> zeph_routing::Result<()> {
+                Ok(())
+            }
+            async fn resolve(&self, _: Cid) -> zeph_routing::Result<Vec<ProviderRecord>> {
+                Ok(vec![])
+            }
+            async fn withdraw(&self, _: Cid) -> zeph_routing::Result<()> {
+                Ok(())
+            }
+            async fn announce_want(&self, _: Cid) -> zeph_routing::Result<()> {
+                Ok(())
+            }
+            async fn withdraw_want(&self, _: Cid) -> zeph_routing::Result<()> {
+                Ok(())
+            }
+            async fn is_wanted(&self, _: Cid) -> zeph_routing::Result<bool> {
+                Ok(false)
+            }
+            async fn announce_meta(
+                &self,
+                _: Cid,
+                _: u64,
+                _: Option<String>,
+            ) -> zeph_routing::Result<()> {
+                Ok(())
+            }
+            async fn withdraw_meta(&self, _: Cid) -> zeph_routing::Result<()> {
+                Ok(())
+            }
+            async fn metas(&self, _: Cid) -> zeph_routing::Result<Vec<MetaRecord>> {
+                Ok(vec![])
+            }
+        }
+        struct NullPeers;
+        #[async_trait::async_trait]
+        impl zeph_obj::PeerSource for NullPeers {
+            async fn peers(&self) -> Vec<(zeph_core::NodeId, PeerAddr)> {
+                vec![]
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let identity = Arc::new(NodeIdentity::generate());
+        let transport = Arc::new(
+            Transport::bind(
+                identity.secret_key_bytes(),
+                Reach::LocalOnly,
+                vec![zeph_transport::MUX_ALPN.to_vec()],
+                0,
+            )
+            .await
+            .unwrap(),
+        );
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let engine = ObjEngine::with_peer_source(
+            transport.clone(),
+            store,
+            Arc::new(NullRouting),
+            Arc::new(NullPeers),
+            ObjConfig::default(),
+        );
+        let clock = transport.clock();
+        let account_store = Arc::new(ProgramAccountStore::open(
+            engine.clone(),
+            dir.path(),
+            clock.clone(),
+        ));
+        let shard_root = Arc::new(ShardRootStore::new(account_store.clone()));
+        // NO .with_durable here: this bench isolates the registry's per-shard SQL register/resolve
+        // scaling from the cross-node erasure-durability path (which needs peers to matter and adds
+        // a constant per-commit encode, not row-scaling). Local pages are all a single node reads.
+        let _ = &engine; // engine kept alive for the account store
+        let shard_sql = Arc::new(
+            CraftSql::register(
+                dir.path().join("regshards"),
+                shard_root.clone(),
+                transport.node_id(),
+            )
+            .unwrap(),
+        );
+        let reg = HeadRegistry::open(
+            identity.clone(),
+            account_store,
+            clock.clone(),
+            transport.clone(),
+            shard_sql,
+            shard_root,
+        );
+        reg.mark_ready();
+
+        let self_id = identity.node_id().0;
+        let cid = [7u8; 32];
+        let sample = 50usize;
+        let checkpoints = [100usize, 500, 1000, 2000, 4000];
+        let p = |v: &mut Vec<u64>, q: f64| {
+            v.sort_unstable();
+            v[(((v.len() as f64) * q) as usize).min(v.len() - 1)]
+        };
+        let mut next = 0usize;
+        let mut first_res_p50 = 0u64;
+        let mut last_res_p50 = 0u64;
+        let mut reg_fail = 0usize;
+        let mut res_miss = 0usize;
+        // Error-tolerant: count failures/misses instead of panicking, so the bench reports the full
+        // curve AND surfaces any scaling failure rate as data (a register/resolve failing IS a
+        // finding worth measuring, not a test crash).
+        println!(
+            "\n rows  reg_p50_us reg_p99_us  res_p50_us res_p99_us  writer_shards program_heads"
+        );
+        for &target in &checkpoints {
+            while next < target {
+                if reg
+                    .register(RT_PROGRAM, &format!("app{next}"), cid, 1, 0)
+                    .await
+                    .is_err()
+                {
+                    reg_fail += 1;
+                }
+                next += 1;
+            }
+            let mut reg_us = Vec::with_capacity(sample);
+            for _ in 0..sample {
+                let t = Instant::now();
+                let r = reg
+                    .register(RT_PROGRAM, &format!("app{next}"), cid, 1, 0)
+                    .await;
+                reg_us.push(t.elapsed().as_micros() as u64);
+                if r.is_err() {
+                    reg_fail += 1;
+                }
+                next += 1;
+            }
+            let mut res_us = Vec::with_capacity(sample);
+            for k in 0..sample {
+                let j = (k * 997) % next; // spread across existing rows
+                let t = Instant::now();
+                let got = reg
+                    .resolve_entry(RT_PROGRAM, self_id, &format!("app{j}"))
+                    .await;
+                res_us.push(t.elapsed().as_micros() as u64);
+                if got.is_none() {
+                    res_miss += 1;
+                }
+            }
+            let st = reg.status().await;
+            let (rp50, rp99, sp50, sp99) = (
+                p(&mut reg_us, 0.5),
+                p(&mut reg_us, 0.99),
+                p(&mut res_us, 0.5),
+                p(&mut res_us, 0.99),
+            );
+            if first_res_p50 == 0 {
+                first_res_p50 = sp50;
+            }
+            last_res_p50 = sp50;
+            println!(
+                "{next:>5}  {rp50:>9} {rp99:>10}  {sp50:>9} {sp99:>10}  {:>13} {:>13}",
+                st.writer_shards, st.program_heads
+            );
+        }
+        println!("\nregister failures: {reg_fail} / {next}   resolve misses: {res_miss}");
+        // The per-row SQL win: resolve p50 at the largest row count must not have blown up vs the
+        // smallest (indexed SELECT is ~O(log n), not O(n)). Generous 8x bound absorbs machine noise.
+        assert!(
+            last_res_p50 <= first_res_p50.max(1) * 8,
+            "resolve latency scaled badly with rows: p50 {first_res_p50}us -> {last_res_p50}us"
+        );
+        assert_eq!(
+            reg_fail, 0,
+            "some registers failed under scaling — see output"
+        );
+        assert_eq!(
+            res_miss, 0,
+            "some resolves of existing heads missed — see output"
+        );
+    }
 
     #[test]
     fn shard_of_is_prefix_stable_under_growth() {

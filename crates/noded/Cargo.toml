@@ -60,3 +60,4 @@ tikv-jemalloc-ctl = "0.6"
 
 [dev-dependencies]
 tempfile.workspace = true
+async-trait.workspace = true
