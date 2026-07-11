@@ -337,28 +337,22 @@ async fn scenario_a_steady_state() {
         ));
     }
 
-    // Element 2 (choke): every node's active-push high-water mark must have
-    // stayed within K (the bound held under real distribution) AND been non-zero
-    // on the pushers (the choke is actually on the push path, not bypassed).
+    // Element 2 (choke): scenario A is pure publish-distribute, which is
+    // DELIBERATELY not choked (a one-shot fan-out that must spread fast; the
+    // choke governs ONGOING transfer — repair/scale/rebalance). So peaks are
+    // expected to be ~0 here; we only assert the bound was never EXCEEDED. The
+    // "choke is wired + exercised" proof lives in scenario C (which repairs).
     let k = nodes[0].engine.config().active_set_k;
     let peaks: Vec<Option<usize>> = nodes.iter().map(|nd| nd.engine.active_set_peak()).collect();
-    println!("scenario A: choke K={k}; active-push peaks per node = {peaks:?}");
+    println!("scenario A: choke K={k} (distribute unchoked); active-push peaks = {peaks:?}");
     for (i, p) in peaks.iter().enumerate() {
-        match p {
-            None => violations.push(format!(
-                "node{i}: choke disabled (active_set_k=0) — element 2 not active"
-            )),
-            Some(peak) if *peak > k => violations.push(format!(
-                "node{i}: active-push peak {peak} exceeded the choke bound K={k}"
-            )),
-            _ => {}
+        if let Some(peak) = p {
+            if *peak > k {
+                violations.push(format!(
+                    "node{i}: active-push peak {peak} exceeded the choke bound K={k}"
+                ));
+            }
         }
-    }
-    if peaks.iter().flatten().all(|p| *p == 0) {
-        violations.push(
-            "no node pushed through the choke — active set never exercised (wiring bypassed?)"
-                .into(),
-        );
     }
 
     if !violations.is_empty() {
@@ -1030,6 +1024,31 @@ async fn scenario_c_kill_holder_repairs() {
                 }
             }
         }
+    }
+
+    // Element 2 (choke): repair is CHOKED, so this scenario exercises the active
+    // set. Assert every survivor's active-push peak stayed within K (bound held
+    // under real repair load) and the choke was actually exercised (some node
+    // repaired through it — proves the wiring, complementing the unit tests).
+    let k = nodes[0].engine.config().active_set_k;
+    let peaks: Vec<Option<usize>> = nodes.iter().map(|nd| nd.engine.active_set_peak()).collect();
+    println!("scenario C: choke K={k}; active-push peaks per node = {peaks:?}");
+    for (i, p) in peaks.iter().enumerate() {
+        match p {
+            None => violations.push(format!(
+                "node{i}: choke disabled (active_set_k=0) — element 2 not active"
+            )),
+            Some(peak) if *peak > k => violations.push(format!(
+                "node{i}: active-push peak {peak} exceeded the choke bound K={k}"
+            )),
+            _ => {}
+        }
+    }
+    if peaks.iter().flatten().all(|p| *p == 0) {
+        violations.push(
+            "repair never pushed through the choke — active set unexercised (wiring bypassed?)"
+                .into(),
+        );
     }
 
     if !violations.is_empty() {

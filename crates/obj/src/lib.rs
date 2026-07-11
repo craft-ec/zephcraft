@@ -653,18 +653,8 @@ impl ObjEngine {
             let peer_source = self.peer_source.clone();
             let routing = self.routing.clone();
             let threshold = self.config.durability_threshold;
-            let active = self.active_set.clone();
             tokio::spawn(async move {
-                distribute_initial(
-                    transport,
-                    store,
-                    peer_source,
-                    routing,
-                    threshold,
-                    active,
-                    cid,
-                )
-                .await;
+                distribute_initial(transport, store, peer_source, routing, threshold, cid).await;
             });
         }
 
@@ -784,6 +774,10 @@ impl ObjEngine {
 
     /// Thin `&self` wrapper over the free [`push_piece`] — propagates the system
     /// class (from the store) so each holder treats it as DB data locally.
+    /// `choke` gates this push through the element-2 active set: `true` for
+    /// ONGOING transfer (repair/scale/rebalance), `false` for the one-shot
+    /// publish spread (which must fan out fast — see `distribute_initial`).
+    #[allow(clippy::too_many_arguments)] // flat push descriptor; a struct would just move the args
     async fn push_piece(
         &self,
         peer: &PeerAddr,
@@ -791,8 +785,14 @@ impl ObjEngine {
         gen: &Generation,
         piece: &CodedPiece,
         class: u8,
+        choke: bool,
         timeout: Duration,
     ) -> anyhow::Result<()> {
+        let active = if choke {
+            self.active_set.as_ref()
+        } else {
+            None
+        };
         push_piece(
             &self.transport,
             self.store.is_system(&cid),
@@ -801,7 +801,7 @@ impl ObjEngine {
             gen,
             piece,
             class,
-            self.active_set.as_ref(),
+            active,
             timeout,
         )
         .await
@@ -2016,7 +2016,7 @@ impl ObjEngine {
                 let peer = &candidates[i % candidates.len()];
                 // Timeout lives INSIDE push_piece — see request()'s contract.
                 if self
-                    .push_piece(peer, cid, &gen, piece, CLASS_NORMAL, PUSH_TIMEOUT)
+                    .push_piece(peer, cid, &gen, piece, CLASS_NORMAL, false, PUSH_TIMEOUT)
                     .await
                     .is_ok()
                 {
@@ -2100,7 +2100,7 @@ impl ObjEngine {
             };
             let pid = piece.piece_id();
             if self
-                .push_piece(taddr, *cid, gen, &piece, CLASS_NORMAL, PUSH_TIMEOUT)
+                .push_piece(taddr, *cid, gen, &piece, CLASS_NORMAL, true, PUSH_TIMEOUT)
                 .await
                 .is_ok()
             {
@@ -2210,7 +2210,7 @@ impl ObjEngine {
                 };
                 let pid = piece.piece_id();
                 if self
-                    .push_piece(taddr, cid, &gen, &piece, CLASS_NORMAL, PUSH_TIMEOUT)
+                    .push_piece(taddr, cid, &gen, &piece, CLASS_NORMAL, true, PUSH_TIMEOUT)
                     .await
                     .is_ok()
                 {
@@ -2302,7 +2302,6 @@ impl ObjEngine {
             self.peer_source.clone(),
             self.routing.clone(),
             self.config.durability_threshold,
-            self.active_set.clone(),
             cid,
         )
         .await
@@ -2446,7 +2445,7 @@ impl ObjEngine {
                 continue;
             }
             if self
-                .push_piece(&addr, cid, &gen, &piece, CLASS_NORMAL, PUSH_TIMEOUT)
+                .push_piece(&addr, cid, &gen, &piece, CLASS_NORMAL, true, PUSH_TIMEOUT)
                 .await
                 .is_ok()
             {
@@ -2572,7 +2571,7 @@ impl ObjEngine {
                         return false;
                     };
                     if self
-                        .push_piece(addr, *cid, gen, &piece, CLASS_CRITICAL, PUSH_TIMEOUT)
+                        .push_piece(addr, *cid, gen, &piece, CLASS_CRITICAL, true, PUSH_TIMEOUT)
                         .await
                         .is_ok()
                     {
@@ -2831,7 +2830,6 @@ async fn distribute_initial(
     peer_source: Arc<dyn PeerSource>,
     routing: Arc<dyn ContentRouting>,
     threshold: usize,
-    active: Option<ActiveSet>,
     cid: Cid,
 ) {
     let pinned = store.is_pinned(&cid);
@@ -2871,9 +2869,14 @@ async fn distribute_initial(
             if let Ok(jobs) = jobs {
                 let gen_ref = &gen;
                 let transport_ref = &transport;
-                let active_ref = active.as_ref();
                 let results =
                     futures::future::join_all(jobs.iter().map(|(peer, piece)| async move {
+                        // Publish-distribute is a ONE-SHOT fan-out that should
+                        // spread fast (offer/grant already admits per-receiver);
+                        // the choke (element 2) is NOT applied here — choking the
+                        // seed's bulk spread serialized it and intermittently
+                        // pushed scenario B's census past its bar. The choke
+                        // governs ONGOING transfer (repair/scale/rebalance).
                         // Timeout lives INSIDE push_piece/request — an external
                         // wrap would drop the future before its pool-evict runs.
                         match push_piece(
@@ -2884,7 +2887,7 @@ async fn distribute_initial(
                             gen_ref,
                             piece,
                             CLASS_NORMAL,
-                            active_ref,
+                            None,
                             PUSH_TIMEOUT,
                         )
                         .await
