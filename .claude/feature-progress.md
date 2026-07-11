@@ -182,7 +182,8 @@ the next candidate in. K governable later (minimal-kernel: mechanism native, pol
     Full gate now green across fmt+clippy+workspace-tests+A-G (7/7). Node-level census+drain fixes
     already live on the fleet; these harness changes need no roll.
 
-Open follow-ups (non-blocking): governance governor reassignment (Mac offline). ===
+Open follow-ups: NONE blocking. (Governor reassignment DISMISSED 2026-07-11 — spin up the Mac node
+on demand for governance ops; see [[zeph-fleet-deploy]].) Transfer plane structural work COMPLETE. ===
 === ALL 5 TPv2 STRUCTURAL ELEMENTS BUILT (1 mux, 2 choke, 3 offer/grant, 4 elected-scan, 5 fair-sched);
 elements 1+3+6 LIVE on the fleet; element 2 built+validated, awaiting staggered roll. ===
 
