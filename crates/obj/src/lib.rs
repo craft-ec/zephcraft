@@ -2210,7 +2210,7 @@ impl ObjEngine {
                 };
                 let pid = piece.piece_id();
                 if self
-                    .push_piece(taddr, cid, &gen, &piece, CLASS_NORMAL, REQUEST_TIMEOUT)
+                    .push_piece(taddr, cid, &gen, &piece, CLASS_NORMAL, PUSH_TIMEOUT)
                     .await
                     .is_ok()
                 {
@@ -2446,7 +2446,7 @@ impl ObjEngine {
                 continue;
             }
             if self
-                .push_piece(&addr, cid, &gen, &piece, CLASS_NORMAL, REQUEST_TIMEOUT)
+                .push_piece(&addr, cid, &gen, &piece, CLASS_NORMAL, PUSH_TIMEOUT)
                 .await
                 .is_ok()
             {
