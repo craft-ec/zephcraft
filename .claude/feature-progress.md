@@ -81,8 +81,12 @@ PHASES (each passes the offline harness before the next; harness FIRST):
     unwired, i.e. every A-F node). Repair still negotiates offer/grant for bandwidth+redirect.
     New deterministic 2-node test high_band_gate_denies_normal_admits_critical_repair PASSES:
     NORMAL denied at ingest (holds 0), CRITICAL repair admitted (accumulates). Full A-G re-run =
-    validating (expected 7/7 — behavior identical for A-F). NOT yet deployed (another wire-format
-    change → needs a simultaneous roll; gate on user go-ahead, batch with next wire change).
+    7/7 GREEN (651s) — scenario B census 17.4s drained=true (NO regression; the offer-RTT approach
+    hit 35s, this doesn't). Adversarial review (feature-dev:code-reviewer): CLEAN, no findings ≥bar
+    (one below-bar cosmetic: reason-string when pressure+tombstone coincide). Clippy clean.
+    NOT yet deployed: the PiecePush class field is a wire-format change → needs a simultaneous roll
+    (gate on user go-ahead; not urgent — jemalloc + critical backstop cover the live fleet; batch
+    with the next wire change or roll standalone when convenient).
 Follow-up (deferred, not blocking): reassign governance governor to a Hetzner node (Mac offline).
 
 # SEED-NODE MEMORY: glibc-arena bloat → jemalloc (2026-07-10, ultracode)
