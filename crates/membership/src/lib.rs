@@ -177,6 +177,15 @@ const EPIDEMIC_DEBOUNCE_MS: u64 = 1_000;
 /// fan-out). One target diffused a join wave through the tail in ~40s;
 /// fan-out spreads new-member knowledge in log-fanout hops.
 const EPIDEMIC_FANOUT: usize = 3;
+/// Periodic epidemic SAFETY NET. The new-member cascade only fires while a node
+/// keeps LEARNING members, so once its neighbors converge a straggler stops
+/// receiving pushes and waits for the 30s shuffle — the measured 3s (cascade
+/// reached everyone) vs ~35s (fell back to shuffle) census-convergence bimodal.
+/// A light periodic push (member map → EPIDEMIC_FANOUT peers) bounds the tail to
+/// ~this interval per hop regardless of cascade luck. Cheaper than the retired
+/// 10s dedicated shuffle round (map-only, fire-and-forget); a no-op merge on the
+/// receiver when nothing is new.
+const EPIDEMIC_PERIODIC: Duration = Duration::from_secs(5);
 
 impl Membership {
     pub fn new(transport: Arc<Transport>, cfg: Config) -> Arc<Self> {
@@ -245,10 +254,18 @@ impl Membership {
             this.shuffle_round().await;
             let mut interval = tokio::time::interval(this.cfg.shuffle_interval);
             interval.tick().await; // consumes the immediate tick
+                                   // Periodic epidemic safety net (see EPIDEMIC_PERIODIC): catches
+                                   // stragglers the new-member cascade missed, so census convergence no
+                                   // longer falls back to the 30s shuffle.
+            let mut epidemic_tick = tokio::time::interval(EPIDEMIC_PERIODIC);
+            epidemic_tick.tick().await; // consume the immediate tick
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
                         this.shuffle_round().await;
+                    }
+                    _ = epidemic_tick.tick() => {
+                        this.epidemic_push().await;
                     }
                     _ = this.epidemic.notified() => {
                         // Epidemic: fan the member map to several active peers
