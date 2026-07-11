@@ -65,16 +65,16 @@ PHASES (each passes the offline harness before the next; harness FIRST):
     drained=true (regression from distribute-offers gone after revert); C recovered; D fair;
     E resolves 1.4x; F rejoin; G recovered + capped repair-window arrivals=0. Wire roll (mux +
     offer/grant on repair) fully built + reviewed (no logic bugs) + validated.
-[ ] P5 SIMULTANEOUS fleet roll — GATED ON USER GO-AHEAD. Wire-incompatible with the old binary, so
-    all 4 Hetzner nodes must restart together (brief full-cluster wire flip, NO old-binary rollback
-    compat). Steps: build linux binary → stage to each node → stop all 4 → swap binary → start all 4
-    → verify peers=4 + census converges + no ALPN/handshake errors. See [[zeph-fleet-deploy]].
-[ ] P3 OFFER/GRANT on piece path (obj): wire Offer{class,cid,items,bytes}/Grant{accept,retry_ms};
-    sender pre-push handshake; gauge-based grant (critical=0/high=1/else<=4, ResourceGauge exists);
-    partial/zero → redirect to next candidate (coded pieces fungible) or requeue-backoff.
-[ ] P4 FULL HARNESS GREEN (A-F + new): conn count drops ~7×; capped receiver sheds via grants.
-[ ] P5 SIMULTANEOUS fleet roll (all 5 nodes at once — brief coordinated downtime; wire-incompat).
-RISK: P5 is the one all-or-nothing outward step (no mixed-version interop). De-risked by P0-P4 offline.
+[x] P5 SIMULTANEOUS fleet roll DONE + VERIFIED (2026-07-11 ~01:00, user-authorized "Roll now").
+    Backed up binary → rsync crates/ → build on box (release, 1m18s) → install → stop all 4 →
+    start all 4 (wire-incompatible flip, ~5s full outage). Verified: all 4 active, NRestarts=0,
+    peers=4, live SWIM keepalives to all 3 peers @ sub-ms RTT, health scan running, ZERO panics.
+    Only log noise = transient bootstrap-unreachable / isolated-rebootstrap + one iroh path-abandon
+    in the 00:59:01-06 flip window (expected — all 4 down together); clean after.
+
+=== WIRE ROLL COMPLETE: elements 1 (mux, conns 24→7) + 3 (offer/grant on repair) LIVE on the fleet.
+Follow-up (deferred, not blocking): distribute-path admission via no-RTT class-on-push + graded
+ingest check (see P3 note); reassign governance governor to a Hetzner node (Mac governor offline).
 
 # SEED-NODE MEMORY: glibc-arena bloat → jemalloc (2026-07-10, ultracode)
 Post-deploy soak surfaced the seed node ('zeph', primary DHT hub) at ~8GB RSS (OOM-killed a few
