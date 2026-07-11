@@ -73,8 +73,17 @@ PHASES (each passes the offline harness before the next; harness FIRST):
     in the 00:59:01-06 flip window (expected — all 4 down together); clean after.
 
 === WIRE ROLL COMPLETE: elements 1 (mux, conns 24→7) + 3 (offer/grant on repair) LIVE on the fleet.
-Follow-up (deferred, not blocking): distribute-path admission via no-RTT class-on-push + graded
-ingest check (see P3 note); reassign governance governor to a Hetzner node (Mac governor offline).
+
+[x] P6 NO-RTT CLASS ADMISSION (commit 191d83c) — closes the deferred distribute-path gap.
+    Add class:u8 to PiecePush (repair→CLASS_CRITICAL, distribute/scale/rebalance→CLASS_NORMAL).
+    ingest() consults grant_gate(class,1): under HIGH pressure admit CRITICAL, reject NORMAL — no
+    offer RTT (so no scenario-B census regression; the ingest check is a no-op when grant_gate is
+    unwired, i.e. every A-F node). Repair still negotiates offer/grant for bandwidth+redirect.
+    New deterministic 2-node test high_band_gate_denies_normal_admits_critical_repair PASSES:
+    NORMAL denied at ingest (holds 0), CRITICAL repair admitted (accumulates). Full A-G re-run =
+    validating (expected 7/7 — behavior identical for A-F). NOT yet deployed (another wire-format
+    change → needs a simultaneous roll; gate on user go-ahead, batch with next wire change).
+Follow-up (deferred, not blocking): reassign governance governor to a Hetzner node (Mac offline).
 
 # SEED-NODE MEMORY: glibc-arena bloat → jemalloc (2026-07-10, ultracode)
 Post-deploy soak surfaced the seed node ('zeph', primary DHT hub) at ~8GB RSS (OOM-killed a few
