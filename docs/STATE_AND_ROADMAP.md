@@ -131,7 +131,7 @@ Cross-references kernel primitives as **[Kn]**.
 **Tier 3 — prove the product thesis:**
 - Federated app demo (multi-owner, enumerated via the registry directory) + cross-node app-DB read path.
 - **Sharing [K3]** — encrypted grants to recipients.
-- **Prove the scaling win with numbers** — deploy hundreds/thousands of heads; measure register/resolve latency vs row count (the per-row SQL win) and held/DB growth (the O(held) win). Converts "should scale" into a curve.
+- **Prove the scaling win with numbers — DONE (single-node bench, `bf834f3`).** `bench_register_resolve_latency_vs_row_count` (in `headreg.rs`, `#[ignore]`): resolve p50 stays FLAT ~74–121µs as heads grow 150→4050 (27×; indexed SELECT is O(log n) — the per-row win over the old whole-shard blobs), register p50 flat ~25–29ms (commit-bound), shards fill to all 256. Still worth doing at scale on a MULTI-node cluster (the O(held) win only shows when a node holds a *fraction* of shards) and with numbers on the live fleet.
 
 **Tier 4 — trust primitives (deferred):**
 - PDP [K5] + reputation; cross-node verify [K6] + attestation gather [K7] → verification layer; threshold shares [K4] → best-achievable crypto-shred.
@@ -144,5 +144,5 @@ The registry scaling ceiling and the transport substrate are done and live, so t
 
 1. **Finish the Tier-0 doc-reconciliation sweep of the stale design docs (§3.4)** — foundation §62/Part F, GOVERNANCE §4/§6, CRAFTCOM_DESIGN §5/§10, ENCRYPTION §8, and the routing/obj/internal-comment drifts still describe attestation/committee/tracker/Pkarr/fixed-shard models the code replaced. Low-risk, high-leverage; misleads anyone building a mental model.
 2. **SWIM Suspect/Dead dissemination [K10]** — the one real robustness gap; the census (JOIN) half is built + hardened, fast active DEATH detection is not.
-3. **Prove the scaling win with numbers** (Tier 3) — turn "should scale" into a measured curve.
+3. **Registry durability at scale** — the scaling bench (`bf834f3`) found that with `ObjDurable` shard-page durability ENABLED, a single-node register hit `sqlite: file is not a database` at ~1100 heads (with it removed, 0 failures across 4050). The registry SQL/root store scales cleanly; the erasure-durability of shard pages corrupts at scale in the single-node config. Determine whether it is single-node-only or a live-fleet risk (production uses `.with_durable`), then a multi-node scaling curve.
 4. Then the deferred layers: sharing [K3], trust primitives [K4–K7], verification (Track B), the K1 anchor half if/when a governed-WASM program appears.
