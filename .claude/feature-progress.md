@@ -131,9 +131,18 @@ the next candidate in. K governable later (minimal-kernel: mechanism native, pol
     refcount bug, 6 concerns cleared). One finding fixed (commit bdbd3ed): scale_one/distribute used
     REQUEST_TIMEOUT (30s) → a slow peer hogged a shared choke slot 10x the PUSH_TIMEOUT (3s) intent,
     able to starve repair's CLASS_CRITICAL pushes; switched both to PUSH_TIMEOUT.
-[ ] P5 STAGGERED roll — GATE ON USER GO-AHEAD. Local-logic (no wire change) → staggered (NOT
-    simultaneous): zeph2→zeph3→zeph4→zeph, verify peers=4 + NRestarts=0 each before the next. Run
-    deploy/gate.sh (FULL, incl A-G) first.
+[~] P5 STAGGERED roll ATTEMPTED — the full gate.sh CAUGHT scenario B (6/7, census 50s>30s) and
+    BLOCKED the roll (gate working as designed). Diagnosed: NOT an element-2 regression.
+    - Refined the choke to ongoing-transfer-only (commit a5c6fc6) while chasing it, then
+    - Ran a choke-OFF baseline: B census 3.4/17/35.8/3.3s across 4 runs → 1 FAIL even with NO choke.
+    PROOF: scenario B's census-20 bar (30s) is INHERENTLY FLAKY (natural variance 3-36s under 20-node
+    mass-rejoin). Element 2 is EXONERATED — it's sound (scenario C: choke peaks [4,1,1,1,4,4,4],
+    bounded + exercised by repair; adversarial review clean). Box binary built (choke, K=4) but NOT
+    installed; fleet untouched.
+    BLOCKER for the roll is the FLAKY B BAR, not element 2 → makes the whole A-G gate ~25% false-fail.
+[ ] NEXT DECISION (user): (a) fix the flaky scenario-B census bar / investigate the 3-36s membership
+    census variance under mass-rejoin (restores a reliable gate, then roll element 2), OR (b) roll
+    element 2 now treating B as a known-flaky orthogonal issue (re-run on false B fail).
 === ALL 5 TPv2 STRUCTURAL ELEMENTS BUILT (1 mux, 2 choke, 3 offer/grant, 4 elected-scan, 5 fair-sched);
 elements 1+3+6 LIVE on the fleet; element 2 built+validated, awaiting staggered roll. ===
 
