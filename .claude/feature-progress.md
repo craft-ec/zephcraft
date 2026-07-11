@@ -120,10 +120,22 @@ Design: ActiveSet choke gate — K permits; enter(peer)->guard; a peer already a
 → next candidate enters. Lives in obj (transfer plane); ping/census excluded by construction (they're
 transport/membership). Composes with offer/grant: grant-0/timeout releases the slot + redirect brings
 the next candidate in. K governable later (minimal-kernel: mechanism native, policy swappable).
-RISK: choke tightens concurrency → may regress settle/census bars (like the offer-RTT did). MEASURE +
-tune K. Phases: [ ] P1 ActiveSet core + unit tests  [ ] P2 wire into obj push/pull paths  [ ] P3
-harness scenario (assert active-peer bound + no settle regression) + full A-G  [ ] P4 review  [ ] P5
-staggered roll (gate on user go-ahead).
+[x] P1 ActiveSet core + 3 unit tests (commit 8bf7bc2) — K permits, refcount, Drop frees slot.
+[x] P2 wired into all push paths via the free push_piece (commit c7b63c3); active_set_k=4 default,
+    0 disables. A+B validated live: A settles 14s (budget 120s), B census 3.35s drained — NO
+    regression (choke REDUCES load, unlike the offer-RTT; risk retired).
+[x] P3 peak high-water-mark + scenario A assertion (commit 6bb13d2): seed peaks EXACTLY at K=4 under
+    a 200-object distribute (bound held precisely), holders at 0 (no steady-state push) — proves the
+    choke is on the push path + bounds real traffic. FULL A-G 7/7 GREEN (605s) with choke active.
+[x] P4 adversarial review (feature-dev:code-reviewer): ActiveSet primitive SOUND (no deadlock/leak/
+    refcount bug, 6 concerns cleared). One finding fixed (commit bdbd3ed): scale_one/distribute used
+    REQUEST_TIMEOUT (30s) → a slow peer hogged a shared choke slot 10x the PUSH_TIMEOUT (3s) intent,
+    able to starve repair's CLASS_CRITICAL pushes; switched both to PUSH_TIMEOUT.
+[ ] P5 STAGGERED roll — GATE ON USER GO-AHEAD. Local-logic (no wire change) → staggered (NOT
+    simultaneous): zeph2→zeph3→zeph4→zeph, verify peers=4 + NRestarts=0 each before the next. Run
+    deploy/gate.sh (FULL, incl A-G) first.
+=== ALL 5 TPv2 STRUCTURAL ELEMENTS BUILT (1 mux, 2 choke, 3 offer/grant, 4 elected-scan, 5 fair-sched);
+elements 1+3+6 LIVE on the fleet; element 2 built+validated, awaiting staggered roll. ===
 
 # SEED-NODE MEMORY: glibc-arena bloat → jemalloc (2026-07-10, ultracode)
 Post-deploy soak surfaced the seed node ('zeph', primary DHT hub) at ~8GB RSS (OOM-killed a few
