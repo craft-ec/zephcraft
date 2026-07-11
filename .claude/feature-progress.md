@@ -89,7 +89,20 @@ PHASES (each passes the offline harness before the next; harness FIRST):
     NRestarts=0, peers=4, live SWIM keepalives @ sub-ms RTT, ZERO panics/ALPN errors. Memory
     bounded (seed 189MB as hub, others 84-97MB; jemalloc holding). Whole transfer-plane piece path
     is now admission-controlled on the live fleet.
-Follow-up (deferred, not blocking): reassign governance governor to a Hetzner node (Mac offline).
+[x] DEAD-CODE CLEANUP (commit 599f9b5) — removed the legacy per-ALPN transport path now that every
+    protocol rides the mux: connect/connect_fresh/evict, pool/dials + PoolKey, ping_dial_permits +
+    MAX_CONCURRENT_PING_DIALS, mod alpn (alpn::PING), and the never-wired open_tagged/send_tagged.
+    connection_count/evict_peer/rebind/close are mux_pool-only; serve() dropped its always-empty
+    conn_handlers param + legacy ALPN branch (12 call sites updated). transport -225 net lines.
+    SURFACED + FIXED 2 latent breakages the ping->mux migration (e2a1292) left OUTSIDE the A-G gate:
+    transport ping unit tests bound the retired alpn::PING (rewritten to the mux API), and
+    two_workers_exchange_heartbeats asserted a dropped "ping served" log (restored in
+    handle_ping_stream). Full workspace 46/46 green, clippy clean, scenario A [7x8] intact.
+    NOT a wire change → no fleet roll needed (removed code was already dead on the running binary).
+    LESSON: the transport unit tests + noded subprocess tests are NOT in the acceptance gate — a
+    future wire change should run `cargo test --workspace` (non-ignored) too, not just A-G.
+Follow-up (deferred, not blocking): reassign governance governor to a Hetzner node (Mac offline);
+add transport unit + noded subprocess tests to the pre-deploy gate (they went red unnoticed).
 
 # SEED-NODE MEMORY: glibc-arena bloat → jemalloc (2026-07-10, ultracode)
 Post-deploy soak surfaced the seed node ('zeph', primary DHT hub) at ~8GB RSS (OOM-killed a few
