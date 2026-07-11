@@ -129,6 +129,13 @@ pub struct PiecePush {
     /// marks it locally so it's kept alive (never fades) + excluded from user
     /// commands + eviction — no per-piece WANT record needed on the network.
     pub system: bool,
+    /// Push class (TRANSFER_PLANE_V2 §3 no-RTT admission): 0 = durability-
+    /// critical (below-floor repair), 1 = normal (distribute / scale surplus).
+    /// The receiver gates intake on this at ingest — under HIGH memory pressure
+    /// it accepts the critical class and rejects the normal class, WITHOUT a
+    /// pre-push offer round-trip. Repair additionally negotiates offer/grant
+    /// before pushing; distribute/scale rely solely on this ingest gate.
+    pub class: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -654,6 +661,7 @@ mod tests {
                 vtags: vec![1, 2, 3],
                 piece: piece.clone(),
                 system: false,
+                class: 0,
             }),
             Message::PiecePushAck(PiecePushAck {
                 ok: false,

@@ -171,16 +171,17 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Max pieces a single repair pass mints for one cid (bounded burst).
 const REPAIR_BATCH: usize = 8;
 
-/// Offer/grant push classes (TRANSFER_PLANE_V2 §3). A durability-critical push
-/// (restoring a cid below its floor) outranks a normal distribute/scale push
-/// when the receiver is under memory pressure — the grant gate protects the
-/// critical class first. Only the CRITICAL (repair) path currently issues
-/// offers; class 1 (normal, for distribute/scale) is reserved — per-piece
-/// offers on the burst distribute path overloaded the seed and pushed
-/// scenario B's census past its bar, so distribute admission is deferred to a
-/// no-extra-RTT design (carry the class on the push, gate graded at ingest).
-/// Meanwhile jemalloc bounds RSS and the critical shed_gate is the backstop.
+/// Push classes (TRANSFER_PLANE_V2 §3). A durability-critical push (restoring a
+/// cid below its floor) outranks a normal distribute/scale push when the
+/// receiver is under memory pressure. Every push carries its class on the wire;
+/// the receiver gates intake at ingest — under HIGH pressure it accepts CRITICAL
+/// and rejects NORMAL, with NO pre-push offer round-trip (per-piece offers on
+/// the burst distribute path overloaded the seed and pushed scenario B's census
+/// past its bar — the class-at-ingest gate closes that gap without the RTT). The
+/// repair path additionally negotiates offer/grant before pushing (bandwidth +
+/// redirect); distribute/scale/rebalance rely solely on the ingest gate.
 pub const CLASS_CRITICAL: u8 = 0;
+pub const CLASS_NORMAL: u8 = 1;
 
 /// Most pieces a healthy receiver grants from a single offer (bounds a burst
 /// from one sender — the sender re-offers or redirects the remainder). The
@@ -759,6 +760,7 @@ impl ObjEngine {
         cid: Cid,
         gen: &Generation,
         piece: &CodedPiece,
+        class: u8,
         timeout: Duration,
     ) -> anyhow::Result<()> {
         push_piece(
@@ -768,6 +770,7 @@ impl ObjEngine {
             cid,
             gen,
             piece,
+            class,
             timeout,
         )
         .await
@@ -1982,7 +1985,7 @@ impl ObjEngine {
                 let peer = &candidates[i % candidates.len()];
                 // Timeout lives INSIDE push_piece — see request()'s contract.
                 if self
-                    .push_piece(peer, cid, &gen, piece, PUSH_TIMEOUT)
+                    .push_piece(peer, cid, &gen, piece, CLASS_NORMAL, PUSH_TIMEOUT)
                     .await
                     .is_ok()
                 {
@@ -2066,7 +2069,7 @@ impl ObjEngine {
             };
             let pid = piece.piece_id();
             if self
-                .push_piece(taddr, *cid, gen, &piece, PUSH_TIMEOUT)
+                .push_piece(taddr, *cid, gen, &piece, CLASS_NORMAL, PUSH_TIMEOUT)
                 .await
                 .is_ok()
             {
@@ -2176,7 +2179,7 @@ impl ObjEngine {
                 };
                 let pid = piece.piece_id();
                 if self
-                    .push_piece(taddr, cid, &gen, &piece, REQUEST_TIMEOUT)
+                    .push_piece(taddr, cid, &gen, &piece, CLASS_NORMAL, REQUEST_TIMEOUT)
                     .await
                     .is_ok()
                 {
@@ -2411,7 +2414,7 @@ impl ObjEngine {
                 continue;
             }
             if self
-                .push_piece(&addr, cid, &gen, &piece, REQUEST_TIMEOUT)
+                .push_piece(&addr, cid, &gen, &piece, CLASS_NORMAL, REQUEST_TIMEOUT)
                 .await
                 .is_ok()
             {
@@ -2537,7 +2540,7 @@ impl ObjEngine {
                         return false;
                     };
                     if self
-                        .push_piece(addr, *cid, gen, &piece, PUSH_TIMEOUT)
+                        .push_piece(addr, *cid, gen, &piece, CLASS_CRITICAL, PUSH_TIMEOUT)
                         .await
                         .is_ok()
                     {
@@ -2689,6 +2692,21 @@ impl ObjEngine {
         if self.shed_gate.get().is_some_and(|gate| gate()) {
             return reject("busy — memory pressure");
         }
+        // Graded class admission (TRANSFER_PLANE_V2 §3, no-RTT variant): below
+        // the critical mark but under HIGH pressure, accept the durability-
+        // critical class (repair) and reject the normal class (distribute /
+        // scale), so a loaded node stops taking best-effort intake before it
+        // reaches the critical shed line. The class rides on the push, so no
+        // pre-push offer round-trip is needed (repair still negotiates offer/
+        // grant separately for bandwidth + redirect). grant_gate returns the
+        // count this node would admit for `(class, 1)`; 0 → reject.
+        if self
+            .grant_gate
+            .get()
+            .is_some_and(|gate| gate(push.class, 1) == 0)
+        {
+            return reject("busy — pressure (class-gated)");
+        }
         let cid = Cid(push.cid);
         if self.store.is_tombstoned(&cid) {
             return reject("tombstoned");
@@ -2831,6 +2849,7 @@ async fn distribute_initial(
                             cid,
                             gen_ref,
                             piece,
+                            CLASS_NORMAL,
                             PUSH_TIMEOUT,
                         )
                         .await
@@ -2886,6 +2905,7 @@ async fn offer(
 /// Push one coded piece to a peer and await its ack. A free fn (over `&Arc<Transport>` +
 /// the precomputed `is_system` flag) so the fire-and-forget distribution task can call it
 /// without `&self`. Wire messages, timeout, and behaviour are identical to the old method.
+#[allow(clippy::too_many_arguments)] // flat push descriptor; a struct would just move the args
 async fn push_piece(
     transport: &Arc<Transport>,
     is_system: bool,
@@ -2893,6 +2913,7 @@ async fn push_piece(
     cid: Cid,
     gen: &Generation,
     piece: &CodedPiece,
+    class: u8,
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let msg = wire::Message::PiecePush(wire::PiecePush {
@@ -2908,6 +2929,8 @@ async fn push_piece(
         // Propagate the system class with every push (publish, repair, distribute)
         // so each holder treats it as DB data locally.
         system: is_system,
+        // Push class (§3): the receiver gates intake on this at ingest.
+        class,
     });
     match request(transport, peer, &msg, timeout).await? {
         wire::Message::PiecePushAck(ack) if ack.ok => Ok(()),

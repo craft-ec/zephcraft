@@ -6,10 +6,11 @@
 //! fresh pieces back onto live peers until availability recovers to the floor —
 //! all discovered by CID alone, no manual peering.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use zeph_crypto::NodeIdentity;
-use zeph_obj::{ConsumeMode, ObjConfig, ObjEngine};
+use zeph_obj::{ConsumeMode, ObjConfig, ObjEngine, CLASS_CRITICAL};
 use zeph_routing::ContentRouting;
 use zeph_store::Store;
 use zeph_testkit::{MemNet, MemRouting};
@@ -884,6 +885,85 @@ async fn dst_churn_wanted_content_survives() {
         );
         fetcher.kill().await;
     }
+}
+
+/// No-RTT class admission gate (TRANSFER_PLANE_V2 §3): a node under simulated
+/// HIGH (not critical) memory pressure grants the durability-critical class and
+/// denies the normal class. It must DENY distribute (NORMAL) intake at ingest
+/// yet ADMIT repair (CRITICAL) — with no offer round-trip. Two nodes so repair
+/// has exactly one candidate (B), making the CRITICAL push to B deterministic.
+#[tokio::test]
+async fn high_band_gate_denies_normal_admits_critical_repair() {
+    let tracker = start_tracker();
+    let dirs: Vec<tempfile::TempDir> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+
+    // Publisher A pins the content, so it retains the whole object and can mint
+    // fresh CRITICAL repair pieces to spread.
+    let a = node(&tracker, dirs[0].path()).await;
+    a.routing.announce_node(0, 0).await.unwrap();
+
+    // Holder B: graded gate only (no always-shedding shed_gate) — admit CRITICAL,
+    // deny NORMAL. Counters record which arm the gate took.
+    let b = node(&tracker, dirs[1].path()).await;
+    b.routing.announce_node(0, 0).await.unwrap();
+    let norm_denied = Arc::new(AtomicU64::new(0));
+    let crit_seen = Arc::new(AtomicU64::new(0));
+    let (nd, cs) = (norm_denied.clone(), crit_seen.clone());
+    b.engine.set_grant_gate(Arc::new(move |class, items| {
+        if class == CLASS_CRITICAL {
+            cs.fetch_add(1, Ordering::Relaxed);
+            items.min(4)
+        } else {
+            nd.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+    }));
+
+    let payload: Vec<u8> = (0..120_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 7) as u8)
+        .collect();
+    let cid = a.engine.publish(&payload, true).await.unwrap().cid;
+
+    // Publish-distribute ships NORMAL pushes to B; every one is denied at ingest,
+    // so B stores nothing from distribution.
+    for _ in 0..25 {
+        if norm_denied.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert!(
+        norm_denied.load(Ordering::Relaxed) > 0,
+        "distribute NORMAL pushes must hit B's class gate"
+    );
+    assert_eq!(
+        b.engine.store().piece_count(&cid),
+        0,
+        "B admitted no NORMAL distribute pieces (class-gated at ingest)"
+    );
+
+    // Repair: A is the sole content holder → elected repairer → mints CRITICAL and
+    // offers B (the only recruit). B's gate admits CRITICAL, so B accepts.
+    let mut got = 0;
+    for _ in 0..80 {
+        a.engine.health_scan().await;
+        got = b.engine.store().piece_count(&cid);
+        if got > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert!(
+        crit_seen.load(Ordering::Relaxed) > 0,
+        "repair must offer/push CRITICAL to B"
+    );
+    assert!(
+        got > 0,
+        "B must admit CRITICAL repair pieces through the class gate (held {got})"
+    );
+
+    a.kill().await;
+    b.kill().await;
 }
 
 /// Sum the pieces the LIVE holders actually hold for `cid` (ground truth,
