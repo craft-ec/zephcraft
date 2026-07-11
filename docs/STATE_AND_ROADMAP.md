@@ -1,6 +1,6 @@
 # ZephCraft — State, Reconciliation & Roadmap
 
-**Date:** 2026-07-07 · **Updated:** 2026-07-09
+**Date:** 2026-07-07 · **Updated:** 2026-07-11
 **Purpose:** the single consolidated view of where the node actually stands — what is built and validated, where the code and the design docs disagree (a 7-domain spec-vs-code reconciliation), what is deferred by choice, the architectural constraints we know of, and the prioritized plan. This supersedes ad-hoc status in conversation and complements `.claude/feature-progress.md` (the working phase tracker).
 
 ---
@@ -21,6 +21,26 @@ Since the 07-07 audit, the registry control-plane — the doc's #1 scaling conce
 **Still open (accurate below):** K10 SWIM Suspect/Dead dissemination (the converged *census* is built; proper epidemic death-detection is not) · K2 `random` host fn (unbound) · the doc-reconciliation sweep itself (REGISTRY_DESIGN / foundation §62·Part F / GOVERNANCE §4·§6 still describe attestation/committee/postcard-blob/256-fixed-shard models) · the Tier-4 trust primitives (K3–K7) · encryption sharing (phase 5).
 
 **Design docs added:** `SQL_REGISTRY_DESIGN.md` · **`ZEPHCRAFT.md` (2026-07-09) — THE consolidated design & state document**: the Tier-0 consolidation this roadmap called for, reconciling every design doc against code, adversarially verified. For any architecture question, read it first; this file remains the working phase ledger.
+
+---
+
+## 0.1 — 2026-07-11 UPDATE — Transfer Plane v2 (transport/coordination substrate) shipped LIVE; census + memory hardened
+
+Since the 07-09 update the **transfer plane** — the shared substrate under storage/registry/DB traffic — was rebuilt to a structural design (`docs/TRANSFER_PLANE_V2.md`) and gated by an offline acceptance harness of REAL components (`tests/tests/transfer_plane.rs`, scenarios A–G). All rolled to the live 4-node Hetzner fleet and verified (peers=4, NRestarts=0, no panics). This supersedes the transport/coordination specifics in §2 and adds a transport-substrate layer the doc did not previously cover.
+
+**The 5 structural elements (all built; 1/2/3 completed this window, 4/5 pre-existing, all harness-green):**
+- **E1 MUX — one QUIC connection per peer** (`dd0b7d1`,`3535f63`,`1468576`…`e2a1292`; cleanup `599f9b5`). Every protocol is a bi-stream with a 1-byte protocol tag instead of a per-ALPN connection; all 7 protocols muxed. Connections/node dropped 24→7 at 8 nodes (harness bar). The legacy per-ALPN transport path was removed.
+- **E2 CHOKE — bounded active set** (`8bf7bc2`,`c7b63c3`,`6bb13d2`,`a5c6fc6`,`5b3dd9b`). Active PUSH work is bounded to K=4 distinct peers (ONGOING transfer only — repair/scale/rebalance; the one-shot publish-distribute burst is unchoked so it fans out fast). NON-BLOCKING (`try_enter`): a choked push DEFERS (retry next pass) instead of blocking + holding a JobCoordinator slot (which starved the queue).
+- **E3 OFFER/GRANT admission** (`d540134`,`58c46cc`,`8a895f8`,`191d83c`). A sender offers a batch before shipping payload; the receiver grants from its `ResourceGauge` (critical→0, high→1 for the durability-critical class, else ≤4); repair redirects the ungranted remainder to a peer with capacity (coded pieces are fungible). Plus a NO-RTT variant: every push carries its class on the wire (`PiecePush.class`) and `ingest()` gates graded from the gauge — so distribute/scale intake is rejected at HIGH pressure with no offer round-trip.
+- **E4 elected healthscan** + **E5 class-fair scheduling** — pre-existing; validated green (scenario E resolves ~1x; scenario D per-class caps).
+
+**Memory — glibc arena bloat, NOT a leak** (`0ed4082`,`be9588b`,`9779416`). A hub/seed node at multi-GB RSS was glibc-malloc arena fragmentation under bursty serve/mint churn. Fix = jemalloc global allocator + baked decay + runtime background-purge thread (~13x cut, seed 8GB→~540MB, confirmed live). A real hub-node stability risk the doc did not previously capture — now bounded on the fleet (~100-530MB/node).
+
+**Census convergence hardened** (`3e4dcf4`). The epidemic member-map cascade only fired while a node kept LEARNING members, so a straggler waited for the 30s shuffle → census-20 was a bimodal 3s/35s coin flip (~1/4 runs over a 30s bar under 20-node mass-rejoin). A periodic epidemic safety net (member map → 3 peers every 5s) collapsed it to a reliable ~3.3s. **This ADVANCES K10** (§6): the converged census is now not just built but *reliably fast-converging* — the substrate the registry election + governance tick run over. (Suspect/Dead epidemic gossip + indirect PING-REQ are still open — the rest of K10.) Note: the periodic push is O(N)/round, which makes the §7-Tier-1 "digest/sampled gossip" item more relevant at large N.
+
+**Deploy gate** (`24eed4d`, `deploy/gate.sh`) — a mandatory pre-roll gate runs the COMPLETE local surface (fmt + clippy + `cargo test --workspace` + the A–G harness), after the ping→mux migration was found to have left transport unit + noded subprocess tests red OUTSIDE the acceptance harness for a whole migration.
+
+**Fleet:** 4 Hetzner nodes (`zeph`/`zeph2`/`zeph3`/`zeph4` on one box), all rolled + healthy. Mac node (the sole governance governor) stopped by choice — spin up on demand for governance ops, do NOT reassign the governor.
 
 ---
 
@@ -138,7 +158,7 @@ What remains is a **bounded, enumerable set of primitives** the kernel must expo
 | **K7** | **Attestation gather** (solicit + collect k-of-n signed statements over a fact) | wire | verification, shred, reputation evidence — any "quorum attests a fact" | The general primitive under K4/K5/K6 policies. The old attestation coordinator was removed; this is its clean, general, consistency-only replacement. |
 | **K8** | **Issue `AvailabilityProbe`s from the health scan** | wire (half-built) | verified availability counts (vs record + liveness today) | Messages exist and are answered; the prober is never *issued* (foundation §62.1). |
 | **K9** | **Dynamic sharding of the account substrate** (split / merge, rebalance) | substrate | breaks the fixed-shard registry ceiling → elastic scale | **DONE + PROVEN LIVE (07-08/09).** Governed `shard_bits`; low-bit routing makes split/merge LOCAL (parent→two children); online reshard with a drain window (catches in-flight writes) + old-generation GC; grow (8→9) and shrink (9→8) both proven cross-node. Not consistent-hashing — power-of-two split/merge on the governed count. See §0. |
-| **K10** | **SWIM dissemination** (Suspect/Dead gossip + indirect PING-REQ) | substrate | robust failure detection at scale | **PARTIAL (07-08).** The CONVERGED census (union + max-last_heard gossip, folded into the existing shuffle) was built — this is what the registry election + governance tick now run over. Still missing: Suspect/Dead epidemic gossip + indirect PING-REQ, so deaths still age out by TTL rather than fast active detection. |
+| **K10** | **SWIM dissemination** (Suspect/Dead gossip + indirect PING-REQ) | substrate | robust failure detection at scale | **PARTIAL (07-08; census half HARDENED 07-11).** The CONVERGED census (union + max-last_heard gossip) was built — the set the registry election + governance tick run over — and 07-11 (`3e4dcf4`) it was made *reliably fast-converging* (periodic epidemic safety net; census-20 3-36s → ~3.3s). Still missing (the JOIN half is done, this is the DEATH half): Suspect/Dead epidemic gossip + indirect PING-REQ, so deaths still age out by TTL (~30s) rather than fast active detection. Caveat: the periodic epidemic is O(N)/round → the "digest/sampled gossip" scale item (§7 Tier-1) is now more relevant. |
 
 **Reading the list by cost:**
 - **Capabilities (K2–K4)** — cheapest: host fns over crypto/PRE already in-tree.
@@ -180,9 +200,9 @@ Tiers cross-reference the kernel primitives in §6 as **[Kn]**.
 
 ---
 
-## 8. Recommended next step (revised 2026-07-09)
+## 8. Recommended next step (revised 2026-07-09; 07-11 note)
 
-Tier 1 (the registry scaling ceiling) is essentially done and proven live (§0), so the plan has moved on. In priority order:
+Tier 1 (the registry scaling ceiling) is essentially done and proven live (§0), so the plan has moved on. **07-11:** the transfer-plane substrate (§0.1: mux + choke + offer/grant) and census/memory hardening also landed live; the priorities below still hold, and item 3 (SWIM Suspect/Dead [K10]) is now the natural next code item since its census half is done + hardened. In priority order:
 
 1. **Finish the Tier-0 doc-reconciliation sweep (in progress).** `STATE_AND_ROADMAP.md` (this file) and `REGISTRY_DESIGN.md` are updated; still stale: **foundation §62 + Part F**, **GOVERNANCE §4/§6**, **CRAFTCOM_DESIGN §5/§10**, **ENCRYPTION §8**, and the routing/obj/internal-comment drifts in §3.4. They still describe attestation/committee/postcard-blob/Pkarr/tracker/256-fixed-shard models the code has replaced. Low-risk, high-leverage.
 2. **Prove the scaling win with numbers** — deploy hundreds/thousands of heads and measure register/resolve latency vs row count (the per-row SQL win) and held/DB growth (the O(held) win). Converts "should scale" into a curve.
