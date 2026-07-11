@@ -6,6 +6,19 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+/// These tests each spawn 2-5 REAL `zeph` subprocesses and assert on
+/// timing-sensitive behavior (heartbeats, membership convergence, death
+/// detection) within fixed timeouts. libtest runs a binary's tests in parallel,
+/// so without this lock the 4 tests race ~10+ processes for CPU at once and the
+/// tightest one (5-worker death detection, ~24s solo) intermittently blows its
+/// 60s timeout under the contention — a flake, not a fault. Serialize them.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take the serial guard, recovering if a previous test poisoned it by panicking.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Kills the child process on drop so failed asserts don't leak workers.
 struct Worker {
     child: Child,
@@ -60,6 +73,7 @@ fn wait_for(worker: &Worker, needle: &str, timeout: Duration) -> Option<String> 
 
 #[test]
 fn two_workers_exchange_heartbeats() {
+    let _serial = serial();
     let dir_a = tempfile::tempdir().unwrap();
     let dir_b = tempfile::tempdir().unwrap();
     let timeout = Duration::from_secs(30);
@@ -104,6 +118,7 @@ fn two_workers_exchange_heartbeats() {
 /// MU.1 GATE: `zeph status` returns the live peer table over the control socket.
 #[test]
 fn status_subcommand_reports_live_peers() {
+    let _serial = serial();
     let dir_a = tempfile::tempdir().unwrap();
     let dir_b = tempfile::tempdir().unwrap();
     let timeout = Duration::from_secs(30);
@@ -210,6 +225,7 @@ fn free_port() -> u16 {
 /// token persists across a daemon restart so an open page keeps working.
 #[test]
 fn dashboard_serves_and_survives_restart() {
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let dir_path = dir.path().to_str().unwrap();
     let port = free_port();
@@ -267,6 +283,7 @@ fn dashboard_serves_and_survives_restart() {
 /// worker is marked dead in the others' peer tables.
 #[test]
 fn five_workers_membership_join_and_death() {
+    let _serial = serial();
     let timeout = Duration::from_secs(60);
     let dirs: Vec<tempfile::TempDir> = (0..5).map(|_| tempfile::tempdir().unwrap()).collect();
 
