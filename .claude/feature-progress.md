@@ -84,9 +84,11 @@ PHASES (each passes the offline harness before the next; harness FIRST):
     7/7 GREEN (651s) — scenario B census 17.4s drained=true (NO regression; the offer-RTT approach
     hit 35s, this doesn't). Adversarial review (feature-dev:code-reviewer): CLEAN, no findings ≥bar
     (one below-bar cosmetic: reason-string when pressure+tombstone coincide). Clippy clean.
-    NOT yet deployed: the PiecePush class field is a wire-format change → needs a simultaneous roll
-    (gate on user go-ahead; not urgent — jemalloc + critical backstop cover the live fleet; batch
-    with the next wire change or roll standalone when convenient).
+    DEPLOYED + VERIFIED (2026-07-11 ~01:47, user-authorized "Roll it now"): simultaneous 4-node
+    flip (backup → rsync → build 1m17s → install → stop all 4 → start all 4). All 4 active,
+    NRestarts=0, peers=4, live SWIM keepalives @ sub-ms RTT, ZERO panics/ALPN errors. Memory
+    bounded (seed 189MB as hub, others 84-97MB; jemalloc holding). Whole transfer-plane piece path
+    is now admission-controlled on the live fleet.
 Follow-up (deferred, not blocking): reassign governance governor to a Hetzner node (Mac offline).
 
 # SEED-NODE MEMORY: glibc-arena bloat → jemalloc (2026-07-10, ultracode)
