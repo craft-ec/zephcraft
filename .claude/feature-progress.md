@@ -160,10 +160,18 @@ the next candidate in. K governable later (minimal-kernel: mechanism native, pol
     20-node mass-rejoin stress test with several tight bars — NOT a code regression (census + drain
     fixes hold; B solo is clean). A 15.6s scan = slow DHT resolve under 20-node churn; irrelevant to
     the real 4-node fleet. Box binary (census+choke fixes) BUILT, NOT installed; fleet untouched.
-[ ] DECISION (user): census + non-blocking-choke fixes are VALIDATED (B solo 5/5). (a) ROLL them now
-    (staggered; B's full-suite max-job flake is orthogonal, re-run gate if it trips), OR (b) harden
-    scenario B's harness bars for the contended full-suite run first (test-quality task: e.g. bound
-    scan-job duration / loosen the 10s job bar for the 20-node stress), then roll.
+[x] ROLLED + VERIFIED (2026-07-11 ~09:45, user "roll it if the gate passes"). Full gate RETRY =
+    7/7 GREEN (the 15.6s scan was a one-off full-suite contention artifact; no parallel build → B
+    clean). STAGGERED roll (mixed-version-safe, no wire change): install → restart zeph2→zeph3→zeph4
+    →zeph one at a time (09:41/09:43/09:44/09:45), verify each before the next. All 4: active,
+    NRestarts=0, full 4-node mesh (each sees 3 peers), 0 panics, memory bounded (seed 531MB fresh,
+    others ~103MB). NOTE: first roll command truncated after zeph2; continued the remaining 3.
+    LIVE ON THE FLEET: census-convergence fix (periodic epidemic) + element 2 non-blocking choke.
+
+=== ALL 5 TPv2 STRUCTURAL ELEMENTS BUILT + LIVE (1 mux, 2 choke, 3 offer/grant, 4 elected-scan,
+5 fair-sched) + P6 no-RTT class admission + census-convergence fix. Fleet: 4 Hetzner nodes, healthy.
+Open follow-ups (non-blocking): governance governor reassignment (Mac offline); harden scenario B's
+harness bars for the contended full-suite run (test-quality; census+drain fixed, max-job can flake). ===
 === ALL 5 TPv2 STRUCTURAL ELEMENTS BUILT (1 mux, 2 choke, 3 offer/grant, 4 elected-scan, 5 fair-sched);
 elements 1+3+6 LIVE on the fleet; element 2 built+validated, awaiting staggered roll. ===
 
