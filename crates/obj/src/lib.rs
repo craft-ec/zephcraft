@@ -98,6 +98,10 @@ pub struct ObjConfig {
     /// re-announce refresh — spaces DHT ops out so reaching steady state is a slow crawl,
     /// not a burst. Default 1s; tests set it ~0. See PACE_CHUNK.
     pub pace_delay: Duration,
+    /// Element 2 (choke): max DISTINCT peers this node actively PUSHES to at a
+    /// time (BitTorrent active-set bound). Others wait as cheap candidates and
+    /// rotate in as active pushes drain. Default 4. 0 disables the choke.
+    pub active_set_k: usize,
 }
 
 impl Default for ObjConfig {
@@ -112,6 +116,7 @@ impl Default for ObjConfig {
             fade_grace: Duration::from_secs(24 * 60 * 60),
             eviction_cooldown: Duration::from_secs(30 * 24 * 60 * 60),
             pace_delay: Duration::from_secs(1),
+            active_set_k: 4,
         }
     }
 }
@@ -366,6 +371,10 @@ pub struct ObjEngine {
     /// non-winner leaves the previous snapshot intact; the staleness ceiling
     /// forces an unconditional refresh so no cid can go unscanned.
     scan_snapshot: Mutex<HashMap<[u8; 32], ScanSnapshot>>,
+    /// Element 2 (choke): bounds active PUSH work to K distinct peers. None when
+    /// `active_set_k == 0` (disabled). Every push path routes through the free
+    /// `push_piece`, which acquires a slot here before shipping payload.
+    active_set: Option<ActiveSet>,
 }
 
 impl ObjEngine {
@@ -378,6 +387,7 @@ impl ObjEngine {
         peer_source: Arc<dyn PeerSource>,
         config: ObjConfig,
     ) -> Arc<Self> {
+        let active_set = (config.active_set_k > 0).then(|| ActiveSet::new(config.active_set_k));
         Arc::new(Self {
             transport,
             store,
@@ -403,6 +413,7 @@ impl ObjEngine {
             node_liveness: Mutex::new(HashMap::new()),
             cid_health: Mutex::new(HashMap::new()),
             scan_snapshot: Mutex::new(HashMap::new()),
+            active_set,
         })
     }
 
@@ -635,8 +646,18 @@ impl ObjEngine {
             let peer_source = self.peer_source.clone();
             let routing = self.routing.clone();
             let threshold = self.config.durability_threshold;
+            let active = self.active_set.clone();
             tokio::spawn(async move {
-                distribute_initial(transport, store, peer_source, routing, threshold, cid).await;
+                distribute_initial(
+                    transport,
+                    store,
+                    peer_source,
+                    routing,
+                    threshold,
+                    active,
+                    cid,
+                )
+                .await;
             });
         }
 
@@ -773,6 +794,7 @@ impl ObjEngine {
             gen,
             piece,
             class,
+            self.active_set.as_ref(),
             timeout,
         )
         .await
@@ -2273,6 +2295,7 @@ impl ObjEngine {
             self.peer_source.clone(),
             self.routing.clone(),
             self.config.durability_threshold,
+            self.active_set.clone(),
             cid,
         )
         .await
@@ -2801,6 +2824,7 @@ async fn distribute_initial(
     peer_source: Arc<dyn PeerSource>,
     routing: Arc<dyn ContentRouting>,
     threshold: usize,
+    active: Option<ActiveSet>,
     cid: Cid,
 ) {
     let pinned = store.is_pinned(&cid);
@@ -2840,6 +2864,7 @@ async fn distribute_initial(
             if let Ok(jobs) = jobs {
                 let gen_ref = &gen;
                 let transport_ref = &transport;
+                let active_ref = active.as_ref();
                 let results =
                     futures::future::join_all(jobs.iter().map(|(peer, piece)| async move {
                         // Timeout lives INSIDE push_piece/request — an external
@@ -2852,6 +2877,7 @@ async fn distribute_initial(
                             gen_ref,
                             piece,
                             CLASS_NORMAL,
+                            active_ref,
                             PUSH_TIMEOUT,
                         )
                         .await
@@ -2916,8 +2942,17 @@ async fn push_piece(
     gen: &Generation,
     piece: &CodedPiece,
     class: u8,
+    active: Option<&ActiveSet>,
     timeout: Duration,
 ) -> anyhow::Result<()> {
+    // Element 2 (choke): wait for one of the K active-push slots for this peer
+    // (free if we're already pushing to it). Held for the whole push, so a busy
+    // node's slow ack occupies the slot until it drains/times out — the active
+    // set naturally rotates to the next candidate as pushes complete.
+    let _slot = match active {
+        Some(a) => Some(a.enter(peer.node_id()).await),
+        None => None,
+    };
     let msg = wire::Message::PiecePush(wire::PiecePush {
         cid: cid.0,
         k: gen.k,

@@ -1184,6 +1184,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
             fade_grace: Duration::from_secs(cfg.fade_grace_secs),
             eviction_cooldown: Duration::from_secs(cfg.eviction_cooldown_secs),
             pace_delay: Duration::from_secs(cfg.pace_delay_secs),
+            active_set_k: 4, // element 2 choke: K distinct active push peers (default)
         },
     );
     // The owner's encryption keypair (PRE), derived from the identity seed —
