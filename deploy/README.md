@@ -3,6 +3,26 @@
 First deployed 2026-07-02 on Hetzner (Ubuntu 24.04, x86_64) — M1.3b gate:
 Mac behind NAT ↔ server heartbeats over the public internet.
 
+## Pre-deploy gate (MANDATORY before any fleet roll)
+
+```bash
+deploy/gate.sh            # full: fmt + clippy(-D warnings) + workspace tests + A-G harness
+deploy/gate.sh --quick    # skips the ~11min A-G harness — LOCAL-LOGIC changes ONLY,
+                          # NEVER for wire/ALPN/transport/seed changes
+```
+
+`gate.sh` runs the **complete** local test surface and exits non-zero on any
+failure. Run it — and see it print `🟢 GATE PASSED` — before rsync/build/roll.
+
+Why a script instead of "just run the acceptance harness": the A-G suite
+(`tests/tests/transfer_plane.rs`, the `--ignored` scenarios) is **not** the whole
+test surface. The transport unit tests (`crates/transport`) and the noded
+subprocess tests (`crates/noded/tests`) live outside it, and the ping→mux
+migration once left them **red for an entire wire migration** while the A-G suite
+stayed green — the breakage only surfaced later during a cleanup. `cargo test
+--workspace` (step 3 of the gate) covers them; the gate makes running it
+non-optional. The roll procedure itself is in the `zeph-fleet-deploy` memory.
+
 ## Steps (as root)
 
 ```bash
