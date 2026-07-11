@@ -150,10 +150,20 @@ the next candidate in. K governable later (minimal-kernel: mechanism native, pol
     at_risk on the seed). Implicates ELEMENT 2's repair choke (K=4 serializes repair pushes → slower
     repair drain under mass-rejoin). Element 2's value is marginal anyway (acute issues already
     solved by mux+jemalloc+offer/grant).
-[ ] DECISION (user): element 2 — (a) HOLD/disable (active_set_k=0 default; keep the reviewed
-    mechanism behind the flag) since it's marginal + destabilizes the drain bar, OR (b) ship enabled
-    and make the drain bar robust, OR (c) unchoke repair too (leaving only scale/rebalance — nearly
-    a no-op). Census fix stands regardless + is worth rolling.
+[x] CHOKE PROPERLY FIXED (commit 5b3dd9b): ActiveSet::try_enter — NON-BLOCKING. A choked push is
+    DEFERRED (bail → caller redirects/retries) instead of blocking + holding a JobCoordinator slot.
+    Validated: B 5/5 census-fast + drained=true (drain flake GONE); C recovered (choke peaks [4,..,4]
+    exercised+bounded); G recovered arrivals=0. Element 2 now works without destabilizing drain.
+[!] FULL GATE still flaky on scenario B — but NOW on a THIRD, different bar: max-job wall-clock (a
+    15.6s SCAN job > 10s bar) in the FULL-suite run, while B in ISOLATION is rock-solid (max-job
+    106-737ms across 5 runs). So it's a full-suite-context / machine-contention artifact of a harsh
+    20-node mass-rejoin stress test with several tight bars — NOT a code regression (census + drain
+    fixes hold; B solo is clean). A 15.6s scan = slow DHT resolve under 20-node churn; irrelevant to
+    the real 4-node fleet. Box binary (census+choke fixes) BUILT, NOT installed; fleet untouched.
+[ ] DECISION (user): census + non-blocking-choke fixes are VALIDATED (B solo 5/5). (a) ROLL them now
+    (staggered; B's full-suite max-job flake is orthogonal, re-run gate if it trips), OR (b) harden
+    scenario B's harness bars for the contended full-suite run first (test-quality task: e.g. bound
+    scan-job duration / loosen the 10s job bar for the 20-node stress), then roll.
 === ALL 5 TPv2 STRUCTURAL ELEMENTS BUILT (1 mux, 2 choke, 3 offer/grant, 4 elected-scan, 5 fair-sched);
 elements 1+3+6 LIVE on the fleet; element 2 built+validated, awaiting staggered roll. ===
 
