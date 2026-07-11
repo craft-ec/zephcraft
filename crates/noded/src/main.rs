@@ -1505,10 +1505,6 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // Fully muxed: every protocol is a per-stream tag on the shared per-peer
     // connection — no legacy per-ALPN connection handlers remain.
     let (ping_stream_tx, mut ping_rx) = tokio::sync::mpsc::channel(32);
-    let handlers: Vec<(
-        Vec<u8>,
-        tokio::sync::mpsc::Sender<zeph_transport::Connection>,
-    )> = vec![];
     let mut stream_handlers: Vec<(u8, tokio::sync::mpsc::Sender<zeph_transport::TaggedStream>)> =
         vec![(zeph_transport::tag::PING, ping_stream_tx)];
     if let Some(dht) = &dht_node {
@@ -1527,7 +1523,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let (invoke_stream_tx, invoke_stream_rx) = tokio::sync::mpsc::channel(32);
     stream_handlers.push((zeph_transport::tag::INVOKE, invoke_stream_tx));
     let server = transport.clone();
-    tokio::spawn(async move { server.serve(handlers, stream_handlers).await });
+    tokio::spawn(async move { server.serve(stream_handlers).await });
     tokio::spawn(engine.clone().serve(piece_stream_rx));
     tokio::spawn(zeph_sql::serve_pages(sql_dir.clone(), sqlpage_stream_rx));
     tokio::spawn(zeph_com::serve_invocations(

@@ -482,7 +482,7 @@ mod tests {
         let node = DhtNode::new(id, transport.clone(), 3_600_000);
         let (tx, rx) = mpsc::channel(64);
         let t = transport.clone();
-        tokio::spawn(async move { t.serve(vec![], vec![(tag::DHT, tx)]).await });
+        tokio::spawn(async move { t.serve(vec![(tag::DHT, tx)]).await });
         node.clone().serve(rx);
         node
     }

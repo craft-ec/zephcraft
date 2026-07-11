@@ -18,12 +18,6 @@ use zeph_core::hlc;
 use zeph_core::{Cid, NodeId};
 use zeph_wire as wire;
 
-/// ALPN identifiers for zeph protocols (foundation §10, §22).
-pub mod alpn {
-    /// Heartbeat ping/pong (M1); superseded by wire frames in M1.4.
-    pub const PING: &[u8] = b"/craftec/ping/1";
-}
-
 /// Transfer Plane v2 element 1 — MUX: one QUIC connection per peer carries
 /// EVERY protocol; each bi-stream begins with a 1-byte protocol tag instead of
 /// negotiating a per-protocol ALPN at handshake. Collapses ~O(peers×protocols)
@@ -183,26 +177,12 @@ pub struct Transport {
     closed: std::sync::atomic::AtomicBool,
     /// Serializes rebinds; a concurrent caller waits, then finds a fresh epoch.
     rebind_lock: tokio::sync::Mutex<()>,
-    /// Pooled connections: ONE live QUIC connection per (peer, ALPN), shared
-    /// by every caller — streams multiplex over it. Reuse keeps handshake
-    /// volume and connection-state memory bounded by PEER COUNT instead of
-    /// request rate: conn-per-request ballooned rejoining nodes to their OOM
-    /// cap under churn (~1 GB of pending-connection state on one node, freed
-    /// in a single instant when the stacked attempts aborted — measured).
-    /// Closed entries re-dial lazily; cleared on rebind.
-    pool: std::sync::Mutex<std::collections::HashMap<PoolKey, Connection>>,
-    /// Per-key dial locks: concurrent dials to the SAME (peer, ALPN) collapse
-    /// into one attempt (the winners re-check the pool). During churn every
-    /// subsystem dials the same dead peer at once — probe, DHT, replication —
-    /// and each parallel attempt held its own handshake state for the full
-    /// timeout.
-    dials: std::sync::Mutex<
-        std::collections::HashMap<PoolKey, std::sync::Arc<tokio::sync::Mutex<()>>>,
-    >,
     /// MUX pool (element 1): ONE live QUIC connection per PEER (keyed by NodeId
     /// only, ALPN-free), shared by every protocol — streams carry a 1-byte tag.
-    /// Coexists with `pool` during the per-protocol migration; once every
-    /// protocol is muxed, `pool`/`dials` (the per-(peer,ALPN) maps) go away.
+    /// Reuse keeps handshake volume and connection-state memory bounded by PEER
+    /// COUNT instead of request rate (conn-per-request ballooned rejoining nodes
+    /// to their OOM cap under churn — measured). Closed entries re-dial lazily;
+    /// cleared on rebind.
     mux_pool: std::sync::Mutex<std::collections::HashMap<[u8; 32], Connection>>,
     /// Per-peer dial-collapse locks for the mux connection (mirrors `dials`).
     mux_dials: std::sync::Mutex<
@@ -214,11 +194,6 @@ pub struct Transport {
     /// timeout, is never pooled, and is retried forever). Excess dialers wait
     /// here as cheap futures instead.
     dial_permits: std::sync::Arc<tokio::sync::Semaphore>,
-    /// RESERVED dial slots for the liveness ping ALPN: probes must never
-    /// queue behind bulk dials, or a storm's dial backlog starves probe
-    /// rounds past their timeout and healthy peers get falsely marked dead —
-    /// churn feeding churn (review finding).
-    ping_dial_permits: std::sync::Arc<tokio::sync::Semaphore>,
     clock: std::sync::Arc<hlc::Clock>,
 }
 
@@ -229,17 +204,12 @@ pub struct Transport {
 /// staying a hard memory bound: 48 in-flight handshakes is ~10MB, vs the
 /// unbounded thousands that OOMed nodes before the cap existed.
 const MAX_CONCURRENT_DIALS: usize = 48;
-/// Reserved concurrent dial slots for liveness pings.
-const MAX_CONCURRENT_PING_DIALS: usize = 4;
 
 /// Max concurrently-dispatching inbound streams per MUX connection (all
 /// protocols share one connection now, so this bounds a single peer's in-flight
 /// requests across every protocol; the permit is held only through the tag read
 /// + hand-off, so slow request HANDLING backpressures via the handler channels).
 const MUX_PIPELINE_STREAMS: usize = 64;
-
-/// Pool key: remote node + ALPN (one connection per protocol per peer).
-type PoolKey = ([u8; 32], Vec<u8>);
 
 impl Transport {
     /// Bind an endpoint using the node's Ed25519 identity as the QUIC secret
@@ -285,14 +255,9 @@ impl Transport {
             epoch: std::sync::atomic::AtomicU64::new(0),
             closed: std::sync::atomic::AtomicBool::new(false),
             rebind_lock: tokio::sync::Mutex::new(()),
-            pool: std::sync::Mutex::new(std::collections::HashMap::new()),
-            dials: std::sync::Mutex::new(std::collections::HashMap::new()),
             mux_pool: std::sync::Mutex::new(std::collections::HashMap::new()),
             mux_dials: std::sync::Mutex::new(std::collections::HashMap::new()),
             dial_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DIALS)),
-            ping_dial_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
-                MAX_CONCURRENT_PING_DIALS,
-            )),
             clock: std::sync::Arc::new(hlc::Clock::new()),
         })
     }
@@ -353,12 +318,11 @@ impl Transport {
         self.epoch.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Number of live pooled connections — the per-(peer,ALPN) pool plus the
-    /// per-peer mux pool. As protocols migrate to mux this shifts from
-    /// O(peers×protocols) toward O(peers); the acceptance harness asserts the
-    /// reduction.
+    /// Number of live pooled connections — one per peer in the mux pool
+    /// (O(peers), not O(peers×protocols)); the acceptance harness asserts this
+    /// per-peer ceiling.
     pub fn connection_count(&self) -> usize {
-        self.pool.lock().expect("conn pool").len() + self.mux_pool.lock().expect("mux pool").len()
+        self.mux_pool.lock().expect("mux pool").len()
     }
 
     /// Tear the endpoint down and bind a fresh one with the identical config
@@ -380,7 +344,6 @@ impl Transport {
         // close — a wedged endpoint may not close cleanly. Every pooled
         // connection belongs to the old endpoint, so flush the pool with it.
         let old = self.current();
-        self.pool.lock().expect("conn pool").clear();
         self.mux_pool.lock().expect("mux pool").clear();
         let _ = tokio::time::timeout(Duration::from_secs(5), old.close()).await;
         let mut last_err = String::new();
@@ -433,107 +396,20 @@ impl Transport {
         PeerAddr(self.current().addr())
     }
 
-    /// A live connection to `peer` for `alpn` — pooled, or freshly dialed and
-    /// pooled. Callers open streams on it (`open_bi`) and MUST NOT close it:
-    /// the connection is shared and long-lived; iroh's idle timeout reclaims
-    /// unused ones (a closed entry re-dials lazily on the next call). After a
-    /// request on it fails, call [`Self::evict`] so the next request re-dials.
-    pub async fn connect(&self, peer: &PeerAddr, alpn: &[u8]) -> Result<Connection> {
-        let key = (peer.node_id().0, alpn.to_vec());
-        if let Some(conn) = self.pool.lock().expect("conn pool").get(&key) {
-            // Closed (idle-timeout, peer restart, error) → fall through and re-dial.
-            if conn.close_reason().is_none() {
-                return Ok(conn.clone());
-            }
-        }
-        self.connect_fresh(peer, alpn).await
-    }
-
-    /// Dial a NEW connection and pool it, replacing any existing entry —
-    /// the recovery path when a pooled connection is broken in a way
-    /// `close_reason` cannot see yet (callers evict the broken entry first).
-    /// A replaced connection is only dropped from the pool, never closed
-    /// here: a concurrent caller may still be mid-request on it, and iroh's
-    /// idle timeout reclaims it shortly after.
-    ///
-    /// Two bounds keep dial-attempt state from ballooning during churn (the
-    /// measured OOM driver once per-request conns were pooled): concurrent
-    /// dials to the SAME (peer, ALPN) serialize on a per-key lock — losers
-    /// re-check the pool the winner filled instead of dialing again — and a
-    /// global semaphore caps handshakes in flight; excess dialers wait as
-    /// cheap futures (cancellation-safe: a caller's timeout dropping the
-    /// future releases both without leaking).
-    pub async fn connect_fresh(&self, peer: &PeerAddr, alpn: &[u8]) -> Result<Connection> {
-        let key = (peer.node_id().0, alpn.to_vec());
-        let dial_lock = {
-            let mut dials = self.dials.lock().expect("dials");
-            dials
-                .entry(key.clone())
-                .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
-            // Entries are tiny and bounded by peers×ALPNs; never pruned.
-        };
-        let _dial_guard = dial_lock.lock().await;
-        // A concurrent dialer may have just filled the pool while we waited —
-        // its connection is as fresh as one we would dial now.
-        if let Some(conn) = self.pool.lock().expect("conn pool").get(&key) {
-            if conn.close_reason().is_none() {
-                return Ok(conn.clone());
-            }
-        }
-        // Liveness pings dial through their own reserved lane.
-        let sem = if alpn == alpn::PING {
-            &self.ping_dial_permits
-        } else {
-            &self.dial_permits
-        };
-        let _permit = sem
-            .acquire()
-            .await
-            .map_err(|_| TransportError::Connect("dial semaphore closed".into()))?;
-        let conn = self
-            .current()
-            .connect(peer.0.clone(), alpn)
-            .await
-            .map_err(|e| TransportError::Connect(e.to_string()))?;
-        self.pool
-            .lock()
-            .expect("conn pool")
-            .insert(key, conn.clone());
-        Ok(conn)
-    }
-
-    /// Drop the pooled connection for (peer, alpn) if it is still `failed` —
-    /// callers report a request failure here so the next request re-dials.
-    /// The identity check keeps a stale caller from evicting a healthy
-    /// replacement that another task already dialed.
-    pub fn evict(&self, peer: &PeerAddr, alpn: &[u8], failed: &Connection) {
-        let key = (peer.node_id().0, alpn.to_vec());
-        let mut pool = self.pool.lock().expect("conn pool");
-        if pool
-            .get(&key)
-            .is_some_and(|c| c.stable_id() == failed.stable_id())
-        {
-            pool.remove(&key);
-        }
-    }
-
-    /// Drop every pooled connection to `peer` (all ALPNs + mux) — for callers
-    /// that declared the peer dead and want no lingering entries for it.
+    /// Drop the pooled mux connection to `peer` — for callers that declared the
+    /// peer dead and want no lingering entry for it.
     pub fn evict_peer(&self, peer: &NodeId) {
-        self.pool
-            .lock()
-            .expect("conn pool")
-            .retain(|(id, _), _| id != &peer.0);
         self.mux_pool.lock().expect("mux pool").remove(&peer.0);
     }
 
     // ── MUX (element 1): one connection per peer, protocol chosen per-stream ──
 
     /// A live MUX connection to `peer` (pooled per-peer, or freshly dialed and
-    /// pooled). Every protocol shares it; callers use [`Self::open_tagged`]
-    /// rather than this directly. Mirrors [`Self::connect`] but keyed by NodeId
-    /// only and dialing the single [`MUX_ALPN`].
+    /// pooled). Every protocol shares it; most callers go through
+    /// [`Self::request_tagged`] rather than dialing this directly. Keyed by
+    /// NodeId only, dialing the single [`MUX_ALPN`]; concurrent first-dials to a
+    /// peer collapse to one handshake and a global semaphore bounds handshakes
+    /// in flight.
     pub async fn mux_conn(&self, peer: &PeerAddr) -> Result<Connection> {
         let id = peer.node_id().0;
         if let Some(conn) = self.mux_pool.lock().expect("mux pool").get(&id) {
@@ -570,30 +446,6 @@ impl Transport {
             .expect("mux pool")
             .insert(id, conn.clone());
         Ok(conn)
-    }
-
-    /// Open a fresh bi-stream to `peer` for protocol `tag` on the shared mux
-    /// connection: writes the 1-byte tag, then hands back the stream halves for
-    /// the caller to write its request payload + `finish()` and read the reply
-    /// (exactly as on a per-ALPN `open_bi` stream). On any stream-open failure
-    /// the mux connection is evicted so the next call re-dials.
-    pub async fn open_tagged(&self, peer: &PeerAddr, tag: u8) -> Result<(SendStream, RecvStream)> {
-        let conn = self.mux_conn(peer).await?;
-        let opened = async {
-            let (mut send, recv) = conn
-                .open_bi()
-                .await
-                .map_err(|e| TransportError::Stream(e.to_string()))?;
-            send.write_all(&[tag])
-                .await
-                .map_err(|e| TransportError::Stream(e.to_string()))?;
-            Ok::<_, TransportError>((send, recv))
-        }
-        .await;
-        if opened.is_err() {
-            self.evict_mux(peer, &conn);
-        }
-        opened
     }
 
     /// Drop the pooled mux connection for `peer` if it is still `failed`
@@ -638,33 +490,6 @@ impl Transport {
             recv.read_to_end(max_reply)
                 .await
                 .map_err(|e| TransportError::Stream(e.to_string()))
-        }
-        .await;
-        if round.is_err() {
-            self.evict_mux(peer, &conn);
-        }
-        round
-    }
-
-    /// One muxed one-way push (no reply): open a `tag` stream, write `req` +
-    /// finish, drop the recv half. Used by fire-and-forget messages (e.g.
-    /// membership Join/Disconnect). Evicts the mux connection on failure.
-    pub async fn send_tagged(&self, peer: &PeerAddr, tag: u8, req: &[u8]) -> Result<()> {
-        let conn = self.mux_conn(peer).await?;
-        let round = async {
-            let (mut send, _recv) = conn
-                .open_bi()
-                .await
-                .map_err(|e| TransportError::Stream(e.to_string()))?;
-            send.write_all(&[tag])
-                .await
-                .map_err(|e| TransportError::Stream(e.to_string()))?;
-            send.write_all(req)
-                .await
-                .map_err(|e| TransportError::Stream(e.to_string()))?;
-            send.finish()
-                .map_err(|e| TransportError::Stream(e.to_string()))?;
-            Ok::<(), TransportError>(())
         }
         .await;
         if round.is_err() {
@@ -737,40 +562,25 @@ impl Transport {
         out
     }
 
-    /// Accept loop: route incoming connections to their handlers. A MUX_ALPN
-    /// connection is demultiplexed per-stream by its 1-byte tag into
-    /// `stream_handlers`; any other (legacy per-ALPN) connection is routed whole
-    /// to `conn_handlers` by its negotiated ALPN. Unrecognized → closed. Survives
-    /// [`Self::rebind`] by re-attaching to the fresh endpoint; runs until
-    /// [`Self::close`]. Spawn this on the runtime.
-    pub async fn serve(
-        &self,
-        conn_handlers: Vec<(Vec<u8>, tokio::sync::mpsc::Sender<Connection>)>,
-        stream_handlers: Vec<(u8, tokio::sync::mpsc::Sender<TaggedStream>)>,
-    ) {
+    /// Accept loop: every inbound connection is a MUX_ALPN connection,
+    /// demultiplexed per-stream by its 1-byte tag into `stream_handlers`; a
+    /// connection on any other ALPN is closed. Survives [`Self::rebind`] by
+    /// re-attaching to the fresh endpoint; runs until [`Self::close`]. Spawn
+    /// this on the runtime.
+    pub async fn serve(&self, stream_handlers: Vec<(u8, tokio::sync::mpsc::Sender<TaggedStream>)>) {
         use std::sync::atomic::Ordering;
-        let conn_handlers = std::sync::Arc::new(conn_handlers);
         let stream_handlers = std::sync::Arc::new(stream_handlers);
         loop {
             let epoch = self.epoch.load(Ordering::Acquire);
             let endpoint = self.current();
             while let Some(incoming) = endpoint.accept().await {
-                let conn_handlers = conn_handlers.clone();
                 let stream_handlers = stream_handlers.clone();
                 tokio::spawn(async move {
                     let Ok(conn) = incoming.await else { return };
-                    let alpn = conn.alpn().to_vec();
-                    if alpn == MUX_ALPN {
+                    if conn.alpn() == MUX_ALPN {
                         Self::demux_conn(conn, stream_handlers).await;
-                        return;
-                    }
-                    match conn_handlers.iter().find(|(a, _)| *a == alpn) {
-                        Some((_, tx)) => {
-                            if tx.send(conn).await.is_err() {
-                                // handler gone; nothing to do
-                            }
-                        }
-                        None => conn.close(1u32.into(), b"unknown alpn"),
+                    } else {
+                        conn.close(1u32.into(), b"unknown alpn");
                     }
                 });
             }
@@ -822,7 +632,7 @@ impl Transport {
     pub async fn serve_ping(&self) {
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let clock = self.clock();
-        let serve = self.serve(vec![], vec![(tag::PING, tx)]);
+        let serve = self.serve(vec![(tag::PING, tx)]);
         let dispatch = async move {
             while let Some(stream) = rx.recv().await {
                 tokio::spawn(Self::handle_ping_stream(clock.clone(), stream));
@@ -860,13 +670,13 @@ impl Transport {
         );
         let _ = send.write_all(&reply).await;
         let _ = send.finish();
+        tracing::info!(peer = %&peer[..12], "ping served");
     }
 
     /// Gracefully close all connections and end the serve loops.
     pub async fn close(&self) {
         self.closed
             .store(true, std::sync::atomic::Ordering::Release);
-        self.pool.lock().expect("conn pool").clear();
         self.mux_pool.lock().expect("mux pool").clear();
         self.current().close().await;
     }
@@ -910,7 +720,7 @@ mod tests {
         let server = Transport::bind(
             server_id.secret_key_bytes(),
             Reach::LocalOnly,
-            vec![alpn::PING.to_vec()],
+            vec![MUX_ALPN.to_vec()],
             0,
         )
         .await
@@ -927,14 +737,15 @@ mod tests {
             .await
             .unwrap();
 
-        // Hand-roll a garbage payload on the ping ALPN: no PONG must come back.
-        let conn = client.connect(&server_addr, alpn::PING).await.unwrap();
+        // Hand-roll a garbage payload on a tag::PING mux stream: no PONG back.
+        // (Shared mux connection — don't close it; the ping below reuses it.)
+        let conn = client.mux_conn(&server_addr).await.unwrap();
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(&[tag::PING]).await.unwrap();
         send.write_all(b"not a frame").await.unwrap();
         send.finish().unwrap();
         let reply = recv.read_to_end(MAX_PING_FRAME).await.unwrap_or_default();
         assert!(reply.is_empty(), "server must not answer garbage");
-        conn.close(0u32.into(), b"done");
 
         // A proper framed ping still works.
         let report = client
@@ -959,7 +770,7 @@ mod tests {
             Transport::bind(
                 server_id.secret_key_bytes(),
                 Reach::LocalOnly,
-                vec![alpn::PING.to_vec()],
+                vec![MUX_ALPN.to_vec()],
                 0,
             )
             .await
@@ -1004,16 +815,17 @@ mod tests {
         serve.abort();
     }
 
-    /// Connection pool: repeated connects to the same (peer, ALPN) return the
-    /// SAME connection; evict forces a re-dial; rebind clears the pool.
+    /// MUX pool: repeated mux_conn to a peer returns the SAME connection (one per
+    /// peer); evict_peer drops it so the next call re-dials; a stale evict_mux is
+    /// ignored; rebind clears the pool.
     #[tokio::test]
-    async fn pool_reuses_evicts_and_clears_on_rebind() {
+    async fn mux_pool_reuses_evicts_and_clears_on_rebind() {
         let server_id = NodeIdentity::generate();
         let server = std::sync::Arc::new(
             Transport::bind(
                 server_id.secret_key_bytes(),
                 Reach::LocalOnly,
-                vec![alpn::PING.to_vec()],
+                vec![MUX_ALPN.to_vec()],
                 0,
             )
             .await
@@ -1030,28 +842,36 @@ mod tests {
             .unwrap();
         let addr = server.addr();
 
-        // Reuse: same underlying connection both times.
-        let c1 = client.connect(&addr, alpn::PING).await.unwrap();
-        let c2 = client.connect(&addr, alpn::PING).await.unwrap();
-        assert_eq!(c1.stable_id(), c2.stable_id(), "pooled connection reused");
-
-        // Two pings ride the pool (no per-request close teardown).
+        // Reuse: one connection per peer, shared by every caller.
+        let c1 = client.mux_conn(&addr).await.unwrap();
+        let c2 = client.mux_conn(&addr).await.unwrap();
+        assert_eq!(
+            c1.stable_id(),
+            c2.stable_id(),
+            "pooled mux connection reused"
+        );
         client.ping(&addr, Duration::from_secs(10)).await.unwrap();
-        client.ping(&addr, Duration::from_secs(10)).await.unwrap();
+        assert_eq!(
+            client.connection_count(),
+            1,
+            "still one connection after a ping"
+        );
 
-        // Evict: next connect dials a NEW connection.
-        client.evict(&addr, alpn::PING, &c2);
-        let c3 = client.connect(&addr, alpn::PING).await.unwrap();
-        assert_ne!(c2.stable_id(), c3.stable_id(), "evicted → re-dialed");
+        // Evict the whole peer → the next mux_conn dials fresh.
+        client.evict_peer(&addr.node_id());
+        assert_eq!(client.connection_count(), 0, "evict_peer cleared the entry");
+        let c3 = client.mux_conn(&addr).await.unwrap();
+        assert_ne!(c1.stable_id(), c3.stable_id(), "evicted → re-dialed");
 
-        // A stale evict (old connection) must NOT drop the current entry.
-        client.evict(&addr, alpn::PING, &c2);
-        let c4 = client.connect(&addr, alpn::PING).await.unwrap();
+        // A stale evict (the OLD connection) must NOT drop the healthy current one.
+        client.evict_mux(&addr, &c1);
+        let c4 = client.mux_conn(&addr).await.unwrap();
         assert_eq!(c3.stable_id(), c4.stable_id(), "stale evict ignored");
 
-        // Rebind clears the pool; connects and pings work from the fresh endpoint.
+        // Rebind clears the pool; a fresh connection dials from the new endpoint.
         client.rebind().await.unwrap();
-        let c5 = client.connect(&addr, alpn::PING).await.unwrap();
+        assert_eq!(client.connection_count(), 0, "rebind cleared the pool");
+        let c5 = client.mux_conn(&addr).await.unwrap();
         assert_ne!(c4.stable_id(), c5.stable_id(), "pool cleared on rebind");
         client.ping(&addr, Duration::from_secs(10)).await.unwrap();
 
@@ -1060,16 +880,16 @@ mod tests {
         serve.abort();
     }
 
-    /// Dial dedup: concurrent first connects to the same (peer, ALPN) must
-    /// collapse into ONE dial — every caller gets the same connection.
+    /// MUX dial dedup: concurrent first mux_conn to the same peer must collapse
+    /// into ONE dial — every caller gets the same connection.
     #[tokio::test]
-    async fn concurrent_connects_dedup_to_one_dial() {
+    async fn concurrent_mux_conn_dedup_to_one_dial() {
         let server_id = NodeIdentity::generate();
         let server = std::sync::Arc::new(
             Transport::bind(
                 server_id.secret_key_bytes(),
                 Reach::LocalOnly,
-                vec![alpn::PING.to_vec()],
+                vec![MUX_ALPN.to_vec()],
                 0,
             )
             .await
@@ -1095,14 +915,15 @@ mod tests {
         for _ in 0..8 {
             let (c, a) = (client.clone(), addr.clone());
             tasks.push(tokio::spawn(async move {
-                c.connect(&a, alpn::PING).await.unwrap().stable_id()
+                c.mux_conn(&a).await.unwrap().stable_id()
             }));
         }
         let mut ids = std::collections::HashSet::new();
         for t in tasks {
             ids.insert(t.await.unwrap());
         }
-        assert_eq!(ids.len(), 1, "8 concurrent connects → 1 dialed connection");
+        assert_eq!(ids.len(), 1, "8 concurrent mux_conn → 1 dialed connection");
+        assert_eq!(client.connection_count(), 1, "one pooled connection");
 
         client.close().await;
         server.close().await;
@@ -1118,7 +939,7 @@ mod tests {
         let server = Transport::bind(
             server_id.secret_key_bytes(),
             Reach::LocalOnly,
-            vec![alpn::PING.to_vec()],
+            vec![MUX_ALPN.to_vec()],
             0,
         )
         .await

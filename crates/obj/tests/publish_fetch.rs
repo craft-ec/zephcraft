@@ -55,10 +55,7 @@ async fn node_with(
 
     let (tx, rx) = tokio::sync::mpsc::channel(64);
     let st = t.clone();
-    tokio::spawn(async move {
-        st.serve(vec![], vec![(zeph_transport::tag::PIECE, tx)])
-            .await
-    });
+    tokio::spawn(async move { st.serve(vec![(zeph_transport::tag::PIECE, tx)]).await });
     let se = engine.clone();
     tokio::spawn(async move { se.serve(rx).await });
     (engine, routing, addr)

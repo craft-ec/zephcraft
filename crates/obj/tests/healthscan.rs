@@ -69,10 +69,8 @@ async fn node(tracker: &MemNet, dir: &std::path::Path) -> Node {
     );
     let (tx, rx) = tokio::sync::mpsc::channel(64);
     let st = t.clone();
-    let serve_task = tokio::spawn(async move {
-        st.serve(vec![], vec![(zeph_transport::tag::PIECE, tx)])
-            .await
-    });
+    let serve_task =
+        tokio::spawn(async move { st.serve(vec![(zeph_transport::tag::PIECE, tx)]).await });
     let se = engine.clone();
     let engine_task = tokio::spawn(async move { se.serve(rx).await });
     Node {

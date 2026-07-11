@@ -261,7 +261,7 @@ mod tests {
         let n = DhtNode::new(id, transport.clone(), 3_600_000);
         let (tx, rx) = mpsc::channel(64);
         let t = transport.clone();
-        tokio::spawn(async move { t.serve(vec![], vec![(zeph_transport::tag::DHT, tx)]).await });
+        tokio::spawn(async move { t.serve(vec![(zeph_transport::tag::DHT, tx)]).await });
         n.clone().serve(rx);
         let c = n.contact();
         (n, c)

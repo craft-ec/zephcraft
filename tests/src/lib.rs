@@ -296,15 +296,9 @@ impl TestNode {
             }));
         }
 
-        // ALPN dispatcher: ping + membership + pieces + dht share the endpoint.
-        // ping is the last legacy per-ALPN connection handler; dht/member/piece
-        // are muxed per-stream-tag handlers.
+        // Mux dispatcher: ping + membership + pieces + dht all ride the shared
+        // per-peer connection as per-stream-tag handlers.
         let (ping_stream_tx, mut ping_rx) = tokio::sync::mpsc::channel(32);
-        // Fully muxed: every protocol is a per-stream tag; no legacy conn handlers.
-        let handlers: Vec<(
-            Vec<u8>,
-            tokio::sync::mpsc::Sender<zeph_transport::Connection>,
-        )> = vec![];
         let (dht_stream_tx, dht_stream_rx) = tokio::sync::mpsc::channel(32);
         let (member_stream_tx, member_stream_rx) = tokio::sync::mpsc::channel(32);
         let (piece_stream_tx, piece_stream_rx) = tokio::sync::mpsc::channel(32);
@@ -316,9 +310,9 @@ impl TestNode {
         ];
         dht.clone().serve(dht_stream_rx);
         let server = transport.clone();
-        tasks.push(tokio::spawn(async move {
-            server.serve(handlers, stream_handlers).await
-        }));
+        tasks.push(tokio::spawn(
+            async move { server.serve(stream_handlers).await },
+        ));
         tasks.push(tokio::spawn(engine.clone().serve(piece_stream_rx)));
         let ping_clock = transport.clock();
         tasks.push(tokio::spawn(async move {
