@@ -11,6 +11,7 @@
 //! so only a transfer to a NEW peer waits for a slot.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -24,6 +25,10 @@ pub struct ActiveSet {
     /// Active peers → their held permit + in-flight refcount. The permit is
     /// retained for as long as the peer has any in-flight transfer work.
     active: Arc<Mutex<HashMap<[u8; 32], Entry>>>,
+    /// High-water mark of concurrent DISTINCT active peers (observability: the
+    /// harness asserts this stays within K, proving the choke actually bounds
+    /// real push traffic and is wired into the path).
+    peak: Arc<AtomicUsize>,
 }
 
 struct Entry {
@@ -48,6 +53,7 @@ impl ActiveSet {
         Self {
             slots: Arc::new(Semaphore::new(k.max(1))),
             active: Arc::new(Mutex::new(HashMap::new())),
+            peak: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -85,6 +91,7 @@ impl ActiveSet {
                         refs: 1,
                     },
                 );
+                self.peak.fetch_max(active.len(), Ordering::Relaxed);
                 return self.guard(id);
             }
         }
@@ -102,6 +109,13 @@ impl ActiveSet {
     /// Distinct peers currently in the active set (observability / tests).
     pub fn active_len(&self) -> usize {
         self.active.lock().expect("active set poisoned").len()
+    }
+
+    /// High-water mark of concurrent distinct active peers since construction —
+    /// the harness asserts this stayed within K (choke bound held under load)
+    /// AND was non-zero (the choke is actually on the push path).
+    pub fn peak_active(&self) -> usize {
+        self.peak.load(Ordering::Relaxed)
     }
 }
 

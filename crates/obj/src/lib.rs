@@ -505,6 +505,13 @@ impl ObjEngine {
         &self.config
     }
 
+    /// Element 2 (choke) high-water mark: the most DISTINCT peers this node
+    /// pushed to concurrently since boot. `None` when the choke is disabled
+    /// (`active_set_k == 0`). The harness asserts `Some(p)` with `1 <= p <= K`.
+    pub fn active_set_peak(&self) -> Option<usize> {
+        self.active_set.as_ref().map(|a| a.peak_active())
+    }
+
     /// Content is "alive" — worth maintaining/spreading — iff it is pinned
     /// (locally or by a provider), wanted (locally or network-wide), or fetched
     /// within the fade grace window. Otherwise it fades (Repair + Distribution

@@ -337,6 +337,30 @@ async fn scenario_a_steady_state() {
         ));
     }
 
+    // Element 2 (choke): every node's active-push high-water mark must have
+    // stayed within K (the bound held under real distribution) AND been non-zero
+    // on the pushers (the choke is actually on the push path, not bypassed).
+    let k = nodes[0].engine.config().active_set_k;
+    let peaks: Vec<Option<usize>> = nodes.iter().map(|nd| nd.engine.active_set_peak()).collect();
+    println!("scenario A: choke K={k}; active-push peaks per node = {peaks:?}");
+    for (i, p) in peaks.iter().enumerate() {
+        match p {
+            None => violations.push(format!(
+                "node{i}: choke disabled (active_set_k=0) — element 2 not active"
+            )),
+            Some(peak) if *peak > k => violations.push(format!(
+                "node{i}: active-push peak {peak} exceeded the choke bound K={k}"
+            )),
+            _ => {}
+        }
+    }
+    if peaks.iter().flatten().all(|p| *p == 0) {
+        violations.push(
+            "no node pushed through the choke — active set never exercised (wiring bypassed?)"
+                .into(),
+        );
+    }
+
     if !violations.is_empty() {
         println!("--- scenario A FAILURE diagnostics ---");
         println!("full latency distribution (ms, sorted): {ms:?}");
