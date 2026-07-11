@@ -174,9 +174,13 @@ const REPAIR_BATCH: usize = 8;
 /// Offer/grant push classes (TRANSFER_PLANE_V2 §3). A durability-critical push
 /// (restoring a cid below its floor) outranks a normal distribute/scale push
 /// when the receiver is under memory pressure — the grant gate protects the
-/// critical class first.
+/// critical class first. Only the CRITICAL (repair) path currently issues
+/// offers; class 1 (normal, for distribute/scale) is reserved — per-piece
+/// offers on the burst distribute path overloaded the seed and pushed
+/// scenario B's census past its bar, so distribute admission is deferred to a
+/// no-extra-RTT design (carry the class on the push, gate graded at ingest).
+/// Meanwhile jemalloc bounds RSS and the critical shed_gate is the backstop.
 pub const CLASS_CRITICAL: u8 = 0;
-pub const CLASS_NORMAL: u8 = 1;
 
 /// Most pieces a healthy receiver grants from a single offer (bounds a burst
 /// from one sender — the sender re-offers or redirects the remainder). The
@@ -778,16 +782,7 @@ impl ObjEngine {
     /// failure or unexpected reply returns 0 — the caller treats a non-grant
     /// like a declined grant and redirects the piece to another candidate.
     async fn offer(&self, peer: &PeerAddr, class: u8, cid: Cid, items: u16, bytes: u64) -> u16 {
-        let msg = wire::Message::Offer(wire::Offer {
-            class,
-            cid: cid.0,
-            items,
-            bytes,
-        });
-        match request(&self.transport, peer, &msg, PUSH_TIMEOUT).await {
-            Ok(wire::Message::Grant(g)) => g.accept.min(items),
-            _ => 0,
-        }
+        offer(&self.transport, peer, class, cid, items, bytes).await
     }
 
     /// Fetch content by CID alone: resolve providers, fetch + verify + decode.
@@ -2860,6 +2855,31 @@ async fn distribute_initial(
     }
     if pinned {
         let _ = routing.announce(cid, 0, true).await;
+    }
+}
+
+/// Offer a batch of `items` pushes for `cid` to `peer` (TRANSFER_PLANE_V2 §3)
+/// and return how many the peer will accept (0..=items). A free fn over
+/// `&Arc<Transport>` so the fire-and-forget distribution task can admission-gate
+/// its pushes without `&self`. Any transport error / unexpected reply → 0 (the
+/// caller skips or redirects the push, treating a non-grant as a decline).
+async fn offer(
+    transport: &Arc<Transport>,
+    peer: &PeerAddr,
+    class: u8,
+    cid: Cid,
+    items: u16,
+    bytes: u64,
+) -> u16 {
+    let msg = wire::Message::Offer(wire::Offer {
+        class,
+        cid: cid.0,
+        items,
+        bytes,
+    });
+    match request(transport, peer, &msg, PUSH_TIMEOUT).await {
+        Ok(wire::Message::Grant(g)) => g.accept.min(items),
+        _ => 0,
     }
 }
 

@@ -46,8 +46,17 @@ PHASES (each passes the offline harness before the next; harness FIRST):
     REDIRECT_MARGIN=8 spare recruits. repair_cid→repair_one so ALL repair traffic is admission-gated
     (publish-distribute + demand-scale paths still push un-offered — repair is the durability-
     critical path + backstop). noded wires grant_gate→ResourceGauge.
-    NOTE: distribute path is NOT yet offer-gated — a follow-up if the harness needs it; repair
-    covers the durability guarantee.
+    Adversarial review (feature-dev:code-reviewer): NO logic bugs in grant/offer/repair_one cursor.
+    Only finding = distribute-path scope gap (HIGH-band accepts non-critical intake).
+    TRIED to close it (offers on distribute_initial/distribute_pending/rebalance_cid/scale_one,
+    CLASS_NORMAL) → MEASURED REGRESSION: per-piece offers doubled the seed's piece-path RTTs during
+    scenario B's 100-object publish burst (node0 ran 1096 jobs), pushing census-20 to 35.4s > 30s
+    bar (drained=false). Everything still CONVERGED (all nodes census=20, queues drained, 0 failed)
+    — pure timing. REVERTED the distribute offers; kept repair-only (proven 7/7 green, census 16.9s).
+    Extracted a free offer() fn (used by the &self method; ready for the follow-up). CLASS_NORMAL
+    removed. DEFERRED distribute admission to a no-extra-RTT design: carry push class on PiecePush,
+    gate graded at ingest via grant_gate(class) — no offer round-trip, so no burst contention.
+    Gap meanwhile covered by jemalloc (RSS bounded) + critical shed_gate backstop (95%).
 [~] Scenario G (capped-receiver) added + RUNNING: node1 grants 0 + sheds+counts all ingest; kill a
     healthy holder → assert (1) recovered (redirect restores floor around the capped node) AND
     (2) repair-window ingest arrivals at capped == 0 (offer/grant saved the payload vs shed-at-
