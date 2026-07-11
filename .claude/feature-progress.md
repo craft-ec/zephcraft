@@ -140,9 +140,20 @@ the next candidate in. K governable later (minimal-kernel: mechanism native, pol
     bounded + exercised by repair; adversarial review clean). Box binary built (choke, K=4) but NOT
     installed; fleet untouched.
     BLOCKER for the roll is the FLAKY B BAR, not element 2 → makes the whole A-G gate ~25% false-fail.
-[ ] NEXT DECISION (user): (a) fix the flaky scenario-B census bar / investigate the 3-36s membership
-    census variance under mass-rejoin (restores a reliable gate, then roll element 2), OR (b) roll
-    element 2 now treating B as a known-flaky orthogonal issue (re-run on false B fail).
+[x] FLAKY GATE — ROOT-CAUSED + census FIXED (commit 3e4dcf4): the epidemic member-map cascade only
+    fired on learning NEW members, so a straggler waited for the 30s shuffle → census-20 was bimodal
+    3s/35s. Added a periodic epidemic safety net (member map → 3 peers every 5s). Measured: census-20
+    now 3.34-3.79s across 9 runs (5 choke-on + 4 choke-off) — variance GONE. Real fleet win (fast
+    census recovery after restart waves); mixed-version-safe local-logic change → staggered roll.
+[!] RESIDUAL: a SECOND scenario-B flaky bar surfaced — the JobCoordinator queue-DRAIN bar. Isolated:
+    choke OFF → B 4/4 drained=true; choke ON → 1/5 drained=false (repair still churning, high
+    at_risk on the seed). Implicates ELEMENT 2's repair choke (K=4 serializes repair pushes → slower
+    repair drain under mass-rejoin). Element 2's value is marginal anyway (acute issues already
+    solved by mux+jemalloc+offer/grant).
+[ ] DECISION (user): element 2 — (a) HOLD/disable (active_set_k=0 default; keep the reviewed
+    mechanism behind the flag) since it's marginal + destabilizes the drain bar, OR (b) ship enabled
+    and make the drain bar robust, OR (c) unchoke repair too (leaving only scale/rebalance — nearly
+    a no-op). Census fix stands regardless + is worth rolling.
 === ALL 5 TPv2 STRUCTURAL ELEMENTS BUILT (1 mux, 2 choke, 3 offer/grant, 4 elected-scan, 5 fair-sched);
 elements 1+3+6 LIVE on the fleet; element 2 built+validated, awaiting staggered roll. ===
 
