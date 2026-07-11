@@ -101,8 +101,14 @@ PHASES (each passes the offline harness before the next; harness FIRST):
     NOT a wire change → no fleet roll needed (removed code was already dead on the running binary).
     LESSON: the transport unit tests + noded subprocess tests are NOT in the acceptance gate — a
     future wire change should run `cargo test --workspace` (non-ignored) too, not just A-G.
-Follow-up (deferred, not blocking): reassign governance governor to a Hetzner node (Mac offline);
-add transport unit + noded subprocess tests to the pre-deploy gate (they went red unnoticed).
+[x] DEPLOY GATE HARDENED (commit 24eed4d) — deploy/gate.sh: mandatory pre-roll gate running the
+    COMPLETE surface (fmt + clippy -D warnings --all-targets + `cargo test --workspace` NON-ignored
+    + A-G harness); exits non-zero on any failure; --quick skips A-G for local-logic-only changes.
+    Closes the gap that let the ping→mux migration leave transport unit + two_workers subprocess
+    tests red for a whole migration (they live outside the A-G harness). Documented in
+    deploy/README.md + wired as step 0 in [[zeph-fleet-deploy]]. Validated: --quick green; full
+    end-to-end run (incl A-G) = validating.
+Follow-up (deferred, not blocking): reassign governance governor to a Hetzner node (Mac offline).
 
 # SEED-NODE MEMORY: glibc-arena bloat → jemalloc (2026-07-10, ultracode)
 Post-deploy soak surfaced the seed node ('zeph', primary DHT hub) at ~8GB RSS (OOM-killed a few
