@@ -28,8 +28,10 @@ use zeph_store::{Generation, Store};
 use zeph_transport::{tag, PeerAddr, TaggedStream, Transport};
 use zeph_wire as wire;
 
+mod active_set;
 mod encrypted;
 mod manifest;
+pub use active_set::{ActiveGuard, ActiveSet};
 pub use encrypted::{EncryptedEnvelope, PlainFile, Recipient, ENVELOPE_MAGIC};
 pub use manifest::{Entry, Manifest};
 

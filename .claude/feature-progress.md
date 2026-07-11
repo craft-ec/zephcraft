@@ -110,6 +110,21 @@ PHASES (each passes the offline harness before the next; harness FIRST):
     end-to-end run (incl A-G) = validating.
 Follow-up (deferred, not blocking): reassign governance governor to a Hetzner node (Mac offline).
 
+=== ELEMENT 2 — BOUNDED ACTIVE SET (choke model) — IN PROGRESS (2026-07-11) ===
+Last unbuilt TPv2 structural element (1/3/4/5 all shipped). Sender-side, NO wire change → local-
+logic, STAGGERED roll (not simultaneous). Spec: docs/TRANSFER_PLANE_V2.md §2 — transfer WORK with
+at most K peers at a time (K=4 default), other peers are cheap candidates; active set rotates as a
+peer's work drains or it misbehaves (busy/slow).
+Design: ActiveSet choke gate — K permits; enter(peer)->guard; a peer already active bumps a refcount
+(free — one conn/peer), a NEW peer waits for a permit; guard drop dec refcount, at 0 frees the permit
+→ next candidate enters. Lives in obj (transfer plane); ping/census excluded by construction (they're
+transport/membership). Composes with offer/grant: grant-0/timeout releases the slot + redirect brings
+the next candidate in. K governable later (minimal-kernel: mechanism native, policy swappable).
+RISK: choke tightens concurrency → may regress settle/census bars (like the offer-RTT did). MEASURE +
+tune K. Phases: [ ] P1 ActiveSet core + unit tests  [ ] P2 wire into obj push/pull paths  [ ] P3
+harness scenario (assert active-peer bound + no settle regression) + full A-G  [ ] P4 review  [ ] P5
+staggered roll (gate on user go-ahead).
+
 # SEED-NODE MEMORY: glibc-arena bloat → jemalloc (2026-07-10, ultracode)
 Post-deploy soak surfaced the seed node ('zeph', primary DHT hub) at ~8GB RSS (OOM-killed a few
 times, auto-recovered, no data loss) while identical-workload peers held <1GB — SAME ~2700 cids,
