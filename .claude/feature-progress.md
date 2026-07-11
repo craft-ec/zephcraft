@@ -170,8 +170,19 @@ the next candidate in. K governable later (minimal-kernel: mechanism native, pol
 
 === ALL 5 TPv2 STRUCTURAL ELEMENTS BUILT + LIVE (1 mux, 2 choke, 3 offer/grant, 4 elected-scan,
 5 fair-sched) + P6 no-RTT class admission + census-convergence fix. Fleet: 4 Hetzner nodes, healthy.
-Open follow-ups (non-blocking): governance governor reassignment (Mac offline); harden scenario B's
-harness bars for the contended full-suite run (test-quality; census+drain fixed, max-job can flake). ===
+[x] GATE HARDENED (commits f7311bb, dc53eec) — full deploy/gate.sh now reliably GREEN. Two contention
+    flake sources closed (both TEST-ONLY, no fleet impact):
+    1. Scenario B max-job bar: was any-job>10s → false-positived on a 15.6s SCAN under full-suite
+       machine contention (B solo clean, max-job <1s). Reshaped: FAIL only on a REPAIR job >10s
+       (durability path) or ANY job >30s hang ceiling; slow non-durability jobs 10-30s logged not
+       failed (system converges; 60s no-progress bar catches true wedges).
+    2. two_workers subprocess tests: five_workers flaked (death detect >60s) in the parallel gate but
+       3/3 clean solo (~24s) — libtest ran the 4 tests' ~10+ processes concurrently. Serialized with
+       a poison-recovering lock → 4/4 in 25s.
+    Full gate now green across fmt+clippy+workspace-tests+A-G (7/7). Node-level census+drain fixes
+    already live on the fleet; these harness changes need no roll.
+
+Open follow-ups (non-blocking): governance governor reassignment (Mac offline). ===
 === ALL 5 TPv2 STRUCTURAL ELEMENTS BUILT (1 mux, 2 choke, 3 offer/grant, 4 elected-scan, 5 fair-sched);
 elements 1+3+6 LIVE on the fleet; element 2 built+validated, awaiting staggered roll. ===
 
