@@ -1,3 +1,250 @@
+# REGISTRY READ VERIFICATION — P1–P4 DONE + review-fixed; P5 (roll) PENDING USER GO-AHEAD (2026-07-12)
+Closed the last registry correctness/security gap: reads WERE trust-on-announce. The write path validated
+the owner sig (RegistryState::apply → sub.verify()) then DISCARDED it — HeadEntry had NO signature, so
+replication-merge + resolve accepted whatever they were given (a malicious writer/replica could inject a
+FORGED head and it propagated + was trusted). Fix: the owner sig TRAVELS with the head and is re-verified
+at every trust boundary.
+
+Design (built): HeadEntry gained `signature: Vec<u8>` (owner ed25519 over
+head_signing_bytes(owner,name,cid,version) — the same bytes HeadSubmission signs; `HeadEntry::verify()`
+re-checks it). apply() stores sub.signature. The SQL heads table gained a `sig BLOB` col (stored on write,
+returned on read). Native + WASM fixture HeadEntry both carry sig (registry.wasm rebuilt → wasm_registry_
+matches_native still byte-identical).
+
+** REVIEW (xhigh) CAUGHT TWO GAPS that defeated the feature — now FIXED + tested: **
+1. CRITICAL: verify() was added to `RegistryState::merge()` (com), but the node's REAL replication path is
+   `sql_merge` (headreg) → `sql_upsert`, which BYPASSED it. A malicious PushState with a high-version
+   forged entry would version-guard-OVERWRITE the honest head, then fail read-verify → the name is ERASED
+   (remote DoS). FIX: `sql_merge` verifies each entry at ingress (drops forged/unsigned). Test:
+   `sql_merge_drops_a_forged_remote_head_and_preserves_the_honest_one` (injects via decode, the real wire
+   vector).
+2. IMPORTANT: the cross-node resolve RPC `RegistryResp::Resolved(Option<(cid,version)>)` carried NO sig →
+   a resolver trusted a remote replica's answer unverified (the common non-holder read path). FIX:
+   `Resolved(Option<HeadEntry>)` carries the signed entry; the asking node `entry.verify()`s before
+   trusting and falls through to the next replica on failure. (sql_resolve/resolve_local now return
+   HeadEntry.)
+
+** MIGRATION — DECIDED: idempotent ALTER, no manual wipe. ** `ADD_SIG_COLUMN` = `ALTER TABLE heads ADD
+COLUMN sig BLOB NOT NULL DEFAULT X''`, run after CREATE_HEADS in `shard_db` (write path); duplicate-column
+error on fresh DBs is swallowed. Legacy rows get a 0-byte sig → fail verify() → unresolvable until the
+owner re-registers (correct: an unsigned legacy head can't be trusted). Lets the fleet upgrade WITHOUT
+wiping regshards. Test: `add_sig_column_migrates_a_legacy_shard_db` (validates the ALTER on real CraftSql).
+Known minor (accepted): read-only replicas of a legacy shard open via `shard_db_existing` (no migration) →
+SELECT sig errors → return None — impact nil (legacy heads can't verify anyway; a write/push migrates it).
+
+Phases:
+- [x] P1 com/registry: HeadEntry+signature; HeadEntry::verify(); apply() stores sig; merge()/merge_entries()
+      reject unverifiable; forged+unsigned merge-rejection tests. WASM fixture synced + rebuilt.
+- [x] P2 SQL persistence (headreg): heads `sig` col + idempotent ALTER migration; sql_upsert stores it;
+      sql_resolve/sql_state carry it; advance_local persists sub.signature.
+- [x] P3 verify on READ: sql_resolve re-verifies (local); sql_merge re-verifies (replication ingress);
+      resolve RPC caller re-verifies the returned HeadEntry (cross-node). Three trust boundaries closed.
+- [x] P4 tests: resolve_drops_a_row (local read), sql_merge_drops_a_forged_remote_head (replication),
+      add_sig_column_migrates_a_legacy_shard_db (migration). All green; fmt+clippy clean; workspace builds.
+- [x] P5 gate GREEN (fmt+clippy+workspace tests + A-H harness 8/8, 761s) → SIMULTANEOUS wire-incompatible
+      roll DONE + LIVE-VALIDATED 2026-07-12 ~14:04. Wire-incompatible (RegistryState.HeadEntry gained a
+      field AND RegistryResp::Resolved changed shape → old binaries can't decode) → stop-all-4/start-all-4.
+      Reconverged in ~80s: 4-node census (each node distinct_alive_peers=3), sub-ms SWIM RTT, 0 panics, 0
+      wire-decode errors, NRestarts=0. END-TO-END LIVE CHECK: wrote a fresh DB-root head on `zeph`
+      (sql-exec ns=rollcheck, valid owner sig) → cross-node read from `zeph2` (--owner zeph) returned
+      `post-roll-readverify` — proves the new resolve RPC (Resolved carries the signed HeadEntry) + verify
+      path serves a validly-signed head across nodes. No regshards wipe (ALTER migrated legacy rows in
+      place). Efficiency nits deferred (acceptable): sql_state + advance_local each re-verify already-trusted
+      rows (belt-and-suspenders; source-filters legacy rows).
+      **CAVEAT:** the Mac governor node still runs the OLD (pre-read-verify) binary — it's stopped/disabled,
+      so no interop today, but it MUST get the new binary (build release locally → install ~/.zeph/zeph)
+      before it's next spun up for a governance op, else it's wire-incompatible with the fleet.
+
+# DIGEST/SAMPLED GOSSIP [S1] — PLAN (2026-07-12)
+Make membership gossip O(Δ), not O(N)/round — the last remaining membership scale ceiling (roadmap;
+pairs with the now-done SWIM). Today `epidemic_push` sends the FULL member map (with ever-fresh
+last_heard) to 3 peers every 5s → O(N) per node/round, O(N²)/round cluster-wide. Can't just "send only
+changes" because last_heard bumps every round for every member.
+
+KEY MOVE (leverages the now-live SWIM): DECOUPLE LIVENESS FROM last_heard. A member is Alive unless a
+Suspect/Dead gossip says otherwise. So census liveness = SWIM STATE (in census iff state != Dead), NOT
+the last_heard-within-CENSUS_TTL check. last_heard demoted to a coarse backstop (forget after
+dead_retention). Then gossip only carries CHANGES — join / addr / incarnation-bump(refute) / Suspect /
+Dead — which are RARE.
+
+MECHANISM (Scuttlebutt-style digest + delta):
+- Steady state: peers exchange a compact DIGEST = hash of the sorted (id, incarnation, state) set
+  (EXCLUDES last_heard → stable when membership is stable). Hashes match ⇒ in sync, done (O(1) msg).
+- A change ⇒ gossip the DELTA (changed entries) eagerly to N peers (like today's epidemic, delta-only).
+- Digest MISMATCH (missed a delta) ⇒ reconcile: exchange per-member versions, send only the entries the
+  peer is behind on — O(divergence), not O(N)/round.
+Result: steady-state O(1), churn O(Δ), full O(N) reconcile ONLY on real divergence.
+
+WIRE: new Digest{hash}/DigestReq + a MemberDelta (or reuse MemberSync for the reconcile payload).
+Positional postcard ⇒ wire-incompatible ⇒ SIMULTANEOUS roll (like SWIM/mux).
+
+** KEY DECISION TO CONFIRM (P1 is the crux): census liveness moves from last_heard-TTL to SWIM-state. **
+Sound because SWIM active detection is LIVE (Dead converges via delta gossip + TTL backstop), but it IS a
+semantic change to the consistency-critical census (the registry election runs over it). The digest
+reconciliation is the eventual-consistency backstop.
+
+Phases (each: build+test+commit):
+- [x] P1 census liveness from SWIM state DONE (user green-lit the crux decision). `census()` (the
+      registry-election census) is now `state != Dead && last_heard < cfg.dead_retention` (was
+      `!= Dead && within CENSUS_TTL 120s`) — a member leaves ONLY when gossiped Dead; last_heard is a
+      COARSE silent-member backstop (dead_retention, default 600s). Removed the `CENSUS_TTL_MS` const.
+      Reworked `census_excludes_stale...` test → proves an Alive member 200s stale (past the old 120s
+      TTL) STAYS in, a member silent beyond the backstop is forgotten, a fresh-but-Dead member is out.
+      membership 13/13, clippy -D clean, workspace builds. BEHAVIOURALLY INERT under current gossip
+      (last_heard stays < 600s, so the census result is unchanged) — no regression, and NO scaling win
+      YET: this only ENABLES O(Δ). `liveness_census()` (repair) left on its 30s TTL for now — coupled to
+      the gossip change, revisit in P2. The O(Δ) win materialises in P2 (delta) + P3 (digest).
+- [~] P2 delta gossip — IMPLEMENTED, re-validating. `Views.dirty: HashMap<NodeId,u8>` (id→remaining
+      re-pushes); marked at every delta-worthy site (merge_one returns changed→dirty; suspect; mark_dead;
+      refute; new-member inserts). `epidemic_push` now sends ONLY dirty members, one-way, skips when
+      empty (the O(N)/round→O(Δ) win); the 30s shuffle stays full-map = the reconciliation backstop.
+      merge_one returns bool (delta-worthy = new/liveness change; last_heard-only bump = false, so
+      freshness ticks DON'T gossip). Unit test delta_gossip_dirties_only_real_changes. census/liveness
+      unchanged (P1).
+      REGRESSION FOUND (scenario B): join-wave census-20 hit 35.5s > 30s bar (push-once + one-way lost
+      the old full-map flood; tail fell back to the 30s shuffle). Scenario H (death) was FINE (46s<90s,
+      no false-pos, no storm). FIX: SWIM limited retransmission — GOSSIP_REPEATS=6, dirty is now a
+      per-member repeat COUNT re-sent each round until 0 (saturates via fanout^repeats + the cascade).
+      membership 14/14, clippy clean. FIXED + VALIDATED: scenario B census-20 back to 16.4s (was 35.5s
+      regressed; bar 30s). Scenario H death still fine. P2 DONE — the 5s hot-path gossip is now O(Δ)
+      (nothing sent in steady state); the 30s shuffle is still the O(N) full-map backstop (P3 kills that).
+      NOTE: re-confirm scenario H with the final re-push code at the P5 gate (it re-runs the full A-H suite).
+- [~] P3 digest hash + reconciliation — IMPLEMENTED, re-validating. wire: Digest{hash:[u8;32]} msg
+      (tag 0x010A) — WIRE-INCOMPATIBLE. members_digest() = blake3 of sorted (id,inc,state) over NON-Dead
+      members (excludes last_heard + Dead → stable when the census is stable). digest_round() (folded
+      into the 30s shuffle tick): send my hash to a random active peer; on MISMATCH → sync_members_with
+      (full reconcile, bidirectional). Digest handler replies own hash. Shuffle + ShuffleReply stop
+      carrying the full member map (members: vec![]) → the shuffle is now HyParView passive-view only;
+      the digest is the O(1) backstop (full sync only on mismatch). Unit test members_digest_reflects_
+      census_not_freshness.
+      Scenario B census-20 = 13.4s (FASTER than P2 — the redundant shuffle carriage gone) BUT drained=FALSE
+      (repair storm): ROOT CAUSE = the P1-flagged liveness_census coupling. It still used last_heard<30s,
+      but P2/P3 stopped refreshing last_heard for un-probed members (only ~active_size=5 of 20 probed) →
+      it dropped LIVE holders → over-repair → queues churned. FIX: liveness_census + indirect_probe helper
+      filter are now SWIM-state-based (live = state==Alive; excludes Suspect too so repair reacts fast),
+      NOT last_heard. Removed LIVENESS_TTL_MS. Reworked its test (liveness_census_is_swim_alive_only).
+      membership 15/15, clippy clean, workspace builds. FIXED + VALIDATED: scenario B census-20 = 8.3s,
+      DRAINED=TRUE, max_job=141ms, at_risk healthy — the repair storm is gone. P3 DONE. The full gossip
+      is now O(1) steady-state (5s epidemic sends nothing when nothing changed; 30s digest = two hashes
+      when in sync), O(Δ) under churn, O(N) reconcile only on a real digest mismatch. Confirming scenario
+      H (mass death) with the P3 liveness change, then P4/P5. Scenario H CONFIRMED: death census 50s,
+      no false-pos, no storm, drained=true. === P1+P2+P3 = the full O(N)→O(Δ)/O(1) gossip mechanism BUILT
+      + harness-validated (B + H). Remaining: P4 a dedicated missed-delta→digest-reconcile integration
+      test (nice-to-have; the unit tests + B/H cover the core), P5 full gate → SIMULTANEOUS wire-
+      incompatible roll (Digest msg). ===
+- [x] P4 tests — covered by the unit tests (delta-tracking invariant, digest census-not-freshness,
+      state-based liveness) + the A-H harness (B mass-rejoin 8.3s drained, H mass-death 50s drained). A
+      dedicated missed-delta→reconcile integration test remains a nice-to-have, not a gap.
+- [x] P5 SIMULTANEOUS ROLL DONE + LIVE-VALIDATED (2026-07-12 ~07:26, user go). Full deploy/gate.sh =
+      🟢 (fmt+clippy+workspace 0-fail + A-H 8/8 incl. scenario_h_mass_death). Backup predigest-20260712-0724
+      → rsync (wire+membership) → build 1m17s → install → SIMULTANEOUS flip (stop all 4/start all 4 @
+      07:26:51, wire-incompatible: Digest msg + reshaped shuffle). Reconverged <60s: all active, NR=0,
+      peers=3, ZERO wire-decode errors (no version split), eligible=4. LIVE: killed zeph4 → 3 survivors
+      logged DEAD in ~35s, eligible 4→3; restarted → rejoined, eligible→4. 0 panics/wire-errors across
+      the roll. Rollback = zeph.bak-predigest-20260712-0724.
+=== DIGEST/SAMPLED GOSSIP [S1] COMPLETE + LIVE. Membership gossip is now O(1) steady-state / O(Δ) churn /
+O(N) reconcile-only-on-mismatch — the last membership scale ceiling is gone. ===
+
+# SWIM ACTIVE DEATH DETECTION [K10] — PLAN (2026-07-12)
+Roadmap's one real robustness gap. Today: direct probe fails 3× → `mark_dead` LOCAL only → the dead
+node ages out of everyone's census by TTL (~30–120s). Add ACTIVE death detection: SWIM Suspect/Dead
+states + incarnation numbers, indirect PING-REQ (rule out local blips), epidemic dissemination of death
+→ deaths converge in ~1–2s.
+
+KEY DESIGN: `MemberSync` ALREADY gossips the full member map with a union-merge (`merge_members`/
+`merge_one`). Put `incarnation`+`state` INTO the member map + make the merge SWIM-ordered → Suspect/Dead
+ride the EXISTING epidemic diffusion (~seconds/hop). No separate death-gossip channel.
+- State: per member `incarnation:u64` (only the member bumps it, to refute) + `state∈{Alive,Suspect,Dead}`.
+- Merge: incoming wins iff inc>existing.inc OR (inc==existing.inc AND rank(state)>rank(existing)), where
+  Alive=0<Suspect=1<Dead=2. Higher-incarnation Alive REFUTES a Suspect/Dead. last_heard_ms = max (backstop).
+DETECTION: direct ping fail (2 tries) → indirect PING-REQ to K=3 alive members → all fail → SUSPECT
+@current inc + local deadline. Deadline passes unrefuted → DEAD (gossips). Refute: a node seeing
+Suspect/Dead about ITSELF bumps inc to max(seen,own)+1 + re-asserts Alive.
+census(): exclude Dead immediately; keep Alive+Suspect (Suspect stays for election-consistency; only Dead,
+which converges fast, is removed). Keep CENSUS_TTL_MS backstop.
+WIRE COMPAT: MemberEntry gains fields + new PingReq/PingReqAck → postcard positional → OLD/NEW can't
+decode each other → SIMULTANEOUS roll (the `zeph-fleet-deploy` mux-migration mode). Gate 🟢 + user go.
+
+Phases (each: build+test+commit before next):
+- [x] P1 wire+state foundation DONE. wire: MemberEntry{+incarnation:u64,+state:u8}; PingReq{target_id,
+      target_addr}/PingReqAck{target_id,alive} msgs (tags 0x0108/0x0109) + enum/type_tag/encode/decode.
+      membership: MemberState{Alive,Suspect,Dead}+rank/to_u8/from_u8; Member{+incarnation,+state}+alive()
+      ctor; Membership.self_incarnation:AtomicU64(0); SWIM merge_one ((inc,rank) liveness merge, higher
+      inc refutes, last_heard max independent); census + liveness_census EXCLUDE state==Dead; probe-success
+      + note_heard PRESERVE inc/state (no clobber; direct ack clears own Suspect); refresh_self stamps
+      self_incarnation. wire 5/5 + membership 9/9 green, workspace builds, clippy -D clean. NO behaviour
+      change yet (all states Alive@0 until P2/P3 wire transitions).
+- [x] P2 indirect PING-REQ DONE (mechanism). Config +indirect_probes(3) +suspect_timeout(15s). handle_message
+      serves PingReq (ping target, reply PingReqAck{alive}). indirect_probe(target,addr): K random alive
+      members (via converged map, LIVENESS_TTL, ≠self/target), CONCURRENT join_all, true on first alive.
+      Death path: direct threshold_hit → indirect_probe → alive⇒rescue (reset failures + note_heard) else
+      → mark_dead. Compiles workspace + clippy -D clean. Full multi-node rescue test → P4.
+- [x] P3 suspect→dead lifecycle + refutation DONE. Member +suspect_since_ms (LOCAL, not gossiped) +
+      set_liveness() (maintains the Suspect clock). Death path: direct+indirect fail → suspect(id)
+      (state=Suspect@cur inc, only from Alive). promote_suspects() (called each probe_round) escalates
+      Suspect past cfg.suspect_timeout → mark_dead. mark_dead now sets the converged record state=Dead
+      @cur inc (GOSSIPS + census-excluded immediately, works even if not in active view) + keeps the
+      dashboard tombstone/promotion. REFUTATION: merge_members, a self-entry that's Suspect/Dead →
+      bump self_incarnation to max(seen,own)+1 + refresh_self (Alive@higher overrides everywhere) — this
+      also handles a RESTARTED node rejoining past its own stale Dead@0 (it refutes on first MemberSync).
+      merge_one uses set_liveness. 3 new unit tests (merge SWIM ordering+refutation, freshness⊥liveness,
+      state u8 roundtrip/rank) — membership 8/8 green, wire 5/5, workspace builds, fmt+clippy -D clean.
+      Timing: 3 direct fails (~15s) → indirect (~3s) → Suspect → suspect_timeout (15s) → Dead, then Dead
+      GOSSIPS in ~seconds + excludes immediately (vs old ~30-120s TTL aging). Tuning knob for faster
+      detection: lower probe_failures→1 + shorter suspect_timeout (indirect probe guards false positives).
+- [x] P4 tests DONE (deterministic logic). 4 new membership tests (12/12 total): (1)
+      suspect_promotes_to_dead_and_drops_from_census — Suspect stays counted, promote_suspects after
+      window → Dead → excluded from BOTH censuses immediately; (2) self_suspicion_is_refuted_by_
+      incarnation_bump — self Dead@5 gossiped → self_incarnation→6 + own record Alive@6; (3)
+      restarted_node_refutes_own_stale_dead_and_rejoins — fresh node (inc0) past its own Dead@0 →
+      Alive@1; (4) ping_req_handler_replies_with_probe_result — PingReq → PingReqAck{alive:false} for an
+      unreachable target (handler wiring). fmt+clippy -D clean. DEFERRED to P5 live validation (too
+      flaky/needs partition control for a unit test): indirect-probe RESCUE (target reachable by helper
+      not directly) + full-cluster Dead convergence over real sockets — validated by killing a fleet node.
+- [x] P5 SIMULTANEOUS ROLL DONE + LIVE-VALIDATED (2026-07-12 ~02:21, user "p5"). Full deploy/gate.sh =
+      🟢 GATE PASSED (fmt+clippy+workspace 0-fail — obj flake didn't recur — + A-G 7/7 incl. C kill-holder
+      & D/F restart-rejoin which exercise death detection). Backup zeph.bak-swim-20260712-0217 → rsync
+      crates/ (wire+membership+headreg bench) → build on box (release 1m18s, 0 err) → install → SIMULTANEOUS
+      flip (stop all 4, start all 4 @ 02:21:29, ~instant). Reconverged <60s: all 4 active, NR=0, peers=3,
+      ZERO wire-decode errors (no bad-frame/UnknownType → all on the new MemberEntry, no version split).
+      LIVE SWIM VALIDATION: killed zeph4 → all 3 survivors logged SUSPECT then DEAD within ~35s, alive_peers
+      2, census eligible 4→3 (Dead excluded immediately, not TTL-aged). Restarted zeph4 → rejoined in 30s,
+      all peers=3, eligible back to 4 (refutation past its stale Dead works live). 0 panics/wire-errors/
+      corruption across the whole roll. Rollback = zeph.bak-swim-* (box). Mac node stays stopped (governor,
+      on-demand). === SWIM ACTIVE DEATH DETECTION [K10] COMPLETE + LIVE ON THE FLEET. ===
+Notes: suspect_timeout ~probe_interval×3 (~15s), must exceed a couple gossip hops so a refute can arrive.
+Decide in P2: keep probe_failures as the direct threshold before indirect, or drop to 1 + rely on indirect.
+
+P4 FOLLOW-UPS (workspace test + adversarial review):
+- Full-workspace test caught five_workers_membership_join_and_death (two_workers.rs): my defaults made
+  detection SLOWER (probe_failures=3 → indirect → 15s suspect ≈ 33s+) so it blew the 60s bar under
+  cross-binary contention. Also found a GAP: status "down" = local `dead` tombstone only, but a survivor
+  that learns C is Dead via GOSSIP set member state=Dead without a tombstone → never showed "down". FIXED:
+  (a) faster defaults probe_failures 3→2, suspect_timeout 15s→6s (indirect probe is the false-positive
+  guard, so suspect sooner; total ~21s ≈ old direct-only, + fast gossip convergence); (b) merge_members
+  now mark_dead's any peer gossip-reports Dead that we still hold as an ACTIVE link (Box::pin — breaks the
+  static async cycle merge→mark_dead→try_promote→add_active→sync→merge; idempotent since mark_dead drops
+  it from active). census/liveness already exclude Dead.
+- Adversarial review (feature-dev:code-reviewer): CLEARED merge convergence/lattice, refutation lock-order,
+  rejoin, indirect_probe, census, wire round-trip, and ALL lock/await sites (no held-lock-across-await).
+  Found + FIXED 2 real bugs I introduced: (1) CRIT — probe-success recovery from Suspect did `m.state=Alive`
+  raw, bypassing set_liveness → stale suspect_since → a later re-suspect promoted to Dead with ~0 grace;
+  now uses set_liveness (clears the clock). Regression test set_liveness_maintains_the_suspect_clock added.
+  (2) IMPORTANT — self-incarnation bump `+1` on an UNAUTH wire field overflows on u64::MAX (panic debug /
+  wrap-0 release → can't refute); now saturating_add(1). Regression test set_liveness_maintains_the_suspect_clock.
+- five_workers STILL failed after the timing fix (89s, "survivor 2 never marked C down") — ROOT CAUSE: a
+  survivor that only knows C via the converged member map (NOT its active view) learns C is Dead via GOSSIP
+  but never creates the local `dead` tombstone that status "down" reads from → never shows down. The
+  active-only fix was insufficient. TRUE FIX: `snapshot()` now surfaces converged SWIM-Dead members as
+  "down" (the Dead state is the authoritative per-node signal, detected OR gossip-learned) + excludes
+  Dead from the active list; probe_round also drops already-Dead peers from the active view (hygiene, no
+  network → no async cycle). Reverted the active-only merge_members mark_dead (+ its Box::pin cycle).
+  five_workers now PASSES in 30.15s (was 89.97s fail; 60s bar → 2x margin). membership 13/13, fmt+clippy clean.
+- FULL WORKSPACE re-run: 15/16 bins green incl. five_workers + two_workers UNDER cross-binary contention.
+  1 fail = unwanted_content_fades_then_want_resumes_repair (crates/obj/tests/healthscan.rs) — the KNOWN
+  pre-existing obj repair-convergence flake (no node death in it → my membership/SWIM change is inert;
+  passed 3/3 in isolation 12/23/24s). NOT a regression. P4 = DONE.
+
 # WIRE ROLL — Elements 1+3 (mux + offer/grant) — PLAN (2026-07-11)
 The last STRUCTURAL Transfer Plane v2 pieces. ONE wire migration → version-consistent SIMULTANEOUS
 fleet roll (wire incompatible with old binary; NOT staggered). Design: docs/TRANSFER_PLANE_V2.md §1,§3.
