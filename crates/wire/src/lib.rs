@@ -33,6 +33,11 @@ pub mod tag {
     pub const SHUFFLE_REPLY: u32 = 0x0106;
     /// Converged full-member-set anti-entropy (union + max-last_heard merge).
     pub const MEMBER_SYNC: u32 = 0x0107;
+    /// SWIM indirect probe: ask a helper to ping a target on our behalf.
+    pub const PING_REQ: u32 = 0x0108;
+    pub const PING_REQ_ACK: u32 = 0x0109;
+    /// Digest anti-entropy: a hash of the member set, exchanged to detect divergence cheaply.
+    pub const DIGEST: u32 = 0x010A;
     // Piece exchange (CRAFTOBJ_DESIGN §Wire Protocol Additions):
     pub const PIECE_REQUEST: u32 = 0x0010;
     pub const PIECE_RESPONSE: u32 = 0x0011;
@@ -242,6 +247,12 @@ pub struct MemberEntry {
     pub id: [u8; 32],
     pub addr: String,
     pub last_heard_ms: u64,
+    /// SWIM incarnation — bumped ONLY by the member itself to refute a false
+    /// Suspect/Dead. Higher incarnation always wins the merge.
+    pub incarnation: u64,
+    /// SWIM liveness state: 0 = Alive, 1 = Suspect, 2 = Dead. At equal
+    /// incarnation the higher rank wins (Dead > Suspect > Alive).
+    pub state: u8,
 }
 
 /// Converged-membership anti-entropy: the sender's ENTIRE liveness-tracked member
@@ -251,6 +262,31 @@ pub struct MemberEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberSync {
     pub members: Vec<MemberEntry>,
+}
+
+/// Digest anti-entropy [S1]: a hash of the sender's member set `(id, incarnation, state)`, exchanged
+/// to detect divergence cheaply (O(1)) — the steady-state replacement for shipping the full member
+/// map every round. Equal hashes ⇒ in sync (done); a mismatch triggers a full `MemberSync` reconcile.
+/// Excludes `last_heard` so the hash is STABLE when membership is stable (freshness ticks every round).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Digest {
+    pub hash: [u8; 32],
+}
+
+/// SWIM indirect probe (PING-REQ): ask the recipient to ping `target` on our
+/// behalf and report back. Used when our DIRECT probe of `target` timed out — a
+/// helper's success rules out a one-hop network blip before we suspect the target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PingReq {
+    pub target_id: [u8; 32],
+    pub target_addr: String,
+}
+
+/// Reply to a [`PingReq`]: did the helper's probe of `target` succeed?
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PingReqAck {
+    pub target_id: [u8; 32],
+    pub alive: bool,
 }
 
 /// HealthScan live probe: "do you currently hold `cid`?" — cheap, transfers
@@ -293,6 +329,9 @@ pub enum Message {
     Shuffle(Shuffle),
     ShuffleReply(ShuffleReply),
     MemberSync(MemberSync),
+    Digest(Digest),
+    PingReq(PingReq),
+    PingReqAck(PingReqAck),
     PiecePush(PiecePush),
     PiecePushAck(PiecePushAck),
     Offer(Offer),
@@ -322,6 +361,9 @@ impl Message {
             Message::Shuffle(_) => tag::SHUFFLE,
             Message::ShuffleReply(_) => tag::SHUFFLE_REPLY,
             Message::MemberSync(_) => tag::MEMBER_SYNC,
+            Message::Digest(_) => tag::DIGEST,
+            Message::PingReq(_) => tag::PING_REQ,
+            Message::PingReqAck(_) => tag::PING_REQ_ACK,
             Message::PiecePush(_) => tag::PIECE_PUSH,
             Message::PiecePushAck(_) => tag::PIECE_PUSH_ACK,
             Message::Offer(_) => tag::OFFER,
@@ -377,6 +419,9 @@ pub fn encode(message: &Message, hlc_ts: u64) -> Vec<u8> {
         Message::Shuffle(p) => postcard::to_allocvec(p),
         Message::ShuffleReply(p) => postcard::to_allocvec(p),
         Message::MemberSync(p) => postcard::to_allocvec(p),
+        Message::Digest(p) => postcard::to_allocvec(p),
+        Message::PingReq(p) => postcard::to_allocvec(p),
+        Message::PingReqAck(p) => postcard::to_allocvec(p),
         Message::PiecePush(p) => postcard::to_allocvec(p),
         Message::PiecePushAck(p) => postcard::to_allocvec(p),
         Message::Offer(p) => postcard::to_allocvec(p),
@@ -449,6 +494,9 @@ pub fn decode(bytes: &[u8]) -> Result<Frame, WireError> {
             Message::ShuffleReply(postcard::from_bytes(payload).map_err(malformed)?)
         }
         tag::MEMBER_SYNC => Message::MemberSync(postcard::from_bytes(payload).map_err(malformed)?),
+        tag::DIGEST => Message::Digest(postcard::from_bytes(payload).map_err(malformed)?),
+        tag::PING_REQ => Message::PingReq(postcard::from_bytes(payload).map_err(malformed)?),
+        tag::PING_REQ_ACK => Message::PingReqAck(postcard::from_bytes(payload).map_err(malformed)?),
         tag::PIECE_PUSH => Message::PiecePush(postcard::from_bytes(payload).map_err(malformed)?),
         tag::PIECE_PUSH_ACK => {
             Message::PiecePushAck(postcard::from_bytes(payload).map_err(malformed)?)
@@ -618,6 +666,8 @@ mod tests {
                     id: [3u8; 32],
                     addr: "jj@2.2.2.2:7".into(),
                     last_heard_ms: 789,
+                    incarnation: 0,
+                    state: 0,
                 }],
             }),
             Message::ShuffleReply(ShuffleReply {
@@ -630,11 +680,15 @@ mod tests {
                         id: [1u8; 32],
                         addr: "hh@4.4.4.4:5".into(),
                         last_heard_ms: 123,
+                        incarnation: 0,
+                        state: 0,
                     },
                     MemberEntry {
                         id: [2u8; 32],
                         addr: "ii@3.3.3.3:6".into(),
                         last_heard_ms: 456,
+                        incarnation: 0,
+                        state: 0,
                     },
                 ],
             }),

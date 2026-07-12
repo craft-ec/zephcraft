@@ -37,8 +37,16 @@ pub struct Config {
     pub prwl: u8,
     pub probe_interval: Duration,
     pub probe_timeout: Duration,
-    /// Consecutive probe failures before a peer is declared dead.
+    /// Consecutive DIRECT probe failures before a peer is put through the SWIM indirect
+    /// probe + suspicion path (was: before it was declared dead).
     pub probe_failures: u32,
+    /// SWIM indirect probe fan-out: on a direct-probe timeout, ask this many random alive
+    /// members to ping the target before suspecting it (rules out a one-hop network blip).
+    pub indirect_probes: usize,
+    /// How long a member stays Suspect before being promoted to Dead — the refutation window
+    /// (the suspected node, hearing the gossiped Suspect, bumps its incarnation + re-asserts
+    /// Alive). Must exceed a couple gossip hops so a refutation can arrive.
+    pub suspect_timeout: Duration,
     pub shuffle_interval: Duration,
     pub shuffle_sample: usize,
     /// How long dead peers stay visible as tombstones in snapshots before
@@ -61,7 +69,15 @@ impl Default for Config {
             prwl: 3,
             probe_interval: Duration::from_secs(5),
             probe_timeout: Duration::from_secs(3),
-            probe_failures: 3,
+            // 2 direct failures then the SWIM indirect probe confirms (was 3 direct = death) — the
+            // indirect probe is the false-positive guard now, so we can suspect sooner.
+            probe_failures: 2,
+            indirect_probes: 3,
+            // Short refutation window: ~1 gossip round-trip (probe_interval 5s) is enough for a
+            // wrongly-suspected node to hear it + re-assert Alive. Keeps total death detection
+            // (~2 fails + indirect + this) near the old direct-only latency while adding fast
+            // gossip convergence.
+            suspect_timeout: Duration::from_secs(6),
             shuffle_interval: Duration::from_secs(30),
             shuffle_sample: 8,
             dead_retention: Duration::from_secs(600),
@@ -69,23 +85,6 @@ impl Default for Config {
         }
     }
 }
-
-/// Window (ms) within which a member counts as alive in the [`Membership::census`].
-/// Generous on purpose: the converged set must not falsely drop a peer between
-/// anti-entropy rounds — genuine deaths age out after `dead_retention`, and a live
-/// peer re-asserts its `last_heard_ms` every sync round (well inside this TTL).
-// Gossip now diffuses via the 30s shuffle (folded in) rather than a 10s dedicated round, so a
-// member's fresh evidence takes a few shuffle hops to reach every node — the TTL must comfortably
-// exceed that diffusion time or transitively-known peers flap in and out of the census.
-const CENSUS_TTL_MS: u64 = 120_000;
-
-/// Tighter freshness window for the REAL-TIME liveness census used by content
-/// placement/repair (vs the 120s election-consistency census). The wide window
-/// keeps registry-writer election consistent, but reusing it as liveness let a
-/// SWIM-dead holder's stale piece_count inflate `have` and SUPPRESS repair for
-/// up to 120s after a death (review finding). 30s > the 30s shuffle interval's
-/// worst-case gossip lag yet ~4x faster death-visibility than the old reuse.
-const LIVENESS_TTL_MS: u64 = 30_000;
 
 /// Minimum interval (ms) between isolation-recovery seed dials — keeps recovery gentle so a
 /// transient loss doesn't storm a fragile relay every probe round.
@@ -119,10 +118,73 @@ impl PeerState {
 /// positive evidence the member was alive (ms since the Unix epoch). This map
 /// is the CONVERGENCE LAYER that lives BESIDE the HyParView active/passive views
 /// — it is not a replacement for them.
+/// SWIM liveness state of a converged member. Ordered by "how dead": at equal
+/// incarnation the higher-ranked state wins the merge (a Suspect/Dead overrides an
+/// Alive), while a higher incarnation always wins (the member refuting a false
+/// suspicion by bumping its own incarnation and re-asserting Alive).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemberState {
+    Alive,
+    Suspect,
+    Dead,
+}
+
+impl MemberState {
+    fn rank(self) -> u8 {
+        match self {
+            MemberState::Alive => 0,
+            MemberState::Suspect => 1,
+            MemberState::Dead => 2,
+        }
+    }
+    fn to_u8(self) -> u8 {
+        self.rank()
+    }
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => MemberState::Suspect,
+            2 => MemberState::Dead,
+            _ => MemberState::Alive,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Member {
     addr: PeerAddr,
     last_heard_ms: u64,
+    /// SWIM incarnation — only the member itself bumps it (to refute). Higher wins the merge.
+    incarnation: u64,
+    state: MemberState,
+    /// LOCAL ONLY (never gossiped): when THIS node first observed the member as Suspect (ms).
+    /// Drives the Suspect→Dead promotion after `cfg.suspect_timeout`. `None` unless Suspect.
+    suspect_since_ms: Option<u64>,
+}
+
+impl Member {
+    /// A freshly-observed ALIVE member at incarnation 0 (the common case: direct
+    /// probe success, an inbound message, self-refresh). SWIM transitions
+    /// (Suspect/Dead, incarnation bumps) are applied by the merge / lifecycle, not here.
+    fn alive(addr: PeerAddr, last_heard_ms: u64) -> Self {
+        Self {
+            addr,
+            last_heard_ms,
+            incarnation: 0,
+            state: MemberState::Alive,
+            suspect_since_ms: None,
+        }
+    }
+
+    /// Apply a new SWIM `(incarnation, state)`, maintaining the local Suspect clock: entering
+    /// Suspect stamps `now`; leaving Suspect clears it. Idempotent for an unchanged Suspect.
+    fn set_liveness(&mut self, incarnation: u64, state: MemberState, now: u64) {
+        self.incarnation = incarnation;
+        self.state = state;
+        self.suspect_since_ms = match state {
+            MemberState::Suspect => Some(self.suspect_since_ms.unwrap_or(now)),
+            _ => None,
+        };
+    }
 }
 
 #[derive(Default)]
@@ -132,13 +194,20 @@ struct Views {
     /// Recently-dead peers with their time of death — kept as tombstones for
     /// the status table until `dead_retention` elapses.
     dead: HashMap<NodeId, (PeerState, std::time::Instant)>,
-    /// The liveness-tracked FULL member set, gossiped by MemberSync anti-entropy.
-    /// Every node converges on the same map (union + max-`last_heard_ms` merge),
-    /// so an election over the derived census ([`Membership::census`]) is
-    /// consistent across nodes — unlike the size-bounded, per-node-divergent
-    /// active view. NOTE: full-map gossip is O(N) per round — fine at current
-    /// scale; a digest / SWIM-piggybacked delta is needed for very large N.
+    /// The liveness-tracked FULL member set. Every node converges on the same map (union + SWIM
+    /// merge), so an election over the derived census ([`Membership::census`]) is consistent across
+    /// nodes — unlike the size-bounded, per-node-divergent active view. Propagated by DELTA gossip
+    /// [S1]: the frequent `epidemic_push` carries only the members in `dirty` (changed since the last
+    /// push); the 30s shuffle carries the FULL map as the reconciliation backstop that repairs any
+    /// missed delta. Steady state (nothing dirty) ⇒ the frequent path sends nothing.
     members: HashMap<NodeId, Member>,
+    /// Delta-gossip retransmission counters: `id → remaining pushes`. A changed member is enqueued at
+    /// [`GOSSIP_REPEATS`] and re-sent (decrementing) on each `epidemic_push` until it hits 0 — SWIM-
+    /// style limited retransmission so a change SATURATES the cluster (push-once left the last nodes
+    /// waiting on the 30s shuffle). A miss only delays to that shuffle (never breaks convergence), so
+    /// it need not be exhaustive. Freshness-only (`last_heard`) bumps do NOT enqueue — `last_heard` is
+    /// no longer a gossiped liveness signal (see `census`).
+    dirty: HashMap<NodeId, u8>,
 }
 
 /// Snapshot for the control API / dashboard.
@@ -169,6 +238,10 @@ pub struct Membership {
     last_epidemic_ms: RwLock<u64>,
     /// Wakes the shuffle task for an immediate epidemic round (new members).
     epidemic: tokio::sync::Notify,
+    /// THIS node's SWIM incarnation — bumped only by us to REFUTE a false Suspect/Dead
+    /// about ourselves (a higher-incarnation Alive overrides it everywhere). We stamp it
+    /// on our own member record ([`Self::refresh_self`] / [`Self::member_entries`]).
+    self_incarnation: std::sync::atomic::AtomicU64,
 }
 
 /// Min interval between epidemic (new-member-triggered) diffusion rounds.
@@ -177,6 +250,10 @@ const EPIDEMIC_DEBOUNCE_MS: u64 = 1_000;
 /// fan-out). One target diffused a join wave through the tail in ~40s;
 /// fan-out spreads new-member knowledge in log-fanout hops.
 const EPIDEMIC_FANOUT: usize = 3;
+/// Times a single delta is re-transmitted (SWIM limited retransmission [S1]): a change is enqueued
+/// at this and re-sent on each epidemic round until it hits 0, so it saturates the cluster via
+/// fan-out^repeats instead of a single push (which left the tail waiting on the 30s shuffle).
+const GOSSIP_REPEATS: u8 = 6;
 /// Periodic epidemic SAFETY NET. The new-member cascade only fires while a node
 /// keeps LEARNING members, so once its neighbors converge a straggler stops
 /// receiving pushes and waits for the 30s shuffle — the measured 3s (cascade
@@ -198,6 +275,7 @@ impl Membership {
             isolated_since_ms: RwLock::new(0),
             last_epidemic_ms: RwLock::new(0),
             epidemic: tokio::sync::Notify::new(),
+            self_incarnation: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -263,6 +341,9 @@ impl Membership {
                 tokio::select! {
                     _ = interval.tick() => {
                         this.shuffle_round().await;
+                        // DIGEST anti-entropy [S1]: the cheap divergence check that replaces the
+                        // shuffle's full-map carriage — full sync only on a hash mismatch.
+                        this.digest_round().await;
                     }
                     _ = epidemic_tick.tick() => {
                         this.epidemic_push().await;
@@ -295,13 +376,39 @@ impl Membership {
         let mut views = self.views.write().await;
         let retention = self.cfg.dead_retention;
         views.dead.retain(|_, (_, died)| died.elapsed() < retention);
+        let swim_dead = |id: &NodeId| {
+            views
+                .members
+                .get(id)
+                .is_some_and(|m| m.state == MemberState::Dead)
+        };
+        // Active peers, EXCLUDING any that gossip has since converged as Dead (they belong in `dead`,
+        // not shown as a live link even for the round or two before probing removes them).
+        let active: Vec<(NodeId, PeerState)> = views
+            .active
+            .iter()
+            .filter(|(id, _)| !swim_dead(id))
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        let mut dead: Vec<(NodeId, PeerState)> = views
+            .dead
+            .iter()
+            .map(|(k, (v, _))| (*k, v.clone()))
+            .collect();
+        // Surface converged SWIM-Dead members not locally tombstoned. The converged Dead state is the
+        // authoritative "this peer is down" signal on EVERY node — whether it detected the death itself
+        // or learned it via gossip — so a node that never held the dead peer as an active link (and so
+        // has no tombstone) still reports it down.
+        for (id, m) in &views.members {
+            if m.state == MemberState::Dead && !dead.iter().any(|(k, _)| k == id) {
+                let mut ps = PeerState::new(m.addr.clone());
+                ps.alive = false;
+                dead.push((*id, ps));
+            }
+        }
         Snapshot {
-            active: views.active.iter().map(|(k, v)| (*k, v.clone())).collect(),
-            dead: views
-                .dead
-                .iter()
-                .map(|(k, (v, _))| (*k, v.clone()))
-                .collect(),
+            active,
+            dead,
             passive_count: views.passive.len(),
         }
     }
@@ -327,11 +434,86 @@ impl Membership {
     /// [`EPIDEMIC_FANOUT`] random active peers concurrently (fire-and-forget).
     /// Triggered by learning NEW members; the receivers merge and re-fire,
     /// giving log-fanout diffusion of a join wave.
+    /// A stable hash of the CENSUS set — sorted `(id, incarnation, state)` over non-Dead members
+    /// (excludes `last_heard`, which ticks, and Dead, whose prune timing varies). Two nodes with the
+    /// same digest hold the identical census ⇒ the same election result. The cheap O(1) divergence
+    /// check that replaces shipping the full member map every round [S1].
+    async fn members_digest(&self) -> [u8; 32] {
+        let views = self.views.read().await;
+        let mut rows: Vec<([u8; 32], u64, u8)> = views
+            .members
+            .iter()
+            .filter(|(_, m)| m.state != MemberState::Dead)
+            .map(|(id, m)| (id.0, m.incarnation, m.state.to_u8()))
+            .collect();
+        rows.sort_unstable();
+        let mut buf = Vec::with_capacity(rows.len() * 41);
+        for (id, inc, state) in rows {
+            buf.extend_from_slice(&id);
+            buf.extend_from_slice(&inc.to_le_bytes());
+            buf.push(state);
+        }
+        zeph_core::Cid::of(&buf).0
+    }
+
+    /// DIGEST anti-entropy [S1]: exchange our census-set hash with a random active peer; only if the
+    /// hashes DIFFER do we do a full `sync_members_with` reconcile. Steady state (in sync) ⇒ just two
+    /// tiny hashes, no member data — the O(N)/round backstop → O(1). A missed delta is caught here
+    /// within one digest interval (same bound the full-map shuffle used to give).
+    async fn digest_round(&self) {
+        let peer = {
+            let views = self.views.read().await;
+            let addrs: Vec<PeerAddr> = views.active.values().map(|s| s.addr.clone()).collect();
+            addrs.choose(&mut rand::thread_rng()).cloned()
+        };
+        let Some(peer) = peer else { return };
+        let my_hash = self.members_digest().await;
+        let msg = wire::Message::Digest(wire::Digest { hash: my_hash });
+        if let Some(frame) = self.request(&peer, &msg, true).await {
+            if let wire::Message::Digest(d) = frame.message {
+                if d.hash != my_hash {
+                    self.sync_members_with(&peer).await;
+                }
+            }
+        }
+    }
+
     async fn epidemic_push(self: &Arc<Self>) {
+        // Keep our own last_heard fresh locally (the 30s shuffle gossips the full map incl. self).
         self.refresh_self().await;
-        let msg = wire::Message::MemberSync(wire::MemberSync {
-            members: self.member_entries().await,
-        });
+        // DELTA gossip [S1]: send ONLY the members that changed since the last push. Steady state
+        // (nothing dirty) → send nothing — the O(N)/round → O(Δ) win. One-way (fire-and-forget): the
+        // 30s shuffle is the bidirectional full-map anti-entropy that repairs any missed delta.
+        let delta: Vec<wire::MemberEntry> = {
+            let mut views = self.views.write().await;
+            if views.dirty.is_empty() {
+                return;
+            }
+            let ids: Vec<NodeId> = views.dirty.keys().copied().collect();
+            let entries: Vec<wire::MemberEntry> = ids
+                .iter()
+                .filter_map(|id| views.members.get(id).map(|m| member_entry(*id, m)))
+                .collect();
+            // Decrement each retransmission counter; retire a member once it has been re-sent
+            // GOSSIP_REPEATS times.
+            for id in &ids {
+                let done = match views.dirty.get_mut(id) {
+                    Some(c) => {
+                        *c = c.saturating_sub(1);
+                        *c == 0
+                    }
+                    None => false,
+                };
+                if done {
+                    views.dirty.remove(id);
+                }
+            }
+            entries
+        };
+        if delta.is_empty() {
+            return;
+        }
+        let msg = wire::Message::MemberSync(wire::MemberSync { members: delta });
         let mut targets: Vec<PeerAddr> = {
             let views = self.views.read().await;
             views.active.values().map(|s| s.addr.clone()).collect()
@@ -342,11 +524,7 @@ impl Membership {
             let this = self.clone();
             let msg = msg.clone();
             async move {
-                if let Some(frame) = this.request(&peer, &msg, true).await {
-                    if let wire::Message::MemberSync(sync) = frame.message {
-                        this.merge_members(&sync.members).await;
-                    }
-                }
+                this.send_oneway(&peer, &msg).await;
             }
         });
         futures::future::join_all(sends).await;
@@ -454,19 +632,107 @@ impl Membership {
         push_passive(&mut views.passive, peer, self.cfg.passive_size);
     }
 
+    /// SWIM indirect probe: after our DIRECT probe of `target` timed out, ask up to
+    /// `cfg.indirect_probes` random ALIVE members (≠ self, ≠ target) to ping it on our behalf,
+    /// concurrently. Returns true as soon as ANY helper reports it alive — a first-hand refutation
+    /// of our timeout that rules out a one-hop network blip before we suspect the target.
+    async fn indirect_probe(&self, target: NodeId, target_addr: &PeerAddr) -> bool {
+        let k = self.cfg.indirect_probes;
+        if k == 0 {
+            return false;
+        }
+        let me = self.my_id();
+        let mut helpers: Vec<PeerAddr> = {
+            let views = self.views.read().await;
+            views
+                .members
+                .iter()
+                // Pick ALIVE helpers by SWIM state (not a last_heard TTL, which delta gossip [S1]
+                // no longer keeps fresh for un-probed members).
+                .filter(|(id, m)| **id != me && **id != target && m.state == MemberState::Alive)
+                .map(|(_, m)| m.addr.clone())
+                .collect()
+        };
+        if helpers.is_empty() {
+            return false;
+        }
+        helpers.shuffle(&mut rand::thread_rng());
+        helpers.truncate(k);
+        let req = wire::Message::PingReq(wire::PingReq {
+            target_id: target.0,
+            target_addr: target_addr.to_string(),
+        });
+        let acks =
+            futures::future::join_all(helpers.iter().map(|h| self.request(h, &req, true))).await;
+        acks.into_iter().flatten().any(|frame| {
+            matches!(frame.message, wire::Message::PingReqAck(ack) if ack.target_id == target.0 && ack.alive)
+        })
+    }
+
+    /// Put a member into SWIM Suspect (at its current incarnation) after direct + indirect probes
+    /// both failed. Gossips via the member map; escalated to Dead by [`Self::promote_suspects`]
+    /// after `cfg.suspect_timeout` unless the member refutes (Alive @ a higher incarnation).
+    async fn suspect(&self, id: NodeId) {
+        let mut views = self.views.write().await;
+        if let Some(m) = views.members.get_mut(&id) {
+            // Only a currently-Alive member (don't downgrade a Dead; a re-suspect keeps the original
+            // suspect_since so the window doesn't reset).
+            if m.state == MemberState::Alive {
+                let inc = m.incarnation;
+                m.set_liveness(inc, MemberState::Suspect, now_ms());
+                views.dirty.insert(id, GOSSIP_REPEATS); // gossip the Suspect as a delta
+                tracing::warn!(peer = %short(&id), "peer SUSPECT (direct+indirect probe failed)");
+            }
+        }
+    }
+
+    /// Promote every member Suspect longer than `cfg.suspect_timeout` to Dead. The first node to
+    /// promote gossips Dead via the member map (census-excluded immediately); others converge.
+    async fn promote_suspects(&self) {
+        let now = now_ms();
+        let timeout = self.cfg.suspect_timeout.as_millis() as u64;
+        let expired: Vec<NodeId> = {
+            let views = self.views.read().await;
+            views
+                .members
+                .iter()
+                .filter(|(_, m)| {
+                    m.state == MemberState::Suspect
+                        && m.suspect_since_ms
+                            .is_some_and(|s| now.saturating_sub(s) >= timeout)
+                })
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        for id in expired {
+            self.mark_dead(id).await;
+        }
+    }
+
     async fn mark_dead(&self, id: NodeId) {
         let promoted = {
             let mut views = self.views.write().await;
-            let Some(mut state) = views.active.remove(&id) else {
-                return;
-            };
-            state.alive = false;
-            views.dead.insert(id, (state, std::time::Instant::now()));
-            // Promote a random passive candidate.
-            views.passive.shuffle(&mut rand::thread_rng());
-            views.passive.pop()
+            // SWIM: mark the converged record Dead at its CURRENT incarnation so it GOSSIPS + drops
+            // from the census immediately (not just TTL-aged). Preserving the incarnation lets the
+            // member refute (Alive @ a higher incarnation) if it is actually alive.
+            if let Some(m) = views.members.get_mut(&id) {
+                let inc = m.incarnation;
+                m.set_liveness(inc, MemberState::Dead, now_ms());
+                views.dirty.insert(id, GOSSIP_REPEATS); // gossip the Dead as a delta
+            }
+            // Active-view maintenance: only if it was a warm link (a Suspect promoted by the tick
+            // may not be in our active view at all).
+            match views.active.remove(&id) {
+                Some(mut state) => {
+                    state.alive = false;
+                    views.dead.insert(id, (state, std::time::Instant::now()));
+                    views.passive.shuffle(&mut rand::thread_rng());
+                    views.passive.pop()
+                }
+                None => None,
+            }
         };
-        tracing::warn!(peer = %short(&id), "peer dead — removed from active view");
+        tracing::warn!(peer = %short(&id), "peer DEAD");
         if let Some(candidate) = promoted {
             self.try_promote(candidate).await;
         }
@@ -565,6 +831,31 @@ impl Membership {
     // ── periodic tasks ────────────────────────────────────────────────────
 
     async fn probe_round(&self) {
+        // SWIM lifecycle: escalate any member Suspect past the timeout to Dead (gossips + drops it
+        // from the census). Runs every round so a death converges within a bounded window.
+        self.promote_suspects().await;
+        // Drop active-view peers already converged Dead (via gossip): no point probing a corpse, it
+        // holds an active slot, and it belongs in `dead`. Local + cheap; fill_active backfills.
+        {
+            let mut views = self.views.write().await;
+            let dead_active: Vec<NodeId> = views
+                .active
+                .keys()
+                .copied()
+                .filter(|id| {
+                    views
+                        .members
+                        .get(id)
+                        .is_some_and(|m| m.state == MemberState::Dead)
+                })
+                .collect();
+            for id in dead_active {
+                if let Some(mut ps) = views.active.remove(&id) {
+                    ps.alive = false;
+                    views.dead.insert(id, (ps, std::time::Instant::now()));
+                }
+            }
+        }
         // ALWAYS top up the active view from passive (cheap; promotions succeed when peers are
         // reachable). This is the PRIMARY recovery path and must never be skipped — skipping it
         // when isolated was a bug that left the node stuck.
@@ -607,14 +898,29 @@ impl Membership {
                         state.last_seen_unix = now_unix();
                         state.consecutive_failures = 0;
                     }
-                    // Positive liveness evidence → refresh the converged member record.
-                    views.members.insert(
-                        id,
-                        Member {
-                            addr: addr.clone(),
-                            last_heard_ms: now_ms(),
-                        },
-                    );
+                    // DIRECT positive liveness evidence → refresh the converged member record.
+                    // Preserve the SWIM incarnation/state (don't clobber a refutation); a first-hand
+                    // probe ack also CLEARS our own Suspect (we have proof it's alive), but leaves a
+                    // higher-incarnation Dead to the member's own refutation.
+                    match views.members.get_mut(&id) {
+                        Some(m) => {
+                            m.last_heard_ms = now_ms();
+                            m.addr = addr.clone();
+                            // First-hand proof it is alive clears OUR Suspect — via set_liveness so
+                            // the local suspect clock resets too (a raw `state = Alive` would leave a
+                            // stale suspect_since that a later re-suspect reuses → premature Dead).
+                            if m.state == MemberState::Suspect {
+                                let inc = m.incarnation;
+                                m.set_liveness(inc, MemberState::Alive, now_ms());
+                            }
+                        }
+                        None => {
+                            views
+                                .members
+                                .insert(id, Member::alive(addr.clone(), now_ms()));
+                            views.dirty.insert(id, GOSSIP_REPEATS); // newly-learned member → gossip as a delta
+                        }
+                    }
                     tracing::info!(
                         peer = %short(&id),
                         rtt_us = report.rtt.as_micros() as u64,
@@ -622,7 +928,7 @@ impl Membership {
                     );
                 }
                 Err(err) => {
-                    let dead = {
+                    let threshold_hit = {
                         let mut views = self.views.write().await;
                         match views.active.get_mut(&id) {
                             Some(state) => {
@@ -633,8 +939,20 @@ impl Membership {
                         }
                     };
                     tracing::warn!(peer = %short(&id), %err, "peer unreachable");
-                    if dead {
-                        self.mark_dead(id).await;
+                    if threshold_hit {
+                        // SWIM: before declaring the peer gone, ask K members to ping it. A helper's
+                        // success means our direct path blipped, not that the peer died — rescue it.
+                        if self.indirect_probe(id, &addr).await {
+                            tracing::info!(peer = %short(&id), "indirect probe reached target — alive");
+                            if let Some(state) = self.views.write().await.active.get_mut(&id) {
+                                state.consecutive_failures = 0;
+                            }
+                            self.note_heard(id).await;
+                        } else {
+                            // Direct AND indirect probes failed → SUSPECT (a refutation grace window
+                            // before Dead). Gossips via the member map; promoted to Dead by the tick.
+                            self.suspect(id).await;
+                        }
                     }
                 }
             }
@@ -705,7 +1023,9 @@ impl Membership {
         let msg = wire::Message::Shuffle(wire::Shuffle {
             origin: self.me(),
             sample,
-            members: self.member_entries().await,
+            // Member gossip no longer rides the shuffle [S1] — the digest round reconciles instead
+            // (full sync only on a hash mismatch). The shuffle is now HyParView passive-view mixing only.
+            members: Vec::new(),
         });
         if let Some(frame) = self.request(&target, &msg, true).await {
             if let wire::Message::ShuffleReply(reply) = frame.message {
@@ -729,11 +1049,17 @@ impl Membership {
     async fn refresh_self(&self) {
         let addr = self.transport.addr();
         let id = self.my_id();
+        let incarnation = self
+            .self_incarnation
+            .load(std::sync::atomic::Ordering::Relaxed);
         self.views.write().await.members.insert(
             id,
             Member {
                 addr,
                 last_heard_ms: now_ms(),
+                incarnation,
+                state: MemberState::Alive,
+                suspect_since_ms: None,
             },
         );
     }
@@ -745,36 +1071,60 @@ impl Membership {
             .await
             .members
             .iter()
-            .map(|(id, m)| wire::MemberEntry {
-                id: id.0,
-                addr: m.addr.to_string(),
-                last_heard_ms: m.last_heard_ms,
-            })
+            .map(|(id, m)| member_entry(*id, m))
             .collect()
     }
 
-    /// Merge an incoming member set into ours: union + max-`last_heard_ms`. Skips
-    /// entries about SELF (we manage our own record authoritatively via
-    /// [`Self::refresh_self`]). Idempotent + commutative → convergence.
+    /// Merge an incoming member set into ours with SWIM ordering (see [`merge_one`]). An entry about
+    /// SELF that says Suspect/Dead triggers REFUTATION: we bump our incarnation above theirs and
+    /// re-assert Alive, so the higher incarnation overrides the false suspicion everywhere.
     async fn merge_members(&self, entries: &[wire::MemberEntry]) {
         let me = self.my_id().0;
-        let new_members = {
+        let mut refute = false;
+        let (new_members, dirtied) = {
             let mut views = self.views.write().await;
             let before = views.members.len();
+            let mut dirtied = false;
             for e in entries {
                 if e.id == me {
+                    // SWIM refutation of a false Suspect/Dead about ourselves.
+                    if MemberState::from_u8(e.state) != MemberState::Alive {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        // saturating: `e.incarnation` is an unauthenticated wire field — a peer
+                        // sending u64::MAX must not overflow (panic in debug / wrap-to-0 in release,
+                        // which would leave us unable to refute).
+                        let bumped = e
+                            .incarnation
+                            .max(self.self_incarnation.load(Relaxed))
+                            .saturating_add(1);
+                        self.self_incarnation.store(bumped, Relaxed);
+                        refute = true;
+                    }
                     continue;
                 }
-                merge_one(&mut views.members, e);
+                // Delta-worthy changes (new member / liveness change) become the next gossip delta.
+                if merge_one(&mut views.members, e) {
+                    views.dirty.insert(NodeId(e.id), GOSSIP_REPEATS);
+                    dirtied = true;
+                }
             }
-            views.members.len() - before
+            (views.members.len() - before, dirtied)
         };
-        // EPIDEMIC DIFFUSION (v2 census bar): learning NEW members triggers one
-        // immediate extra shuffle toward a random active peer (debounced), so
-        // new-member knowledge doubles per ~seconds-hop instead of per 30s
-        // cycle — a 20-node join wave converges in ~5 hops. Zero steady-state
-        // cost: no new information, no extra shuffle.
-        if new_members > 0 {
+        if refute {
+            // Stamp the bumped incarnation onto our own record (done outside the lock —
+            // refresh_self takes the views lock itself), and gossip the refutation as a delta.
+            self.refresh_self().await;
+            self.views
+                .write()
+                .await
+                .dirty
+                .insert(self.my_id(), GOSSIP_REPEATS);
+        }
+        // EPIDEMIC DIFFUSION: ANY delta-worthy change (new member OR a liveness change — suspect /
+        // dead / refute) wakes an immediate debounced delta push, so it diffuses per-seconds-hop
+        // instead of waiting the 5s periodic tick or the 30s shuffle. Steady state (no change) → no
+        // wake, no gossip.
+        if new_members > 0 || dirtied || refute {
             let now = now_ms();
             let fire = {
                 let mut last = self.last_epidemic_ms.write().await;
@@ -801,15 +1151,13 @@ impl Membership {
         let now = now_ms();
         let mut views = self.views.write().await;
         if let Some(m) = views.members.get_mut(&id) {
+            // Positive evidence refreshes freshness but PRESERVES the SWIM incarnation/state
+            // (a refuted higher incarnation must not regress; a gossiped Suspect/Dead is only
+            // cleared by the member's own refutation, not by us hearing one message).
             m.last_heard_ms = now;
         } else if let Some(addr) = views.active.get(&id).map(|s| s.addr.clone()) {
-            views.members.insert(
-                id,
-                Member {
-                    addr,
-                    last_heard_ms: now,
-                },
-            );
+            views.members.insert(id, Member::alive(addr, now));
+            views.dirty.insert(id, GOSSIP_REPEATS); // newly-learned member → gossip as a delta
         }
     }
 
@@ -826,13 +1174,19 @@ impl Membership {
             .retain(|id, m| *id == me || now.saturating_sub(m.last_heard_ms) < retention);
     }
 
-    /// The CONVERGED alive set: every member (incl. SELF) whose `last_heard_ms`
-    /// is within [`CENSUS_TTL_MS`]. Because the member map converges across nodes
-    /// (union + max-merge) this returns the SAME set on every node, so an election
-    /// over it is consistent — the whole point of this layer. Unlike `snapshot().active`
-    /// it is the FULL alive membership, not a size-bounded per-node partial view.
+    /// The CONVERGED alive set for the registry writer election: every KNOWN member (incl. SELF)
+    /// that is not SWIM-Dead. Because the member map converges across nodes (union + SWIM merge)
+    /// this returns the SAME set on every node, so the election is consistent — the point of this layer.
+    ///
+    /// LIVENESS IS THE SWIM STATE, NOT a freshness TTL [S1]: a member leaves the census only when it
+    /// is gossiped `Dead` (active detection, converges in seconds) — NOT when its `last_heard` goes
+    /// stale. `last_heard` is only a COARSE backstop (`dead_retention`) for a member that went totally
+    /// silent without a `Dead` reaching us (a lost gossip / long partition). Decoupling liveness from
+    /// the ever-ticking `last_heard` is what lets gossip become O(Δ) — the freshness clock no longer
+    /// has to be refreshed cluster-wide every round to keep a live member in the census.
     pub async fn census(&self) -> Vec<(NodeId, PeerAddr)> {
         let now = now_ms();
+        let backstop = self.cfg.dead_retention.as_millis() as u64;
         let me = self.my_id();
         let views = self.views.read().await;
         // SELF is trivially alive — always included, with our current address.
@@ -841,27 +1195,37 @@ impl Membership {
             if *id == me {
                 continue;
             }
-            if now.saturating_sub(m.last_heard_ms) < CENSUS_TTL_MS {
+            // Alive OR Suspect stay (Suspect is still probably alive; only fast-converging Dead is
+            // excluded). The `last_heard` check is the coarse silent-member backstop, NOT the primary
+            // liveness signal.
+            if m.state != MemberState::Dead && now.saturating_sub(m.last_heard_ms) < backstop {
                 out.push((*id, m.addr.clone()));
             }
         }
         out
     }
 
-    /// The REAL-TIME liveness census for content placement/repair: members
-    /// heard within [`LIVENESS_TTL_MS`] AND not locally tombstoned-dead. Tighter
-    /// than [`Self::census`] so a dead holder stops counting toward durability
-    /// quickly; the 120s census stays for registry-writer election consistency.
+    /// The REAL-TIME liveness census for content placement/repair: members that are SWIM **Alive**
+    /// (not Suspect/Dead) and not locally tombstoned. Tighter than [`Self::census`] (which keeps
+    /// Suspect) so a holder stops counting toward durability the moment it is suspected → repair
+    /// fires fast. State-based, not a `last_heard` TTL (see the body / [`Self::census`]).
     pub async fn liveness_census(&self) -> Vec<(NodeId, PeerAddr)> {
         let now = now_ms();
+        let backstop = self.cfg.dead_retention.as_millis() as u64;
         let me = self.my_id();
         let views = self.views.read().await;
         let mut out = vec![(me, self.transport.addr())];
         for (id, m) in &views.members {
-            if *id == me || views.dead.contains_key(id) {
+            // Live-for-durability = SWIM **Alive** (excludes Suspect AND Dead, so repair reacts to a
+            // holder the moment it is suspected) and not locally tombstoned. Uses the CONVERGED state,
+            // NOT a `last_heard` freshness TTL: with delta gossip [S1] a node no longer refreshes
+            // `last_heard` for members it doesn't directly probe, so a TTL here would falsely drop live
+            // holders (only ~active_size are probed) → a repair storm. A coarse backstop still forgets
+            // a truly-silent member.
+            if *id == me || views.dead.contains_key(id) || m.state != MemberState::Alive {
                 continue;
             }
-            if now.saturating_sub(m.last_heard_ms) < LIVENESS_TTL_MS {
+            if now.saturating_sub(m.last_heard_ms) < backstop {
                 out.push((*id, m.addr.clone()));
             }
         }
@@ -1025,11 +1389,13 @@ impl Membership {
                 }
                 // Converged-membership gossip rides the shuffle: merge the sender's member set
                 // and reply with ours — no separate connection (that congested relay peers).
+                // Merge any members the sender rode along (empty now that the digest replaced the
+                // shuffle carriage [S1]; kept for robustness), and reply with only the passive sample.
                 self.merge_members(&shuffle.members).await;
                 self.refresh_self().await;
                 Some(wire::Message::ShuffleReply(wire::ShuffleReply {
                     sample: reply_sample,
-                    members: self.member_entries().await,
+                    members: Vec::new(),
                 }))
             }
             wire::Message::MemberSync(sync) => {
@@ -1039,6 +1405,29 @@ impl Membership {
                 self.refresh_self().await;
                 Some(wire::Message::MemberSync(wire::MemberSync {
                     members: self.member_entries().await,
+                }))
+            }
+            wire::Message::Digest(_) => {
+                // Reply with our own census-set hash. The requester reconciles (full sync) on a
+                // mismatch — which is bidirectional, so we learn from it too; no action needed here.
+                Some(wire::Message::Digest(wire::Digest {
+                    hash: self.members_digest().await,
+                }))
+            }
+            wire::Message::PingReq(req) => {
+                // SWIM indirect probe: a peer whose DIRECT probe of `target` timed out asks us to
+                // ping it. A helper's success rules out a one-hop blip before the target is suspected.
+                let alive = match req.target_addr.parse::<PeerAddr>() {
+                    Ok(addr) => self
+                        .transport
+                        .ping(&addr, self.cfg.probe_timeout)
+                        .await
+                        .is_ok(),
+                    Err(_) => false,
+                };
+                Some(wire::Message::PingReqAck(wire::PingReqAck {
+                    target_id: req.target_id,
+                    alive,
                 }))
             }
             other => {
@@ -1079,25 +1468,61 @@ fn now_ms() -> u64 {
 
 /// Merge one wire entry into a member map: union + max-`last_heard_ms` (upserting
 /// the address when the entry is fresher). Commutative and idempotent.
-fn merge_one(members: &mut HashMap<NodeId, Member>, e: &wire::MemberEntry) {
+/// Merge ONE incoming member entry with SWIM ordering. The liveness winner is decided by
+/// `(incarnation, rank(state))`: a strictly higher incarnation wins outright (this is how a member
+/// REFUTES a false Suspect/Dead — it bumps its incarnation and re-asserts Alive); at EQUAL
+/// incarnation the higher-ranked state wins (Dead > Suspect > Alive), so a suspicion/death
+/// propagates. `last_heard_ms` always takes the max (freshness backstop, independent of state).
+/// Commutative + idempotent on `(incarnation, rank)` → the map still converges across nodes.
+/// Serialize one converged member as a wire entry.
+fn member_entry(id: NodeId, m: &Member) -> wire::MemberEntry {
+    wire::MemberEntry {
+        id: id.0,
+        addr: m.addr.to_string(),
+        last_heard_ms: m.last_heard_ms,
+        incarnation: m.incarnation,
+        state: m.state.to_u8(),
+    }
+}
+
+/// Returns `true` iff this merge made a DELTA-WORTHY change — a new member or a liveness
+/// `(incarnation, state)` change — so the caller can mark it `dirty` for delta gossip. A
+/// `last_heard`-only advance returns `false` (freshness is not a gossiped liveness signal).
+fn merge_one(members: &mut HashMap<NodeId, Member>, e: &wire::MemberEntry) -> bool {
     let id = NodeId(e.id);
     let Ok(addr) = e.addr.parse::<PeerAddr>() else {
-        return;
+        return false;
     };
+    let in_state = MemberState::from_u8(e.state);
     match members.get_mut(&id) {
-        Some(existing) if e.last_heard_ms <= existing.last_heard_ms => {}
         Some(existing) => {
-            existing.last_heard_ms = e.last_heard_ms;
-            existing.addr = addr;
+            // Liveness ((incarnation, rank)) and freshness (last_heard) merge INDEPENDENTLY.
+            let incoming_wins = e.incarnation > existing.incarnation
+                || (e.incarnation == existing.incarnation
+                    && in_state.rank() > existing.state.rank());
+            if incoming_wins {
+                // set_liveness maintains the local Suspect clock (stamp on enter, clear on leave).
+                existing.set_liveness(e.incarnation, in_state, now_ms());
+            }
+            if e.last_heard_ms > existing.last_heard_ms {
+                existing.last_heard_ms = e.last_heard_ms;
+                existing.addr = addr;
+            }
+            incoming_wins
         }
         None => {
-            members.insert(
-                id,
-                Member {
-                    addr,
-                    last_heard_ms: e.last_heard_ms,
-                },
-            );
+            let mut m = Member {
+                addr,
+                last_heard_ms: e.last_heard_ms,
+                incarnation: e.incarnation,
+                state: in_state,
+                suspect_since_ms: None,
+            };
+            if in_state == MemberState::Suspect {
+                m.suspect_since_ms = Some(now_ms());
+            }
+            members.insert(id, m);
+            true // a newly-learned member is delta-worthy
         }
     }
 }
@@ -1249,11 +1674,386 @@ mod tests {
             id: addr.node_id().0,
             addr: addr.to_string(),
             last_heard_ms,
+            incarnation: 0,
+            state: 0,
         }
+    }
+
+    fn swim_entry(
+        addr: &PeerAddr,
+        last_heard_ms: u64,
+        incarnation: u64,
+        state: MemberState,
+    ) -> wire::MemberEntry {
+        wire::MemberEntry {
+            id: addr.node_id().0,
+            addr: addr.to_string(),
+            last_heard_ms,
+            incarnation,
+            state: state.to_u8(),
+        }
+    }
+
+    #[test]
+    fn member_state_u8_roundtrips_and_ranks() {
+        for s in [MemberState::Alive, MemberState::Suspect, MemberState::Dead] {
+            assert_eq!(MemberState::from_u8(s.to_u8()), s);
+        }
+        assert!(MemberState::Alive.rank() < MemberState::Suspect.rank());
+        assert!(MemberState::Suspect.rank() < MemberState::Dead.rank());
+        assert_eq!(MemberState::from_u8(99), MemberState::Alive); // unknown byte → Alive
+    }
+
+    #[tokio::test]
+    async fn set_liveness_maintains_the_suspect_clock() {
+        let mut m = Member::alive(test_addr().await, 0);
+        assert!(m.suspect_since_ms.is_none());
+        // Entering Suspect stamps the local clock.
+        m.set_liveness(0, MemberState::Suspect, 100);
+        assert_eq!(m.suspect_since_ms, Some(100));
+        // Re-applying Suspect keeps the ORIGINAL stamp — a re-suspect must not reset the window.
+        m.set_liveness(0, MemberState::Suspect, 200);
+        assert_eq!(m.suspect_since_ms, Some(100));
+        // Leaving Suspect (→Alive) CLEARS the clock; otherwise a later re-suspect would reuse a
+        // stale, long-expired window and promote to Dead with ~no grace (the reviewed bug).
+        m.set_liveness(1, MemberState::Alive, 300);
+        assert_eq!(m.suspect_since_ms, None);
+        // A fresh Suspect after recovery stamps a NEW time.
+        m.set_liveness(1, MemberState::Suspect, 400);
+        assert_eq!(m.suspect_since_ms, Some(400));
+        // Dead also clears the clock.
+        m.set_liveness(1, MemberState::Dead, 500);
+        assert_eq!(m.suspect_since_ms, None);
+    }
+
+    #[tokio::test]
+    async fn merge_one_swim_liveness_ordering_and_refutation() {
+        let a = test_addr().await;
+        let id = a.node_id();
+        let mut m: HashMap<NodeId, Member> = HashMap::new();
+
+        // First observation: Alive@0.
+        merge_one(&mut m, &swim_entry(&a, 100, 0, MemberState::Alive));
+        assert_eq!(m[&id].state, MemberState::Alive);
+
+        // Same incarnation, HIGHER rank wins: Suspect@0 overrides Alive@0, and stamps the clock.
+        merge_one(&mut m, &swim_entry(&a, 100, 0, MemberState::Suspect));
+        assert_eq!(m[&id].state, MemberState::Suspect);
+        assert!(
+            m[&id].suspect_since_ms.is_some(),
+            "entering Suspect stamps the local clock"
+        );
+
+        // Same incarnation, LOWER rank does NOT override (an Alive@0 can't clear a Suspect@0).
+        merge_one(&mut m, &swim_entry(&a, 100, 0, MemberState::Alive));
+        assert_eq!(m[&id].state, MemberState::Suspect);
+
+        // Escalate to Dead@0 (highest rank at the same incarnation); the Suspect clock clears.
+        merge_one(&mut m, &swim_entry(&a, 100, 0, MemberState::Dead));
+        assert_eq!(m[&id].state, MemberState::Dead);
+        assert!(
+            m[&id].suspect_since_ms.is_none(),
+            "leaving Suspect clears the clock"
+        );
+
+        // REFUTATION: Alive at a HIGHER incarnation beats Dead@0 (the member came back / refuted).
+        merge_one(&mut m, &swim_entry(&a, 100, 1, MemberState::Alive));
+        assert_eq!(m[&id].state, MemberState::Alive);
+        assert_eq!(m[&id].incarnation, 1);
+    }
+
+    #[tokio::test]
+    async fn merge_one_freshness_is_independent_of_liveness() {
+        let a = test_addr().await;
+        let id = a.node_id();
+        let mut m: HashMap<NodeId, Member> = HashMap::new();
+        merge_one(&mut m, &swim_entry(&a, 100, 5, MemberState::Alive));
+
+        // A STALER (lower last_heard) but higher-rank entry: liveness merges, freshness does NOT regress.
+        merge_one(&mut m, &swim_entry(&a, 50, 5, MemberState::Suspect));
+        assert_eq!(m[&id].state, MemberState::Suspect, "liveness merged");
+        assert_eq!(
+            m[&id].last_heard_ms, 100,
+            "freshness kept the max, not regressed"
+        );
+
+        // A FRESHER entry whose liveness LOSES: freshness advances, liveness unchanged.
+        merge_one(&mut m, &swim_entry(&a, 200, 5, MemberState::Alive));
+        assert_eq!(m[&id].last_heard_ms, 200, "freshness advanced");
+        assert_eq!(
+            m[&id].state,
+            MemberState::Suspect,
+            "lower rank at equal incarnation did not override"
+        );
     }
 
     fn last_heard(members: &HashMap<NodeId, Member>, id: NodeId) -> Option<u64> {
         members.get(&id).map(|m| m.last_heard_ms)
+    }
+
+    // ── SWIM active death detection (P4) ─────────────────────────────────────
+
+    /// A Suspect member is escalated to Dead once its window elapses, and Dead drops it from BOTH
+    /// censuses IMMEDIATELY (active detection) rather than waiting out the ~120s/30s TTL.
+    #[tokio::test]
+    async fn suspect_promotes_to_dead_and_drops_from_census() {
+        let transport = Arc::new(
+            Transport::bind(
+                zeph_crypto_test_identity(),
+                zeph_transport::Reach::LocalOnly,
+                vec![],
+                0,
+            )
+            .await
+            .unwrap(),
+        );
+        let m = Membership::new(
+            transport,
+            Config {
+                suspect_timeout: Duration::from_millis(50),
+                ..Default::default()
+            },
+        );
+        // A freshly-heard alive peer is in the census.
+        let peer = test_addr().await;
+        let pid = peer.node_id();
+        m.merge_members(&[entry(&peer, now_ms())]).await;
+        assert!(in_census(&m, pid).await, "alive peer is in the census");
+
+        // Direct+indirect failure ⇒ Suspect. Still counted (only Dead is excluded).
+        m.suspect(pid).await;
+        assert!(in_census(&m, pid).await, "a Suspect stays in the census");
+
+        // After the window the promotion tick escalates it to Dead → excluded from both censuses.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        m.promote_suspects().await;
+        assert!(
+            !in_census(&m, pid).await,
+            "Dead is dropped from the election census"
+        );
+        assert!(
+            !m.liveness_census().await.iter().any(|(id, _)| *id == pid),
+            "Dead is dropped from the liveness census"
+        );
+    }
+
+    /// A node that hears a FALSE Suspect/Dead about ITSELF refutes it: bumps its incarnation above
+    /// the accuser's and re-asserts Alive, so the higher incarnation overrides the false state.
+    #[tokio::test]
+    async fn self_suspicion_is_refuted_by_incarnation_bump() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let transport = Arc::new(
+            Transport::bind(
+                zeph_crypto_test_identity(),
+                zeph_transport::Reach::LocalOnly,
+                vec![],
+                0,
+            )
+            .await
+            .unwrap(),
+        );
+        let m = Membership::new(transport, Config::default());
+        let me = m.my_id();
+        let my_addr = m.transport.addr();
+
+        // Someone gossips us as Dead @ incarnation 5.
+        m.merge_members(&[swim_entry(&my_addr, now_ms(), 5, MemberState::Dead)])
+            .await;
+
+        assert_eq!(
+            m.self_incarnation.load(Relaxed),
+            6,
+            "incarnation bumped above the false Dead's"
+        );
+        // Our own gossiped record is Alive @ the bumped incarnation (this is what refutes it fleet-wide).
+        let self_entry = m
+            .member_entries()
+            .await
+            .into_iter()
+            .find(|e| e.id == me.0)
+            .expect("self in member map");
+        assert_eq!(self_entry.state, MemberState::Alive.to_u8());
+        assert_eq!(self_entry.incarnation, 6);
+        assert!(in_census(&m, me).await, "we keep ourselves in the census");
+    }
+
+    /// A RESTARTED node comes up at incarnation 0 while the cluster still holds it Dead@0. It must
+    /// refute past its own stale tombstone (Alive@1 > Dead@0) on its first sync, else it can't rejoin.
+    #[tokio::test]
+    async fn restarted_node_refutes_own_stale_dead_and_rejoins() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let transport = Arc::new(
+            Transport::bind(
+                zeph_crypto_test_identity(),
+                zeph_transport::Reach::LocalOnly,
+                vec![],
+                0,
+            )
+            .await
+            .unwrap(),
+        );
+        let m = Membership::new(transport, Config::default());
+        let me = m.my_id();
+        let my_addr = m.transport.addr();
+
+        // Fresh node (self_incarnation 0) syncs a peer whose map still says WE are Dead@0.
+        m.merge_members(&[swim_entry(&my_addr, now_ms(), 0, MemberState::Dead)])
+            .await;
+
+        assert_eq!(m.self_incarnation.load(Relaxed), 1, "bumped from 0 to 1");
+        let self_entry = m
+            .member_entries()
+            .await
+            .into_iter()
+            .find(|e| e.id == me.0)
+            .unwrap();
+        assert_eq!(
+            (self_entry.state, self_entry.incarnation),
+            (MemberState::Alive.to_u8(), 1),
+            "re-asserts Alive@1, overriding the stale Dead@0"
+        );
+    }
+
+    /// The indirect-probe HELPER side: a `PingReq` is answered with a `PingReqAck` carrying the
+    /// helper's probe result. An unreachable target ⇒ `alive: false` (exercises the handler wiring;
+    /// the alive path needs a live serving target, validated on the fleet at roll).
+    #[tokio::test]
+    async fn ping_req_handler_replies_with_probe_result() {
+        let m = Membership::new(
+            Arc::new(
+                Transport::bind(
+                    zeph_crypto_test_identity(),
+                    zeph_transport::Reach::LocalOnly,
+                    vec![],
+                    0,
+                )
+                .await
+                .unwrap(),
+            ),
+            Config {
+                probe_timeout: Duration::from_millis(200),
+                ..Default::default()
+            },
+        );
+        // test_addr binds then drops the transport, so this address is unreachable.
+        let dead = test_addr().await;
+        let reply = m
+            .handle_message(wire::Message::PingReq(wire::PingReq {
+                target_id: dead.node_id().0,
+                target_addr: dead.to_string(),
+            }))
+            .await;
+        match reply {
+            Some(wire::Message::PingReqAck(ack)) => {
+                assert_eq!(ack.target_id, dead.node_id().0, "acks the requested target");
+                assert!(!ack.alive, "unreachable target reported not alive");
+            }
+            other => panic!("expected a PingReqAck, got {other:?}"),
+        }
+    }
+
+    /// Delta gossip [S1]: only real changes (new member / liveness) dirty the delta set; a
+    /// `last_heard`-only refresh does NOT — that's what makes steady-state gossip O(1) (the freshness
+    /// clock ticks every round but doesn't get gossiped).
+    #[tokio::test]
+    async fn delta_gossip_dirties_only_real_changes() {
+        let m = Membership::new(
+            Arc::new(
+                Transport::bind(
+                    zeph_crypto_test_identity(),
+                    zeph_transport::Reach::LocalOnly,
+                    vec![],
+                    0,
+                )
+                .await
+                .unwrap(),
+            ),
+            Config::default(),
+        );
+        let peer = test_addr().await;
+        let pid = peer.node_id();
+
+        // Learning a NEW member is delta-worthy.
+        m.merge_members(&[swim_entry(&peer, now_ms(), 0, MemberState::Alive)])
+            .await;
+        assert!(
+            m.views.read().await.dirty.contains_key(&pid),
+            "a newly-learned member is dirty"
+        );
+        m.views.write().await.dirty.clear();
+
+        // A pure last_heard advance (same incarnation+state) is NOT delta-worthy.
+        m.merge_members(&[swim_entry(&peer, now_ms() + 1000, 0, MemberState::Alive)])
+            .await;
+        assert!(
+            m.views.read().await.dirty.is_empty(),
+            "a last_heard-only bump does not dirty — freshness is not gossiped"
+        );
+
+        // A liveness change (→Suspect) IS delta-worthy.
+        m.merge_members(&[swim_entry(&peer, now_ms() + 2000, 0, MemberState::Suspect)])
+            .await;
+        assert!(
+            m.views.read().await.dirty.contains_key(&pid),
+            "a liveness change is dirty"
+        );
+    }
+
+    /// Digest [S1]: the census-set hash changes on a membership change but NOT on a freshness bump,
+    /// and excludes Dead — so two nodes with the same census have the same hash (⇒ no reconcile).
+    #[tokio::test]
+    async fn members_digest_reflects_census_not_freshness() {
+        let m = Membership::new(
+            Arc::new(
+                Transport::bind(
+                    zeph_crypto_test_identity(),
+                    zeph_transport::Reach::LocalOnly,
+                    vec![],
+                    0,
+                )
+                .await
+                .unwrap(),
+            ),
+            Config::default(),
+        );
+        let a = test_addr().await;
+        let empty = m.members_digest().await;
+
+        m.merge_members(&[swim_entry(&a, now_ms(), 0, MemberState::Alive)])
+            .await;
+        let h1 = m.members_digest().await;
+        assert_ne!(empty, h1, "adding a member changes the digest");
+
+        // A last_heard-only bump does NOT change it (freshness is excluded).
+        m.merge_members(&[swim_entry(&a, now_ms() + 9_999, 0, MemberState::Alive)])
+            .await;
+        assert_eq!(
+            h1,
+            m.members_digest().await,
+            "freshness does not affect the digest"
+        );
+
+        // A liveness change DOES change it.
+        m.merge_members(&[swim_entry(&a, now_ms(), 0, MemberState::Suspect)])
+            .await;
+        assert_ne!(
+            h1,
+            m.members_digest().await,
+            "a liveness change changes the digest"
+        );
+
+        // Dead is excluded from the census hash → back to the empty-census digest.
+        m.merge_members(&[swim_entry(&a, now_ms(), 0, MemberState::Dead)])
+            .await;
+        assert_eq!(
+            empty,
+            m.members_digest().await,
+            "Dead is excluded — digest returns to the empty-census hash"
+        );
+    }
+
+    async fn in_census(m: &Membership, id: NodeId) -> bool {
+        m.census().await.iter().any(|(i, _)| *i == id)
     }
 
     #[tokio::test]
@@ -1311,34 +2111,46 @@ mod tests {
         let me = transport.node_id();
         let membership = Membership::new(transport, Config::default());
 
-        let fresh = test_addr().await;
-        let stale = test_addr().await;
+        // Liveness is the SWIM STATE, not a tight freshness TTL [S1]. dead_retention (default 600s)
+        // is only the coarse silent-member backstop.
+        let backstop = Config::default().dead_retention.as_millis() as u64;
+        let fresh = test_addr().await; // Alive, just heard → in
+        let old_but_alive = test_addr().await; // Alive, heard 200s ago (past the OLD 120s TTL) → STILL in
+        let silent = test_addr().await; // Alive but silent beyond the backstop → out
+        let dead = test_addr().await; // freshly heard but SWIM-Dead → out
         {
             let mut views = membership.views.write().await;
+            views
+                .members
+                .insert(fresh.node_id(), Member::alive(fresh.clone(), now_ms()));
             views.members.insert(
-                fresh.node_id(),
-                Member {
-                    addr: fresh.clone(),
-                    last_heard_ms: now_ms(),
-                },
+                old_but_alive.node_id(),
+                Member::alive(old_but_alive.clone(), now_ms().saturating_sub(200_000)),
             );
-            // Older than CENSUS_TTL_MS → must be excluded.
             views.members.insert(
-                stale.node_id(),
-                Member {
-                    addr: stale.clone(),
-                    last_heard_ms: now_ms().saturating_sub(CENSUS_TTL_MS + 5_000),
-                },
+                silent.node_id(),
+                Member::alive(silent.clone(), now_ms().saturating_sub(backstop + 5_000)),
             );
+            let mut d = Member::alive(dead.clone(), now_ms());
+            d.set_liveness(0, MemberState::Dead, now_ms());
+            views.members.insert(dead.node_id(), d);
         }
 
         let census = membership.census().await;
         let ids: Vec<NodeId> = census.iter().map(|(id, _)| *id).collect();
         assert!(ids.contains(&me), "census always includes self");
-        assert!(ids.contains(&fresh.node_id()), "fresh member is alive");
+        assert!(ids.contains(&fresh.node_id()), "fresh Alive member is in");
         assert!(
-            !ids.contains(&stale.node_id()),
-            "stale member aged out of the census"
+            ids.contains(&old_but_alive.node_id()),
+            "an Alive member past the old freshness TTL STAYS in — liveness is SWIM state, not a clock"
+        );
+        assert!(
+            !ids.contains(&silent.node_id()),
+            "a member silent beyond the coarse backstop is forgotten"
+        );
+        assert!(
+            !ids.contains(&dead.node_id()),
+            "a SWIM-Dead member is excluded regardless of freshness"
         );
     }
 
@@ -1348,7 +2160,7 @@ mod tests {
     /// otherwise a dead holder's stale piece_count inflates `have` and
     /// suppresses repair for up to 120s after a death.
     #[tokio::test]
-    async fn liveness_census_drops_dead_and_beyond_liveness_ttl() {
+    async fn liveness_census_is_swim_alive_only() {
         let transport = Arc::new(
             Transport::bind(
                 zeph_crypto_test_identity(),
@@ -1362,32 +2174,36 @@ mod tests {
         let me = transport.node_id();
         let membership = Membership::new(transport, Config::default());
 
-        let fresh = test_addr().await;
-        let dead = test_addr().await;
-        // Heard within the wide 120s census window but PAST the 30s liveness TTL.
-        let stale_but_in_census = test_addr().await;
+        let fresh = test_addr().await; // Alive, just heard
+        let stale_alive = test_addr().await; // Alive but heard 200s ago (past the old 30s liveness TTL)
+        let suspect = test_addr().await; // SWIM Suspect
+        let dead_state = test_addr().await; // SWIM Dead
+        let tombstoned = test_addr().await; // Alive record but locally tombstoned
         {
             let mut views = membership.views.write().await;
-            for (a, heard) in [
-                (&fresh, now_ms()),
-                (&dead, now_ms()),
-                (
-                    &stale_but_in_census,
-                    now_ms().saturating_sub(LIVENESS_TTL_MS + 5_000),
-                ),
-            ] {
-                views.members.insert(
-                    a.node_id(),
-                    Member {
-                        addr: a.clone(),
-                        last_heard_ms: heard,
-                    },
-                );
-            }
-            // `dead` is fresh in members but locally tombstoned-dead.
+            views
+                .members
+                .insert(fresh.node_id(), Member::alive(fresh.clone(), now_ms()));
+            views.members.insert(
+                stale_alive.node_id(),
+                Member::alive(stale_alive.clone(), now_ms().saturating_sub(200_000)),
+            );
+            let mut sus = Member::alive(suspect.clone(), now_ms());
+            sus.set_liveness(0, MemberState::Suspect, now_ms());
+            views.members.insert(suspect.node_id(), sus);
+            let mut d = Member::alive(dead_state.clone(), now_ms());
+            d.set_liveness(0, MemberState::Dead, now_ms());
+            views.members.insert(dead_state.node_id(), d);
+            views.members.insert(
+                tombstoned.node_id(),
+                Member::alive(tombstoned.clone(), now_ms()),
+            );
             views.dead.insert(
-                dead.node_id(),
-                (PeerState::new(dead.clone()), std::time::Instant::now()),
+                tombstoned.node_id(),
+                (
+                    PeerState::new(tombstoned.clone()),
+                    std::time::Instant::now(),
+                ),
             );
         }
 
@@ -1399,19 +2215,27 @@ mod tests {
             .map(|(i, _)| *i)
             .collect();
 
-        // The wide census keeps all three (election consistency).
-        assert!(wide.contains(&dead.node_id()));
-        assert!(wide.contains(&stale_but_in_census.node_id()));
-        // The liveness census keeps only self + genuinely-fresh, drops the
-        // dead holder and the beyond-TTL one — the durability fix.
+        // Liveness census = SWIM Alive ONLY (state-based, not a freshness TTL).
         assert!(live.contains(&me) && live.contains(&fresh.node_id()));
         assert!(
-            !live.contains(&dead.node_id()),
-            "SWIM-dead holder excluded from liveness"
+            live.contains(&stale_alive.node_id()),
+            "an Alive holder past the old 30s TTL STAYS live — state-based (fixes the repair storm)"
         );
         assert!(
-            !live.contains(&stale_but_in_census.node_id()),
-            "beyond-liveness-TTL member excluded"
+            !live.contains(&suspect.node_id()),
+            "a Suspect holder is excluded from liveness so repair reacts fast"
+        );
+        assert!(!live.contains(&dead_state.node_id()), "SWIM-Dead excluded");
+        assert!(!live.contains(&tombstoned.node_id()), "tombstoned excluded");
+        // The wide election census keeps Alive + Suspect + stale-alive, drops only Dead.
+        assert!(
+            wide.contains(&suspect.node_id()),
+            "Suspect stays in the election census"
+        );
+        assert!(wide.contains(&stale_alive.node_id()));
+        assert!(
+            !wide.contains(&dead_state.node_id()),
+            "Dead excluded from the election census too"
         );
     }
 }

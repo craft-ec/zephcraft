@@ -3,7 +3,11 @@
 //! from REAL components (no testkit doubles). Nothing deploys without passing
 //! these bars; a FAILING run against current code is the recorded baseline.
 //!
-//! Heavy (in-process clusters of 8 and 20 real nodes) — run explicitly:
+//! Scenarios A-G cover steady-state / mass-rejoin / kill-holder / fairness / elected-scan /
+//! restart-rejoin / capped-receiver; scenario H is MASS DEATH (many nodes offline at once — the
+//! 19-node live-cluster storm reproduced offline, exercising SWIM active death detection [K10]).
+//!
+//! Heavy (in-process clusters of 8-20 real nodes) — run explicitly:
 //!
 //! ```text
 //! cargo test -p zeph-tests --test transfer_plane -- --ignored --test-threads=1
@@ -45,6 +49,9 @@ const BAR_JOB_MS: u64 = 10_000;
 const BAR_JOB_HANG: u64 = 30_000;
 /// Scenario B: queues must end below this depth on every node.
 const BAR_QUEUE_DEPTH: u64 = 10;
+/// Scenario H (mass death): every survivor's census must drop to the survivor count within this.
+/// Kept UNDER the 120s census TTL so passing it proves ACTIVE SWIM detection, not TTL aging.
+const BAR_DEATH: Duration = Duration::from_secs(90);
 /// Scenario B (doc bar): no node's queue may sit at/above BAR_QUEUE_DEPTH —
 /// and no node's coordinator may go progress-free with slots occupied — for
 /// longer than this ("queue drains monotonically, no plateau > 60s").
@@ -664,6 +671,144 @@ async fn scenario_b_mass_rejoin() {
     assert!(
         violations.is_empty(),
         "scenario B bars failed:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// Scenario H — MASS DEATH: a converged cluster loses many nodes AT ONCE (transport closed, no
+/// goodbye — `shutdown()` aborts tasks + closes the endpoint). This is the offline reproduction of
+/// the concern that froze the 19-node live cluster: "multiple nodes offline at the same time". It
+/// exercises the SWIM active death path [K10] + the mux one-connection-per-peer invariant under a
+/// death wave. Bars, on the SURVIVORS:
+///   1. DETECTION — every survivor's census drops to the survivor count within `BAR_DEATH` (active
+///      SWIM detect + gossip, well under the 120s TTL); the killed nodes are excluded.
+///   2. NO FALSE-POSITIVE CASCADE — no survivor's census ever falls BELOW the survivor count: the
+///      death wave + its indirect-probe burst must not make live survivors suspect each other to DEATH.
+///   3. NO CONNECTION STORM — no survivor's connection count exceeds the cluster size (mux bounds it
+///      to one conn per peer; dead conns are evicted, not multiplied — the 19-node storm was conn/RTT).
+///   4. DRAIN — the survivors' job queues drain (no thrash from the death wave + repair).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "heavy: real in-process cluster — run explicitly (see module doc)"]
+async fn scenario_h_mass_death() {
+    let _serial = SERIAL.lock().await;
+    let mut violations: Vec<String> = Vec::new();
+
+    // A converged 12-node cluster with pinned content in flight (so the wave hits a working cluster).
+    let mut nodes = vec![TestNode::spawn(&[]).await.expect("seed node")];
+    let seed = nodes[0].contact.clone();
+    nodes.extend(spawn_wave(&seed, 11).await);
+    let full = nodes.len();
+    println!(
+        "scenario H: {full} nodes up (seed {})",
+        nodes[0].node_id.to_hex()
+    );
+    let _cids = publish_pinned_and_settle(&nodes[0], 20, "scenario H", &mut violations).await;
+
+    // Converge full census BEFORE the wave — so any post-death drop is a real detection, not a
+    // still-forming view.
+    let t0 = Instant::now();
+    let mut pre = census_counts(&nodes).await;
+    while !pre.iter().all(|&c| c >= full) && t0.elapsed() < BAR_CENSUS {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        pre = census_counts(&nodes).await;
+    }
+    if !pre.iter().all(|&c| c >= full) {
+        violations.push(format!("pre-death census never reached {full}: {pre:?}"));
+    }
+    println!("scenario H: full census {full} at {:?}", t0.elapsed());
+
+    // MASS DEATH: kill the last K nodes SIMULTANEOUSLY (the seed + first survivors stay up).
+    const K: usize = 5;
+    let survivors_n = full - K;
+    let victims: Vec<TestNode> = nodes.split_off(survivors_n);
+    println!("scenario H: killing {K} nodes at once → {survivors_n} survivors");
+    let t_death = Instant::now();
+    futures::future::join_all(
+        victims
+            .into_iter()
+            .map(|mut v| async move { v.shutdown().await }),
+    )
+    .await;
+
+    // Bars 1-3, polled together across the detection window.
+    let mut converged_at: Option<Duration> = None;
+    let mut min_census = usize::MAX;
+    let mut max_conns = 0usize;
+    let mut last: Vec<usize>;
+    loop {
+        last = census_counts(&nodes).await;
+        min_census = min_census.min(last.iter().copied().min().unwrap_or(0));
+        max_conns = max_conns.max(
+            nodes
+                .iter()
+                .map(|n| n.transport.connection_count())
+                .max()
+                .unwrap_or(0),
+        );
+        if last.iter().all(|&c| c == survivors_n) {
+            converged_at = Some(t_death.elapsed());
+            break;
+        }
+        if t_death.elapsed() >= BAR_DEATH {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    println!(
+        "scenario H: death census {survivors_n} converged at {converged_at:?} \
+         (min_census_seen={min_census}, max_survivor_conns={max_conns}; last {last:?})"
+    );
+    if converged_at.is_none() {
+        violations.push(format!(
+            "survivors' census did not converge to {survivors_n} within {BAR_DEATH:?} \
+             (active SWIM detection, not TTL): last {last:?}"
+        ));
+    }
+    if min_census < survivors_n {
+        violations.push(format!(
+            "false-positive cascade: a survivor's census fell to {min_census} < {survivors_n} \
+             (a LIVE node was wrongly marked DEAD under the death wave)"
+        ));
+    }
+    if max_conns > full {
+        violations.push(format!(
+            "connection storm: a survivor held {max_conns} connections > cluster size {full} \
+             (mux one-conn-per-peer should bound it)"
+        ));
+    }
+
+    // Bar 4: survivors' queues drain (no thrash) — final DRAINED_STREAK polls all below the depth bar.
+    let mut ok_streak = 0usize;
+    let mut worst_depth = 0u64;
+    let drain_start = Instant::now();
+    loop {
+        let all_below = nodes.iter().all(|n| {
+            let d = n.jobs.stats().queue_depth;
+            worst_depth = worst_depth.max(d);
+            d < BAR_QUEUE_DEPTH
+        });
+        ok_streak = if all_below { ok_streak + 1 } else { 0 };
+        if ok_streak >= DRAINED_STREAK || drain_start.elapsed() >= DRAIN_WINDOW {
+            break;
+        }
+        tokio::time::sleep(DRAIN_POLL).await;
+    }
+    let drained = ok_streak >= DRAINED_STREAK;
+    println!("scenario H: survivors drained={drained} (worst queue_depth={worst_depth})");
+    if !drained {
+        violations.push(format!(
+            "survivors' queues did not drain after the death wave (worst depth {worst_depth} >= {BAR_QUEUE_DEPTH})"
+        ));
+    }
+
+    if !violations.is_empty() {
+        println!("--- scenario H FAILURE diagnostics ---");
+        dump_cluster(&nodes).await;
+    }
+    shutdown_all(&mut nodes).await;
+    assert!(
+        violations.is_empty(),
+        "scenario H (mass death) bars failed:\n{}",
         violations.join("\n")
     );
 }
