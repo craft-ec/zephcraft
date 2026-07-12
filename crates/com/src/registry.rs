@@ -78,13 +78,30 @@ impl HeadSubmission {
     }
 }
 
-/// One registry row — the current head for a `(owner, name)` key.
+/// One registry row — the current head for a `(owner, name)` key, CARRYING the owner's signature so
+/// it can be re-verified on merge (a forged head can't propagate through replication) and on read
+/// (a resolver never trusts an unverified head — closes the trust-on-announce gap).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HeadEntry {
     pub owner: [u8; 32],
     pub name: String,
     pub cid: [u8; 32],
     pub version: u64,
+    /// The owner's ed25519 signature over `head_signing_bytes(owner, name, cid, version)` — the
+    /// SAME bytes [`HeadSubmission`] signs, so an entry is a submission minus the redundant fields.
+    pub signature: Vec<u8>,
+}
+
+impl HeadEntry {
+    /// Verify the owner actually signed this `(owner, name, cid, version)`. The sole read/merge
+    /// authority check — `owner` is the pubkey, so a valid signature proves the owner authored it.
+    pub fn verify(&self) -> bool {
+        let Ok(sig) = <[u8; 64]>::try_from(self.signature.as_slice()) else {
+            return false;
+        };
+        let msg = head_signing_bytes(&self.owner, &self.name, &self.cid, self.version);
+        NodeIdentity::verify(&NodeId(self.owner), &msg, &sig)
+    }
 }
 
 /// The registry state: the canonical (sorted by `(owner, name)`) set of current heads —
@@ -152,6 +169,8 @@ impl RegistryState {
             name: sub.name.clone(),
             cid: sub.cid,
             version: sub.version,
+            // Persist the (already-verified) signature so every downstream merge + read can re-verify.
+            signature: sub.signature.clone(),
         };
         match next.find(&sub.owner, &sub.name) {
             Ok(i) => {
@@ -173,6 +192,12 @@ impl RegistryState {
     /// up on takeover.
     pub fn merge(&mut self, other: &RegistryState) {
         for e in &other.entries {
+            // VERIFY before accepting: a replica/writer cannot inject a forged or unsigned head into
+            // the shard state — the owner signature is checked at every merge, not just the origin
+            // write. This is what makes replication trustworthy (closes the trust-on-announce gap).
+            if !e.verify() {
+                continue;
+            }
             match self.find(&e.owner, &e.name) {
                 Ok(i) => {
                     if e.version > self.entries[i].version {
@@ -189,6 +214,10 @@ impl RegistryState {
     /// accounts into a NEW generation's account. Idempotent, so re-running the reshard converges.
     pub fn merge_entries(&mut self, entries: impl IntoIterator<Item = HeadEntry>) {
         for e in entries {
+            // Verify (as in `merge`) — a reshard must not launder an unsigned/forged head.
+            if !e.verify() {
+                continue;
+            }
             match self.find(&e.owner, &e.name) {
                 Ok(i) => {
                     if e.version > self.entries[i].version {
@@ -524,6 +553,62 @@ mod tests {
             lhs.root(),
             rhs2.root(),
             "merge converges regardless of order"
+        );
+    }
+
+    #[test]
+    fn merge_rejects_a_forged_or_unsigned_entry() {
+        let a = id();
+        // An honest, validly-signed head.
+        let honest = RegistryState::default()
+            .apply(&HeadSubmission::sign(&a, "feed", [1u8; 32], 1))
+            .unwrap();
+
+        // A FORGED entry a malicious replica pushes: the owner's name but a cid they never signed,
+        // at a higher version so it WOULD win LWW — the signature still binds the OLD cid, so it fails.
+        let mut forged = honest.resolve(&a.node_id().0, "feed").unwrap().clone();
+        forged.cid = [9u8; 32];
+        forged.version = 99;
+        let forged_state = RegistryState {
+            entries: vec![forged],
+        };
+        let mut victim = honest.clone();
+        victim.merge(&forged_state);
+        let head = victim.resolve(&a.node_id().0, "feed").unwrap();
+        assert_eq!(
+            (head.cid, head.version),
+            ([1u8; 32], 1),
+            "forged head rejected at merge — the honest head stands"
+        );
+
+        // An UNSIGNED entry (empty signature) is also rejected — nothing to trust.
+        let unsigned = RegistryState {
+            entries: vec![HeadEntry {
+                owner: a.node_id().0,
+                name: "x".into(),
+                cid: [5u8; 32],
+                version: 1,
+                signature: vec![],
+            }],
+        };
+        let mut v2 = RegistryState::default();
+        v2.merge(&unsigned);
+        assert!(v2.is_empty(), "unsigned entry rejected at merge");
+    }
+
+    #[test]
+    fn stored_entry_carries_a_verifiable_signature() {
+        let a = id();
+        let state = RegistryState::default()
+            .apply(&HeadSubmission::sign(&a, "feed", [1u8; 32], 1))
+            .unwrap();
+        let e = state.resolve(&a.node_id().0, "feed").unwrap();
+        assert!(e.verify(), "a stored head re-verifies against the owner");
+        let mut tampered = e.clone();
+        tampered.cid = [2u8; 32];
+        assert!(
+            !tampered.verify(),
+            "tampering the cid breaks the stored signature"
         );
     }
 

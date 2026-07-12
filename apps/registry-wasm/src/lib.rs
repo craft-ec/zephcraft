@@ -47,6 +47,8 @@ struct HeadEntry {
     name: String,
     cid: [u8; 32],
     version: u64,
+    // Carry the owner signature so the node can re-verify on merge/read (matches native HeadEntry).
+    signature: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -125,6 +127,7 @@ pub extern "C" fn run() {
         name: sub.name.clone(),
         cid: sub.cid,
         version: sub.version,
+        signature: sub.signature.clone(),
     };
     match st.entries.binary_search_by(|e| {
         e.owner

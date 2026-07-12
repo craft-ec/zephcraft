@@ -49,11 +49,26 @@ const MAX_NAME_LEN: usize = 32;
 /// resolve. One such table per shard DB.
 const CREATE_HEADS: &str = "CREATE TABLE IF NOT EXISTS heads (\
      owner BLOB NOT NULL, name TEXT NOT NULL, cid BLOB NOT NULL, version INTEGER NOT NULL, \
+     sig BLOB NOT NULL, \
      PRIMARY KEY (owner, name))";
+
+/// Idempotent migration for shard DBs created BEFORE read verification (no `sig` column). On a
+/// fresh DB `CREATE_HEADS` already made the column, so this ALTER fails with "duplicate column"
+/// — which we swallow. On a legacy DB it adds `sig` (empty default) so the write path's INSERT
+/// (which now references the column) doesn't error. Legacy rows then carry a 0-byte sig, so they
+/// fail read verification (`verify()` requires 64 bytes) and become unresolvable until their owner
+/// re-registers with a signature — the correct outcome, since an unsigned legacy head can't be
+/// trusted. Lets the fleet upgrade WITHOUT a manual `regshards` wipe.
+const ADD_SIG_COLUMN: &str = "ALTER TABLE heads ADD COLUMN sig BLOB NOT NULL DEFAULT X''";
+
+/// A BLOB literal `X'..'` for a variable-length byte string (e.g. the owner signature).
+fn hexlit_bytes(b: &[u8]) -> String {
+    format!("X'{}'", hex::encode(b))
+}
 
 /// A BLOB literal `X'..'` for embedding a 32-byte id in write SQL.
 fn hexlit(b: &[u8; 32]) -> String {
-    format!("X'{}'", hex::encode(b))
+    hexlit_bytes(b)
 }
 
 /// A single-quoted TEXT literal with `'` escaped — names are untrusted, so this is the
@@ -417,6 +432,7 @@ impl HeadRegistry {
     /// single-node bench has no census to converge (self is the writer for every shard), so this
     /// skips the `wait_ready` gate that would otherwise stall each op for `READY_WAIT_SECS`.
     #[doc(hidden)]
+    #[allow(dead_code)] // test/bench readiness hook; unused in the non-test binary build
     pub fn mark_ready(&self) {
         self.ready.store(true, std::sync::atomic::Ordering::Relaxed);
     }
@@ -553,6 +569,9 @@ impl HeadRegistry {
         }
         let mut db = self.sql.open(&ns).await?;
         db.write(CREATE_HEADS).await?;
+        // Idempotent read-verification migration; the duplicate-column error on a fresh DB
+        // (where CREATE_HEADS already added `sig`) is expected and ignored.
+        let _ = db.write(ADD_SIG_COLUMN).await;
         let handle = Arc::new(Mutex::new(db));
         g.insert(ns, handle.clone());
         Ok(handle)
@@ -580,27 +599,45 @@ impl HeadRegistry {
         Some(handle)
     }
 
-    /// Read the current `(cid, version)` for `(owner, name)` in shard `sk`'s DB, or `None`.
-    async fn sql_resolve(
-        &self,
-        sk: ShardKey,
-        owner: &[u8; 32],
-        name: &str,
-    ) -> Option<([u8; 32], u64)> {
+    /// Read the current head for `(owner, name)` in shard `sk`'s DB as its verified [`HeadEntry`]
+    /// (with the owner signature), or `None`. Callers that only need `(cid, version)` project it off
+    /// the entry; the resolve RPC returns the whole entry so the asker can re-verify.
+    async fn sql_resolve(&self, sk: ShardKey, owner: &[u8; 32], name: &str) -> Option<HeadEntry> {
         let db = self.shard_db_existing(sk).await?; // read: don't create an empty DB
         let db = db.lock().await;
         let row = db.conn().query_row(
-            "SELECT cid, version FROM heads WHERE owner = ?1 AND name = ?2",
+            "SELECT cid, version, sig FROM heads WHERE owner = ?1 AND name = ?2",
             rusqlite::params![&owner[..], name],
             |r| {
                 let cid: Vec<u8> = r.get(0)?;
                 let version: i64 = r.get(1)?;
-                Ok((cid, version as u64))
+                let sig: Vec<u8> = r.get(2)?;
+                Ok((cid, version as u64, sig))
             },
         );
         match row {
-            Ok((cid, version)) if cid.len() == 32 => {
-                Some((cid.try_into().expect("32 bytes"), version))
+            Ok((cid, version, sig)) if cid.len() == 32 => {
+                let cid: [u8; 32] = cid.try_into().expect("32 bytes");
+                // READ VERIFICATION: never serve a stored head without re-checking the owner
+                // signature. A row that got here via a forged/corrupt replication path (or a
+                // tampered shard DB) fails here and resolves to `None` rather than being served.
+                let entry = HeadEntry {
+                    owner: *owner,
+                    name: name.to_string(),
+                    cid,
+                    version,
+                    signature: sig,
+                };
+                if entry.verify() {
+                    Some(entry)
+                } else {
+                    tracing::warn!(
+                        owner = %hex::encode(owner),
+                        name,
+                        "registry: dropping head with invalid owner signature on read"
+                    );
+                    None
+                }
             }
             _ => None,
         }
@@ -612,13 +649,14 @@ impl HeadRegistry {
         let db = self.shard_db(sk).await?;
         let mut db = db.lock().await;
         let sql = format!(
-            "INSERT INTO heads(owner,name,cid,version) VALUES({},{},{},{}) \
-             ON CONFLICT(owner,name) DO UPDATE SET cid=excluded.cid, version=excluded.version \
+            "INSERT INTO heads(owner,name,cid,version,sig) VALUES({},{},{},{},{}) \
+             ON CONFLICT(owner,name) DO UPDATE SET cid=excluded.cid, version=excluded.version, sig=excluded.sig \
              WHERE excluded.version > heads.version",
             hexlit(&e.owner),
             textlit(&e.name),
             hexlit(&e.cid),
-            e.version
+            e.version,
+            hexlit_bytes(&e.signature)
         );
         db.write(&sql).await?;
         let root = db.root().map(|c| c.0).unwrap_or_default();
@@ -638,7 +676,7 @@ impl HeadRegistry {
         let db = db.lock().await;
         let mut stmt = match db
             .conn()
-            .prepare("SELECT owner,name,cid,version FROM heads")
+            .prepare("SELECT owner,name,cid,version,sig FROM heads")
         {
             Ok(s) => s,
             Err(_) => return RegistryState::default(),
@@ -648,20 +686,24 @@ impl HeadRegistry {
             let name: String = r.get(1)?;
             let cid: Vec<u8> = r.get(2)?;
             let version: i64 = r.get(3)?;
-            Ok((owner, name, cid, version as u64))
+            let sig: Vec<u8> = r.get(4)?;
+            Ok((owner, name, cid, version as u64, sig))
         });
         let mut out = RegistryState::default();
         if let Ok(rows) = rows {
             let entries: Vec<HeadEntry> = rows
                 .flatten()
-                .filter(|(o, _, c, _)| o.len() == 32 && c.len() == 32)
-                .map(|(o, name, c, version)| HeadEntry {
+                .filter(|(o, _, c, _, _)| o.len() == 32 && c.len() == 32)
+                .map(|(o, name, c, version, sig)| HeadEntry {
                     owner: o.try_into().expect("32"),
                     name,
                     cid: c.try_into().expect("32"),
                     version,
+                    signature: sig,
                 })
                 .collect();
+            // merge_entries re-verifies each signature; a shard DB with a tampered row can't
+            // leak an unsigned/forged head into a `GetState`/replication snapshot.
             out.merge_entries(entries);
         }
         out
@@ -669,8 +711,24 @@ impl HeadRegistry {
 
     /// Upsert every row of `state` into shard `sk`'s DB (version-guarded per row). Used by the
     /// `PushState` replica handler, takeover merge, and reshard — the SQL form of a CRDT merge.
+    ///
+    /// This is a NETWORK TRUST BOUNDARY: `state` arrived from another node (a PushState, a fetched
+    /// GetState, a reshard of a fetched account). Every entry is re-verified here BEFORE it is
+    /// upserted, so a malicious/compromised node cannot inject a forged or unsigned head — and, in
+    /// particular, cannot push a high-version forged entry that would overwrite (version-guard) a
+    /// legitimate head and then fail read verification, erasing the name. `sql_upsert` itself trusts
+    /// its caller (the local `advance_local` write path already verified the submission), so the
+    /// check belongs here at ingress, mirroring `RegistryState::merge`.
     async fn sql_merge(&self, sk: ShardKey, state: &RegistryState) -> anyhow::Result<()> {
         for e in state.entries() {
+            if !e.verify() {
+                tracing::warn!(
+                    owner = %hex::encode(e.owner),
+                    name = %e.name,
+                    "registry: dropping forged/unsigned head from a remote merge"
+                );
+                continue;
+            }
             self.sql_upsert(sk, e).await?;
         }
         Ok(())
@@ -1094,6 +1152,9 @@ impl HeadRegistry {
             name: sub.name.clone(),
             cid: sub.cid,
             version: sub.version,
+            // Persist the owner signature alongside the head so replicas and readers can
+            // re-verify it (read verification) rather than trusting it on announce.
+            signature: sub.signature.clone(),
         };
         let root = self.sql_upsert(sk, &entry).await?;
         // Row-level replication: push just this head (a 1-row RegistryState) to the replicas.
@@ -1254,14 +1315,10 @@ impl HeadRegistry {
             }
         });
     }
-    /// Local resolve against this node's own copy of `sk`'s registry account. Returns the head
-    /// `(cid, version)` so a version-aware caller gets the seq.
-    async fn resolve_local(
-        &self,
-        sk: ShardKey,
-        owner: [u8; 32],
-        name: &str,
-    ) -> Option<([u8; 32], u64)> {
+    /// Local resolve against this node's own copy of `sk`'s registry account. Returns the full
+    /// owner-signed [`HeadEntry`] (with signature) so the resolve RPC can hand it to the asker to
+    /// re-verify, and a version-aware caller gets the seq off `entry.version`.
+    async fn resolve_local(&self, sk: ShardKey, owner: [u8; 32], name: &str) -> Option<HeadEntry> {
         // Merge the other replicas' state if we've just become the writer, before resolving.
         self.ensure_current(sk).await;
         self.sql_resolve(sk, &owner, name).await
@@ -1421,7 +1478,7 @@ impl HeadRegistry {
         // (a) Local read if this node holds the shard's state as a replica.
         if reps.contains(&self.self_id) {
             if let Some(entry) = self.sql_resolve(sk, &owner, name).await {
-                return Some(entry);
+                return Some((entry.cid, entry.version)); // sql_resolve already verified it
             }
         }
         // (b/c) Ordered remote targets: current writer first, then the other replicas. Deduped,
@@ -1453,7 +1510,19 @@ impl HeadRegistry {
             )
             .await
             {
-                return Some(entry);
+                // READ VERIFICATION at the RPC trust boundary: the entry came from a remote replica,
+                // which is NOT trusted. Re-verify the owner signature before accepting it — a
+                // compromised/malicious replica that answers with a forged (cid, version) is
+                // rejected here, and we fall through to the next target rather than trusting it.
+                if entry.verify() {
+                    return Some((entry.cid, entry.version));
+                }
+                tracing::warn!(
+                    peer = %hex::encode(t),
+                    owner = %hex::encode(owner),
+                    name,
+                    "registry: remote resolve returned an unverifiable head — ignoring, trying next replica"
+                );
             }
         }
         None
@@ -1588,7 +1657,7 @@ impl HeadRegistry {
                         let v = this
                             .sql_resolve(sk, &owner, &name)
                             .await
-                            .map(|(_, v)| v)
+                            .map(|e| e.version)
                             .unwrap_or(0);
                         RegistryResp::Version(v)
                     }
@@ -1643,7 +1712,7 @@ impl HeadRegistry {
             return self
                 .sql_resolve(sk, &owner, name)
                 .await
-                .map(|(_, v)| v)
+                .map(|e| e.version)
                 .unwrap_or(0);
         }
         let Ok(addr) = self.writer_addr(sk).await else {
@@ -1892,6 +1961,290 @@ impl HeadRegistry {
 mod tests {
     use super::*;
 
+    /// A minimal single-node registry on a `LocalOnly` transport: null routing, no peers, no
+    /// durability. Every shard elects self as writer, so `register` = a local CraftSQL upsert and
+    /// `resolve` = a local SELECT — no network. Returns the registry, its owning identity, and the
+    /// tempdir (kept alive; the shard DBs live under it). Shared by the read-verification test and
+    /// callable by anything else needing a live registry without the full node stack.
+    async fn open_test_registry() -> (HeadRegistry, Arc<NodeIdentity>, tempfile::TempDir) {
+        use zeph_obj::{ObjConfig, ObjEngine};
+        use zeph_routing::{ContentRouting, MetaRecord, ProviderRecord};
+        use zeph_store::Store;
+        use zeph_transport::Reach;
+
+        struct NullRouting;
+        #[async_trait::async_trait]
+        impl ContentRouting for NullRouting {
+            async fn announce(&self, _: Cid, _: u32, _: bool) -> zeph_routing::Result<()> {
+                Ok(())
+            }
+            async fn resolve(&self, _: Cid) -> zeph_routing::Result<Vec<ProviderRecord>> {
+                Ok(vec![])
+            }
+            async fn withdraw(&self, _: Cid) -> zeph_routing::Result<()> {
+                Ok(())
+            }
+            async fn announce_want(&self, _: Cid) -> zeph_routing::Result<()> {
+                Ok(())
+            }
+            async fn withdraw_want(&self, _: Cid) -> zeph_routing::Result<()> {
+                Ok(())
+            }
+            async fn is_wanted(&self, _: Cid) -> zeph_routing::Result<bool> {
+                Ok(false)
+            }
+            async fn announce_meta(
+                &self,
+                _: Cid,
+                _: u64,
+                _: Option<String>,
+            ) -> zeph_routing::Result<()> {
+                Ok(())
+            }
+            async fn withdraw_meta(&self, _: Cid) -> zeph_routing::Result<()> {
+                Ok(())
+            }
+            async fn metas(&self, _: Cid) -> zeph_routing::Result<Vec<MetaRecord>> {
+                Ok(vec![])
+            }
+        }
+        struct NullPeers;
+        #[async_trait::async_trait]
+        impl zeph_obj::PeerSource for NullPeers {
+            async fn peers(&self) -> Vec<(zeph_core::NodeId, PeerAddr)> {
+                vec![]
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let identity = Arc::new(NodeIdentity::generate());
+        let transport = Arc::new(
+            Transport::bind(
+                identity.secret_key_bytes(),
+                Reach::LocalOnly,
+                vec![zeph_transport::MUX_ALPN.to_vec()],
+                0,
+            )
+            .await
+            .unwrap(),
+        );
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let engine = ObjEngine::with_peer_source(
+            transport.clone(),
+            store,
+            Arc::new(NullRouting),
+            Arc::new(NullPeers),
+            ObjConfig::default(),
+        );
+        let clock = transport.clock();
+        let account_store = Arc::new(ProgramAccountStore::open(
+            engine.clone(),
+            dir.path(),
+            clock.clone(),
+        ));
+        let shard_root = Arc::new(ShardRootStore::new(account_store.clone()));
+        let _ = &engine; // engine kept alive for the account store
+        let shard_sql = Arc::new(
+            CraftSql::register(
+                dir.path().join("regshards"),
+                shard_root.clone(),
+                transport.node_id(),
+            )
+            .unwrap(),
+        );
+        let reg = HeadRegistry::open(
+            identity.clone(),
+            account_store,
+            clock.clone(),
+            transport.clone(),
+            shard_sql,
+            shard_root,
+        );
+        reg.mark_ready();
+        (reg, identity, dir)
+    }
+
+    /// READ VERIFICATION — a stored head whose signature no longer matches its (cid,version) must
+    /// never be served. We register a head normally (valid sig), confirm it resolves, then inject a
+    /// tampered row directly via `sql_upsert` (which trusts its caller): same name/owner, a DIFFERENT
+    /// cid, but carrying the ORIGINAL signature — exactly what a forged/corrupt replication push or a
+    /// tampered shard DB looks like. `sql_resolve` must re-verify and drop it (returns None), while
+    /// the honest control still resolves. This is the last-line defense that makes registry reads
+    /// trustless rather than trust-on-announce.
+    #[tokio::test]
+    async fn resolve_drops_a_row_whose_signature_no_longer_matches() {
+        let (reg, identity, _dir) = open_test_registry().await;
+        let owner = identity.node_id().0;
+        let bits = reg.shard_bits().await;
+
+        // (1) Honest register: a valid owner signature over (owner,"app",good_cid,1).
+        let good_cid = [9u8; 32];
+        reg.register(RT_PROGRAM, "app", good_cid, 1, 0)
+            .await
+            .unwrap();
+        let sk = ShardKey {
+            rtype: RT_PROGRAM,
+            bits,
+            shard: shard_of(&owner, "app", bits),
+        };
+        assert_eq!(
+            reg.sql_resolve(sk, &owner, "app")
+                .await
+                .map(|e| (e.cid, e.version)),
+            Some((good_cid, 1)),
+            "honest head must resolve"
+        );
+
+        // (2) Tamper: a NEW cid at a higher version, but signed for good_cid (so the sig is valid
+        // ed25519 by the owner, just not over this row's contents). sql_upsert trusts the caller and
+        // stores it; only the read path can catch the mismatch.
+        let sub = HeadSubmission::sign(&identity, "app", good_cid, 2);
+        let forged = HeadEntry {
+            owner,
+            name: "app".to_string(),
+            cid: [0xEEu8; 32], // does NOT match what the signature covers
+            version: 2,
+            signature: sub.signature.clone(),
+        };
+        assert!(
+            !forged.verify(),
+            "sanity: the tampered entry is unverifiable"
+        );
+        reg.sql_upsert(sk, &forged).await.unwrap();
+
+        // (3) The read path re-verifies and refuses to serve the tampered row.
+        assert!(
+            reg.sql_resolve(sk, &owner, "app").await.is_none(),
+            "a head whose signature does not cover its (cid,version) must not be served"
+        );
+    }
+
+    /// REPLICATION TRUST BOUNDARY — `sql_merge` (the PushState/GetState/takeover merge) must drop a
+    /// forged entry, so a malicious peer cannot inject a head via replication. This is the path a
+    /// real attack takes: a crafted `RegistryState` decoded off the wire (its `entries` field is
+    /// private, so the ONLY way to hold a forged one is `decode`, exactly as `PushState` does). The
+    /// forge is at a HIGH version so, absent verification, its version-guarded upsert WOULD overwrite
+    /// the honest head and then fail read-verify — erasing the name (a remote DoS). Verification at
+    /// `sql_merge` prevents both the injection and the erasure.
+    #[tokio::test]
+    async fn sql_merge_drops_a_forged_remote_head_and_preserves_the_honest_one() {
+        let (reg, identity, _dir) = open_test_registry().await;
+        let owner = identity.node_id().0;
+        let bits = reg.shard_bits().await;
+        let good_cid = [9u8; 32];
+        reg.register(RT_PROGRAM, "feed", good_cid, 1, 0)
+            .await
+            .unwrap();
+        let sk = ShardKey {
+            rtype: RT_PROGRAM,
+            bits,
+            shard: shard_of(&owner, "feed", bits),
+        };
+
+        // Craft a malicious PushState: a forged entry {owner, "feed", attacker_cid, version=999}
+        // whose signature only binds the ORIGINAL (good_cid, 1). A RegistryState is a single-field
+        // struct, so its postcard encoding is exactly that of the entries Vec — hand-encode it and
+        // `decode` it back into a state, reproducing a wire-received PushState with no verification.
+        let honest_sig = HeadSubmission::sign(&identity, "feed", good_cid, 1).signature;
+        let forged = HeadEntry {
+            owner,
+            name: "feed".to_string(),
+            cid: [0xEEu8; 32],
+            version: 999,
+            signature: honest_sig,
+        };
+        let forged_bytes = postcard::to_allocvec(&vec![forged]).unwrap();
+        let forged_state =
+            RegistryState::decode(&forged_bytes).expect("crafted bytes decode as a RegistryState");
+        assert_eq!(
+            forged_state.entries().len(),
+            1,
+            "setup: the forged entry is present in the decoded state"
+        );
+
+        // The merge must DROP the forged entry — neither storing it nor overwriting the honest head.
+        reg.sql_merge(sk, &forged_state).await.unwrap();
+        assert_eq!(
+            reg.sql_resolve(sk, &owner, "feed")
+                .await
+                .map(|e| (e.cid, e.version)),
+            Some((good_cid, 1)),
+            "the honest head survives; the forged high-version head neither overwrote nor erased it"
+        );
+    }
+
+    /// MIGRATION — `ADD_SIG_COLUMN` upgrades a shard DB created before read verification. We build a
+    /// legacy `heads` table (no `sig` column) with a row, then run the migration on the same handle
+    /// (no cross-handle publish race) and confirm: the column is added, the legacy row carries an
+    /// empty sig (so it fails read verification), and a new sig-bearing INSERT succeeds. Validates
+    /// the ALTER against the real CraftSql engine — the live-upgrade path for the fleet's regshards.
+    #[tokio::test]
+    async fn add_sig_column_migrates_a_legacy_shard_db() {
+        let (reg, identity, _dir) = open_test_registry().await;
+        let owner = identity.node_id().0;
+        let sk = ShardKey {
+            rtype: RT_PROGRAM,
+            bits: DEFAULT_SHARD_BITS,
+            shard: 0,
+        };
+        let ns = HeadRegistry::ns_of(sk);
+        let mut db = reg.sql.open(&ns).await.unwrap();
+
+        // Pre-migration schema: the old `heads` table WITHOUT a `sig` column, plus a legacy row.
+        db.write(
+            "CREATE TABLE heads (owner BLOB NOT NULL, name TEXT NOT NULL, cid BLOB NOT NULL, \
+             version INTEGER NOT NULL, PRIMARY KEY (owner, name))",
+        )
+        .await
+        .unwrap();
+        db.write(&format!(
+            "INSERT INTO heads(owner,name,cid,version) VALUES({},{},{},1)",
+            hexlit(&owner),
+            textlit("legacy"),
+            hexlit(&[3u8; 32])
+        ))
+        .await
+        .unwrap();
+        assert!(
+            db.conn().prepare("SELECT sig FROM heads").is_err(),
+            "sanity: the legacy schema has no sig column"
+        );
+
+        // Run the migration (idempotent ALTER). The column is added; the legacy row's sig defaults
+        // to an empty blob → it can never pass read verification (verify() needs 64 bytes).
+        db.write(ADD_SIG_COLUMN).await.unwrap();
+        let legacy_sig: Vec<u8> = db
+            .conn()
+            .query_row("SELECT sig FROM heads WHERE name='legacy'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(
+            legacy_sig.is_empty(),
+            "the legacy row carries an empty sig after migration → unresolvable until re-registered"
+        );
+
+        // A fresh sig-bearing INSERT (what the post-migration write path emits) now succeeds.
+        db.write(&format!(
+            "INSERT INTO heads(owner,name,cid,version,sig) VALUES({},{},{},2,{})",
+            hexlit(&owner),
+            textlit("fresh"),
+            hexlit(&[4u8; 32]),
+            hexlit_bytes(&[7u8; 64])
+        ))
+        .await
+        .unwrap();
+        let n: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM heads", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            n, 2,
+            "migrated table holds both the legacy and the fresh row"
+        );
+        let _ = &identity; // identity kept alive for `owner`
+    }
+
     /// BENCH — prove the registry scales with ROW COUNT, not just node count. A single node is the
     /// writer for every shard (`eligible` always includes self), so register = local CraftSQL
     /// upsert+commit and resolve = local indexed SELECT — no network. We fill the registry to
@@ -2088,6 +2441,95 @@ mod tests {
         );
     }
 
+    // Multi-node registry scaling: how per-node work scales with cluster size N. Drives the REAL
+    // election functions (`replicas` / `writer_of`) over synthetic N-node censuses — pure, so it
+    // isolates the O(held) property: a node's storage + status/enumeration/reshard work is
+    // proportional to the shards it HOLDS, not the whole 2^bits keyspace (`held_shards` iterates the
+    // held index, not 0..2^bits). Complements the single-node row-count bench (resolve p50 flat): N
+    // nodes each hold ~total*K/N shard-keys, and each resolve stays O(log rows).
+    #[test]
+    #[ignore] // scaling bench: cargo test -p zeph-noded --bin zeph bench_registry_multinode_scaling -- --ignored --nocapture
+    fn bench_registry_multinode_scaling() {
+        // Deterministic node-ids (no RNG in a bench): id_i = blake3("scale-node-" ‖ i).
+        let node_id = |i: usize| -> [u8; 32] { Cid::of(format!("scale-node-{i}").as_bytes()).0 };
+        let bits = DEFAULT_SHARD_BITS; // 8 → 256 shards
+        let rtypes = [RT_PROGRAM, RT_DBROOT, RT_MANIFEST];
+        let shardkeys: Vec<ShardKey> = rtypes
+            .iter()
+            .flat_map(|&rtype| {
+                (0..(1u64 << bits)).map(move |shard| ShardKey { rtype, bits, shard })
+            })
+            .collect();
+        let total = shardkeys.len(); // 3 rtypes × 256 shards = 768 shard-keys
+        let epoch = 0u64;
+
+        println!(
+            "\n keyspace = {total} shard-keys (3 rtypes × {} shards), K={REPLICATION_FACTOR} replication",
+            1u64 << bits
+        );
+        println!("    N    held/node min/mean/max  bal    writers/node min/mean/max  bal");
+        for &n in &[1usize, 2, 3, 4, 8, 16, 32, 64, 128, 256] {
+            let elig: Vec<[u8; 32]> = (0..n).map(&node_id).collect();
+            let idx: HashMap<[u8; 32], usize> =
+                elig.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+            let mut held = vec![0usize; n]; // shards this node stores (replica set membership)
+            let mut writers = vec![0usize; n]; // shards this node is the elected writer for (@epoch)
+            for &sk in &shardkeys {
+                for r in HeadRegistry::replicas(sk, &elig) {
+                    held[idx[&r]] += 1;
+                }
+                let w = HeadRegistry::writer_of(sk, &elig, epoch, elig[0]);
+                writers[idx[&w]] += 1;
+            }
+            let stat = |v: &[usize]| {
+                let mn = *v.iter().min().unwrap();
+                let mx = *v.iter().max().unwrap();
+                let mean = v.iter().sum::<usize>() as f64 / v.len() as f64;
+                (mn, mean, mx, mx as f64 / mean.max(1.0))
+            };
+            let (hmn, hmean, hmx, hbal) = stat(&held);
+            let (wmn, wmean, wmx, wbal) = stat(&writers);
+            println!(
+                "{n:>5}   {hmn:>4}/{hmean:>7.1}/{hmx:<5} {hbal:.2}x   {wmn:>4}/{wmean:>6.1}/{wmx:<5} {wbal:.2}x"
+            );
+
+            // Per-node held (storage + O(held) enumeration work) is EXACTLY total·min(K,N)/N — it
+            // shrinks ~linearly as the cluster grows: the O(held) scaling win.
+            let expected_held = (total * REPLICATION_FACTOR.min(n)) as f64 / n as f64;
+            assert!(
+                (hmean - expected_held).abs() < 1e-9,
+                "N={n}: mean held {hmean} must equal total·min(K,N)/N = {expected_held}"
+            );
+            // Exactly one writer per shard-key ⇒ writers sum to `total`, mean = total/N (write
+            // parallelism grows with N).
+            assert_eq!(
+                writers.iter().sum::<usize>(),
+                total,
+                "N={n}: every shard-key has exactly one writer"
+            );
+            assert!((wmean - total as f64 / n as f64).abs() < 1e-9);
+            // Load balance: blake3 rendezvous hashing spreads shards evenly. Where per-node counts
+            // are large enough for the law of large numbers to bite (4 ≤ N ≤ 32 ⇒ ≥72 held/node), no
+            // node carries much above the mean — no hotspot as the cluster grows.
+            if (4..=32).contains(&n) {
+                assert!(
+                    hmx as f64 <= hmean * 1.5,
+                    "N={n}: held hotspot — max {hmx} vs mean {hmean:.1} ({hbal:.2}×)"
+                );
+                assert!(
+                    wmx as f64 <= wmean * 1.8,
+                    "N={n}: writer hotspot — max {wmx} vs mean {wmean:.1} ({wbal:.2}×)"
+                );
+            }
+        }
+        // Takeaway: held/node = total·min(K,N)/N — flat at 768 through N=3 (K≥N ⇒ everyone holds
+        // everything), then shrinking ~linearly once K=3 caps replication: 576 @4, 72 @32, 9 @256.
+        // So at N=256 each node holds 9 shard-keys vs 768 for a lone node — its status/enumeration/
+        // reshard loops (all O(held)) do ~85× less work, while writers spread total/N = 3 per node.
+        // With resolve O(log rows) per the row-count bench, the registry scales OUT (more nodes ⇒
+        // less per-node work + more parallel writers), not just UP.
+    }
+
     #[test]
     fn shard_of_is_prefix_stable_under_growth() {
         let owner = [7u8; 32];
@@ -2137,6 +2579,7 @@ mod tests {
                 name: format!("app{i}"),
                 cid: [0u8; 32],
                 version: 1,
+                signature: vec![], // routing test — rebucket groups by shard, never verifies
             })
             .collect();
         let grouped = rebucket_entries(&entries, 9);

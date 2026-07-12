@@ -8,6 +8,7 @@
 //! reads back a postcard-encoded response.
 
 use serde::{Deserialize, Serialize};
+use zeph_com::HeadEntry;
 use zeph_transport::{tag, PeerAddr, Transport};
 
 /// Max size of a registry request/response frame.
@@ -77,9 +78,12 @@ pub struct HeadRowWire {
 pub enum RegistryResp {
     /// A `Submit` was applied; the new registry-account root.
     SubmitAck([u8; 32]),
-    /// A `Resolve` result: the current head `(cid, version)` (`None` = not registered). The
-    /// version is surfaced so a version-aware caller (e.g. a `RootStore`) gets the head seq.
-    Resolved(Option<([u8; 32], u64)>),
+    /// A `Resolve` result: the current head as its full owner-SIGNED [`HeadEntry`] (`None` = not
+    /// registered). The signature TRAVELS with the head so the ASKING node re-verifies it
+    /// (`HeadEntry::verify`) before trusting it — a resolve RPC is a network trust boundary, so a
+    /// compromised/malicious replica cannot answer with a forged `(cid, version)`. `version` is on
+    /// the entry, so a version-aware caller (e.g. a `RootStore`) still gets the head seq.
+    Resolved(Option<HeadEntry>),
     /// The full registry-account state bytes (empty = no state yet) — reply to `GetState`,
     /// used for the takeover merge.
     State(Vec<u8>),
