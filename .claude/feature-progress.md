@@ -1,3 +1,37 @@
+# VERIFICATION PRIMITIVE (K6 / task #8) — building (2026-07-13)
+Build the automated-consistency verification primitive per VERIFICATION_DESIGN.md (re-cut to
+consistency-only): "is this the correct output of this deterministic program?" answered by ANY node
+re-running the pure function and comparing; app-declared threshold k (1/2/3); interchangeable open
+verifiers. Distinct from attestation (authority, task #9). Rides the BUILT runtime: `run_program`
+(returns the committed output), `CapabilityGrant::deterministic()` (fail-safe, reproducible), the
+`Random`-template for a new reserved host fn.
+
+Phases (VERIFICATION_DESIGN §9 build order; each: build+test+gate+commit):
+- [x] P1 Verdict + local re-verify (offline core) DONE 2026-07-13. New `crates/com/src/verification.rs`:
+      `VerifyRequest { program_cid, prev_state, request, now, claimed_output }` (+ `request_hash`);
+      `Verdict { verifier, program_cid, request_hash, output_hash, agree, signature }` (+ signing
+      bytes / sign / verify, mirroring registry's HeadSubmission pattern); `verify_locally(runtime,
+      identity, req, wasm, fuel) -> Verdict` re-runs under the DETERMINISTIC grant + same `now`
+      (reproducible) and signs agree = (rerun_output == claimed_output). No board, no host-fn, no
+      capability change yet. Tests: honest→agree, tampered→disagree, trap→disagree, sig verifies,
+      cross-node determinism (two identities, same request → same agree).
+- [ ] P2 `Verify` capability + host ABI. New `Capability::Verify` variant (Random template) + a
+      `verify(func, inputs, claimed_output)` host fn (orchestration, app profile); INERT in
+      verify-mode (a verifier re-run does NOT bind `verify` → no recursion / no nested verify).
+- [ ] P3 The request board — global append-only, gossiped: producer posts
+      `(VerifyRequest, policy)`; nodes see pending requests. Board stays "dumb" (no invariant).
+- [ ] P4 Cooldown-rotated verifier selection + verdict collection to threshold k; policy schema
+      (`quorum k`, `set: open|whitelist`). Redundancy-is-a-feature (not claim-once). No self-verify.
+- [ ] P5 First consumer — a shared-counter test program declaring verify k=1 then k=n; end-to-end
+      + integration-check. (App-registry is deliberately NOT a consumer.)
+
+NOTE (design): SYBIL is the honest ceiling (per-node cooldown binds one node, not a fleet) — name it,
+don't claim to defend it (stake/reputation weighting is deferred). NO self-verification (a DIFFERENT
+node must re-run). Determinism boundary: the re-run reads only explicit inputs (prev_state, request,
+now) — `now` must be carried in the request, never host wall-time.
+
+---
+
 # REGISTRY READ VERIFICATION — P1–P4 DONE + review-fixed; P5 (roll) PENDING USER GO-AHEAD (2026-07-12)
 Closed the last registry correctness/security gap: reads WERE trust-on-announce. The write path validated
 the owner sig (RegistryState::apply → sub.verify()) then DISCARDED it — HeadEntry had NO signature, so

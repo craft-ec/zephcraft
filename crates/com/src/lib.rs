@@ -38,6 +38,7 @@ mod gov;
 mod invoke;
 mod registry;
 mod transition;
+mod verification;
 pub use capability::{Capability, CapabilityGrant};
 pub use craft::CraftBackend;
 pub use gov::{
@@ -49,6 +50,7 @@ pub use registry::{
     ProgramRegistryState, RegistryProgram, RegistryState,
 };
 pub use transition::{pda, TransitionCtx, TransitionRuntime};
+pub use verification::{verify_locally, Verdict, VerifyRequest};
 
 /// Default fuel budget per invocation — roughly proportional to executed WASM
 /// instructions (foundation §38). A runaway loop exhausts this and traps.
