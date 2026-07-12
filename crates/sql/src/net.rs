@@ -11,7 +11,7 @@ use zeph_core::{Cid, NodeId};
 use zeph_obj::{ConsumeMode, ObjEngine, PeerSource};
 use zeph_transport::{tag, PeerAddr, TaggedStream, Transport};
 
-use crate::{DurableStore, ObjectStore, PageSource, Result, SqlError};
+use crate::{DurableStore, PageSource, Result, SqlError};
 
 /// ALPN for CraftSQL page-object fetch.
 pub const ALPN: &[u8] = b"/craftec/sqlpage/1";
@@ -25,17 +25,15 @@ const MAX_OBJECT: usize = 16 * 1024 * 1024;
 /// DB fetches many pages back-to-back and serial handling made that N round
 /// trips instead of a pipeline.
 pub async fn serve_pages(store_dir: PathBuf, mut streams: mpsc::Receiver<TaggedStream>) {
-    // Muxed: one tagged stream per page fetch. Open the store ONCE (the demux
-    // already bounds per-peer pipelining), then handle each request stream.
-    let Ok(store) = ObjectStore::open(&store_dir) else {
-        return;
-    };
-    let store = std::sync::Arc::new(store);
+    // Muxed: one tagged stream per page fetch. The fetch protocol is CID-only (it can't name the
+    // owning DB), and pages now live in per-DB subdirs (`store_dir/<key>/`), so serve by SEARCHING
+    // the store tree for the content-addressed object — see `find_object`.
+    let store_dir = std::sync::Arc::new(store_dir);
     while let Some(TaggedStream {
         mut send, mut recv, ..
     }) = streams.recv().await
     {
-        let store = store.clone();
+        let store_dir = store_dir.clone();
         tokio::spawn(async move {
             let Ok(req) = recv.read_to_end(64).await else {
                 return;
@@ -43,12 +41,41 @@ pub async fn serve_pages(store_dir: PathBuf, mut streams: mpsc::Receiver<TaggedS
             if req.len() == 32 {
                 let mut cid = [0u8; 32];
                 cid.copy_from_slice(&req);
-                let data = store.get(&Cid(cid)).unwrap_or_default();
+                let data = find_object(&store_dir, &Cid(cid)).unwrap_or_default();
                 let _ = send.write_all(&data).await;
             }
             let _ = send.finish();
         });
     }
+}
+
+/// Find a page object by CID anywhere in the store tree: the legacy flat root first, then each
+/// per-DB subdir (`store_dir/<key>/`). The object is content-addressed, so any copy is
+/// authoritative; a CID-only fetch can't name the owning DB, so the server searches. Cheap — one
+/// stat on the flat path, then a bounded scan of the per-DB subdirs (one per hosted DB).
+fn find_object(store_dir: &std::path::Path, cid: &Cid) -> Option<Vec<u8>> {
+    let hex = cid.to_hex();
+    let rel = std::path::Path::new(&hex[0..2]).join(&hex);
+    // Legacy flat root first (`store_dir/<2hex>/<hex>`).
+    if let Ok(b) = std::fs::read(store_dir.join(&rel)) {
+        return Some(b);
+    }
+    // Then each per-DB subdir. Keys are `<owner16>_<ns>` (len >= 18), so skip the 2-char legacy
+    // object-shard dirs already covered by the flat read above.
+    let rd = std::fs::read_dir(store_dir).ok()?;
+    for e in rd.flatten() {
+        let name = e.file_name();
+        if name.to_string_lossy().len() == 2 {
+            continue;
+        }
+        let p = e.path();
+        if p.is_dir() {
+            if let Ok(b) = std::fs::read(p.join(&rel)) {
+                return Some(b);
+            }
+        }
+    }
+    None
 }
 
 /// Fetches CraftSQL page objects from a DB owner over the transport (resolving

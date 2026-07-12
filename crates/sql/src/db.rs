@@ -153,11 +153,18 @@ impl CraftSql {
     /// node, and every page object — into the local store (each verified by CID),
     /// so the sync VFS can then read locally. Walks the tree so only the DB's
     /// live pages are fetched.
-    async fn sync_reachable(&self, owner: NodeId, root: Cid, fetch_pages: bool) -> Result<()> {
+    async fn sync_reachable(
+        &self,
+        owner: NodeId,
+        key: &str,
+        root: Cid,
+        fetch_pages: bool,
+    ) -> Result<()> {
         let Some(source) = &self.source else {
             return Ok(());
         };
-        let store = ObjectStore::open(&self.store_dir)?;
+        // Write fetched pages into THIS db's per-key store so the VFS reads them locally.
+        let store = open_db_store(&self.store_dir, key)?;
         let src = source.as_ref();
         let root_bytes = ensure(&store, src, owner, root).await?;
         let ri = crate::pager::decode_root(&root_bytes)?;
@@ -225,7 +232,7 @@ impl CraftSql {
     /// can't unwrap registers nothing → its pages read as ciphertext (open fails).
     fn register_cipher_existing(&self, key: &str, root: Cid) -> Result<()> {
         let Some(kp) = &self.enc else { return Ok(()) };
-        let store = ObjectStore::open(&self.store_dir)?;
+        let store = open_db_store(&self.store_dir, key)?;
         let Some(bytes) = store.get(&root) else {
             return Ok(());
         };
@@ -266,6 +273,14 @@ impl CraftSql {
         writable: bool,
         private_hint: bool,
     ) -> Result<CraftDb> {
+        // Reject a namespace that isn't a single safe path component BEFORE it is used to build a
+        // key / on-disk directory — it flows in unsanitized from app callers, and the key becomes a
+        // `store_dir/<key>/` root (traversal guard; also enforced at the store boundary).
+        if !crate::store::is_safe_component(namespace) {
+            return Err(SqlError::Sqlite(format!(
+                "unsafe db namespace: {namespace:?}"
+            )));
+        }
         let key = format!("{}_{}", &owner.to_hex()[..16], namespace);
         // Resolve the authoritative head — sidecar-first for our own DB, so the owner is never
         // locked out of its own database by head-store (registry) liveness.
@@ -290,7 +305,7 @@ impl CraftSql {
                 if !writable && self.source.is_some() {
                     // Lazy reader: sync only the (tiny) index; pull page contents
                     // on demand as the query touches them.
-                    self.sync_reachable(owner, root, false).await?;
+                    self.sync_reachable(owner, &key, root, false).await?;
                     let fetcher = self.spawn_fetcher(owner);
                     self.fetchers
                         .lock()
@@ -298,7 +313,7 @@ impl CraftSql {
                         .insert(key.clone(), fetcher);
                 } else {
                     // Writer (all local) or source-less: ensure everything present.
-                    self.sync_reachable(owner, root, true).await?;
+                    self.sync_reachable(owner, &key, root, true).await?;
                 }
                 self.roots
                     .lock()
@@ -366,8 +381,8 @@ impl CraftSql {
             .durable
             .as_ref()
             .ok_or_else(|| SqlError::Sqlite("no durable store configured".into()))?;
-        let store = ObjectStore::open(&self.store_dir)?;
         let key = format!("{}_{}", &owner.to_hex()[..16], namespace);
+        let store = open_db_store(&self.store_dir, &key)?;
         let gens: Vec<[u8; 32]> = match &self.manifests {
             Some(mstore) => match mstore.resolve(owner, namespace).await? {
                 Some((manifest_cid, _)) => {
@@ -494,7 +509,7 @@ impl CraftDb {
         let Some(durable) = &self.durable else {
             return Ok(());
         };
-        let store = ObjectStore::open(&self.store_dir)?;
+        let store = open_db_store(&self.store_dir, &self.key)?;
         let mut manifest = load_manifest(&self.store_dir, &self.key);
         if manifest.last_root == Some(root.0) {
             return Ok(());
@@ -600,6 +615,15 @@ fn save_manifest(store_dir: &Path, key: &str, m: &GenManifest) -> Result<()> {
     Ok(())
 }
 
+/// Open the per-DB page store rooted at `store_dir/<key>/`, with reads falling back to the legacy
+/// flat `store_dir` root (objects written before per-DB isolation). Writes and GC stay in the
+/// per-key root, so one DB's compaction can never delete another DB's dedup'd objects. Every
+/// place that opens a store for a SPECIFIC db (`key`) must go through this — never the flat root.
+fn open_db_store(store_dir: &Path, key: &str) -> Result<ObjectStore> {
+    // `open_db_component` validates `key` is a single safe path component (traversal guard).
+    Ok(ObjectStore::open_db_component(store_dir, key, store_dir)?)
+}
+
 /// Ensure `cid` is present in `store`, fetching + verifying it from the network
 /// source if missing. Returns its bytes.
 async fn ensure(
@@ -636,7 +660,7 @@ async fn run_compaction(
     durable: &Arc<dyn DurableStore>,
     manifests: &Option<Arc<dyn ManifestStore>>,
 ) -> Result<usize> {
-    let store = ObjectStore::open(store_dir)?;
+    let store = open_db_store(store_dir, key)?;
     let mut manifest = load_manifest(store_dir, key);
     if manifest.generations.len() <= 1 {
         return Ok(0);
@@ -859,9 +883,10 @@ mod tests {
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await; // let the async head publish land
 
-        // Reader has an EMPTY store + a page source pointing at the owner's store.
+        // Reader has an EMPTY store + a page source pointing at the owner's per-key store.
+        let mail_key = format!("{}_{}", &owner_id.to_hex()[..16], "mail");
         let source = Arc::new(MockSource {
-            owner_store: crate::ObjectStore::open(owner_dir.path()).unwrap(),
+            owner_store: open_db_store(owner_dir.path(), &mail_key).unwrap(),
         });
         let r = CraftSql::register(reader_dir.path(), heads.clone(), owner_id)
             .unwrap()
@@ -879,7 +904,7 @@ mod tests {
         );
 
         // The pages really were absent then fetched: the reader store now holds them.
-        let reader_store = crate::ObjectStore::open(reader_dir.path()).unwrap();
+        let reader_store = open_db_store(reader_dir.path(), &mail_key).unwrap();
         let head = db2.root().unwrap();
         assert!(
             reader_store.has(&head),
@@ -1094,15 +1119,16 @@ mod tests {
         db.write(&sql).await.unwrap();
         drop(db);
 
-        // Total objects reachable from the DB root.
+        // Total objects reachable from the DB root. Pages live in the per-DB store `<dir>/<key>/`.
         let (root, _) = heads.resolve(owner_id, "big").await.unwrap().unwrap();
-        let owner_store = crate::ObjectStore::open(owner_dir.path()).unwrap();
+        let big_key = format!("{}_{}", &owner_id.to_hex()[..16], "big");
+        let owner_store = open_db_store(owner_dir.path(), &big_key).unwrap();
         let total = crate::pager::reachable(&owner_store, root).unwrap().len();
         assert!(total > 10, "DB should span many objects, got {total}");
 
         // Lazy reader: a point query should fetch far fewer than every object.
         let src = Arc::new(CountingSource {
-            owner_store: crate::ObjectStore::open(owner_dir.path()).unwrap(),
+            owner_store: open_db_store(owner_dir.path(), &big_key).unwrap(),
             count: std::sync::atomic::AtomicUsize::new(0),
         });
         let r = CraftSql::register(reader_dir.path(), heads.clone(), owner_id)
@@ -1144,7 +1170,9 @@ mod tests {
                 .unwrap();
         }
         drop(db);
-        let objs_before = crate::ObjectStore::open(dir.path())
+        // Count objects in the DB's OWN per-key store (`<dir>/<key>/`).
+        let app_key = format!("{}_{}", &owner.to_hex()[..16], "app");
+        let objs_before = open_db_store(dir.path(), &app_key)
             .unwrap()
             .list()
             .unwrap()
@@ -1153,7 +1181,7 @@ mod tests {
         // Compact: fold into one base generation + GC superseded objects.
         let reclaimed = sql.compact("app").await.unwrap();
         assert!(reclaimed > 0, "compaction reclaimed superseded objects");
-        let objs_after = crate::ObjectStore::open(dir.path())
+        let objs_after = open_db_store(dir.path(), &app_key)
             .unwrap()
             .list()
             .unwrap()
@@ -1182,5 +1210,85 @@ mod tests {
             .query_row("SELECT v FROM t WHERE id=5", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, "row5", "compacted DB still fully recoverable");
+    }
+
+    #[tokio::test]
+    async fn one_dbs_compaction_never_touches_a_sibling_db() {
+        // Two same-schema DBs share one CraftSql store. Their identical initial pages dedup to one
+        // object, and a per-DB GC over a SHARED store used to delete the sibling's pages — compacting
+        // one shard corrupted all the others ("file is not a database"). Per-DB store isolation must
+        // keep DB "a"'s compaction from deleting any of DB "b"'s objects. (Regression for the
+        // ObjDurable shard-page corruption.)
+        let dir = tempdir().unwrap();
+        let owner = NodeId([12u8; 32]);
+        let heads = MockHeads::new(owner);
+        let durable = Arc::new(MockDurable::default());
+        let manifests = MockManifest::new(owner);
+        let sql = CraftSql::register(dir.path(), heads.clone(), owner)
+            .unwrap()
+            .with_durable(durable.clone())
+            .with_manifests(manifests.clone());
+
+        // Sibling DB "b": one row we re-read at the end.
+        let mut b = sql.open("b").await.unwrap();
+        b.write("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t VALUES (1,'keep');")
+            .await
+            .unwrap();
+        drop(b);
+
+        // DB "a": many writes accumulate superseded pages + generations, then compact (the GC step
+        // that used to delete across the whole shared store).
+        let mut a = sql.open("a").await.unwrap();
+        a.write("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);")
+            .await
+            .unwrap();
+        for i in 0..8 {
+            a.write(&format!("INSERT INTO t VALUES ({i},'row{i}');"))
+                .await
+                .unwrap();
+        }
+        drop(a);
+        let reclaimed = sql.compact("a").await.unwrap();
+        assert!(
+            reclaimed > 0,
+            "a's compaction reclaimed its own superseded pages"
+        );
+
+        // The sibling DB "b" must STILL open and read — its pages were not GC'd by a's compaction.
+        let b2 = sql.open("b").await.unwrap();
+        let v: String = b2
+            .conn()
+            .query_row("SELECT v FROM t WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            v, "keep",
+            "sibling DB survived another DB's compaction (per-DB store isolation)"
+        );
+    }
+
+    #[tokio::test]
+    async fn traversal_namespace_is_rejected() {
+        // The namespace becomes a `store_dir/<key>/` directory, and it flows in unsanitized from
+        // app callers — so a name with path separators / `..` must be rejected, not turned into a
+        // create_dir_all outside the store dir (path-traversal guard).
+        let base = tempdir().unwrap();
+        let store_dir = base.path().join("store");
+        let owner = NodeId([13u8; 32]);
+        let heads = MockHeads::new(owner);
+        let sql = CraftSql::register(&store_dir, heads, owner).unwrap();
+        for ns in ["../evil", "a/../../evil", "a/b", "/abs", "..", "."] {
+            assert!(
+                sql.open(ns).await.is_err(),
+                "traversal namespace {ns:?} must be rejected"
+            );
+        }
+        // The guard itself: legit registry/app namespaces pass; separators/dot-dirs don't.
+        assert!(crate::store::is_safe_component("reg_0_8_42"));
+        assert!(crate::store::is_safe_component("app.mydb"));
+        assert!(crate::store::is_safe_component("weird..name")); // dots INSIDE a component are fine
+        assert!(!crate::store::is_safe_component("../x"));
+        assert!(!crate::store::is_safe_component("a/b"));
+        assert!(!crate::store::is_safe_component(".."));
+        assert!(!crate::store::is_safe_component(""));
     }
 }

@@ -92,7 +92,12 @@ impl Vfs for CraftVfs {
 
     fn open(&self, db: &str, opts: OpenOptions) -> io::Result<CraftHandle> {
         if opts.kind == OpenKind::MainDb {
-            let store = ObjectStore::open(&self.dir)?;
+            // Per-DB isolation: this DB's pages live under `dir/<key>/` (key == `db`), with reads
+            // falling back to the legacy flat `dir` root so pre-isolation nodes keep resolving after
+            // upgrade. See `ObjectStore` docs — a shared store let one DB's GC delete another's
+            // dedup'd pages. `open_db_component` validates `db` is a safe path component (traversal
+            // guard) — a bad namespace fails the open here rather than escaping `dir`.
+            let store = ObjectStore::open_db_component(&self.dir, db, &self.dir)?;
             let roots = self.roots.clone();
             let mut pager = match roots.lock().expect("roots").get(db).copied() {
                 Some(root) => Pager::open(store, Cid(root)).map_err(to_io)?,
