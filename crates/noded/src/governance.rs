@@ -91,7 +91,7 @@ impl GovernanceChainStore {
     }
 
     pub async fn is_governor(&self) -> bool {
-        self.current().await.is_governor(&self.self_id)
+        self.current().await.is_member(&self.self_id)
     }
 
     /// Draft a proposal at the next seq, signed with THIS node's key (if a governor).
@@ -111,11 +111,7 @@ impl GovernanceChainStore {
             anyhow::bail!("this node is not a governor");
         }
         let sig = approval.proposal.sign(&self.identity);
-        if !approval
-            .signatures
-            .iter()
-            .any(|s| s.governor == sig.governor)
-        {
+        if !approval.signatures.iter().any(|s| s.member == sig.member) {
             approval.signatures.push(sig);
         }
         Ok(())
@@ -262,7 +258,7 @@ impl GovernanceChainStore {
                 }
             }
         }
-        for g in self.current().await.governors {
+        for g in self.current().await.members {
             if g != self.self_id && !targets.contains(&g) {
                 targets.push(g);
             }

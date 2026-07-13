@@ -67,11 +67,20 @@ impl AttestProposal {
     }
 }
 
-/// One member's signature over a proposal. Generalizes `GovSignature`.
+/// One member's signature over a proposal. Governance's `GovSignature` is an alias of this.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MemberSignature {
     pub member: [u8; 32],
     pub signature: Vec<u8>,
+}
+
+/// A membership self-amendment — the reconfiguration path shared by governance + attestation. A
+/// payload action (an app `Statement`, or governance's `SetProgram`/`SetConfig`) maps to `None`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemberChange {
+    Add([u8; 32]),
+    Remove([u8; 32]),
+    SetThreshold(u64),
 }
 
 /// A proposal plus the collected member signatures — the k-of-n unit. Generalizes
@@ -111,17 +120,18 @@ impl Quorum {
         self.members.binary_search(id).is_ok()
     }
 
-    /// Distinct valid MEMBER signatures over the attestation's proposal (a non-member's signature
-    /// is ignored). Identity-bound: this is where "authority = who signed" is enforced.
-    fn quorum(&self, att: &Attestation) -> usize {
-        let msg = att.proposal.signing_bytes();
+    /// **Shared substrate** (governance + attestation): count DISTINCT valid member signatures over
+    /// `msg` (a non-member's signature is ignored). This is where "authority = who signed" is
+    /// enforced — the one k-of-n crypto count for both consumers, each passing its own domain-tagged
+    /// proposal bytes.
+    pub fn count_signers(&self, msg: &[u8], sigs: &[MemberSignature]) -> usize {
         let mut set = HashSet::new();
-        for s in &att.signatures {
+        for s in sigs {
             if !self.is_member(&s.member) {
                 continue;
             }
             if let Ok(sig) = <[u8; 64]>::try_from(s.signature.as_slice()) {
-                if NodeIdentity::verify(&NodeId(s.member), &msg, &sig) {
+                if NodeIdentity::verify(&NodeId(s.member), msg, &sig) {
                     set.insert(s.member);
                 }
             }
@@ -129,37 +139,59 @@ impl Quorum {
         set.len()
     }
 
-    /// Valid iff the proposal targets the next seq AND ≥ `threshold` distinct members signed it.
-    pub fn verify(&self, att: &Attestation) -> bool {
-        att.proposal.seq == self.seq + 1 && self.quorum(att) >= self.threshold
-    }
-
-    /// Apply an authorized attestation, returning the advanced quorum (seq + 1, with any membership
-    /// change applied). A `Statement` only advances the seq — its authority is consumed by the app,
-    /// not by the quorum. `None` if invalid.
-    pub fn apply(&self, att: &Attestation) -> Option<Quorum> {
-        if !self.verify(att) {
-            return None;
-        }
+    /// **Shared substrate**: advance the quorum by one seq, applying an optional membership change.
+    /// A payload action (a `Statement`, or governance's `SetProgram`/`SetConfig`) passes `None` — it
+    /// only bumps the seq; its authority is consumed by the app/registry, not by the quorum.
+    pub fn advance(&self, change: Option<MemberChange>) -> Quorum {
         let mut next = self.clone();
         next.seq += 1;
-        match &att.proposal.action {
-            AttestAction::AddMember { member } => {
-                if next.members.binary_search(member).is_err() {
-                    next.members.push(*member);
+        match change {
+            Some(MemberChange::Add(member)) => {
+                if next.members.binary_search(&member).is_err() {
+                    next.members.push(member);
                     next.members.sort();
                 }
             }
-            AttestAction::RemoveMember { member } => {
-                next.members.retain(|m| m != member);
+            Some(MemberChange::Remove(member)) => {
+                next.members.retain(|m| *m != member);
                 next.threshold = next.threshold.min(next.members.len().max(1));
             }
-            AttestAction::SetThreshold { threshold } => {
-                next.threshold = (*threshold as usize).clamp(1, next.members.len().max(1));
+            Some(MemberChange::SetThreshold(threshold)) => {
+                next.threshold = (threshold as usize).clamp(1, next.members.len().max(1));
             }
-            AttestAction::Statement(_) => {}
+            None => {}
         }
-        Some(next)
+        next
+    }
+}
+
+impl AttestAction {
+    /// The membership change this action makes (self-amendment), or `None` for a `Statement`.
+    fn member_change(&self) -> Option<MemberChange> {
+        match self {
+            AttestAction::AddMember { member } => Some(MemberChange::Add(*member)),
+            AttestAction::RemoveMember { member } => Some(MemberChange::Remove(*member)),
+            AttestAction::SetThreshold { threshold } => {
+                Some(MemberChange::SetThreshold(*threshold))
+            }
+            AttestAction::Statement(_) => None,
+        }
+    }
+}
+
+impl Attestation {
+    /// Authorized against `q` iff it targets the next seq AND ≥ `q.threshold` distinct members
+    /// signed it.
+    pub fn authorizes(&self, q: &Quorum) -> bool {
+        self.proposal.seq == q.seq + 1
+            && q.count_signers(&self.proposal.signing_bytes(), &self.signatures) >= q.threshold
+    }
+
+    /// Apply to `q` → the advanced quorum (seq + 1, with any membership change), or `None` if not
+    /// authorized.
+    pub fn apply_to(&self, q: &Quorum) -> Option<Quorum> {
+        self.authorizes(q)
+            .then(|| q.advance(self.proposal.action.member_change()))
     }
 }
 
@@ -202,7 +234,7 @@ impl QuorumChain {
     pub fn current(&self) -> Option<Quorum> {
         let mut q = self.genesis.clone();
         for a in &self.attestations {
-            q = q.apply(a)?;
+            q = a.apply_to(&q)?;
         }
         Some(q)
     }
@@ -210,7 +242,7 @@ impl QuorumChain {
     /// Append an attestation iff it validly extends the current chain (returns success).
     pub fn append(&mut self, att: Attestation) -> bool {
         match self.current() {
-            Some(cur) if cur.apply(&att).is_some() => {
+            Some(cur) if att.apply_to(&cur).is_some() => {
                 self.attestations.push(att);
                 true
             }
@@ -224,7 +256,7 @@ impl QuorumChain {
         let mut q = self.genesis.clone();
         let mut out = Vec::new();
         for a in &self.attestations {
-            let Some(next) = q.apply(a) else {
+            let Some(next) = a.apply_to(&q) else {
                 return out; // a break in the chain — nothing beyond is authorized
             };
             if let AttestAction::Statement(s) = &a.proposal.action {
@@ -268,14 +300,14 @@ mod tests {
         let stmt = AttestAction::Statement(b"authorize the thing".to_vec());
 
         // 1 signer < k=2 → not enough
-        assert!(!q.verify(&attest(stmt.clone(), 1, &[&ids[0]])));
-        // 2 distinct signers → verifies
-        assert!(q.verify(&attest(stmt.clone(), 1, &[&ids[0], &ids[1]])));
+        assert!(!attest(stmt.clone(), 1, &[&ids[0]]).authorizes(&q));
+        // 2 distinct signers → authorizes
+        assert!(attest(stmt.clone(), 1, &[&ids[0], &ids[1]]).authorizes(&q));
         // the same member twice still counts once → not enough
-        assert!(!q.verify(&attest(stmt.clone(), 1, &[&ids[0], &ids[0]])));
+        assert!(!attest(stmt.clone(), 1, &[&ids[0], &ids[0]]).authorizes(&q));
         // an outsider's signature doesn't count
         let outsider = NodeIdentity::generate();
-        assert!(!q.verify(&attest(stmt.clone(), 1, &[&ids[0], &outsider])));
+        assert!(!attest(stmt.clone(), 1, &[&ids[0], &outsider]).authorizes(&q));
     }
 
     #[test]
@@ -284,15 +316,15 @@ mod tests {
         let q = quorum(&ids, 2);
         let a = AttestAction::Statement(b"x".to_vec());
         assert!(
-            q.verify(&attest(a.clone(), 1, &[&ids[0], &ids[1]])),
+            attest(a.clone(), 1, &[&ids[0], &ids[1]]).authorizes(&q),
             "seq must be current+1 = 1"
         );
         assert!(
-            !q.verify(&attest(a.clone(), 2, &[&ids[0], &ids[1]])),
+            !attest(a.clone(), 2, &[&ids[0], &ids[1]]).authorizes(&q),
             "seq 2 is wrong at seq 0"
         );
         assert!(
-            !q.verify(&attest(a, 0, &[&ids[0], &ids[1]])),
+            !attest(a, 0, &[&ids[0], &ids[1]]).authorizes(&q),
             "replay of seq 0 rejected"
         );
     }
@@ -304,32 +336,33 @@ mod tests {
         let newcomer = NodeIdentity::generate();
 
         // add a 4th member (2-of-3 authorizes it)
-        q = q
-            .apply(&attest(
-                AttestAction::AddMember {
-                    member: newcomer.node_id().0,
-                },
-                1,
-                &[&ids[0], &ids[1]],
-            ))
-            .expect("add authorized");
+        q = attest(
+            AttestAction::AddMember {
+                member: newcomer.node_id().0,
+            },
+            1,
+            &[&ids[0], &ids[1]],
+        )
+        .apply_to(&q)
+        .expect("add authorized");
         assert!(q.is_member(&newcomer.node_id().0) && q.seq == 1);
 
         // raise the threshold to 3 (2-of-4 still authorizes this transition)
-        q = q
-            .apply(&attest(
-                AttestAction::SetThreshold { threshold: 3 },
-                2,
-                &[&ids[0], &ids[1]],
-            ))
-            .expect("threshold change authorized");
+        q = attest(
+            AttestAction::SetThreshold { threshold: 3 },
+            2,
+            &[&ids[0], &ids[1]],
+        )
+        .apply_to(&q)
+        .expect("threshold change authorized");
         assert_eq!(q.threshold, 3);
         // now 2 signers is no longer enough
-        assert!(!q.verify(&attest(
+        assert!(!attest(
             AttestAction::Statement(b"z".to_vec()),
             3,
             &[&ids[0], &ids[1]]
-        )));
+        )
+        .authorizes(&q));
     }
 
     #[test]

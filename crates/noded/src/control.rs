@@ -1236,7 +1236,7 @@ fn parse_gov_action(p: &serde_json::Value) -> Result<zeph_com::GovAction, String
 
 fn gov_set_json(set: &zeph_com::GovernanceSet, is_gov: bool) -> serde_json::Value {
     serde_json::json!({
-        "governors": set.governors.iter().map(hex::encode).collect::<Vec<_>>(),
+        "governors": set.members.iter().map(hex::encode).collect::<Vec<_>>(),
         "threshold": set.threshold,
         "seq": set.seq,
         "is_governor": is_gov,

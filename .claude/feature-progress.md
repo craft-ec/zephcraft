@@ -14,9 +14,15 @@ Phases (each: build+test+gate+commit):
       RemoveMember | SetThreshold}`; `AttestProposal{action,seq}` (+sign, domain b"craftec/attest/1");
       `MemberSignature{member,signature}`; `Attestation{proposal,signatures}`; `QuorumChain{genesis,
       attestations}` (current fold + append + `is_authorized(statement)` = replay Statement actions).
-      Pure/offline; tests mirror gov.rs. NOTE: built standalone (not refactoring live gov.rs to share
-      the type — that unify is a deferred, riskier follow-up; governance is the genesis instance
-      CONCEPTUALLY + could later BE a Quorum).
+      Pure/offline; tests mirror gov.rs. UNIFIED 2026-07-14 (user chose "unify now"): governance is
+      now a LITERAL instance — the shared quorum mechanics live on `Quorum` (`count_signers`, `advance`
+      + `MemberChange`), each approval type (`Attestation`, `GovernanceApproval`) carries its own
+      `authorizes`/`apply_to`; `GovernanceSet = Quorum`, `GovSignature = MemberSignature` (type
+      aliases). WIRE-IDENTICAL (postcard positional — `{governors,threshold,seq}` == `{members,…}`);
+      pinned by a `governance_set_wire_layout_is_unchanged` guard test (35-byte layout). No governance
+      wire/behavior change → no dedicated roll needed (ships mixed-version-safe with the attestation
+      roll). Fixed 5 external sites (governance.rs is_governor→is_member/.governor→.member/.governors
+      →.members, control.rs .governors→.members). com 70, noded 11, integration 4.
 - [ ] P2 the `attest` host ABI + AttestBackend (com): a program declares its quorum (account/config),
       triggers attestation over a statement, gates a transition on k-of-n; mirror the verify()/
       VerifyBackend wiring. Owner-sig bootstrap of the initial quorum.

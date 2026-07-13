@@ -12,12 +12,11 @@
 //! mechanism/policy split) — the multisig quorum makes the decision, the chain-fold makes
 //! it durable and self-verifying.
 
-use std::collections::HashSet;
-
 use serde::{Deserialize, Serialize};
-use zeph_core::{Cid, NodeId};
+use zeph_core::Cid;
 use zeph_crypto::NodeIdentity;
 
+use crate::attestation::{MemberChange, MemberSignature, Quorum};
 use crate::registry::{ConfigRegistryState, ProgramRegistryState};
 
 const GOV_DOMAIN: &[u8] = b"craftec/gov/1";
@@ -56,106 +55,63 @@ impl GovernanceProposal {
     /// A governor signs this proposal.
     pub fn sign(&self, identity: &NodeIdentity) -> GovSignature {
         GovSignature {
-            governor: identity.node_id().0,
+            member: identity.node_id().0,
             signature: identity.sign(&self.signing_bytes()).to_vec(),
         }
     }
 }
 
-/// One governor's signature over a proposal.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct GovSignature {
-    pub governor: [u8; 32],
-    pub signature: Vec<u8>,
-}
+/// One governor's signature over a proposal. Governance is an instance of the attestation quorum
+/// substrate, so a governor signature IS a [`MemberSignature`] (wire-identical to the old
+/// `{governor, signature}`).
+pub type GovSignature = MemberSignature;
 
-/// A proposal plus the collected governor signatures.
+/// A proposal plus the collected governor signatures — governance's
+/// [`crate::attestation::Attestation`].
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GovernanceApproval {
     pub proposal: GovernanceProposal,
     pub signatures: Vec<GovSignature>,
 }
 
-/// The governor set + threshold + monotonic seq. It is itself amendable — via approved
-/// `AddGovernor`/`RemoveGovernor`/`SetThreshold` proposals — so governance can evolve
-/// its own membership without a binary release.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct GovernanceSet {
-    /// Governor public keys, canonical (sorted) order.
-    pub governors: Vec<[u8; 32]>,
-    pub threshold: usize,
-    pub seq: u64,
+impl GovAction {
+    /// The membership self-amendment this action makes, or `None` for a payload action
+    /// (`SetProgram`/`SetConfig`, whose effect lands in the program/config registries).
+    fn member_change(&self) -> Option<MemberChange> {
+        match self {
+            GovAction::AddGovernor { governor } => Some(MemberChange::Add(*governor)),
+            GovAction::RemoveGovernor { governor } => Some(MemberChange::Remove(*governor)),
+            GovAction::SetThreshold { threshold } => Some(MemberChange::SetThreshold(*threshold)),
+            GovAction::SetProgram { .. } | GovAction::SetConfig { .. } => None,
+        }
+    }
 }
 
-impl GovernanceSet {
-    /// The bootstrap governance set (genesis governors + threshold).
-    pub fn genesis(governors: Vec<[u8; 32]>, threshold: usize) -> Self {
-        let mut g = governors;
-        g.sort();
-        g.dedup();
-        let threshold = threshold.clamp(1, g.len().max(1));
-        Self {
-            governors: g,
-            threshold,
-            seq: 0,
-        }
+impl GovernanceApproval {
+    /// Authorized against `set` iff it targets the next seq AND ≥ threshold distinct governors
+    /// signed it. The k-of-n check is [`Quorum::count_signers`] — shared with app attestation.
+    pub fn authorizes(&self, set: &Quorum) -> bool {
+        self.proposal.seq == set.seq + 1
+            && set.count_signers(&self.proposal.signing_bytes(), &self.signatures) >= set.threshold
     }
 
-    pub fn is_governor(&self, id: &[u8; 32]) -> bool {
-        self.governors.binary_search(id).is_ok()
-    }
-
-    /// Distinct valid governor signatures over the approval's proposal.
-    fn quorum(&self, approval: &GovernanceApproval) -> usize {
-        let msg = approval.proposal.signing_bytes();
-        let mut set = HashSet::new();
-        for s in &approval.signatures {
-            if !self.is_governor(&s.governor) {
-                continue;
-            }
-            if let Ok(sig) = <[u8; 64]>::try_from(s.signature.as_slice()) {
-                if NodeIdentity::verify(&NodeId(s.governor), &msg, &sig) {
-                    set.insert(s.governor);
-                }
-            }
-        }
-        set.len()
-    }
-
-    /// Valid iff the proposal targets the next seq AND ≥ threshold distinct governors
-    /// signed it. This is what the program/config registry checks before recording.
-    pub fn verify(&self, approval: &GovernanceApproval) -> bool {
-        approval.proposal.seq == self.seq + 1 && self.quorum(approval) >= self.threshold
-    }
-
-    /// Apply an approved proposal, returning the advanced set (seq + 1, with any
-    /// governor/threshold change applied). `SetProgram`/`SetConfig` only advance the seq
-    /// here — their effect lands in the program/config registries. None if invalid.
-    pub fn apply(&self, approval: &GovernanceApproval) -> Option<GovernanceSet> {
-        if !self.verify(approval) {
-            return None;
-        }
-        let mut next = self.clone();
-        next.seq += 1;
-        match &approval.proposal.action {
-            GovAction::AddGovernor { governor } => {
-                if next.governors.binary_search(governor).is_err() {
-                    next.governors.push(*governor);
-                    next.governors.sort();
-                }
-            }
-            GovAction::RemoveGovernor { governor } => {
-                next.governors.retain(|g| g != governor);
-                next.threshold = next.threshold.min(next.governors.len().max(1));
-            }
-            GovAction::SetThreshold { threshold } => {
-                next.threshold = (*threshold as usize).clamp(1, next.governors.len().max(1));
-            }
-            GovAction::SetProgram { .. } | GovAction::SetConfig { .. } => {}
-        }
-        Some(next)
+    /// Apply to `set` → the advanced governor set (seq + 1, with any membership change), or `None`
+    /// if not authorized. `SetProgram`/`SetConfig` only advance the seq; their effect lands in the
+    /// registries.
+    pub fn apply_to(&self, set: &Quorum) -> Option<Quorum> {
+        self.authorizes(set)
+            .then(|| set.advance(self.proposal.action.member_change()))
     }
 }
+
+/// The governor set — a literal INSTANCE of the attestation [`Quorum`] substrate: members (the
+/// governors) + threshold + monotonic seq, self-amendable via `AddGovernor`/`RemoveGovernor`/
+/// `SetThreshold`. Wire-identical to the old `{governors, threshold, seq}` struct (postcard is
+/// positional), so the governance chain's format is unchanged. Its k-of-n check
+/// ([`Quorum::count_signers`]) and membership self-amend ([`Quorum::advance`]) are the SHARED
+/// substrate; governance adds only its `GovAction` payloads, above, via [`GovernanceApproval`].
+/// Members are read via [`Quorum::is_member`] and [`Quorum::members`].
+pub type GovernanceSet = Quorum;
 
 /// A durable, **self-verifying** chain of governance approvals from a genesis governor
 /// set. Every node derives the SAME current governor set + program registry by folding
@@ -198,7 +154,7 @@ impl GovernanceChain {
     pub fn current(&self) -> Option<GovernanceSet> {
         let mut set = self.genesis.clone();
         for a in &self.approvals {
-            set = set.apply(a)?;
+            set = a.apply_to(&set)?;
         }
         Some(set)
     }
@@ -206,7 +162,7 @@ impl GovernanceChain {
     /// Append an approval iff it validly extends the current chain (returns success).
     pub fn append(&mut self, approval: GovernanceApproval) -> bool {
         match self.current() {
-            Some(cur) if cur.apply(&approval).is_some() => {
+            Some(cur) if approval.apply_to(&cur).is_some() => {
                 self.approvals.push(approval);
                 true
             }
@@ -289,10 +245,10 @@ mod tests {
         let g = govs(3);
         let gs = set(&g, 2);
         let a = approve(&g, 2, GovAction::SetThreshold { threshold: 3 }, 1);
-        assert!(gs.verify(&a));
+        assert!(a.authorizes(&gs));
         // one signature is below threshold
         let a1 = approve(&g, 1, GovAction::SetThreshold { threshold: 3 }, 1);
-        assert!(!gs.verify(&a1));
+        assert!(!a1.authorizes(&gs));
     }
 
     #[test]
@@ -301,7 +257,7 @@ mod tests {
         let gs = set(&g, 2);
         // gs.seq is 0, so seq must be 1
         let a = approve(&g, 2, GovAction::SetThreshold { threshold: 3 }, 5);
-        assert!(!gs.verify(&a), "a proposal must target the next seq");
+        assert!(!a.authorizes(&gs), "a proposal must target the next seq");
     }
 
     #[test]
@@ -311,7 +267,7 @@ mod tests {
         let outsiders = govs(3);
         let a = approve(&outsiders, 3, GovAction::SetThreshold { threshold: 1 }, 1);
         assert!(
-            !gs.verify(&a),
+            !a.authorizes(&gs),
             "only governor signatures count toward the quorum"
         );
     }
@@ -329,12 +285,12 @@ mod tests {
             },
             1,
         );
-        let next = gs.apply(&a).expect("valid approval amends the set");
+        let next = a.apply_to(&gs).expect("valid approval amends the set");
         assert_eq!(next.seq, 1);
-        assert!(next.is_governor(&newcomer.node_id().0));
-        assert_eq!(next.governors.len(), 4);
+        assert!(next.is_member(&newcomer.node_id().0));
+        assert_eq!(next.members.len(), 4);
         // the same approval can't be replayed (seq is now 1, needs 2)
-        assert!(next.apply(&a).is_none());
+        assert!(a.apply_to(&next).is_none());
     }
 
     #[test]
@@ -436,11 +392,29 @@ mod tests {
             },
             1,
         );
-        let next = gs.apply(&a).expect("valid");
+        let next = a.apply_to(&gs).expect("valid");
         assert_eq!(next.seq, 1);
         assert_eq!(
-            next.governors, gs.governors,
+            next.members, gs.members,
             "program change doesn't touch governors"
         );
+    }
+
+    // WIRE-COMPAT GUARD: making GovernanceSet an alias of the attestation Quorum must NOT change the
+    // governance chain's on-wire format (deployed chains must still decode). postcard is positional,
+    // so `{governors, threshold, seq}` and `{members, threshold, seq}` are byte-identical — this pins
+    // the exact layout so a future field reorder/type change can't silently break live governance.
+    #[test]
+    fn governance_set_wire_layout_is_unchanged() {
+        let g = GovernanceSet::genesis(vec![[1u8; 32]], 1);
+        let bytes = postcard::to_allocvec(&g).unwrap();
+        // Vec len varint (1) ‖ 32-byte member ‖ threshold varint (1) ‖ seq varint (0).
+        assert_eq!(bytes.len(), 1 + 32 + 1 + 1);
+        assert_eq!(bytes[0], 1, "member-count varint");
+        assert_eq!(&bytes[1..33], &[1u8; 32], "the 32-byte member key");
+        assert_eq!(bytes[33], 1, "threshold");
+        assert_eq!(bytes[34], 0, "seq");
+        // and it round-trips
+        assert_eq!(postcard::from_bytes::<GovernanceSet>(&bytes).unwrap(), g);
     }
 }
