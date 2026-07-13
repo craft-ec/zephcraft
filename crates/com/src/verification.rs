@@ -11,8 +11,10 @@
 //! append-only store of posted requests + verdicts, with the collect-to-`k` read semantics. The
 //! board stays "dumb" precisely because every verdict is a self-contained, signature-checkable
 //! statement, so correctness is paid back by readers ([`Board::satisfied`]) and a gossiped/merged
-//! board is safe. Cooldown-rotated verifier selection + the producer's collect loop are P4;
-//! wiring the board across nodes over the transport is the P5 integration.
+//! board is safe. **P4** the [`Verifier`] cooldown scheduler (rendezvous-picked, cooldown-gated
+//! grabbing that forces `k` distinct verifiers + disrupts collusion) and [`Board::collected`] (the
+//! ≥`k` verdict certificate). Wiring the board across nodes over the transport — gossip/anti-entropy
+//! + the producer's async wait — is the P5 integration.
 //!
 //! **Determinism boundary (what makes it sound):** the re-run uses the
 //! [`CapabilityGrant::verifier`] grant (the deterministic subset — no wall-clock, no RNG — plus
@@ -289,12 +291,28 @@ impl Board {
     }
 
     /// Count DISTINCT verifiers with a valid, agreeing verdict for `posted` (the check behind
-    /// [`Board::satisfied`]). Inner-map keys are verifiers, so the count is already per-distinct.
+    /// [`Board::satisfied`]).
     pub fn valid_agreements(&self, posted: &PostedRequest) -> usize {
+        self.valid_verdicts(posted).len()
+    }
+
+    /// The verification **certificate** once `posted` is satisfied: the ≥`k` valid, agreeing,
+    /// distinct-verifier verdicts a producer collects as proof the claim was independently verified.
+    /// `None` until the policy is met. (In the wired system the producer waits for gossip to deliver
+    /// these; here it is a pure read over the current board.)
+    pub fn collected(&self, posted: &PostedRequest) -> Option<Vec<Verdict>> {
+        let vs = self.valid_verdicts(posted);
+        (vs.len() >= posted.policy.k as usize).then(|| vs.into_iter().cloned().collect())
+    }
+
+    /// The verdicts that COUNT for `posted`: authentically signed, over this exact
+    /// `(request_hash, output_hash)`, agreeing, from an eligible non-producer verifier. Inner-map
+    /// keys are verifiers, so these are already one-per-distinct-verifier.
+    fn valid_verdicts(&self, posted: &PostedRequest) -> Vec<&Verdict> {
         let rh = posted.req.request_hash();
         let oh = posted.req.output_hash();
         let Some(vs) = self.verdicts.get(&rh) else {
-            return 0;
+            return Vec::new();
         };
         vs.values()
             .filter(|v| {
@@ -305,7 +323,66 @@ impl Board {
                     && posted.policy.set.allows(&v.verifier)
                     && v.verify_sig()
             })
-            .count()
+            .collect()
+    }
+}
+
+/// A rendezvous score `blake3(node ‖ request_hash)` — lets each verifier deterministically prefer a
+/// *different* request (load spread), and keeps the choice unpredictable to a producer (it is keyed
+/// on the verifier's own id, which the producer can't control).
+fn rendezvous(node: &[u8; 32], request_hash: &[u8; 32]) -> [u8; 32] {
+    let mut b = Vec::with_capacity(64);
+    b.extend_from_slice(node);
+    b.extend_from_slice(request_hash);
+    Cid::of(&b).0
+}
+
+/// A verifier node's **cooldown scheduler** (`VERIFICATION_DESIGN §5`). After posting a verdict a
+/// node holds a `cooldown` before grabbing another. That single mechanism does three jobs: it
+/// **spreads load** across the fleet, it forces **`k` DISTINCT verifiers** (diversity — one node
+/// can't rush to satisfy a request alone), and it **disrupts collusion** — a producer cannot steer
+/// its job to a chosen colluder, because each node independently picks its *own* next job (keyed on
+/// its own id) and no one assigns work.
+pub struct Verifier {
+    node: [u8; 32],
+    cooldown_ms: u64,
+    /// When this node last posted a verdict (ms since some fixed epoch). `None` = never → ready.
+    last_verified_ms: Option<u64>,
+}
+
+impl Verifier {
+    pub fn new(node: [u8; 32], cooldown_ms: u64) -> Self {
+        Self {
+            node,
+            cooldown_ms,
+            last_verified_ms: None,
+        }
+    }
+
+    /// Off cooldown at `now_ms`?
+    pub fn ready(&self, now_ms: u64) -> bool {
+        match self.last_verified_ms {
+            None => true,
+            Some(t) => now_ms >= t.saturating_add(self.cooldown_ms),
+        }
+    }
+
+    /// The request this node should verify next at `now_ms`: `None` if on cooldown or nothing is
+    /// grabbable. Among grabbable requests it picks the one minimising [`rendezvous`], so different
+    /// nodes prefer different requests and the producer can't predict which node grabs its job.
+    pub fn select<'a>(&self, board: &'a Board, now_ms: u64) -> Option<&'a PostedRequest> {
+        if !self.ready(now_ms) {
+            return None;
+        }
+        board
+            .grabbable_by(&self.node)
+            .into_iter()
+            .min_by_key(|p| rendezvous(&self.node, &p.req.request_hash()))
+    }
+
+    /// Record that this node just posted a verdict at `now_ms` — starts its cooldown.
+    pub fn mark_verified(&mut self, now_ms: u64) {
+        self.last_verified_ms = Some(now_ms);
     }
 }
 
@@ -677,5 +754,128 @@ mod tests {
             1,
             "a re-posted request collapses to one entry"
         );
+    }
+
+    // ---- P4: cooldown-rotated verifier selection + collection certificate ----
+
+    #[test]
+    fn verifier_respects_cooldown_and_readiness() {
+        let producer = NodeIdentity::generate();
+        let node = NodeIdentity::generate();
+        let req = req_for(DOUBLE_WAT, &[21], &[42]);
+        let mut board = Board::new();
+        board.post_request(open_posted(producer.node_id().0, req.clone(), 1));
+
+        let mut v = Verifier::new(node.node_id().0, 1000);
+        assert!(v.ready(0), "a fresh verifier is ready");
+        assert!(
+            v.select(&board, 0).is_some(),
+            "and can grab a pending request"
+        );
+
+        v.mark_verified(500);
+        assert!(!v.ready(1000), "on cooldown 500..1500");
+        assert!(
+            v.select(&board, 1000).is_none(),
+            "no grab while cooling down"
+        );
+        assert!(v.ready(1500), "ready again at last+cooldown");
+    }
+
+    #[test]
+    fn a_single_verifier_cannot_satisfy_a_k_of_3_policy() {
+        // distinctness (dedup) + cooldown: one node can post at most one COUNTING verdict, so it can
+        // never meet k=3 alone — verification needs k DISTINCT verifiers.
+        let producer = NodeIdentity::generate();
+        let node = NodeIdentity::generate();
+        let req = req_for(DOUBLE_WAT, &[21], &[42]);
+        let posted = open_posted(producer.node_id().0, req.clone(), 3);
+        let mut board = Board::new();
+        board.post_request(posted.clone());
+
+        let mut v = Verifier::new(node.node_id().0, 1000);
+        let mut now = 0u64;
+        for _ in 0..50 {
+            if v.select(&board, now).is_some() {
+                board.post_verdict(agree_verdict(&node, &req));
+                v.mark_verified(now);
+            }
+            now += 1000;
+        }
+        assert!(
+            !board.satisfied(&posted),
+            "one distinct verifier can't meet k=3"
+        );
+        assert_eq!(
+            board.valid_agreements(&posted),
+            1,
+            "its repeats dedup to one"
+        );
+        assert!(board.collected(&posted).is_none(), "no certificate");
+    }
+
+    #[test]
+    fn cooldown_scheduler_converges_with_k_distinct_verifiers() {
+        let producer = NodeIdentity::generate();
+        let req = req_for(DOUBLE_WAT, &[21], &[42]);
+        let k = 3u32;
+        let posted = open_posted(producer.node_id().0, req.clone(), k);
+        let mut board = Board::new();
+        board.post_request(posted.clone());
+
+        let ids: Vec<NodeIdentity> = (0..5).map(|_| NodeIdentity::generate()).collect();
+        let mut verifiers: Vec<Verifier> = ids
+            .iter()
+            .map(|id| Verifier::new(id.node_id().0, 1000))
+            .collect();
+
+        let mut now = 0u64;
+        let mut participants: std::collections::HashSet<[u8; 32]> =
+            std::collections::HashSet::new();
+        for _ in 0..100 {
+            if board.satisfied(&posted) {
+                break;
+            }
+            for (i, v) in verifiers.iter_mut().enumerate() {
+                // a node re-runs + agrees when it grabs (re-run correctness is tested in P1);
+                // `.is_some()` drops the board borrow before we post.
+                if v.select(&board, now).is_some() {
+                    board.post_verdict(agree_verdict(&ids[i], &req));
+                    v.mark_verified(now);
+                    participants.insert(ids[i].node_id().0);
+                }
+            }
+            now += 200;
+        }
+        assert!(
+            board.satisfied(&posted),
+            "the scheduler converges to k verdicts"
+        );
+        assert!(
+            participants.len() >= k as usize,
+            "k distinct nodes participated — cooldown/dedup forced diversity"
+        );
+        let cert = board
+            .collected(&posted)
+            .expect("a certificate once satisfied");
+        assert!(cert.len() >= k as usize && cert.iter().all(|v| v.agree && v.verify_sig()));
+    }
+
+    #[test]
+    fn collected_yields_the_certificate_only_when_satisfied() {
+        let producer = NodeIdentity::generate();
+        let req = req_for(DOUBLE_WAT, &[21], &[42]);
+        let posted = open_posted(producer.node_id().0, req.clone(), 2);
+        let mut board = Board::new();
+        board.post_request(posted.clone());
+
+        board.post_verdict(agree_verdict(&NodeIdentity::generate(), &req));
+        assert!(
+            board.collected(&posted).is_none(),
+            "1 of 2 — no certificate yet"
+        );
+        board.post_verdict(agree_verdict(&NodeIdentity::generate(), &req));
+        let cert = board.collected(&posted).expect("2 of 2 → certificate");
+        assert_eq!(cert.len(), 2);
     }
 }

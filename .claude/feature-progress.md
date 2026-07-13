@@ -34,8 +34,15 @@ Phases (VERIFICATION_DESIGN §9 build order; each: build+test+gate+commit):
       is DUMB — accepts anything on post, ALL correctness paid back by readers, so a gossiped/merged
       board (a union) is safe. 6 tests: collect-to-k, dedup+ignore-disagree, reject self-verify +
       invalid-on-read, whitelist-only, grabbable exclusions, idempotent post.
-- [ ] P4 Cooldown-rotated verifier selection + verdict collection to threshold k; policy schema
-      (`quorum k`, `set: open|whitelist`). Redundancy-is-a-feature (not claim-once). No self-verify.
+- [x] P4 Cooldown scheduler + collection certificate DONE 2026-07-13. `Verifier{node,cooldown_ms,
+      last_verified_ms}`: `ready(now)`, `select(board,now)` (None if on cooldown; else the grabbable
+      request minimising rendezvous `blake3(node‖request_hash)` — spreads load + a producer can't
+      steer which node grabs, since the pick is keyed on the verifier's OWN id), `mark_verified(now)`.
+      `Board::collected(posted) -> Option<Vec<Verdict>>` = the ≥k valid-verdict certificate (refactored
+      valid_agreements onto a shared `valid_verdicts`). Cooldown does 3 jobs: spread load, force k
+      DISTINCT verifiers, disrupt collusion. 4 tests: cooldown/readiness gating, single-verifier can't
+      meet k=3 (dedup), 5-node convergence to k distinct + certificate, collected-only-when-satisfied.
+      (Policy schema `VerifyPolicy{k,set}` landed in P3.)
 - [ ] P5 First consumer — a shared-counter test program declaring verify k=1 then k=n; end-to-end
       + integration-check. (App-registry is deliberately NOT a consumer.)
 
