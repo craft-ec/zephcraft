@@ -92,8 +92,13 @@ Phases (VERIFICATION_DESIGN §9 build order; each: build+test+gate+commit):
         Some(board) as the verify backend. Tests: com producer-path (mock backend → 1/0/-1), noded
         VerifyBackend collects another node's pre-injected verdict → true. workspace builds; com 64 +
         noded 11 + integration pass; clippy/fmt clean.
-        REMAINING: staggered fleet roll + a LIVE 2-node cross-node smoke (producer on A calls verify()
-        → verifier on B confirms → A collects) — the true multi-node validation not done in-unit.
+  - [x] P5 ROLL + LIVE SMOKE DONE 2026-07-13. Gate 🟢 (A-G 8/8, 769s). STAGGERED roll (additive
+        tag::BOARD) of all 4 Hetzner nodes — each active, NRestarts=0, 4-node census, 0 panics.
+        LIVE cross-node smoke: published a verify()-calling demo app on zeph (cid 00209e60…),
+        invoked it → the app's verify("f",[x],[x*2]) posted to the board → gossiped → ANOTHER node
+        re-ran f + posted a verdict → zeph collected the cert → verify()→1 → app committed [01]
+        (VERIFIED). Repeatable (2nd invoke also 01). Since a producer can't self-verify, [01] proves
+        a different node confirmed it. **VERIFICATION (#8) COMPLETE + LIVE.**
 
 NOTE (design): SYBIL is the honest ceiling (per-node cooldown binds one node, not a fleet) — name it,
 don't claim to defend it (stake/reputation weighting is deferred). NO self-verification (a DIFFERENT
