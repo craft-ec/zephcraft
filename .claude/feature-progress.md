@@ -43,8 +43,15 @@ Phases (VERIFICATION_DESIGN §9 build order; each: build+test+gate+commit):
       DISTINCT verifiers, disrupt collusion. 4 tests: cooldown/readiness gating, single-verifier can't
       meet k=3 (dedup), 5-node convergence to k distinct + certificate, collected-only-when-satisfied.
       (Policy schema `VerifyPolicy{k,set}` landed in P3.)
-- [ ] P5 First consumer — a shared-counter test program declaring verify k=1 then k=n; end-to-end
-      + integration-check. (App-registry is deliberately NOT a consumer.)
+- [x] P5a First consumer + local end-to-end DONE 2026-07-13. `produce()` (producer side: run the
+      pure f under verifier()+verify_mode → package a VerifyRequest byte-identical to what verifiers
+      reproduce). COUNTER_WAT (consistency-critical shared counter, pure f=state+input). E2E test:
+      produce → post k=3 open → 5 cooldown-scheduled verifiers verify_locally (real re-run) → collect
+      the k=3 certificate; + a forged transition (claims 9, f yields 8) never collects. Ties P1+P3+P4.
+- [ ] P5b Network integration — gossip/anti-entropy the Board across nodes over the transport (wire
+      msg + ALPN or ride an existing channel), connect the producer `verify` host fn to post+collect
+      on the real board, the producer's async wait-until-collected-or-timeout. noded-level. integration
+      -check + (if wire-incompatible) simultaneous roll.
 
 NOTE (design): SYBIL is the honest ceiling (per-node cooldown binds one node, not a fleet) — name it,
 don't claim to defend it (stake/reputation weighting is deferred). NO self-verification (a DIFFERENT

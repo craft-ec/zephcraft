@@ -13,8 +13,9 @@
 //! statement, so correctness is paid back by readers ([`Board::satisfied`]) and a gossiped/merged
 //! board is safe. **P4** the [`Verifier`] cooldown scheduler (rendezvous-picked, cooldown-gated
 //! grabbing that forces `k` distinct verifiers + disrupts collusion) and [`Board::collected`] (the
-//! ≥`k` verdict certificate). Wiring the board across nodes over the transport — gossip/anti-entropy
-//! + the producer's async wait — is the P5 integration.
+//! ≥`k` verdict certificate). **P5a** the producer helper [`produce`] + a first consumer (a shared
+//! counter) proven end-to-end over the in-memory board. What remains (P5b) is the network layer:
+//! gossiping the board across nodes over the transport + the producer's async wait.
 //!
 //! **Determinism boundary (what makes it sound):** the re-run uses the
 //! [`CapabilityGrant::verifier`] grant (the deterministic subset — no wall-clock, no RNG — plus
@@ -182,6 +183,36 @@ pub async fn verify_locally(
         )
     };
     Verdict::sign(identity, req.request_hash(), req.output_hash(), agree)
+}
+
+/// **Producer side** of verification: run the pure `func` on `(prev_state, request)` at consensus
+/// time `now`, and package a [`VerifyRequest`] for its output — the claim `k` independent nodes will
+/// confirm. It runs `func` exactly as a verifier will re-run it ([`CapabilityGrant::verifier`] +
+/// verify-mode), so `claimed_output` is byte-identical to what verifiers reproduce. The producer
+/// then posts this (as a [`PostedRequest`] with its policy) to the [`Board`] and waits for
+/// [`Board::collected`]. Errors only if the program traps / won't run.
+pub async fn produce(
+    runtime: &TransitionRuntime,
+    wasm: &[u8],
+    func: &str,
+    prev_state: &[u8],
+    request: &[u8],
+    now: u64,
+    fuel: u64,
+) -> anyhow::Result<VerifyRequest> {
+    let ctx =
+        TransitionCtx::deterministic(prev_state.to_vec(), request.to_vec(), now).in_verify_mode();
+    let claimed_output = runtime
+        .run_program(wasm, func, ctx, fuel, &CapabilityGrant::verifier())
+        .await?;
+    Ok(VerifyRequest {
+        program_cid: Cid::of(wasm).0, // a content-addressed program's cid IS its wasm hash
+        func: func.to_string(),
+        prev_state: prev_state.to_vec(),
+        request: request.to_vec(),
+        now,
+        claimed_output,
+    })
 }
 
 /// Which nodes may verify a request (`VERIFICATION_DESIGN §4/§5`).
@@ -877,5 +908,115 @@ mod tests {
         board.post_verdict(agree_verdict(&NodeIdentity::generate(), &req));
         let cert = board.collected(&posted).expect("2 of 2 → certificate");
         assert_eq!(cert.len(), 2);
+    }
+
+    // ---- P5a: first consumer (a shared counter) — end-to-end over the in-memory board ----
+
+    // A consistency-critical shared counter: pure `f(state, input) = state + input` (1-byte). It
+    // reads only explicit inputs (state + input) and never calls verify → verifiable. This is the
+    // kind of state (a counter/quota/balance) where a producer wants k nodes to confirm the
+    // transition before committing.
+    const COUNTER_WAT: &[u8] = br#"(module
+      (import "craftcom" "state"  (func $state  (param i32 i32) (result i32)))
+      (import "craftcom" "input"  (func $input  (param i32 i32) (result i32)))
+      (import "craftcom" "commit" (func $commit (param i32 i32) (result i32)))
+      (memory (export "memory") 1)
+      (func (export "f")
+        (drop (call $state (i32.const 0) (i32.const 1)))
+        (drop (call $input (i32.const 1) (i32.const 1)))
+        (i32.store8 (i32.const 2)
+          (i32.add (i32.load8_u (i32.const 0)) (i32.load8_u (i32.const 1))))
+        (drop (call $commit (i32.const 2) (i32.const 1)))))"#;
+
+    #[tokio::test]
+    async fn shared_counter_verifies_k_of_3_end_to_end() {
+        let rt = TransitionRuntime::new().unwrap();
+        let producer = NodeIdentity::generate();
+        let (prev, inc, now) = (&[5u8][..], &[3u8][..], 42u64);
+
+        // Producer computes the canonical output + packages the claim.
+        let req = produce(&rt, COUNTER_WAT, "f", prev, inc, now, FUEL)
+            .await
+            .unwrap();
+        assert_eq!(req.claimed_output, vec![8], "5 + 3 = 8");
+
+        // Posts it with a k=3 open policy.
+        let posted = PostedRequest {
+            producer: producer.node_id().0,
+            req: req.clone(),
+            policy: VerifyPolicy {
+                k: 3,
+                set: VerifierSet::Open,
+            },
+        };
+        let mut board = Board::new();
+        board.post_request(posted.clone());
+
+        // Cooldown-scheduled verifiers grab, RE-RUN the counter, and post real verdicts.
+        let ids: Vec<NodeIdentity> = (0..5).map(|_| NodeIdentity::generate()).collect();
+        let mut verifiers: Vec<Verifier> = ids
+            .iter()
+            .map(|id| Verifier::new(id.node_id().0, 1000))
+            .collect();
+        let mut t = 0u64;
+        for _ in 0..50 {
+            if board.satisfied(&posted) {
+                break;
+            }
+            let acting: Vec<usize> = verifiers
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| v.select(&board, t).is_some())
+                .map(|(i, _)| i)
+                .collect();
+            for i in acting {
+                let verdict = verify_locally(&rt, &ids[i], &req, COUNTER_WAT, FUEL).await;
+                assert!(verdict.agree, "an honest verifier reproduces 8");
+                board.post_verdict(verdict);
+                verifiers[i].mark_verified(t);
+            }
+            t += 200;
+        }
+        let cert = board
+            .collected(&posted)
+            .expect("k=3 independent confirmations");
+        assert!(cert.len() >= 3 && cert.iter().all(|v| v.agree && v.verify_sig()));
+    }
+
+    #[tokio::test]
+    async fn a_forged_counter_transition_never_collects_a_certificate() {
+        let rt = TransitionRuntime::new().unwrap();
+        let producer = NodeIdentity::generate();
+
+        // Producer LIES: claims 5 + 3 = 9. The verifier re-runs f and gets 8 → disagree → no cert.
+        let mut req = produce(&rt, COUNTER_WAT, "f", &[5u8], &[3u8], 0, FUEL)
+            .await
+            .unwrap();
+        req.claimed_output = vec![9];
+        let posted = PostedRequest {
+            producer: producer.node_id().0,
+            req: req.clone(),
+            policy: VerifyPolicy {
+                k: 1,
+                set: VerifierSet::Open,
+            },
+        };
+        let mut board = Board::new();
+        board.post_request(posted.clone());
+        // even many verifiers can't confirm a false claim
+        for _ in 0..3 {
+            board.post_verdict(
+                verify_locally(&rt, &NodeIdentity::generate(), &req, COUNTER_WAT, FUEL).await,
+            );
+        }
+        assert_eq!(
+            board.valid_agreements(&posted),
+            0,
+            "no one reproduces the forged output"
+        );
+        assert!(
+            board.collected(&posted).is_none(),
+            "a forged transition never collects a certificate"
+        );
     }
 }

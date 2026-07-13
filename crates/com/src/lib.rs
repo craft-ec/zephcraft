@@ -51,7 +51,7 @@ pub use registry::{
 };
 pub use transition::{pda, TransitionCtx, TransitionRuntime};
 pub use verification::{
-    verify_locally, Board, PostedRequest, Verdict, Verifier, VerifierSet, VerifyPolicy,
+    produce, verify_locally, Board, PostedRequest, Verdict, Verifier, VerifierSet, VerifyPolicy,
     VerifyRequest,
 };
 
