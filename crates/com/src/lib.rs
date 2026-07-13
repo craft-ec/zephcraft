@@ -50,7 +50,9 @@ pub use registry::{
     ProgramRegistryState, RegistryProgram, RegistryState,
 };
 pub use transition::{pda, TransitionCtx, TransitionRuntime};
-pub use verification::{verify_locally, Verdict, VerifyRequest};
+pub use verification::{
+    verify_locally, Board, PostedRequest, Verdict, VerifierSet, VerifyPolicy, VerifyRequest,
+};
 
 /// Default fuel budget per invocation — roughly proportional to executed WASM
 /// instructions (foundation §38). A runaway loop exhausts this and traps.

@@ -7,9 +7,12 @@
 //!
 //! Built so far: **P1** the offline core — the [`Verdict`] a verifier signs and the
 //! [`verify_locally`] re-run that produces it; **P2** the `verify` capability + host ABI (the
-//! producer's orchestration call, inert on a re-run). The distribution layer (an open request board
-//! with cooldown-rotated verifiers collecting `k` verdicts) rides on top in later phases; the board
-//! stays "dumb" precisely because every verdict is a self-contained, signature-checkable statement.
+//! producer's orchestration call, inert on a re-run); **P3** the open request [`Board`] — a dumb,
+//! append-only store of posted requests + verdicts, with the collect-to-`k` read semantics. The
+//! board stays "dumb" precisely because every verdict is a self-contained, signature-checkable
+//! statement, so correctness is paid back by readers ([`Board::satisfied`]) and a gossiped/merged
+//! board is safe. Cooldown-rotated verifier selection + the producer's collect loop are P4;
+//! wiring the board across nodes over the transport is the P5 integration.
 //!
 //! **Determinism boundary (what makes it sound):** the re-run uses the
 //! [`CapabilityGrant::verifier`] grant (the deterministic subset — no wall-clock, no RNG — plus
@@ -17,6 +20,8 @@
 //! *any* node is bit-identical. A program can only be verified if everything its **pure `f`** reads
 //! is an explicit input — `prev_state`, `request`, `now` — never host-varying time, and its `f`
 //! never calls `verify` (orchestration does that, and orchestration is not re-run).
+
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use zeph_core::{Cid, NodeId};
@@ -175,6 +180,133 @@ pub async fn verify_locally(
         )
     };
     Verdict::sign(identity, req.request_hash(), req.output_hash(), agree)
+}
+
+/// Which nodes may verify a request (`VERIFICATION_DESIGN §4/§5`).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum VerifierSet {
+    /// Any node — the open board (the default). Cooldown-rotated grabbing (P4) spreads the load.
+    Open,
+    /// Only these nodes — a pre-agreed set. Lower latency (no open-board wait), at the cost of a
+    /// fixed verifier pool.
+    Whitelist(Vec<[u8; 32]>),
+}
+
+impl VerifierSet {
+    /// Whether `node` is eligible to verify under this set.
+    pub fn allows(&self, node: &[u8; 32]) -> bool {
+        match self {
+            VerifierSet::Open => true,
+            VerifierSet::Whitelist(set) => set.contains(node),
+        }
+    }
+}
+
+/// The app's declared verification policy: how many DISTINCT agreeing verdicts are required (`k`)
+/// and which verifiers are eligible. `k = 1, set = Open` is the baseline `verify`; a larger `k`
+/// raises the bar to `k` independent colluders.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerifyPolicy {
+    pub k: u32,
+    pub set: VerifierSet,
+}
+
+/// A request as it sits on the board: the run to verify, the policy, and WHO posted it. The
+/// producer is recorded so it is excluded from its own verdict count — a producer cannot verify
+/// itself (`VERIFICATION_DESIGN §3`).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PostedRequest {
+    pub producer: [u8; 32],
+    pub req: VerifyRequest,
+    pub policy: VerifyPolicy,
+}
+
+/// The open verification board (`VERIFICATION_DESIGN §5`) — a **dumb**, append-only, dedup'd store
+/// of posted requests and the verdicts on them. It holds NO invariant of its own: `post_*` accept
+/// any well-formed entry, and ALL correctness (valid signatures, the threshold `k`, the verifier
+/// set, no self-verification) is paid back by READERS in [`Board::satisfied`]. Keeping the board
+/// dumb is what lets it be freely gossiped and merged — every verdict is a self-contained, signed
+/// statement, so a node can trust what it collected without trusting the board.
+///
+/// This is the **local semantics**, fully testable offline. Making one logical board across nodes
+/// (gossip/anti-entropy over the transport) is the integration layer; because the board is an
+/// append-only dedup'd map, that merge is a union — order-independent and idempotent.
+#[derive(Default)]
+pub struct Board {
+    /// `request_hash` → the posted request.
+    requests: HashMap<[u8; 32], PostedRequest>,
+    /// `request_hash` → (`verifier` → its verdict). The inner map dedups by verifier, so a verifier
+    /// counts at most once no matter how many times its verdict is gossiped.
+    verdicts: HashMap<[u8; 32], HashMap<[u8; 32], Verdict>>,
+}
+
+impl Board {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Post a request. Idempotent by `request_hash` — redundant posts (e.g. re-gossiped) collapse.
+    pub fn post_request(&mut self, posted: PostedRequest) {
+        self.requests
+            .entry(posted.req.request_hash())
+            .or_insert(posted);
+    }
+
+    /// Post a verdict (append; dedup by `(request_hash, verifier)`). The board is **dumb** — it does
+    /// NOT check the signature here; [`Board::satisfied`] verifies on read. Redundancy is a feature:
+    /// verdicts from many verifiers for the same request are all kept.
+    pub fn post_verdict(&mut self, v: Verdict) {
+        self.verdicts
+            .entry(v.request_hash)
+            .or_default()
+            .insert(v.verifier, v);
+    }
+
+    /// The requests `node` may grab to verify now: it is eligible (open / whitelisted), it did NOT
+    /// produce the request (no self-verification), it has not already verified it, and the request
+    /// is not already satisfied. Cooldown-rotated ordering among these is P4.
+    pub fn grabbable_by(&self, node: &[u8; 32]) -> Vec<&PostedRequest> {
+        self.requests
+            .values()
+            .filter(|p| {
+                p.producer != *node
+                    && p.policy.set.allows(node)
+                    && !self
+                        .verdicts
+                        .get(&p.req.request_hash())
+                        .is_some_and(|m| m.contains_key(node))
+                    && !self.satisfied(p)
+            })
+            .collect()
+    }
+
+    /// Whether `posted` has reached its policy: `k` DISTINCT verifiers whose verdicts are each
+    /// (a) authentically signed, (b) over this exact `(request_hash, output_hash)`, (c) agreeing,
+    /// (d) from an eligible verifier, and (e) NOT the producer. This is where the board's dumbness
+    /// is repaid — every correctness check happens on read, so a gossiped/merged board is safe.
+    pub fn satisfied(&self, posted: &PostedRequest) -> bool {
+        self.valid_agreements(posted) >= posted.policy.k as usize
+    }
+
+    /// Count DISTINCT verifiers with a valid, agreeing verdict for `posted` (the check behind
+    /// [`Board::satisfied`]). Inner-map keys are verifiers, so the count is already per-distinct.
+    pub fn valid_agreements(&self, posted: &PostedRequest) -> usize {
+        let rh = posted.req.request_hash();
+        let oh = posted.req.output_hash();
+        let Some(vs) = self.verdicts.get(&rh) else {
+            return 0;
+        };
+        vs.values()
+            .filter(|v| {
+                v.agree
+                    && v.request_hash == rh
+                    && v.output_hash == oh
+                    && v.verifier != posted.producer
+                    && posted.policy.set.allows(&v.verifier)
+                    && v.verify_sig()
+            })
+            .count()
+    }
 }
 
 #[cfg(test)]
@@ -378,6 +510,172 @@ mod tests {
             .unwrap(),
             vec![2],
             "verify is INERT on a re-run — no recursion into nested verification"
+        );
+    }
+
+    // ---- P3: the open request board ----
+
+    fn agree_verdict(id: &NodeIdentity, req: &VerifyRequest) -> Verdict {
+        Verdict::sign(id, req.request_hash(), req.output_hash(), true)
+    }
+
+    fn open_posted(producer: [u8; 32], req: VerifyRequest, k: u32) -> PostedRequest {
+        PostedRequest {
+            producer,
+            req,
+            policy: VerifyPolicy {
+                k,
+                set: VerifierSet::Open,
+            },
+        }
+    }
+
+    #[test]
+    fn board_collects_k_distinct_agreeing_verdicts() {
+        let producer = NodeIdentity::generate();
+        let req = req_for(DOUBLE_WAT, &[21], &[42]);
+        let posted = open_posted(producer.node_id().0, req.clone(), 2);
+        let mut b = Board::new();
+        b.post_request(posted.clone());
+        assert!(!b.satisfied(&posted), "no verdicts yet");
+
+        let v1 = NodeIdentity::generate();
+        b.post_verdict(agree_verdict(&v1, &req));
+        assert_eq!(b.valid_agreements(&posted), 1);
+        assert!(!b.satisfied(&posted), "1 of 2");
+
+        let v2 = NodeIdentity::generate();
+        b.post_verdict(agree_verdict(&v2, &req));
+        assert!(
+            b.satisfied(&posted),
+            "2 distinct agreeing verdicts meet k=2"
+        );
+    }
+
+    #[test]
+    fn board_dedups_a_verifier_and_ignores_disagreement() {
+        let producer = NodeIdentity::generate();
+        let req = req_for(DOUBLE_WAT, &[21], &[42]);
+        let posted = open_posted(producer.node_id().0, req.clone(), 2);
+        let mut b = Board::new();
+        b.post_request(posted.clone());
+
+        let v1 = NodeIdentity::generate();
+        b.post_verdict(agree_verdict(&v1, &req));
+        b.post_verdict(agree_verdict(&v1, &req)); // same verifier again
+        assert_eq!(b.valid_agreements(&posted), 1, "one verifier counts once");
+
+        // a disagreeing verdict doesn't count toward the agree-threshold
+        let v2 = NodeIdentity::generate();
+        b.post_verdict(Verdict::sign(
+            &v2,
+            req.request_hash(),
+            req.output_hash(),
+            false,
+        ));
+        assert_eq!(b.valid_agreements(&posted), 1);
+    }
+
+    #[test]
+    fn board_rejects_self_verification_and_invalid_verdicts_on_read() {
+        let producer = NodeIdentity::generate();
+        let req = req_for(DOUBLE_WAT, &[21], &[42]);
+        let posted = open_posted(producer.node_id().0, req.clone(), 1);
+        let mut b = Board::new();
+        b.post_request(posted.clone());
+
+        // no self-verification: the producer's own verdict doesn't count
+        b.post_verdict(agree_verdict(&producer, &req));
+        assert_eq!(
+            b.valid_agreements(&posted),
+            0,
+            "producer cannot verify itself"
+        );
+
+        // a tampered verdict (sig no longer matches its fields) is ignored on read
+        let v = NodeIdentity::generate();
+        let mut forged = agree_verdict(&v, &req);
+        forged.output_hash = [0xEE; 32];
+        b.post_verdict(forged);
+        assert_eq!(b.valid_agreements(&posted), 0, "invalid verdict ignored");
+
+        // an honest third-party verdict satisfies k=1
+        let w = NodeIdentity::generate();
+        b.post_verdict(agree_verdict(&w, &req));
+        assert!(b.satisfied(&posted));
+    }
+
+    #[test]
+    fn whitelist_policy_only_counts_listed_verifiers() {
+        let producer = NodeIdentity::generate();
+        let allowed = NodeIdentity::generate();
+        let outsider = NodeIdentity::generate();
+        let req = req_for(DOUBLE_WAT, &[21], &[42]);
+        let posted = PostedRequest {
+            producer: producer.node_id().0,
+            req: req.clone(),
+            policy: VerifyPolicy {
+                k: 1,
+                set: VerifierSet::Whitelist(vec![allowed.node_id().0]),
+            },
+        };
+        let mut b = Board::new();
+        b.post_request(posted.clone());
+
+        b.post_verdict(agree_verdict(&outsider, &req));
+        assert_eq!(
+            b.valid_agreements(&posted),
+            0,
+            "a non-whitelisted verifier doesn't count"
+        );
+        b.post_verdict(agree_verdict(&allowed, &req));
+        assert!(b.satisfied(&posted), "a whitelisted verifier does");
+    }
+
+    #[test]
+    fn grabbable_excludes_producer_already_verified_and_satisfied() {
+        let producer = NodeIdentity::generate();
+        let verifier = NodeIdentity::generate();
+        let req = req_for(DOUBLE_WAT, &[21], &[42]);
+        let posted = open_posted(producer.node_id().0, req.clone(), 1);
+        let mut b = Board::new();
+        b.post_request(posted);
+
+        assert!(
+            b.grabbable_by(&producer.node_id().0).is_empty(),
+            "no self-verification — producer can't grab its own request"
+        );
+        assert_eq!(
+            b.grabbable_by(&verifier.node_id().0).len(),
+            1,
+            "a fresh eligible verifier can grab it"
+        );
+
+        b.post_verdict(agree_verdict(&verifier, &req));
+        assert!(
+            b.grabbable_by(&verifier.node_id().0).is_empty(),
+            "not grabbable again by a verifier who already verified it"
+        );
+        let other = NodeIdentity::generate();
+        assert!(
+            b.grabbable_by(&other.node_id().0).is_empty(),
+            "a satisfied request isn't grabbable"
+        );
+    }
+
+    #[test]
+    fn post_request_is_idempotent() {
+        let producer = NodeIdentity::generate();
+        let req = req_for(DOUBLE_WAT, &[21], &[42]);
+        let posted = open_posted(producer.node_id().0, req, 1);
+        let mut b = Board::new();
+        b.post_request(posted.clone());
+        b.post_request(posted); // re-gossiped
+        let some_node = NodeIdentity::generate().node_id().0;
+        assert_eq!(
+            b.grabbable_by(&some_node).len(),
+            1,
+            "a re-posted request collapses to one entry"
         );
     }
 }

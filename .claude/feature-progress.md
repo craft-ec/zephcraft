@@ -25,8 +25,15 @@ Phases (VERIFICATION_DESIGN §9 build order; each: build+test+gate+commit):
       (inert) outputs diverge. 4 P2 tests: link-gate (verify import fails under deterministic, links
       under verifier), pure-f-of-a-verify-importing-module still verifies, inert-on-rerun vs
       unavailable-to-producer, verifier() grant membership.
-- [ ] P3 The request board — global append-only, gossiped: producer posts
-      `(VerifyRequest, policy)`; nodes see pending requests. Board stays "dumb" (no invariant).
+- [x] P3 The request board DONE 2026-07-13 (LOCAL semantics; gossip wiring deferred to P5 integ).
+      `VerifierSet{Open|Whitelist}` + `VerifyPolicy{k,set}` + `PostedRequest{producer,req,policy}` +
+      `Board` (append-only dedup'd HashMaps: request_hash→request, request_hash→verifier→verdict).
+      `post_request` (idempotent), `post_verdict` (dedup by (rh,verifier)), `grabbable_by(node)`
+      (eligible + not-producer + not-already-verified + not-satisfied), `satisfied`/`valid_agreements`
+      (k DISTINCT verdicts each: valid sig + matches (rh,oh) + agree + eligible + NOT producer). Board
+      is DUMB — accepts anything on post, ALL correctness paid back by readers, so a gossiped/merged
+      board (a union) is safe. 6 tests: collect-to-k, dedup+ignore-disagree, reject self-verify +
+      invalid-on-read, whitelist-only, grabbable exclusions, idempotent post.
 - [ ] P4 Cooldown-rotated verifier selection + verdict collection to threshold k; policy schema
       (`quorum k`, `set: open|whitelist`). Redundancy-is-a-feature (not claim-once). No self-verify.
 - [ ] P5 First consumer — a shared-counter test program declaring verify k=1 then k=n; end-to-end
