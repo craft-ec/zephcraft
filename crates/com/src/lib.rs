@@ -82,3 +82,14 @@ pub trait AppBackend: Send + Sync {
     /// Current HLC time in millis (sync — no IO).
     fn now_millis(&self) -> u64;
 }
+
+/// The node service the `verify` host fn calls to run one verification round: post `req` to the
+/// board (as this node's producer) and await its policy certificate, or time out. Injected into a
+/// program run the same way [`AppBackend`] is (identity-bound, per-node). Returns true iff `k`
+/// independent verifiers confirmed the claim — the `verify` host fn maps that to `1` (verified) /
+/// `0` (rejected). Keeps consistency (verification) out of the deterministic runtime: it is an
+/// app-profile orchestration call, never part of a re-run pure `f`.
+#[async_trait]
+pub trait VerifyBackend: Send + Sync {
+    async fn verify(&self, req: VerifyRequest) -> bool;
+}

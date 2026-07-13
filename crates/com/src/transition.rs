@@ -20,7 +20,7 @@ use wasmtime::{Caller, Config, Engine, Extern, Linker, Memory, Module, Store};
 use zeph_core::{Cid, NodeId};
 use zeph_crypto::NodeIdentity;
 
-use crate::{AppBackend, Capability, CapabilityGrant};
+use crate::{AppBackend, Capability, CapabilityGrant, VerifyBackend, VerifyRequest};
 
 /// Import module the restricted deterministic ABI is bound under (shares the `craftcom`
 /// namespace with the capability runtime, but exposes only `input` + `commit` + `state`).
@@ -63,6 +63,13 @@ pub struct TransitionCtx {
     /// `verify` host fn is then bound INERT (a no-op), so a re-run can't recurse into nested
     /// verification (`VERIFICATION_DESIGN §9`). Set via [`Self::in_verify_mode`].
     verify_mode: bool,
+    /// The content cid of the WASM being run — named in a [`VerifyRequest`] so verifiers fetch +
+    /// re-run the same program. Set by the invoker via [`Self::with_program`]; default `[0;32]`.
+    program_cid: [u8; 32],
+    /// The node service the `verify` host fn drives (post a request + await the certificate).
+    /// `None` on the deterministic/protocol path and during a verifier re-run — so `verify` reports
+    /// UNAVAILABLE there. Set by the invoker via [`Self::with_verify_backend`].
+    verify_backend: Option<Arc<dyn VerifyBackend>>,
 }
 
 impl TransitionCtx {
@@ -86,6 +93,8 @@ impl TransitionCtx {
             now,
             backend,
             verify_mode: false,
+            program_cid: [0u8; 32],
+            verify_backend: None,
         }
     }
 
@@ -101,6 +110,20 @@ impl TransitionCtx {
     /// [`CapabilityGrant::verifier`].
     pub fn in_verify_mode(mut self) -> Self {
         self.verify_mode = true;
+        self
+    }
+
+    /// Name the program being run (its content cid), so a `verify` call can name it in the
+    /// [`VerifyRequest`] verifiers fetch + re-run.
+    pub fn with_program(mut self, program_cid: [u8; 32]) -> Self {
+        self.program_cid = program_cid;
+        self
+    }
+
+    /// Inject the [`VerifyBackend`] the `verify` host fn drives (post + await). Absent → `verify`
+    /// reports UNAVAILABLE.
+    pub fn with_verify_backend(mut self, backend: Option<Arc<dyn VerifyBackend>>) -> Self {
+        self.verify_backend = backend;
         self
     }
 }
@@ -546,20 +569,31 @@ fn bind_granted(linker: &mut Linker<TransitionCtx>, grant: &CapabilityGrant) -> 
                     if caller.data().verify_mode {
                         return 2i32;
                     }
-                    // Validate the ABI reads (function name + inputs + claimed output) so a
-                    // malformed call is a clean -1, never a trap. Wiring the board consumes these
-                    // in P3; here they only gate a well-formed call.
+                    // Read the ABI args (function name + inputs + claimed output); a malformed call
+                    // is a clean -1, never a trap.
                     let Some(mem) = det_memory(&mut caller) else {
                         return -1i32;
                     };
-                    let (Some(_func), Some(_inputs), Some(_claimed)) = (
+                    let (Some(func), Some(request), Some(claimed_output)) = (
                         det_read_str(&caller, &mem, fp, fl),
                         det_read(&caller, &mem, ip, il),
                         det_read(&caller, &mem, cp, cl),
                     ) else {
                         return -1;
                     };
-                    -1 // UNAVAILABLE: verifier backend not wired (P3)
+                    // Producer path: post the request to the board + await its certificate.
+                    let Some(vb) = caller.data().verify_backend.clone() else {
+                        return -1; // no verifier backend wired → UNAVAILABLE
+                    };
+                    let req = VerifyRequest {
+                        program_cid: caller.data().program_cid,
+                        func,
+                        prev_state: caller.data().prev_state.clone(),
+                        request,
+                        now: caller.data().now,
+                        claimed_output,
+                    };
+                    i32::from(vb.verify(req).await) // 1 = verified (k agreed), 0 = rejected/timeout
                 })
             },
         )?;
@@ -571,6 +605,78 @@ fn bind_granted(linker: &mut Linker<TransitionCtx>, grant: &CapabilityGrant) -> 
 mod tests {
     use super::*;
     use crate::DEFAULT_FUEL;
+
+    // Producer-path verify() test: a mock backend returns a fixed verdict, and a program that calls
+    // verify() and commits the result byte proves the host fn maps it to 1 / 0 / -1.
+    struct MockVerify(bool);
+    #[async_trait::async_trait]
+    impl VerifyBackend for MockVerify {
+        async fn verify(&self, _req: VerifyRequest) -> bool {
+            self.0
+        }
+    }
+
+    const VERIFY_ORCH_WAT: &[u8] = br#"(module
+      (import "craftcom" "verify" (func $verify (param i32 i32 i32 i32 i32 i32) (result i32)))
+      (import "craftcom" "commit" (func $commit (param i32 i32) (result i32)))
+      (memory (export "memory") 1)
+      (func (export "run")
+        (i32.store8 (i32.const 0)
+          (call $verify (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
+        (drop (call $commit (i32.const 0) (i32.const 1)))))"#;
+
+    #[tokio::test]
+    async fn verify_producer_path_returns_the_backend_verdict() {
+        let rt = TransitionRuntime::new().unwrap();
+        // verified → 1
+        let ctx = TransitionCtx::deterministic(vec![], vec![], 0)
+            .with_program([7u8; 32])
+            .with_verify_backend(Some(Arc::new(MockVerify(true))));
+        assert_eq!(
+            rt.run_program(
+                VERIFY_ORCH_WAT,
+                "run",
+                ctx,
+                DEFAULT_FUEL,
+                &CapabilityGrant::full()
+            )
+            .await
+            .unwrap(),
+            vec![1],
+            "backend says verified → 1"
+        );
+        // rejected → 0
+        let ctx = TransitionCtx::deterministic(vec![], vec![], 0)
+            .with_verify_backend(Some(Arc::new(MockVerify(false))));
+        assert_eq!(
+            rt.run_program(
+                VERIFY_ORCH_WAT,
+                "run",
+                ctx,
+                DEFAULT_FUEL,
+                &CapabilityGrant::full()
+            )
+            .await
+            .unwrap(),
+            vec![0],
+            "backend says rejected → 0"
+        );
+        // no backend → -1 (stored as 0xFF)
+        let ctx = TransitionCtx::deterministic(vec![], vec![], 0);
+        assert_eq!(
+            rt.run_program(
+                VERIFY_ORCH_WAT,
+                "run",
+                ctx,
+                DEFAULT_FUEL,
+                &CapabilityGrant::full()
+            )
+            .await
+            .unwrap(),
+            vec![0xFF],
+            "no verify backend → UNAVAILABLE (-1)"
+        );
+    }
 
     // A deterministic program: read the first input byte `b`, commit `[b, b*2]`.
     const DOUBLE_WAT: &[u8] = br#"(module

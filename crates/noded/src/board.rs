@@ -1,21 +1,22 @@
-//! The verification **board service** (`VERIFICATION_DESIGN §5`, phase P5b-2a) — wires `zeph_com`'s
-//! [`Board`] CRDT into the node. It (a) **gossips** [`BoardSnapshot`]s to `census()` peers
-//! (fire-and-forget, like the membership epidemic push), (b) **merges** inbound snapshots (the board
-//! is a union CRDT, so merge is order-independent + idempotent), and (c) runs a background
+//! The verification **board service** (`VERIFICATION_DESIGN §5`, phases P5b-2a/2b) — wires
+//! `zeph_com`'s [`Board`] CRDT into the node. It (a) **gossips** [`BoardSnapshot`]s to `census()`
+//! peers (fire-and-forget, like the membership epidemic push), (b) **merges** inbound snapshots (the
+//! board is a union CRDT, so merge is order-independent + idempotent), (c) runs a background
 //! **verifier loop** that grabs pending requests via the cooldown [`Verifier`] scheduler, re-runs
-//! the program deterministically ([`verify_locally`]), and posts its signed verdict back.
+//! the program deterministically ([`verify_locally`]), and posts its signed verdict back, and (d)
+//! implements [`VerifyBackend`] — the **producer** side of a `verify` host-fn call: post a request,
+//! gossip it, and poll [`zeph_com::Board::collected`] until the certificate arrives or it times out.
 //!
 //! Distribution is **additive**: `tag::BOARD` is an appended mux tag, so a node without this handler
 //! simply drops the stream — board gossip is mixed-version-safe (a staggered roll, not simultaneous).
-//! The `verify` host-fn producer path (post a request + await [`zeph_com::Board::collected`]) is
-//! wired in P5b-2b.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{mpsc, RwLock};
 use zeph_com::{
-    verify_locally, Board, BoardSnapshot, PostedRequest, TransitionRuntime, Verifier, DEFAULT_FUEL,
+    verify_locally, Board, BoardSnapshot, PostedRequest, TransitionRuntime, Verifier, VerifierSet,
+    VerifyBackend, VerifyPolicy, VerifyRequest, DEFAULT_FUEL,
 };
 use zeph_core::{hlc::Clock, Cid, NodeId};
 use zeph_crypto::NodeIdentity;
@@ -33,6 +34,10 @@ const GOSSIP_SECS: u64 = 5;
 const VERIFY_SECS: u64 = 2;
 /// How many census peers a gossip round pushes to.
 const FANOUT: usize = 3;
+/// How long a producer's `verify` call waits for the certificate before giving up (returns 0).
+const VERIFY_TIMEOUT_SECS: u64 = 30;
+/// How often the producer polls the board for its certificate while waiting.
+const POLL_MS: u64 = 500;
 
 /// The node-side verification board: the `com` [`Board`] CRDT + this node's verifier scheduler,
 /// gossiped over `tag::BOARD` and driven by background loops.
@@ -74,9 +79,8 @@ impl BoardService {
         *self.membership.write().await = Some(m);
     }
 
-    /// A local producer posts a request (the `verify` host fn is wired here in P5b-2b): merge it in
-    /// and gossip so verifiers pick it up. (Producer entry point — wired to callers in P5b-2b.)
-    #[allow(dead_code)]
+    /// A local producer posts a request (driven by the `verify` host fn via [`VerifyBackend`]):
+    /// merge it in and gossip so verifiers pick it up.
     pub async fn post_request(&self, posted: PostedRequest) {
         self.board.write().await.post_request(posted);
         self.gossip_once().await;
@@ -209,10 +213,39 @@ impl BoardService {
     }
 }
 
+#[async_trait::async_trait]
+impl VerifyBackend for BoardService {
+    /// The producer side of a `verify` host-fn call: post `req` (as this node) with a baseline
+    /// `k = 1, Open` policy, gossip it, then poll for the certificate until it collects or times out.
+    /// Returns true iff an independent verifier confirmed the claim.
+    async fn verify(&self, req: VerifyRequest) -> bool {
+        let posted = PostedRequest {
+            producer: self.identity.node_id().0,
+            req,
+            policy: VerifyPolicy {
+                k: 1,
+                set: VerifierSet::Open,
+            },
+        };
+        self.post_request(posted.clone()).await; // merge locally + gossip so a verifier picks it up
+        let poll = async {
+            loop {
+                if self.board.read().await.collected(&posted).is_some() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(POLL_MS)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(VERIFY_TIMEOUT_SECS), poll)
+            .await
+            .unwrap_or(false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeph_com::{produce, VerifierSet, VerifyPolicy};
+    use zeph_com::{produce, Verdict, VerifierSet, VerifyPolicy};
     use zeph_obj::{ObjConfig, PeerSource};
     use zeph_routing::{ContentRouting, MetaRecord, ProviderRecord};
     use zeph_store::Store;
@@ -325,6 +358,54 @@ mod tests {
         assert!(
             service.board.read().await.satisfied(&posted),
             "the node fetched, re-ran the program, and posted a valid verdict → k=1 met"
+        );
+    }
+
+    // The producer side (VerifyBackend::verify): posting a request and awaiting the certificate.
+    // A single node can't verify its own request (no self-verification), so we pre-inject another
+    // node's verdict — then verify() collects it and returns true without waiting out the timeout.
+    #[tokio::test]
+    async fn verify_backend_returns_true_once_another_node_confirms() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = Arc::new(NodeIdentity::generate());
+        let transport = Arc::new(
+            Transport::bind(
+                identity.secret_key_bytes(),
+                Reach::LocalOnly,
+                vec![zeph_transport::MUX_ALPN.to_vec()],
+                0,
+            )
+            .await
+            .unwrap(),
+        );
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let engine = ObjEngine::with_peer_source(
+            transport.clone(),
+            store,
+            Arc::new(NullRouting),
+            Arc::new(NullPeers),
+            ObjConfig::default(),
+        );
+        let service = BoardService::new(identity.clone(), transport, engine);
+
+        let rt = TransitionRuntime::new().unwrap();
+        let req = produce(&rt, COUNTER_WAT, "f", &[5u8], &[3u8], 0, DEFAULT_FUEL)
+            .await
+            .unwrap();
+
+        // Another node (B) has already verified this exact request — seed its agree verdict. verify()
+        // builds the same PostedRequest (producer = this node), so B's verdict counts (B != producer).
+        let b = NodeIdentity::generate();
+        service.board.write().await.post_verdict(Verdict::sign(
+            &b,
+            req.request_hash(),
+            req.output_hash(),
+            true,
+        ));
+
+        assert!(
+            service.verify(req).await,
+            "verify() collects the independent verdict and returns verified"
         );
     }
 }

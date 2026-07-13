@@ -20,7 +20,9 @@ use zeph_core::Cid;
 use zeph_obj::{ConsumeMode, ObjEngine};
 use zeph_transport::{tag, PeerAddr, TaggedStream, Transport};
 
-use crate::{AppBackend, CapabilityGrant, TransitionCtx, TransitionRuntime, DEFAULT_FUEL};
+use crate::{
+    AppBackend, CapabilityGrant, TransitionCtx, TransitionRuntime, VerifyBackend, DEFAULT_FUEL,
+};
 
 /// ALPN for remote app invocation.
 pub const INVOKE_ALPN: &[u8] = b"/craftec/invoke/1";
@@ -42,6 +44,8 @@ pub struct InvokeService {
     runtime: TransitionRuntime,
     obj: Arc<ObjEngine>,
     backend: Arc<dyn AppBackend>,
+    /// Drives the `verify` host fn (post + await a certificate). `None` → `verify` is UNAVAILABLE.
+    verify_backend: Option<Arc<dyn VerifyBackend>>,
 }
 
 impl InvokeService {
@@ -49,11 +53,13 @@ impl InvokeService {
         runtime: TransitionRuntime,
         obj: Arc<ObjEngine>,
         backend: Arc<dyn AppBackend>,
+        verify_backend: Option<Arc<dyn VerifyBackend>>,
     ) -> Self {
         Self {
             runtime,
             obj,
             backend,
+            verify_backend,
         }
     }
 
@@ -80,7 +86,11 @@ impl InvokeService {
             // as `wall_clock`). There is no agreed consensus timestamp for a one-off app run.
             self.backend.now_millis(),
             Some(self.backend.clone()),
-        );
+        )
+        // Name the program (content cid) so a `verify` call can point verifiers at the same wasm,
+        // and hand it the backend that posts + awaits the certificate.
+        .with_program(Cid::of(&wasm).0)
+        .with_verify_backend(self.verify_backend.clone());
         self.runtime
             .run_program(
                 &wasm,

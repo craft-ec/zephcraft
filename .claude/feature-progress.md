@@ -81,8 +81,19 @@ Phases (VERIFICATION_DESIGN §9 build order; each: build+test+gate+commit):
         noded builds + 10 unit + 4 integration tests pass; clippy/fmt clean. NOTE: cross-node GOSSIP
         over real transport is by-construction (mirrors registry_net request_tagged+serve) + wired;
         it'll be LIVE-smoke-tested after the roll (a 2-node transport harness wasn't stood up in-unit).
-  - [ ] P5b-2b VerifyBackend + verify() host-fn producer path (post + async wait-until-collected) +
-        an end-to-end consumer that calls verify(). Then roll (staggered) + live cross-node smoke.
+  - [x] P5b-2b VerifyBackend + verify() producer path DONE 2026-07-13. com: `VerifyBackend` trait
+        (beside AppBackend); `TransitionCtx.{program_cid, verify_backend}` + `with_program`/
+        `with_verify_backend` builders; the `verify()` host fn now (not verify_mode, backend present)
+        builds a VerifyRequest {program_cid=ctx.program_cid, func/request/claimed from guest,
+        prev_state/now from ctx} and returns `i32::from(vb.verify(req).await)` (1/0), still -1 w/o a
+        backend; invoke.rs threads program_cid=Cid::of(wasm) + the backend into the ctx. noded:
+        `impl VerifyBackend for BoardService` = post (k=1 Open, this node producer) + gossip + poll
+        `collected` w/ 30s timeout; main.rs constructs board_service BEFORE com_service + passes
+        Some(board) as the verify backend. Tests: com producer-path (mock backend → 1/0/-1), noded
+        VerifyBackend collects another node's pre-injected verdict → true. workspace builds; com 64 +
+        noded 11 + integration pass; clippy/fmt clean.
+        REMAINING: staggered fleet roll + a LIVE 2-node cross-node smoke (producer on A calls verify()
+        → verifier on B confirms → A collects) — the true multi-node validation not done in-unit.
 
 NOTE (design): SYBIL is the honest ceiling (per-node cooldown binds one node, not a fleet) — name it,
 don't claim to defend it (stake/reputation weighting is deferred). NO self-verification (a DIFFERENT

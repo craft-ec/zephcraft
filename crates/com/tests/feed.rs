@@ -118,6 +118,7 @@ async fn node(tracker: &MemNet, dir: &Path, heads: &MemHeads) -> Node {
         TransitionRuntime::new().unwrap(),
         engine.clone(),
         backend,
+        None,
     ));
     tokio::spawn(serve_invocations(invoke_rx, service.clone()));
     Node {

@@ -1269,10 +1269,15 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         engine.clone(),
         transport.clock(),
     ));
+    // The verification board service is the app runtime's verify() backend (post + await a
+    // certificate), and it also serves/gossips/verifies over tag::BOARD (wired further below).
+    let board_service =
+        board::BoardService::new(identity.clone(), transport.clone(), engine.clone());
     let com_service = Arc::new(zeph_com::InvokeService::new(
         zeph_com::TransitionRuntime::new()?,
         engine.clone(),
         com_backend,
+        Some(board_service.clone()),
     ));
 
     tracing::info!(
@@ -1524,9 +1529,8 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     stream_handlers.push((zeph_transport::tag::SQLPAGE, sqlpage_stream_tx));
     let (invoke_stream_tx, invoke_stream_rx) = tokio::sync::mpsc::channel(32);
     stream_handlers.push((zeph_transport::tag::INVOKE, invoke_stream_tx));
-    // Verification board: gossips + verifies over tag::BOARD (additive — old nodes drop it).
-    let board_service =
-        board::BoardService::new(identity.clone(), transport.clone(), engine.clone());
+    // Verification board handler (the service was built above as the com verify backend): gossips +
+    // verifies over tag::BOARD (additive — old nodes drop it).
     let (board_stream_tx, board_stream_rx) = tokio::sync::mpsc::channel(32);
     stream_handlers.push((zeph_transport::tag::BOARD, board_stream_tx));
     let server = transport.clone();
