@@ -35,6 +35,7 @@ pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muz
 pub static malloc_conf: &[u8] = b"dirty_decay_ms:1000,muzzy_decay_ms:0\0";
 
 mod account;
+mod board;
 mod control;
 mod governance;
 mod headreg;
@@ -1523,6 +1524,11 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     stream_handlers.push((zeph_transport::tag::SQLPAGE, sqlpage_stream_tx));
     let (invoke_stream_tx, invoke_stream_rx) = tokio::sync::mpsc::channel(32);
     stream_handlers.push((zeph_transport::tag::INVOKE, invoke_stream_tx));
+    // Verification board: gossips + verifies over tag::BOARD (additive — old nodes drop it).
+    let board_service =
+        board::BoardService::new(identity.clone(), transport.clone(), engine.clone());
+    let (board_stream_tx, board_stream_rx) = tokio::sync::mpsc::channel(32);
+    stream_handlers.push((zeph_transport::tag::BOARD, board_stream_tx));
     let server = transport.clone();
     tokio::spawn(async move { server.serve(stream_handlers).await });
     tokio::spawn(engine.clone().serve(piece_stream_rx));
@@ -1533,6 +1539,8 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     ));
     // Serve cross-node registry requests (writer path advances; queries resolve).
     tokio::spawn(head_registry.clone().serve(registry_stream_rx));
+    // Serve + gossip + verify the verification board.
+    tokio::spawn(board_service.clone().serve(board_stream_rx));
     // "Pending distribution" completion (per-incomplete-cid DHT resolve + deficit pushes)
     // — network fan-out, so it runs THROUGH the coordinator (Distribution priority,
     // deduped: a slow pass coalesces with the next tick instead of stacking). This loop
@@ -1655,6 +1663,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     }
     governance_store.set_membership(membership.clone()).await;
     head_registry.set_membership(membership.clone()).await;
+    board_service.set_membership(membership.clone()).await;
     head_registry.set_programs(governance_store.clone()).await;
     head_registry.clone().set_jobs(jobs.clone()).await;
 

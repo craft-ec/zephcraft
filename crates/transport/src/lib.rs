@@ -36,6 +36,9 @@ pub mod tag {
     pub const INVOKE: u8 = 5;
     pub const REGISTRY: u8 = 6;
     pub const DHT: u8 = 7;
+    /// Verification board gossip (a `BoardSnapshot` push). Additive: a node without this handler
+    /// drops the stream, so board gossip is mixed-version-safe (a staggered roll, not simultaneous).
+    pub const BOARD: u8 = 8;
 }
 
 /// An inbound muxed bi-stream, already tag-dispatched: the remote's NodeId

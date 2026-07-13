@@ -52,12 +52,37 @@ Phases (VERIFICATION_DESIGN §9 build order; each: build+test+gate+commit):
       `Board::snapshot()` + `Board::merge(snap)` (CRDT UNION via the idempotent post_* — commutative,
       idempotent, convergent). Malicious-snapshot-safe (readers re-check → can't fabricate a cert).
       4 tests: postcard round-trip, idempotent union, commutative, forged-snapshot-can't-fabricate.
-- [ ] P5b-2 noded transport wiring — gossip/anti-entropy the BoardSnapshot across nodes (wire msg +
-      ALPN or ride mux), a background VERIFIER LOOP (grab pending → verify_locally → post verdict →
-      gossip), connect the producer `verify` host fn (currently -1 UNAVAILABLE) to post+collect on the
-      real board, the producer's async wait-until-collected-or-timeout. Multi-node integration test +
-      (if wire-incompatible) simultaneous roll. NEEDS a short design pass (new ALPN vs ride mux;
-      anti-entropy cadence) before building.
+- [ ] P5b-2 noded transport wiring. DESIGN (grounded in the noded patterns brief 2026-07-13):
+      the Board is a union-merge CRDT (built), so distribution = the MEMBERSHIP epidemic-gossip
+      pattern + the REGISTRY serve/mux shape. Components:
+      1. WIRE: `transport::tag::BOARD = 8` (append-only tag — an old node without the handler drops
+         board msgs → ADDITIVE, so a normal STAGGERED roll, NOT wire-incompatible). Payload =
+         `BoardSnapshot` postcard, fire-and-forget push (like membership epidemic_push).
+      2. noded `BoardService`: `Arc<RwLock<com::Board>>` + membership handle (set_membership setter,
+         copy governance) + identity + TransitionRuntime + obj (fetch wasm by program_cid).
+         `serve(mpsc::Receiver<TaggedStream>)` → decode snapshot → `board.merge()` (copy headreg
+         serve). Gossip loop (interval ~5s): snapshot → push to a census() fanout. Verifier loop:
+         grabbable (Verifier scheduler + cooldown) → obj.get(program_cid) → verify_locally →
+         post_verdict → gossip. Wire in main.rs (tag channel + serve spawn + set_membership).
+      3. `VerifyBackend` trait (com, beside AppBackend) + `TransitionCtx.verify_backend` field; the
+         `verify()` host fn (currently -1) posts a PostedRequest + awaits `Board::collected` w/
+         timeout → 1 verified / 0 rejected. Inject exactly like AppBackend (InvokeService + main.rs).
+      ROLL: additive → staggered (not simultaneous). Key refs: registry_net.rs, headreg.rs:1535
+      serve, governance.rs:251 tick + :83 set_membership, membership epidemic_push, transport::tag,
+      invoke.rs:74 backend injection, main.rs:1266/1520.
+  - [x] P5b-2a wire tag + BoardService DONE 2026-07-13. `transport::tag::BOARD=8` (additive). New
+        `crates/noded/src/board.rs` `BoardService`: `serve()` (read snapshot → `Board::merge`, per-
+        stream spawn, mirrors registry serve), gossip loop (5s, fire-and-forget push to a census()
+        FANOUT=3), verifier loop (2s: `Verifier::select` off cooldown → `fetch_program` (obj.get,
+        deref File manifest) → `verify_locally` → `post_verdict` → gossip), `set_membership`,
+        `post_request` (producer entry, wired in 2b). Wired in main.rs (channel+handler before
+        server.serve, serve spawn, set_membership). 1 integration test: publish counter → post
+        (different producer) → `verify_once` fetches+re-runs+posts a valid verdict → k=1 satisfied.
+        noded builds + 10 unit + 4 integration tests pass; clippy/fmt clean. NOTE: cross-node GOSSIP
+        over real transport is by-construction (mirrors registry_net request_tagged+serve) + wired;
+        it'll be LIVE-smoke-tested after the roll (a 2-node transport harness wasn't stood up in-unit).
+  - [ ] P5b-2b VerifyBackend + verify() host-fn producer path (post + async wait-until-collected) +
+        an end-to-end consumer that calls verify(). Then roll (staggered) + live cross-node smoke.
 
 NOTE (design): SYBIL is the honest ceiling (per-node cooldown binds one node, not a fleet) — name it,
 don't claim to defend it (stake/reputation weighting is deferred). NO self-verification (a DIFFERENT
