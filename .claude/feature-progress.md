@@ -1,3 +1,33 @@
+# ATTESTATION SUBSTRATE (K7 / task #9) — building (2026-07-14)
+User-defined quorum AUTHORITY per VERIFICATION_ATTESTATION_MODEL.md + ATTESTATION_DESIGN.md: "do the
+specific parties I chose authorize this?" A program declares a named quorum (member pubkeys + k-of-n)
+and triggers it to authorize a statement. Distinct from verification (consistency, #8 DONE) — they
+compose in the program. It is `gov.rs` GENERALIZED from the single network anchor to an app-declarable
+one: GovernanceSet→Quorum, GovAction→(opaque app Statement + self-amendment), GovernanceApproval→
+Attestation, GovernanceChain→QuorumChain. Network governance is the genesis instance of the same
+substrate. Reconfiguration = governance's self-amending apply() (already solves the "hard part").
+
+Phases (each: build+test+gate+commit):
+- [x] P1 core types (com) DONE 2026-07-14 — new `crates/com/src/attestation.rs`, near-verbatim generalization
+      of gov.rs: `Quorum{members,threshold,seq}` (genesis/is_member/quorum(distinct valid sigs)/verify
+      (seq+1 & ≥threshold)/apply(self-amend)); `AttestAction{Statement(Vec<u8>) | AddMember |
+      RemoveMember | SetThreshold}`; `AttestProposal{action,seq}` (+sign, domain b"craftec/attest/1");
+      `MemberSignature{member,signature}`; `Attestation{proposal,signatures}`; `QuorumChain{genesis,
+      attestations}` (current fold + append + `is_authorized(statement)` = replay Statement actions).
+      Pure/offline; tests mirror gov.rs. NOTE: built standalone (not refactoring live gov.rs to share
+      the type — that unify is a deferred, riskier follow-up; governance is the genesis instance
+      CONCEPTUALLY + could later BE a Quorum).
+- [ ] P2 the `attest` host ABI + AttestBackend (com): a program declares its quorum (account/config),
+      triggers attestation over a statement, gates a transition on k-of-n; mirror the verify()/
+      VerifyBackend wiring. Owner-sig bootstrap of the initial quorum.
+- [ ] P3 noded collection service: solicit sign-offs from the NAMED quorum members over the transport
+      (tag::ATTEST — closed/named, unlike verification's open board), collect k-of-n, durable
+      QuorumChain, producer wait. Member-signing policy (open Q: auto-sign vs owner/app policy).
+- [ ] P4 consumer + governance-as-genesis-instance wiring + roll + live smoke.
+OPEN Qs (from the design): what members attest to = arbitrary app statement (the one genuinely new
+piece over gov.rs, DONE in P1's AttestAction::Statement); liveness policy for a closed quorum
+(timeout/fallback); the member-signing policy (P3).
+
 # VERIFICATION PRIMITIVE (K6 / task #8) — building (2026-07-13)
 Build the automated-consistency verification primitive per VERIFICATION_DESIGN.md (re-cut to
 consistency-only): "is this the correct output of this deterministic program?" answered by ANY node

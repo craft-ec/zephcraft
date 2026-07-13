@@ -32,6 +32,7 @@
 
 use async_trait::async_trait;
 
+mod attestation;
 mod capability;
 mod craft;
 mod gov;
@@ -39,6 +40,9 @@ mod invoke;
 mod registry;
 mod transition;
 mod verification;
+pub use attestation::{
+    AttestAction, AttestProposal, Attestation, MemberSignature, Quorum, QuorumChain,
+};
 pub use capability::{Capability, CapabilityGrant};
 pub use craft::CraftBackend;
 pub use gov::{
