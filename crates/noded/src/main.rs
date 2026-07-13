@@ -35,6 +35,7 @@ pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muz
 pub static malloc_conf: &[u8] = b"dirty_decay_ms:1000,muzzy_decay_ms:0\0";
 
 mod account;
+mod attest;
 mod board;
 mod control;
 mod governance;
@@ -1273,12 +1274,15 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // certificate), and it also serves/gossips/verifies over tag::BOARD (wired further below).
     let board_service =
         board::BoardService::new(identity.clone(), transport.clone(), engine.clone());
+    // The attestation store is the app runtime's attest() backend: per-program quorum chains;
+    // attest() = "is this statement authorized by the program's quorum?" (P3-1 local; P3-2 gossips).
+    let attest_store = attest::AttestStore::open(identity.clone(), data_dir);
     let com_service = Arc::new(zeph_com::InvokeService::new(
         zeph_com::TransitionRuntime::new()?,
         engine.clone(),
         com_backend,
         Some(board_service.clone()),
-        None, // attest backend wired in P3 (the quorum-solicitation service)
+        Some(attest_store.clone()),
     ));
 
     tracing::info!(

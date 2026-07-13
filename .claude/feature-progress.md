@@ -31,9 +31,23 @@ Phases (each: build+test+gate+commit):
       invoke.rs threads it (main + 2 com test callers pass None for now). Test: mock backend → 1/0/-1/2.
       NOTE: quorum bootstrap/lookup + solicitation deferred to P3 (the backend is where the program's
       QuorumChain lives + members are solicited). com 71; clippy/fmt clean.
-- [ ] P3 noded collection service: solicit sign-offs from the NAMED quorum members over the transport
-      (tag::ATTEST — closed/named, unlike verification's open board), collect k-of-n, durable
-      QuorumChain, producer wait. Member-signing policy (open Q: auto-sign vs owner/app policy).
+- MEMBER-SIGNING POLICY DECIDED 2026-07-14 (Package A): governance-style — a statement is proposed,
+  the NAMED members cosign MANUALLY (human judgment, like gov_sign), k-of-n appended to the program's
+  QuorumChain; `attest()` = a CHECK ("is my statement authorized?"), decoupling the sync host call
+  from async human signing. Automated *discrete* signing (a member-side policy program) = deferred
+  attestation add-on. AGGREGATION oracle (feeds→median+freshness) = a SEPARATE future substrate, NOT
+  attestation (boundary recorded in VERIFICATION_ATTESTATION_MODEL.md §5.3).
+- [x] P3-1 local store + AttestBackend DONE 2026-07-14. `crates/noded/src/attest.rs` `AttestStore`:
+      per-program QuorumChains keyed by program_cid, persisted to `<data>/attest/<cid>.chain`,
+      loaded on open (only chains that fold validly). `bootstrap` (genesis quorum), `propose`/`cosign`
+      (this node's sig), `submit` (append k-of-n + persist), `is_authorized`. `impl AttestBackend`:
+      attest = is_authorized (the check). Wired in main.rs as the com attest backend. 2 tests: k-of-n
+      authorizes → attest true; sub-threshold rejected + persists nothing (reopen confirms). noded 13,
+      workspace builds, clippy/fmt clean. (propose/cosign/bootstrap/submit are the P3-2 control-plane
+      API — #[allow(dead_code)] in the bin until the CLI wires them.)
+- [ ] P3-2 cross-node: tag::ATTEST to solicit remote members' cosigns + gossip/resolve the program
+      chain (like governance's DHT-publish + pull); a control-plane CLI (attest-bootstrap/propose/
+      cosign/submit). Then P4.
 - [ ] P4 consumer + governance-as-genesis-instance wiring + roll + live smoke.
 OPEN Qs (from the design): what members attest to = arbitrary app statement (the one genuinely new
 piece over gov.rs, DONE in P1's AttestAction::Statement); liveness policy for a closed quorum
