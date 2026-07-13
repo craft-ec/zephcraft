@@ -59,6 +59,10 @@ pub struct TransitionCtx {
     /// programs don't import those functions); a called sql/obj/wall_clock fn with `None`
     /// returns its failure path rather than panicking.
     backend: Option<Arc<dyn AppBackend>>,
+    /// True when THIS run is itself a verifier re-run (under [`CapabilityGrant::verifier`]). The
+    /// `verify` host fn is then bound INERT (a no-op), so a re-run can't recurse into nested
+    /// verification (`VERIFICATION_DESIGN §9`). Set via [`Self::in_verify_mode`].
+    verify_mode: bool,
 }
 
 impl TransitionCtx {
@@ -81,6 +85,7 @@ impl TransitionCtx {
             app_ns,
             now,
             backend,
+            verify_mode: false,
         }
     }
 
@@ -89,6 +94,14 @@ impl TransitionCtx {
     /// protocol programs run with a reproducible clock and no host-varying surface.
     pub fn deterministic(prev_state: Vec<u8>, input: Vec<u8>, now: u64) -> Self {
         Self::new(prev_state, input, [0u8; 32], String::new(), now, None)
+    }
+
+    /// Mark this context as a verifier re-run, so the `verify` host fn binds INERT (the recursion
+    /// guard — see [`Self::verify_mode`]). Used by `verify_locally` when re-running under
+    /// [`CapabilityGrant::verifier`].
+    pub fn in_verify_mode(mut self) -> Self {
+        self.verify_mode = true;
+        self
     }
 }
 
@@ -507,6 +520,46 @@ fn bind_granted(linker: &mut Linker<TransitionCtx>, grant: &CapabilityGrant) -> 
                         Some(backend) => backend.now_millis() as i64,
                         None => 0,
                     }
+                })
+            },
+        )?;
+    }
+    if grant.allows(Capability::Verify) {
+        // `verify(func_ptr, func_len, in_ptr, in_len, claim_ptr, claim_len) -> i32` — a PRODUCER
+        // program's orchestration call into the VERIFICATION primitive (consistency): "get k
+        // independent nodes to confirm `f(inputs) = claimed_output`." Consistency, not authority
+        // (that is attestation). Return codes:
+        //   `2`  INERT — this run is itself a verifier re-run (`ctx.verify_mode`): verify is a
+        //        no-op, the recursion guard that lets a single-module program re-run its pure `f`
+        //        without triggering nested verification (`VERIFICATION_DESIGN §9`).
+        //   `-1` UNAVAILABLE — no verifier backend wired yet (P2) or a malformed call. The board +
+        //        cooldown-rotated collection to threshold `k` land in P3/P4; until then the
+        //        producer path reports unavailable rather than pretending to verify.
+        // (`1` verified / `0` rejected are reserved for the wired board.) Never panics.
+        linker.func_wrap_async(
+            TRANSITION_HOST_MODULE,
+            "verify",
+            |mut caller: Caller<'_, TransitionCtx>,
+             (fp, fl, ip, il, cp, cl): (i32, i32, i32, i32, i32, i32)| {
+                Box::new(async move {
+                    // Recursion guard FIRST: a verifier's re-run must never trigger verification.
+                    if caller.data().verify_mode {
+                        return 2i32;
+                    }
+                    // Validate the ABI reads (function name + inputs + claimed output) so a
+                    // malformed call is a clean -1, never a trap. Wiring the board consumes these
+                    // in P3; here they only gate a well-formed call.
+                    let Some(mem) = det_memory(&mut caller) else {
+                        return -1i32;
+                    };
+                    let (Some(_func), Some(_inputs), Some(_claimed)) = (
+                        det_read_str(&caller, &mem, fp, fl),
+                        det_read(&caller, &mem, ip, il),
+                        det_read(&caller, &mem, cp, cl),
+                    ) else {
+                        return -1;
+                    };
+                    -1 // UNAVAILABLE: verifier backend not wired (P3)
                 })
             },
         )?;

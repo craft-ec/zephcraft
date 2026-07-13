@@ -5,16 +5,18 @@
 //! not durability. Verifiers are interchangeable; the app's threshold `k` (how many independent
 //! re-runs must agree) is the one policy knob.
 //!
-//! This module is P1 — the **offline core**: the [`Verdict`] a verifier signs and the
-//! [`verify_locally`] re-run that produces it. The distribution layer (an open request board +
-//! cooldown-rotated verifiers collecting `k` verdicts) rides on top in later phases; the board
+//! Built so far: **P1** the offline core — the [`Verdict`] a verifier signs and the
+//! [`verify_locally`] re-run that produces it; **P2** the `verify` capability + host ABI (the
+//! producer's orchestration call, inert on a re-run). The distribution layer (an open request board
+//! with cooldown-rotated verifiers collecting `k` verdicts) rides on top in later phases; the board
 //! stays "dumb" precisely because every verdict is a self-contained, signature-checkable statement.
 //!
-//! **Determinism boundary (what makes it sound):** the re-run uses
-//! [`CapabilityGrant::deterministic`] (the fail-safe profile — no wall-clock, no RNG) and the
-//! consensus `now` carried in the request, so an honest re-run on *any* node is bit-identical. A
-//! program can only be verified if everything it reads is an explicit input — `prev_state`,
-//! `request`, `now` — never host-varying time.
+//! **Determinism boundary (what makes it sound):** the re-run uses the
+//! [`CapabilityGrant::verifier`] grant (the deterministic subset — no wall-clock, no RNG — plus
+//! `verify` bound INERT) and the consensus `now` carried in the request, so an honest re-run on
+//! *any* node is bit-identical. A program can only be verified if everything its **pure `f`** reads
+//! is an explicit input — `prev_state`, `request`, `now` — never host-varying time, and its `f`
+//! never calls `verify` (orchestration does that, and orchestration is not re-run).
 
 use serde::{Deserialize, Serialize};
 use zeph_core::{Cid, NodeId};
@@ -139,8 +141,9 @@ impl Verdict {
 }
 
 /// Re-run `wasm` deterministically on `req` and produce a **signed** [`Verdict`] on whether it
-/// reproduces `req.claimed_output`. The re-run uses [`CapabilityGrant::deterministic`] (fail-safe:
-/// no host-varying inputs) and `req.now`, so an honest re-run on any node yields the identical
+/// reproduces `req.claimed_output`. The re-run uses [`CapabilityGrant::verifier`] (the fail-safe
+/// deterministic subset plus `verify` bound inert) and `req.now`, so an honest re-run on any node
+/// yields the identical
 /// output — the property that makes verification sound. A program that **traps, exceeds fuel, or
 /// won't instantiate** counts as NOT reproducing the claim (`agree = false`): a bad producer can't
 /// hide behind a crashing re-run. If `wasm` doesn't hash to `req.program_cid`, it's the wrong
@@ -159,9 +162,13 @@ pub async fn verify_locally(
     let agree = if Cid::of(wasm).0 != req.program_cid {
         false // wrong program bytes for the claimed cid — nothing to verify
     } else {
+        // Re-run under the VERIFIER grant + verify_mode: deterministic caps (reproducible) plus
+        // `verify` bound INERT, so a single-module program (pure `f` alongside orchestration that
+        // imports `verify`) still instantiates and re-runs without recursing.
         let ctx =
-            TransitionCtx::deterministic(req.prev_state.clone(), req.request.clone(), req.now);
-        let grant = CapabilityGrant::deterministic();
+            TransitionCtx::deterministic(req.prev_state.clone(), req.request.clone(), req.now)
+                .in_verify_mode();
+        let grant = CapabilityGrant::verifier();
         matches!(
             runtime.run_program(wasm, &req.func, ctx, fuel, &grant).await,
             Ok(out) if out == req.claimed_output
@@ -277,5 +284,100 @@ mod tests {
         // flip the verdict from agree→disagree without re-signing: the signature no longer matches.
         v.agree = false;
         assert!(!v.verify_sig(), "flipping the verdict breaks the signature");
+    }
+
+    // ---- P2: the `verify` capability + host ABI (verify-mode inert; link-time gate) ----
+
+    // A split-module program: a PURE `f` (verifiable — never calls verify) alongside an
+    // `orchestrate` export that DOES call verify (producer-only, not re-run). The module imports
+    // `verify`, so it only instantiates where that capability is granted.
+    const SPLIT_WAT: &[u8] = br#"(module
+      (import "craftcom" "input"  (func $input  (param i32 i32) (result i32)))
+      (import "craftcom" "commit" (func $commit (param i32 i32) (result i32)))
+      (import "craftcom" "verify" (func $verify (param i32 i32 i32 i32 i32 i32) (result i32)))
+      (memory (export "memory") 1)
+      (func (export "f")
+        (drop (call $input (i32.const 0) (i32.const 64)))
+        (i32.store8 (i32.const 100) (i32.mul (i32.load8_u (i32.const 0)) (i32.const 2)))
+        (drop (call $commit (i32.const 100) (i32.const 1))))
+      (func (export "orchestrate")
+        (i32.store8 (i32.const 0)
+          (call $verify (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
+        (drop (call $commit (i32.const 0) (i32.const 1)))))"#;
+
+    #[tokio::test]
+    async fn a_verify_importing_program_is_gated_by_the_capability() {
+        let rt = TransitionRuntime::new().unwrap();
+        // deterministic grant does NOT bind `verify` → the import can't resolve → won't instantiate.
+        let det = TransitionCtx::deterministic(vec![], vec![21], 0);
+        assert!(
+            rt.run_program(SPLIT_WAT, "f", det, FUEL, &CapabilityGrant::deterministic())
+                .await
+                .is_err(),
+            "a program importing `verify` fails to instantiate without the Verify capability"
+        );
+        // the verifier grant binds it (inert) → the same module instantiates and its pure f runs.
+        let ver = TransitionCtx::deterministic(vec![], vec![21], 0).in_verify_mode();
+        assert_eq!(
+            rt.run_program(SPLIT_WAT, "f", ver, FUEL, &CapabilityGrant::verifier())
+                .await
+                .unwrap(),
+            vec![42],
+            "the pure f re-runs correctly under the verifier grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_verify_importing_programs_pure_f_still_verifies() {
+        // THE P2 GUARANTEE: even though the module imports `verify`, its pure `f` (which never
+        // calls verify) verifies — the verifier grant resolves the import inert, so no recursion
+        // and f's output is reproducible.
+        let rt = TransitionRuntime::new().unwrap();
+        let id = NodeIdentity::generate();
+        let req = req_for(SPLIT_WAT, &[21], &[42]); // note: func defaults to "run"
+        let req = VerifyRequest {
+            func: "f".to_string(),
+            ..req
+        };
+        let v = verify_locally(&rt, &id, &req, SPLIT_WAT, FUEL).await;
+        assert!(
+            v.agree,
+            "the verify-importing module's pure f is verifiable"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_is_inert_on_a_re_run_but_reports_unavailable_to_a_producer() {
+        let rt = TransitionRuntime::new().unwrap();
+        // Producer mode (full profile, no board backend wired): verify() -> -1, stored as byte 0xFF.
+        let producer = TransitionCtx::deterministic(vec![], vec![], 0);
+        assert_eq!(
+            rt.run_program(
+                SPLIT_WAT,
+                "orchestrate",
+                producer,
+                FUEL,
+                &CapabilityGrant::full()
+            )
+            .await
+            .unwrap(),
+            vec![0xFF],
+            "producer path reports UNAVAILABLE (-1) until the board is wired (P3)"
+        );
+        // Verifier re-run (verify_mode): verify() -> 2 (INERT), the recursion guard.
+        let rerun = TransitionCtx::deterministic(vec![], vec![], 0).in_verify_mode();
+        assert_eq!(
+            rt.run_program(
+                SPLIT_WAT,
+                "orchestrate",
+                rerun,
+                FUEL,
+                &CapabilityGrant::verifier()
+            )
+            .await
+            .unwrap(),
+            vec![2],
+            "verify is INERT on a re-run — no recursion into nested verification"
+        );
     }
 }

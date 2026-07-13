@@ -15,9 +15,16 @@ Phases (VERIFICATION_DESIGN §9 build order; each: build+test+gate+commit):
       (reproducible) and signs agree = (rerun_output == claimed_output). No board, no host-fn, no
       capability change yet. Tests: honest→agree, tampered→disagree, trap→disagree, sig verifies,
       cross-node determinism (two identities, same request → same agree).
-- [ ] P2 `Verify` capability + host ABI. New `Capability::Verify` variant (Random template) + a
-      `verify(func, inputs, claimed_output)` host fn (orchestration, app profile); INERT in
-      verify-mode (a verifier re-run does NOT bind `verify` → no recursion / no nested verify).
+- [x] P2 `Verify` capability + host ABI DONE 2026-07-13. `Capability::Verify` (app `full()` profile
+      + `CapabilityGrant::verifier()` re-run grant); `TransitionCtx.verify_mode` + `in_verify_mode()`;
+      `verify(func,in,claimed)->i32` host fn: `2`=INERT (verify_mode, the recursion guard), `-1`=
+      UNAVAILABLE (no board yet / malformed), `1`/`0` reserved for the wired board. verify_locally
+      now re-runs under `verifier()`+verify_mode so a single-module program (pure f + verify-importing
+      orchestration) re-runs without recursion. KEY RULE: the pure `f` must NEVER call verify (only
+      orchestration does, and orchestration is not re-run) — else producer (real verify) and verifier
+      (inert) outputs diverge. 4 P2 tests: link-gate (verify import fails under deterministic, links
+      under verifier), pure-f-of-a-verify-importing-module still verifies, inert-on-rerun vs
+      unavailable-to-producer, verifier() grant membership.
 - [ ] P3 The request board — global append-only, gossiped: producer posts
       `(VerifyRequest, policy)`; nodes see pending requests. Board stays "dumb" (no invariant).
 - [ ] P4 Cooldown-rotated verifier selection + verdict collection to threshold k; policy schema

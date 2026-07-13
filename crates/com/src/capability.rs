@@ -11,8 +11,10 @@
 //! The full [`Capability`] surface (§4) is bound in the transition runtime: the
 //! deterministic caps (`Input`/`Caller`/`State`/`Commit`/`Crypto`/`Sql`/`Obj`/`Clock`, the
 //! last being the *consensus* clock — `ctx.now`) plus the non-deterministic `WallClock`
-//! (real per-node wall-time, app profile only). `Random` is a reserved variant with NO bound
-//! host fn (kernel primitive K2, deferred), so no profile — not even `full` — grants it.
+//! (real per-node wall-time, app profile only) and `Verify` (the verification-orchestration
+//! host fn; app profile + the [`CapabilityGrant::verifier`] re-run grant, where it is bound
+//! INERT). `Random` is a reserved variant with NO bound host fn (kernel primitive K2, deferred),
+//! so no profile — not even `full` — grants it.
 
 use std::collections::HashSet;
 
@@ -46,6 +48,14 @@ pub enum Capability {
     /// is request-seeded. NOT bound by any profile (including `full`) until then.
     #[allow(dead_code)]
     Random,
+    /// `verify` — a PRODUCER program's orchestration call into the **verification** primitive
+    /// (consistency: "get k independent nodes to confirm `f(inputs) = claimed_output`"). Bound in
+    /// the app (`full`) profile and in the [`verifier`](CapabilityGrant::verifier) re-run grant,
+    /// NOT the deterministic profile (protocol programs don't orchestrate verification). During a
+    /// verifier's re-run it binds **inert** (`TransitionCtx::verify_mode`) so a single-module
+    /// program instantiates without recursing (`VERIFICATION_DESIGN §9`). Distinct from attestation
+    /// (authority) — see `VERIFICATION_ATTESTATION_MODEL.md`.
+    Verify,
 }
 
 /// The set of [`Capability`]s a program is granted. A capability not in the set is **not
@@ -83,15 +93,29 @@ impl CapabilityGrant {
         }
     }
 
-    /// The **app (full) profile** — the deterministic subset **plus** `wall_clock` (§5). For
-    /// userspace apps that are not consensus-critical and may be non-deterministic.
-    /// `WallClock` binds the `wall_clock` host fn (real per-node wall-time). `Random` is
-    /// deliberately NOT granted: it has no bound host fn (K2, deferred), and the advertised
-    /// grant must match the actually-bound host fns — otherwise a full-profile app importing
-    /// `random` would fail to instantiate (`unknown import`).
+    /// The **app (full) profile** — the deterministic subset **plus** `wall_clock` and `verify`
+    /// (§5). For userspace apps that are not consensus-critical and may be non-deterministic.
+    /// `WallClock` binds the `wall_clock` host fn (real per-node wall-time); `Verify` binds the
+    /// `verify` orchestration host fn (a producer requesting cross-node consistency). `Random` is
+    /// deliberately NOT granted: it has no bound host fn (K2, deferred), and the advertised grant
+    /// must match the actually-bound host fns — otherwise a full-profile app importing `random`
+    /// would fail to instantiate (`unknown import`).
     pub fn full() -> Self {
         let mut g = Self::deterministic();
         g.caps.insert(Capability::WallClock);
+        g.caps.insert(Capability::Verify);
+        g
+    }
+
+    /// The **verifier re-run grant** — the deterministic subset **plus** `Verify` bound INERT. A
+    /// verifier re-runs the pure `f` under this grant with [`TransitionCtx::verify_mode`] set, so a
+    /// single-module program (its pure `f` sharing a module with orchestration that imports
+    /// `verify`) still instantiates — the `verify` import resolves — but every `verify` call is a
+    /// no-op, preventing recursion (`VERIFICATION_DESIGN §9`). It stays otherwise deterministic (no
+    /// `wall_clock`), so the re-run is reproducible.
+    pub fn verifier() -> Self {
+        let mut g = Self::deterministic();
+        g.caps.insert(Capability::Verify);
         g
     }
 
@@ -135,12 +159,21 @@ mod tests {
         // Real per-node wall-time (`wall_clock`) is host-varying → NOT deterministic.
         assert!(!g.allows(Capability::WallClock), "wall-clock is non-det");
         assert!(!g.allows(Capability::Random), "random is non-det");
+        // `verify` is producer orchestration (network/board), not a consensus-program surface.
+        assert!(
+            !g.allows(Capability::Verify),
+            "verify orchestration is not in the deterministic profile"
+        );
     }
 
     #[test]
-    fn full_profile_adds_wall_clock_but_not_random() {
+    fn full_profile_adds_wall_clock_and_verify_but_not_random() {
         let g = CapabilityGrant::full();
         assert!(g.allows(Capability::WallClock));
+        assert!(
+            g.allows(Capability::Verify),
+            "full grants verify orchestration"
+        );
         // `Random` has no bound host fn (K2, deferred), so the advertised grant must NOT
         // include it — else a full-profile app importing `random` fails to instantiate.
         assert!(
@@ -148,6 +181,22 @@ mod tests {
             "random is not bound → not granted"
         );
         assert!(g.allows(Capability::Commit), "full ⊇ deterministic");
+    }
+
+    #[test]
+    fn verifier_grant_is_deterministic_plus_inert_verify() {
+        let g = CapabilityGrant::verifier();
+        assert!(
+            g.allows(Capability::Verify),
+            "the re-run grant binds verify (inert via verify_mode) so a verify-importing module links"
+        );
+        assert!(g.allows(Capability::Commit), "verifier ⊇ deterministic");
+        // The re-run must stay reproducible: no host-varying wall-clock.
+        assert!(
+            !g.allows(Capability::WallClock),
+            "the verifier re-run stays deterministic — no wall-clock"
+        );
+        assert!(!g.allows(Capability::Random));
     }
 
     #[test]
