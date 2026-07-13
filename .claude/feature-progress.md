@@ -23,9 +23,14 @@ Phases (each: build+test+gate+commit):
       wire/behavior change → no dedicated roll needed (ships mixed-version-safe with the attestation
       roll). Fixed 5 external sites (governance.rs is_governor→is_member/.governor→.member/.governors
       →.members, control.rs .governors→.members). com 70, noded 11, integration 4.
-- [ ] P2 the `attest` host ABI + AttestBackend (com): a program declares its quorum (account/config),
-      triggers attestation over a statement, gates a transition on k-of-n; mirror the verify()/
-      VerifyBackend wiring. Owner-sig bootstrap of the initial quorum.
+- [x] P2 the `attest` host ABI + AttestBackend (com) DONE 2026-07-14 — mirrors verify()/VerifyBackend:
+      `Capability::Attest` (app full() + verifier() re-run grant, NOT deterministic); `attest(stmt_ptr,
+      stmt_len)->i32` host fn (`2`=INERT on a verifier re-run — attestation is non-deterministic;
+      `-1`=no backend; `1`/`0`=authorized/rejected from the backend); `AttestBackend` trait
+      (`attest(program_cid, statement)->bool`); `TransitionCtx.attest_backend` + `with_attest_backend`;
+      invoke.rs threads it (main + 2 com test callers pass None for now). Test: mock backend → 1/0/-1/2.
+      NOTE: quorum bootstrap/lookup + solicitation deferred to P3 (the backend is where the program's
+      QuorumChain lives + members are solicited). com 71; clippy/fmt clean.
 - [ ] P3 noded collection service: solicit sign-offs from the NAMED quorum members over the transport
       (tag::ATTEST — closed/named, unlike verification's open board), collect k-of-n, durable
       QuorumChain, producer wait. Member-signing policy (open Q: auto-sign vs owner/app policy).

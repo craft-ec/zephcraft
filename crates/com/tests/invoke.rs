@@ -128,6 +128,7 @@ async fn node_b_invokes_an_app_on_node_a_as_a_distinct_identity() {
         host.engine.clone(),
         backend,
         None,
+        None,
     ));
     tokio::spawn(serve_invocations(host.invoke_rx, service));
 

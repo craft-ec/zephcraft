@@ -97,3 +97,14 @@ pub trait AppBackend: Send + Sync {
 pub trait VerifyBackend: Send + Sync {
     async fn verify(&self, req: VerifyRequest) -> bool;
 }
+
+/// The node service the `attest` host fn calls to run one attestation round: solicit sign-offs from
+/// the program's declared quorum over `statement`, and return whether `k`-of-n authorized it (or a
+/// timeout). Injected the same way [`AppBackend`]/[`VerifyBackend`] are. Attestation is AUTHORITY —
+/// "do the parties I chose approve this?" — distinct from verification (consistency); the `attest`
+/// host fn maps the result to `1` (authorized) / `0` (rejected). App-profile orchestration, never
+/// part of a re-run pure `f`.
+#[async_trait]
+pub trait AttestBackend: Send + Sync {
+    async fn attest(&self, program_cid: [u8; 32], statement: Vec<u8>) -> bool;
+}

@@ -56,6 +56,12 @@ pub enum Capability {
     /// program instantiates without recursing (`VERIFICATION_DESIGN §9`). Distinct from attestation
     /// (authority) — see `VERIFICATION_ATTESTATION_MODEL.md`.
     Verify,
+    /// `attest` — a program's orchestration call into the **attestation** primitive (authority:
+    /// "does my chosen quorum authorize this statement?"). Like [`Verify`](Capability::Verify): app
+    /// (`full`) profile + the [`verifier`](CapabilityGrant::verifier) re-run grant (bound inert on a
+    /// re-run — attestation is non-deterministic, so a verifiable pure `f` never calls it), NOT the
+    /// deterministic profile. Distinct from verification (consistency).
+    Attest,
 }
 
 /// The set of [`Capability`]s a program is granted. A capability not in the set is **not
@@ -104,6 +110,7 @@ impl CapabilityGrant {
         let mut g = Self::deterministic();
         g.caps.insert(Capability::WallClock);
         g.caps.insert(Capability::Verify);
+        g.caps.insert(Capability::Attest);
         g
     }
 
@@ -116,6 +123,7 @@ impl CapabilityGrant {
     pub fn verifier() -> Self {
         let mut g = Self::deterministic();
         g.caps.insert(Capability::Verify);
+        g.caps.insert(Capability::Attest);
         g
     }
 
@@ -159,10 +167,14 @@ mod tests {
         // Real per-node wall-time (`wall_clock`) is host-varying → NOT deterministic.
         assert!(!g.allows(Capability::WallClock), "wall-clock is non-det");
         assert!(!g.allows(Capability::Random), "random is non-det");
-        // `verify` is producer orchestration (network/board), not a consensus-program surface.
+        // `verify`/`attest` are producer orchestration (network), not a consensus-program surface.
         assert!(
             !g.allows(Capability::Verify),
             "verify orchestration is not in the deterministic profile"
+        );
+        assert!(
+            !g.allows(Capability::Attest),
+            "attest orchestration is not in the deterministic profile"
         );
     }
 
@@ -173,6 +185,10 @@ mod tests {
         assert!(
             g.allows(Capability::Verify),
             "full grants verify orchestration"
+        );
+        assert!(
+            g.allows(Capability::Attest),
+            "full grants attest orchestration"
         );
         // `Random` has no bound host fn (K2, deferred), so the advertised grant must NOT
         // include it — else a full-profile app importing `random` fails to instantiate.
@@ -189,6 +205,10 @@ mod tests {
         assert!(
             g.allows(Capability::Verify),
             "the re-run grant binds verify (inert via verify_mode) so a verify-importing module links"
+        );
+        assert!(
+            g.allows(Capability::Attest),
+            "the re-run grant also binds attest (inert), so an attest-importing module links"
         );
         assert!(g.allows(Capability::Commit), "verifier ⊇ deterministic");
         // The re-run must stay reproducible: no host-varying wall-clock.

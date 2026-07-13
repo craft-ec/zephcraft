@@ -20,7 +20,7 @@ use wasmtime::{Caller, Config, Engine, Extern, Linker, Memory, Module, Store};
 use zeph_core::{Cid, NodeId};
 use zeph_crypto::NodeIdentity;
 
-use crate::{AppBackend, Capability, CapabilityGrant, VerifyBackend, VerifyRequest};
+use crate::{AppBackend, AttestBackend, Capability, CapabilityGrant, VerifyBackend, VerifyRequest};
 
 /// Import module the restricted deterministic ABI is bound under (shares the `craftcom`
 /// namespace with the capability runtime, but exposes only `input` + `commit` + `state`).
@@ -70,6 +70,9 @@ pub struct TransitionCtx {
     /// `None` on the deterministic/protocol path and during a verifier re-run — so `verify` reports
     /// UNAVAILABLE there. Set by the invoker via [`Self::with_verify_backend`].
     verify_backend: Option<Arc<dyn VerifyBackend>>,
+    /// The node service the `attest` host fn drives (solicit the quorum's sign-offs + await
+    /// authorization). `None` → `attest` reports UNAVAILABLE. Set via [`Self::with_attest_backend`].
+    attest_backend: Option<Arc<dyn AttestBackend>>,
 }
 
 impl TransitionCtx {
@@ -95,6 +98,7 @@ impl TransitionCtx {
             verify_mode: false,
             program_cid: [0u8; 32],
             verify_backend: None,
+            attest_backend: None,
         }
     }
 
@@ -124,6 +128,13 @@ impl TransitionCtx {
     /// reports UNAVAILABLE.
     pub fn with_verify_backend(mut self, backend: Option<Arc<dyn VerifyBackend>>) -> Self {
         self.verify_backend = backend;
+        self
+    }
+
+    /// Inject the [`AttestBackend`] the `attest` host fn drives (solicit + await). Absent → `attest`
+    /// reports UNAVAILABLE.
+    pub fn with_attest_backend(mut self, backend: Option<Arc<dyn AttestBackend>>) -> Self {
+        self.attest_backend = backend;
         self
     }
 }
@@ -598,6 +609,35 @@ fn bind_granted(linker: &mut Linker<TransitionCtx>, grant: &CapabilityGrant) -> 
             },
         )?;
     }
+    if grant.allows(Capability::Attest) {
+        // `attest(statement_ptr, statement_len) -> i32` — a program's orchestration call into the
+        // ATTESTATION primitive (authority): "does my declared quorum authorize this statement?"
+        // `2` INERT on a verifier re-run (`ctx.verify_mode`) — attestation is non-deterministic, so a
+        // re-run must not re-trigger it; `-1` UNAVAILABLE (no backend / malformed); else
+        // `1` authorized / `0` rejected from the quorum-solicitation backend. Never panics.
+        linker.func_wrap_async(
+            TRANSITION_HOST_MODULE,
+            "attest",
+            |mut caller: Caller<'_, TransitionCtx>, (sp, sl): (i32, i32)| {
+                Box::new(async move {
+                    if caller.data().verify_mode {
+                        return 2i32;
+                    }
+                    let Some(mem) = det_memory(&mut caller) else {
+                        return -1i32;
+                    };
+                    let Some(statement) = det_read(&caller, &mem, sp, sl) else {
+                        return -1;
+                    };
+                    let Some(ab) = caller.data().attest_backend.clone() else {
+                        return -1; // no attest backend wired → UNAVAILABLE
+                    };
+                    let program_cid = caller.data().program_cid;
+                    i32::from(ab.attest(program_cid, statement).await) // 1 authorized / 0 rejected
+                })
+            },
+        )?;
+    }
     Ok(())
 }
 
@@ -675,6 +715,93 @@ mod tests {
             .unwrap(),
             vec![0xFF],
             "no verify backend → UNAVAILABLE (-1)"
+        );
+    }
+
+    // Producer-path attest() test — mirrors verify(): a mock quorum backend returns a fixed
+    // authorization, and a program calling attest() + committing the result proves 1 / 0 / -1 / 2.
+    struct MockAttest(bool);
+    #[async_trait::async_trait]
+    impl AttestBackend for MockAttest {
+        async fn attest(&self, _program_cid: [u8; 32], _statement: Vec<u8>) -> bool {
+            self.0
+        }
+    }
+
+    const ATTEST_ORCH_WAT: &[u8] = br#"(module
+      (import "craftcom" "attest" (func $attest (param i32 i32) (result i32)))
+      (import "craftcom" "commit" (func $commit (param i32 i32) (result i32)))
+      (memory (export "memory") 1)
+      (func (export "run")
+        (i32.store8 (i32.const 0) (call $attest (i32.const 0) (i32.const 0)))
+        (drop (call $commit (i32.const 0) (i32.const 1)))))"#;
+
+    #[tokio::test]
+    async fn attest_producer_path_returns_the_backend_authorization() {
+        let rt = TransitionRuntime::new().unwrap();
+        // authorized → 1
+        let ctx = TransitionCtx::deterministic(vec![], vec![], 0)
+            .with_attest_backend(Some(Arc::new(MockAttest(true))));
+        assert_eq!(
+            rt.run_program(
+                ATTEST_ORCH_WAT,
+                "run",
+                ctx,
+                DEFAULT_FUEL,
+                &CapabilityGrant::full()
+            )
+            .await
+            .unwrap(),
+            vec![1],
+            "quorum authorized → 1"
+        );
+        // rejected → 0
+        let ctx = TransitionCtx::deterministic(vec![], vec![], 0)
+            .with_attest_backend(Some(Arc::new(MockAttest(false))));
+        assert_eq!(
+            rt.run_program(
+                ATTEST_ORCH_WAT,
+                "run",
+                ctx,
+                DEFAULT_FUEL,
+                &CapabilityGrant::full()
+            )
+            .await
+            .unwrap(),
+            vec![0],
+            "quorum rejected → 0"
+        );
+        // no backend → -1 (0xFF)
+        let ctx = TransitionCtx::deterministic(vec![], vec![], 0);
+        assert_eq!(
+            rt.run_program(
+                ATTEST_ORCH_WAT,
+                "run",
+                ctx,
+                DEFAULT_FUEL,
+                &CapabilityGrant::full()
+            )
+            .await
+            .unwrap(),
+            vec![0xFF],
+            "no attest backend → UNAVAILABLE (-1)"
+        );
+        // inert on a verifier re-run → 2 (attestation is non-deterministic; a re-run must not trigger it)
+        let ctx = TransitionCtx::deterministic(vec![], vec![], 0)
+            .in_verify_mode()
+            .with_attest_backend(Some(Arc::new(MockAttest(true))));
+        assert_eq!(
+            rt.run_program(
+                ATTEST_ORCH_WAT,
+                "run",
+                ctx,
+                DEFAULT_FUEL,
+                &CapabilityGrant::verifier()
+            )
+            .await
+            .unwrap(),
+            vec![2],
+            "attest is INERT on a re-run"
         );
     }
 

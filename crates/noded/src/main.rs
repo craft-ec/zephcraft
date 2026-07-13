@@ -1278,6 +1278,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         engine.clone(),
         com_backend,
         Some(board_service.clone()),
+        None, // attest backend wired in P3 (the quorum-solicitation service)
     ));
 
     tracing::info!(

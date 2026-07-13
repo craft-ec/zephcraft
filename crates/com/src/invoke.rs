@@ -21,7 +21,8 @@ use zeph_obj::{ConsumeMode, ObjEngine};
 use zeph_transport::{tag, PeerAddr, TaggedStream, Transport};
 
 use crate::{
-    AppBackend, CapabilityGrant, TransitionCtx, TransitionRuntime, VerifyBackend, DEFAULT_FUEL,
+    AppBackend, AttestBackend, CapabilityGrant, TransitionCtx, TransitionRuntime, VerifyBackend,
+    DEFAULT_FUEL,
 };
 
 /// ALPN for remote app invocation.
@@ -46,6 +47,8 @@ pub struct InvokeService {
     backend: Arc<dyn AppBackend>,
     /// Drives the `verify` host fn (post + await a certificate). `None` → `verify` is UNAVAILABLE.
     verify_backend: Option<Arc<dyn VerifyBackend>>,
+    /// Drives the `attest` host fn (solicit the quorum + await). `None` → `attest` is UNAVAILABLE.
+    attest_backend: Option<Arc<dyn AttestBackend>>,
 }
 
 impl InvokeService {
@@ -54,12 +57,14 @@ impl InvokeService {
         obj: Arc<ObjEngine>,
         backend: Arc<dyn AppBackend>,
         verify_backend: Option<Arc<dyn VerifyBackend>>,
+        attest_backend: Option<Arc<dyn AttestBackend>>,
     ) -> Self {
         Self {
             runtime,
             obj,
             backend,
             verify_backend,
+            attest_backend,
         }
     }
 
@@ -90,7 +95,8 @@ impl InvokeService {
         // Name the program (content cid) so a `verify` call can point verifiers at the same wasm,
         // and hand it the backend that posts + awaits the certificate.
         .with_program(Cid::of(&wasm).0)
-        .with_verify_backend(self.verify_backend.clone());
+        .with_verify_backend(self.verify_backend.clone())
+        .with_attest_backend(self.attest_backend.clone());
         self.runtime
             .run_program(
                 &wasm,
