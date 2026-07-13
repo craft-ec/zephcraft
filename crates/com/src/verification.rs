@@ -14,8 +14,11 @@
 //! board is safe. **P4** the [`Verifier`] cooldown scheduler (rendezvous-picked, cooldown-gated
 //! grabbing that forces `k` distinct verifiers + disrupts collusion) and [`Board::collected`] (the
 //! ≥`k` verdict certificate). **P5a** the producer helper [`produce`] + a first consumer (a shared
-//! counter) proven end-to-end over the in-memory board. What remains (P5b) is the network layer:
-//! gossiping the board across nodes over the transport + the producer's async wait.
+//! counter) proven end-to-end over the in-memory board. **P5b-1** the board as a wire-serializable
+//! **CRDT** ([`BoardSnapshot`] + [`Board::merge`]): nodes converge by exchanging snapshots (a union
+//! of self-contained signed entries), so distribution needs no coordinator. What remains (P5b-2) is
+//! the noded transport wiring: gossip the snapshot over the network + a verifier loop + the producer's
+//! async wait.
 //!
 //! **Determinism boundary (what makes it sound):** the re-run uses the
 //! [`CapabilityGrant::verifier`] grant (the deterministic subset — no wall-clock, no RNG — plus
@@ -254,6 +257,16 @@ pub struct PostedRequest {
     pub policy: VerifyPolicy,
 }
 
+/// A serializable snapshot of a [`Board`] — the gossip payload peers exchange. Because every entry
+/// is a self-contained signed statement and the board is append-only + dedup'd, merging two
+/// snapshots is a plain UNION (order-independent, idempotent), so the board is a **CRDT**: nodes
+/// converge to the same board by exchanging snapshots, with no coordinator.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BoardSnapshot {
+    pub requests: Vec<PostedRequest>,
+    pub verdicts: Vec<Verdict>,
+}
+
 /// The open verification board (`VERIFICATION_DESIGN §5`) — a **dumb**, append-only, dedup'd store
 /// of posted requests and the verdicts on them. It holds NO invariant of its own: `post_*` accept
 /// any well-formed entry, and ALL correctness (valid signatures, the threshold `k`, the verifier
@@ -355,6 +368,32 @@ impl Board {
                     && v.verify_sig()
             })
             .collect()
+    }
+
+    /// Snapshot the board for gossip — every request + verdict it currently holds.
+    pub fn snapshot(&self) -> BoardSnapshot {
+        BoardSnapshot {
+            requests: self.requests.values().cloned().collect(),
+            verdicts: self
+                .verdicts
+                .values()
+                .flat_map(|m| m.values().cloned())
+                .collect(),
+        }
+    }
+
+    /// Merge a peer's snapshot — a **CRDT union**: add every request + verdict not already held
+    /// (via the same idempotent [`Board::post_request`] / [`Board::post_verdict`]). Idempotent and
+    /// commutative, so repeated/crossed gossip converges. Safe against a malicious snapshot: the
+    /// board stays dumb, so a bad entry can only add something a reader will independently re-check
+    /// ([`Board::satisfied`]) — it can't corrupt an existing entry or fabricate a certificate.
+    pub fn merge(&mut self, snap: BoardSnapshot) {
+        for r in snap.requests {
+            self.post_request(r);
+        }
+        for v in snap.verdicts {
+            self.post_verdict(v);
+        }
     }
 }
 
@@ -1018,5 +1057,107 @@ mod tests {
             board.collected(&posted).is_none(),
             "a forged transition never collects a certificate"
         );
+    }
+
+    // ---- P5b-1: the board as a wire-serializable CRDT (snapshot + merge) ----
+
+    #[test]
+    fn board_snapshot_round_trips_via_postcard() {
+        let producer = NodeIdentity::generate();
+        let req = req_for(DOUBLE_WAT, &[21], &[42]);
+        let posted = open_posted(producer.node_id().0, req.clone(), 1);
+        let mut b = Board::new();
+        b.post_request(posted.clone());
+        b.post_verdict(agree_verdict(&NodeIdentity::generate(), &req));
+
+        let bytes = postcard::to_allocvec(&b.snapshot()).unwrap();
+        let snap: BoardSnapshot = postcard::from_bytes(&bytes).unwrap();
+        let mut b2 = Board::new();
+        b2.merge(snap);
+        assert!(
+            b2.satisfied(&posted),
+            "a decoded snapshot reconstructs the board"
+        );
+    }
+
+    #[test]
+    fn merging_snapshots_is_an_idempotent_union() {
+        let producer = NodeIdentity::generate();
+        let req = req_for(DOUBLE_WAT, &[21], &[42]);
+        let posted = open_posted(producer.node_id().0, req.clone(), 2);
+
+        // node A saw v1's verdict, node B saw v2's — each holds the request + one verdict
+        let mut a = Board::new();
+        a.post_request(posted.clone());
+        a.post_verdict(agree_verdict(&NodeIdentity::generate(), &req));
+        let mut b = Board::new();
+        b.post_request(posted.clone());
+        b.post_verdict(agree_verdict(&NodeIdentity::generate(), &req));
+
+        assert!(
+            !a.satisfied(&posted) && !b.satisfied(&posted),
+            "1 of 2 each"
+        );
+        a.merge(b.snapshot());
+        assert!(
+            a.satisfied(&posted),
+            "the union has both verdicts → k=2 met"
+        );
+        let before = a.valid_agreements(&posted);
+        a.merge(b.snapshot());
+        assert_eq!(
+            a.valid_agreements(&posted),
+            before,
+            "merging again changes nothing (idempotent)"
+        );
+    }
+
+    #[test]
+    fn merge_is_commutative() {
+        let producer = NodeIdentity::generate();
+        let req = req_for(DOUBLE_WAT, &[21], &[42]);
+        let posted = open_posted(producer.node_id().0, req.clone(), 2);
+
+        let mut a = Board::new();
+        a.post_request(posted.clone());
+        a.post_verdict(agree_verdict(&NodeIdentity::generate(), &req));
+        let mut b = Board::new();
+        b.post_request(posted.clone());
+        b.post_verdict(agree_verdict(&NodeIdentity::generate(), &req));
+
+        let mut ab = Board::new();
+        ab.merge(a.snapshot());
+        ab.merge(b.snapshot());
+        let mut ba = Board::new();
+        ba.merge(b.snapshot());
+        ba.merge(a.snapshot());
+        assert!(
+            ab.satisfied(&posted) && ba.satisfied(&posted),
+            "either merge order reaches k=2"
+        );
+    }
+
+    #[test]
+    fn a_gossiped_snapshot_cannot_fabricate_a_certificate() {
+        let producer = NodeIdentity::generate();
+        let req = req_for(DOUBLE_WAT, &[21], &[42]);
+        let posted = open_posted(producer.node_id().0, req.clone(), 1);
+        let mut b = Board::new();
+        b.post_request(posted.clone());
+
+        // a malicious peer gossips a forged (invalid-sig) verdict AND a producer self-verdict
+        let mut forged = agree_verdict(&NodeIdentity::generate(), &req);
+        forged.output_hash = [0xEE; 32]; // breaks the signature
+        let snap = BoardSnapshot {
+            requests: vec![],
+            verdicts: vec![forged, agree_verdict(&producer, &req)],
+        };
+        b.merge(snap);
+        assert_eq!(
+            b.valid_agreements(&posted),
+            0,
+            "readers re-check — forged and self verdicts don't count"
+        );
+        assert!(b.collected(&posted).is_none());
     }
 }

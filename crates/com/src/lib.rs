@@ -51,8 +51,8 @@ pub use registry::{
 };
 pub use transition::{pda, TransitionCtx, TransitionRuntime};
 pub use verification::{
-    produce, verify_locally, Board, PostedRequest, Verdict, Verifier, VerifierSet, VerifyPolicy,
-    VerifyRequest,
+    produce, verify_locally, Board, BoardSnapshot, PostedRequest, Verdict, Verifier, VerifierSet,
+    VerifyPolicy, VerifyRequest,
 };
 
 /// Default fuel budget per invocation — roughly proportional to executed WASM

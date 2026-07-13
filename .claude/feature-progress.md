@@ -48,10 +48,16 @@ Phases (VERIFICATION_DESIGN §9 build order; each: build+test+gate+commit):
       reproduce). COUNTER_WAT (consistency-critical shared counter, pure f=state+input). E2E test:
       produce → post k=3 open → 5 cooldown-scheduled verifiers verify_locally (real re-run) → collect
       the k=3 certificate; + a forged transition (claims 9, f yields 8) never collects. Ties P1+P3+P4.
-- [ ] P5b Network integration — gossip/anti-entropy the Board across nodes over the transport (wire
-      msg + ALPN or ride an existing channel), connect the producer `verify` host fn to post+collect
-      on the real board, the producer's async wait-until-collected-or-timeout. noded-level. integration
-      -check + (if wire-incompatible) simultaneous roll.
+- [x] P5b-1 Board CRDT (gossip payload) DONE 2026-07-13. `BoardSnapshot{requests,verdicts}` +
+      `Board::snapshot()` + `Board::merge(snap)` (CRDT UNION via the idempotent post_* — commutative,
+      idempotent, convergent). Malicious-snapshot-safe (readers re-check → can't fabricate a cert).
+      4 tests: postcard round-trip, idempotent union, commutative, forged-snapshot-can't-fabricate.
+- [ ] P5b-2 noded transport wiring — gossip/anti-entropy the BoardSnapshot across nodes (wire msg +
+      ALPN or ride mux), a background VERIFIER LOOP (grab pending → verify_locally → post verdict →
+      gossip), connect the producer `verify` host fn (currently -1 UNAVAILABLE) to post+collect on the
+      real board, the producer's async wait-until-collected-or-timeout. Multi-node integration test +
+      (if wire-incompatible) simultaneous roll. NEEDS a short design pass (new ALPN vs ride mux;
+      anti-entropy cadence) before building.
 
 NOTE (design): SYBIL is the honest ceiling (per-node cooldown binds one node, not a fleet) — name it,
 don't claim to defend it (stake/reputation weighting is deferred). NO self-verification (a DIFFERENT
