@@ -54,7 +54,16 @@ Phases (each: build+test+gate+commit):
       verbs via cmd_attest/query_unix_params) + AttestStore in State. Workspace builds; noded 13;
       clippy/fmt clean; CLI verbs present. DEFERRED (P3-2b, optional): tag::ATTEST chain GOSSIP so a
       NON-collector node also sees is_authorized (not needed when the producer is the collector).
-- [ ] P4 consumer + governance-as-genesis-instance wiring + roll + live smoke.
+- [x] P4 ROLL + LIVE SMOKE DONE 2026-07-14. Gate 🟢 (A-G 8/8, 814s). STAGGERED roll (additive — gov
+      unification wire-identical, tag::ATTEST gossip deferred) of all 4 Hetzner nodes: active,
+      NRestarts=0, 4-node census, 0 panics. GOVERNANCE UNIFICATION VALIDATED LIVE: `zeph gov` folds
+      the deployed chain (1-of-1 seq 6) correctly under the refactored Quorum code. LIVE ATTESTATION
+      SMOKE: published an attest()-calling demo app on zeph (cid efb1d194…), bootstrapped a 2-of-2
+      quorum {zeph, zeph2}, proposed "authorized" on zeph → cosigned on zeph2 (CROSS-NODE) → submitted
+      2-of-2 → attest-status authorized:true → invoked the app with "authorized" → committed [01]
+      (attest=1); with an unauthorized statement → committed [00] (attest=0). **ATTESTATION (#9)
+      COMPLETE + LIVE.** Deferred enhancements: tag::ATTEST chain gossip (non-collector nodes);
+      member-side policy-program auto-signing (the discrete-fact automated niche).
 OPEN Qs (from the design): what members attest to = arbitrary app statement (the one genuinely new
 piece over gov.rs, DONE in P1's AttestAction::Statement); liveness policy for a closed quorum
 (timeout/fallback); the member-signing policy (P3).
