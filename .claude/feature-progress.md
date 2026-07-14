@@ -22,13 +22,38 @@ PHASES (each: build+test):
       fails, owner still self-decrypts; kfrag/cfrag postcard roundtrip. clippy clean. Added postcard
       dev-dep to cipher. NOTE confirmed: crypto-shred (destroy capsule) already in cipher — single-key,
       K4 not needed.
-- [ ] P2 host ABI: `Capability::Pre` (app/full profile only — non-deterministic key ops), host fns
-      `pre_rekey`(owner generates kfrags for recipient_pk) + `pre_reencrypt`(proxy applies a kfrag).
-      Mirror the K2/verify/attest host-fn pattern (transition.rs bind + capability.rs grant + test).
-- [ ] P3 wire + node glue if grants/kfrags travel over the network (a proxy node receives a kfrag +
-      reencrypts on request) — OR keep P2 app-orchestrated (kfrags passed as data, like attestation's
-      hex-passing). Decide app-orchestrated vs node-service at P3.
-- [ ] P4 gate + (roll if a wire/node service added; else it's additive/inert) + validate.
+**DESIGN CORRECTION (2026-07-14, before P2) — checked ENCRYPTION_DESIGN §9b/§13 + the user's steer, which
+overturned the original P2 plan (`pre_rekey`+`pre_reencrypt` raw-key host fns):**
+- §9b: the re-encryption transform is **pure WASM (`umbral-pre`), NEEDS NO HOST FN**; its threshold trust
+  "maps directly onto CraftCOM's attestation" (k-of-n proxies = a quorum, already built) → **`pre_reencrypt`
+  DROPPED.**
+- §13: **"the app never sees raw keys — the runtime mediates"** → a raw-key `pre_rekey` is wrong; the ONE
+  key-touching op (`generate_kfrags`) must be **runtime/backend-mediated**.
+- Grant RECORD = a row in the **OWNER's own CraftSQL DB** (existing `sql_execute`), NOT a new KIND_ record and
+  NOT the registry single-writer path: a grant is owner-authored + bilateral, no contention → no consensus.
+  The owner writes their own record (sidecar-authoritative); the DB head rides `RT_DBROOT` (owner-signed,
+  background-published, no CAS) only for offline-owner DISCOVERY, never on R's critical path. `KIND_GRANT=8`
+  is reserved in routing but subsumed by owner-DB rows.
+- [x] P2 host ABI DONE 2026-07-15 — `Capability::Pre` + the runtime-mediated `pre_grant` host fn (the ONLY
+      new host fn K3 needs). `crates/com/src/capability.rs`: `Pre` in `full()` (app-profile: non-det
+      `generate_kfrags`) + `verifier()` INERT (single-module link), NOT `deterministic()`. `lib.rs`:
+      `AppBackend::pre_rekey(recipient_pk: Vec<u8>, threshold, shares) -> Result<Option<Vec<u8>>>` default
+      `Ok(None)` (noded overrides in P3; mocks/CraftBackend compile unchanged). `transition.rs`:
+      `pre_grant(recipient_ptr,len, threshold, shares, out,cap) -> i32` — `2` INERT on verify-mode, `-1`
+      UNAVAILABLE (no backend / `Ok(None)` / bad recipient / small buf), else the serialized `Vec<ReKeyFrag>`
+      length. Delegates with the RUNNING identity's OWN key (backend-derived) → no self-authorize risk, no
+      `program_owner` check (unlike attest). Recipient key is the raw 33-byte compressed PRE pubkey (NOT a
+      32-byte NodeId — caught + fixed a `[u8;32]` ABI bug via a failing test). Tests (75 com pass):
+      end-to-end `pre_grant` → real `cipher::grant` fragments → proxy reencrypt → recipient decrypts (owner
+      key never leaves the backend), below-threshold fails; + the Pre capability GATE (deterministic profile →
+      `pre_grant` unbound → fails to instantiate). clippy+fmt clean, full workspace builds.
+- [ ] P3 noded glue: `CraftBackend::pre_rekey` impl (derive the node identity's `EncKeypair` via
+      `from_identity_seed` → `cipher::grant` → serialize). Storage of the grant row + distributing kfrags to
+      R/proxies is app-orchestrated (existing `sql_execute` + kfrags-as-data, like attestation's hex-passing);
+      reencrypt is pure WASM. Reconcile ENCRYPTION_DESIGN §9b ("grant record = owner-DB row, not a registry
+      record / no single-writer").
+- [ ] P4 gate + validate. Additive (new app-profile host fn + a backend method with a default) → mixed-version
+      safe, no simultaneous roll; validate a real grant→reencrypt→decrypt on the fleet.
 NOTE: it's "add the re-encryption ops" not merely "expose" — cipher has encrypt/self-open but not the
 kfrag/reencrypt side yet (both are in the `umbral_pre` dep, just unwired). Still cheap.
 

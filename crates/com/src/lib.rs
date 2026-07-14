@@ -85,6 +85,26 @@ pub trait AppBackend: Send + Sync {
     async fn obj_get(&self, cid: [u8; 32]) -> anyhow::Result<Vec<u8>>;
     /// Current HLC time in millis (sync — no IO).
     fn now_millis(&self) -> u64;
+    /// Runtime-mediated PRE delegation (K3 sharing, `ENCRYPTION_DESIGN §9b/§13`): derive THIS
+    /// identity's PRE keypair and produce the *blind* re-encryption fragments delegating decryption
+    /// to `recipient_pk` (Umbral `generate_kfrags`, `threshold`-of-`shares`). The backend holds the
+    /// key; the runtime and app never see it (they get only the fragments). Returns the serialized
+    /// `Vec<zeph_cipher::ReKeyFrag>` (postcard). The default is `Ok(None)` — a backend that has not
+    /// wired sharing — which the `pre_grant` host fn maps to UNAVAILABLE (`-1`); the noded backend
+    /// overrides it. The caller stores the returned fragments in its own grants table (via the
+    /// existing `sql_execute`) and distributes them to the recipient / proxies; the proxy
+    /// re-encryption transform itself is pure WASM and needs no host fn.
+    ///
+    /// `recipient_pk` is the recipient's raw serialized PRE public key (a compressed curve point —
+    /// NOT a 32-byte Ed25519 NodeId), which the backend validates via `EncPublicKey::from_bytes`.
+    async fn pre_rekey(
+        &self,
+        _recipient_pk: Vec<u8>,
+        _threshold: u32,
+        _shares: u32,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
 }
 
 /// The node service the `verify` host fn calls to run one verification round: post `req` to the

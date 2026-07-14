@@ -60,6 +60,18 @@ pub enum Capability {
     /// re-run — attestation is non-deterministic, so a verifiable pure `f` never calls it), NOT the
     /// deterministic profile. Distinct from verification (consistency).
     Attest,
+    /// `pre_grant` — a program's runtime-mediated **proxy re-encryption delegation** (sharing,
+    /// kernel primitive K3). The backend derives THIS identity's PRE key and returns the *blind*
+    /// re-encryption fragments delegating to a recipient (Umbral `generate_kfrags`); the app never
+    /// sees the secret — the runtime mediates (`ENCRYPTION_DESIGN §13`). Like
+    /// [`Random`](Capability::Random) it is non-deterministic (`generate_kfrags` draws OS randomness),
+    /// so it is app (`full`) profile only; and like [`Attest`](Capability::Attest) it is bound in the
+    /// [`verifier`](CapabilityGrant::verifier) re-run grant (INERT via `verify_mode`) so a
+    /// single-module app whose pure `f` shares a module with a `share()` that imports `pre_grant`
+    /// still links — a re-run never delegates. NOT the deterministic profile. The *grant record* is
+    /// an owner-DB row (existing `sql`), and the *re-encryption transform* is pure WASM — neither
+    /// needs a host fn (`ENCRYPTION_DESIGN §9b`); only the key-touching `generate_kfrags` does.
+    Pre,
 }
 
 /// The set of [`Capability`]s a program is granted. A capability not in the set is **not
@@ -107,6 +119,7 @@ impl CapabilityGrant {
         g.caps.insert(Capability::Random);
         g.caps.insert(Capability::Verify);
         g.caps.insert(Capability::Attest);
+        g.caps.insert(Capability::Pre);
         g
     }
 
@@ -120,6 +133,7 @@ impl CapabilityGrant {
         let mut g = Self::deterministic();
         g.caps.insert(Capability::Verify);
         g.caps.insert(Capability::Attest);
+        g.caps.insert(Capability::Pre);
         g
     }
 
@@ -172,6 +186,11 @@ mod tests {
             !g.allows(Capability::Attest),
             "attest orchestration is not in the deterministic profile"
         );
+        // `pre_grant` is key-touching + non-deterministic (generate_kfrags) → not a consensus surface.
+        assert!(
+            !g.allows(Capability::Pre),
+            "pre_grant (sharing delegation) is not in the deterministic profile"
+        );
     }
 
     #[test]
@@ -191,6 +210,11 @@ mod tests {
             g.allows(Capability::Attest),
             "full grants attest orchestration"
         );
+        // `Pre` (K3 sharing delegation) is bound in the app profile — matched by the `pre_grant` host fn.
+        assert!(
+            g.allows(Capability::Pre),
+            "full grants pre_grant (app-profile only)"
+        );
         assert!(g.allows(Capability::Commit), "full ⊇ deterministic");
     }
 
@@ -204,6 +228,10 @@ mod tests {
         assert!(
             g.allows(Capability::Attest),
             "the re-run grant also binds attest (inert), so an attest-importing module links"
+        );
+        assert!(
+            g.allows(Capability::Pre),
+            "the re-run grant also binds pre_grant (inert), so a share-importing module links"
         );
         assert!(g.allows(Capability::Commit), "verifier ⊇ deterministic");
         // The re-run must stay reproducible: no host-varying wall-clock.

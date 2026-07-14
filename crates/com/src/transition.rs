@@ -686,6 +686,62 @@ fn bind_granted(linker: &mut Linker<TransitionCtx>, grant: &CapabilityGrant) -> 
             },
         )?;
     }
+    if grant.allows(Capability::Pre) {
+        // `pre_grant(recipient_ptr, recipient_len, threshold, shares, out_ptr, out_cap) -> i32` — a
+        // program's runtime-mediated PROXY RE-ENCRYPTION delegation (K3 sharing). The backend derives
+        // THIS identity's PRE key and returns the *blind* re-encryption fragments delegating
+        // decryption to `recipient_pk` (Umbral generate_kfrags, `threshold`-of-`shares`); the app
+        // never sees the secret (`ENCRYPTION_DESIGN §13`). It uses the running identity's OWN key —
+        // you can only ever delegate your own data, so there is no self-authorize risk and (unlike
+        // `attest`) no registry-owner check is needed. Writes the serialized `Vec<ReKeyFrag>`
+        // (postcard) to `(out, cap)` and returns its length. Return codes:
+        //   `2`  INERT on a verifier re-run (`ctx.verify_mode`) — delegation is non-deterministic, so
+        //        a re-run must never mint fragments; the recursion/repro guard that lets a
+        //        single-module program (pure `f` + a `share()`) still link.
+        //   `-1` UNAVAILABLE — no backend / backend has not wired sharing (`Ok(None)`) / a malformed
+        //        call (bad recipient length, threshold∉[1,shares]) / the output buffer is too small.
+        // The app then stores the fragments in its OWN grants table (via `sql_execute`) and
+        // distributes them; the re-encryption transform itself is pure WASM (no host fn). Never panics.
+        linker.func_wrap_async(
+            TRANSITION_HOST_MODULE,
+            "pre_grant",
+            |mut caller: Caller<'_, TransitionCtx>,
+             (rp, rl, threshold, shares, out, cap): (i32, i32, i32, i32, i32, i32)| {
+                Box::new(async move {
+                    // A verifier's re-run must never mint delegation fragments (non-deterministic).
+                    if caller.data().verify_mode {
+                        return 2i32;
+                    }
+                    let Some(mem) = det_memory(&mut caller) else {
+                        return -1i32;
+                    };
+                    // Recipient PRE public key: raw serialized bytes (a compressed curve point, not a
+                    // 32-byte NodeId). The backend validates the encoding; here just bound the length so
+                    // a bogus (rp, rl) is a clean -1, never an over-read. A compressed key is ~33 bytes.
+                    let Some(recipient) = det_read(&caller, &mem, rp, rl) else {
+                        return -1;
+                    };
+                    if recipient.is_empty() || recipient.len() > 64 {
+                        return -1;
+                    }
+                    // Threshold must be a valid m-of-n (1 ≤ m ≤ n): a clean -1, never a trap.
+                    if threshold < 1 || shares < 1 || threshold > shares {
+                        return -1;
+                    }
+                    let Some(backend) = caller.data().backend.clone() else {
+                        return -1; // no substrate → UNAVAILABLE
+                    };
+                    match backend
+                        .pre_rekey(recipient, threshold as u32, shares as u32)
+                        .await
+                    {
+                        Ok(Some(bytes)) => det_write(&mut caller, &mem, out, cap, &bytes),
+                        _ => -1, // Ok(None) (unwired) or Err → UNAVAILABLE
+                    }
+                })
+            },
+        )?;
+    }
     Ok(())
 }
 
@@ -875,6 +931,158 @@ mod tests {
             .unwrap(),
             vec![2],
             "attest is INERT on a re-run"
+        );
+    }
+
+    // Producer-path pre_grant() test (K3 sharing): a mock backend holds the OWNER's PRE key and
+    // returns the blind re-encryption fragments delegating to the recipient (a REAL cipher::grant) —
+    // the runtime-mediated ReKeyGen the app never does itself. A program reads the recipient's pubkey
+    // from `input`, calls pre_grant, and commits the serialized fragments. The test then proves those
+    // fragments are USABLE end-to-end: a proxy re-encrypts a real sealed object and only the recipient
+    // (at ≥ threshold) recovers the plaintext — the owner key never left the backend.
+    struct MockPre {
+        owner: zeph_cipher::EncKeypair,
+    }
+    #[async_trait::async_trait]
+    impl AppBackend for MockPre {
+        async fn sql_execute(&self, _ns: &str, _sql: &str) -> anyhow::Result<u64> {
+            Ok(0)
+        }
+        async fn sql_query(
+            &self,
+            _o: Option<[u8; 32]>,
+            _ns: &str,
+            _sql: &str,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+        async fn obj_put(&self, _d: &[u8]) -> anyhow::Result<[u8; 32]> {
+            Ok([0u8; 32])
+        }
+        async fn obj_get(&self, _c: [u8; 32]) -> anyhow::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn now_millis(&self) -> u64 {
+            0
+        }
+        async fn pre_rekey(
+            &self,
+            recipient_pk: Vec<u8>,
+            threshold: u32,
+            shares: u32,
+        ) -> anyhow::Result<Option<Vec<u8>>> {
+            let recipient = zeph_cipher::EncPublicKey::from_bytes(&recipient_pk)?;
+            let kfrags =
+                zeph_cipher::grant(&self.owner, &recipient, threshold as usize, shares as usize);
+            Ok(Some(postcard::to_allocvec(&kfrags)?))
+        }
+    }
+
+    // Reads the 33-byte recipient PRE pubkey (compressed curve point) from `input` (offset 0) then
+    // delegates 2-of-3, writing the serialized fragments to offset 64 and committing exactly the
+    // returned length.
+    const PRE_GRANT_WAT: &[u8] = br#"(module
+      (import "craftcom" "input"     (func $input     (param i32 i32) (result i32)))
+      (import "craftcom" "pre_grant" (func $pre_grant (param i32 i32 i32 i32 i32 i32) (result i32)))
+      (import "craftcom" "commit"    (func $commit    (param i32 i32) (result i32)))
+      (memory (export "memory") 1)
+      (func (export "run")
+        (local $n i32)
+        (drop (call $input (i32.const 0) (i32.const 33)))
+        (local.set $n
+          (call $pre_grant (i32.const 0) (i32.const 33) (i32.const 2) (i32.const 3) (i32.const 64) (i32.const 8000)))
+        (drop (call $commit (i32.const 64) (local.get $n)))))"#;
+
+    #[tokio::test]
+    async fn pre_grant_produces_usable_delegation_fragments() {
+        let rt = TransitionRuntime::new().unwrap();
+        let owner = zeph_cipher::EncKeypair::from_identity_seed(&[1u8; 32]);
+        let recipient = zeph_cipher::EncKeypair::from_identity_seed(&[2u8; 32]);
+        let owner_pk = owner.public();
+        let recipient_pk = recipient.public();
+
+        // The program receives the recipient's pubkey as input and asks the runtime to delegate. The
+        // backend (own identity) holds the owner key; the app only ever sees the resulting fragments.
+        let backend: Arc<dyn AppBackend> = Arc::new(MockPre {
+            owner: zeph_cipher::EncKeypair::from_identity_seed(&[1u8; 32]),
+        });
+        let ctx = TransitionCtx::new(
+            Vec::new(),
+            recipient_pk.to_bytes(),
+            [0u8; 32],
+            "share".into(),
+            0,
+            Some(backend),
+        );
+        let committed = rt
+            .run_program(
+                PRE_GRANT_WAT,
+                "run",
+                ctx,
+                DEFAULT_FUEL,
+                &CapabilityGrant::full(),
+            )
+            .await
+            .unwrap();
+
+        // The committed bytes deserialize to real re-encryption fragments (2-of-3).
+        let kfrags: Vec<zeph_cipher::ReKeyFrag> =
+            postcard::from_bytes(&committed).expect("pre_grant returns serialized kfrags");
+        assert_eq!(kfrags.len(), 3, "3 shares delegated");
+
+        // END-TO-END: a proxy re-encrypts a real sealed object with 2 fragments; the recipient recovers
+        // it. This is the whole point — the fragments the app got from the host fn actually work, and
+        // the owner secret never entered the runtime or the WASM.
+        let secret = b"granted via the runtime, never touching the owner key";
+        let obj = zeph_cipher::encrypt(&owner_pk, secret);
+        let cfrags: Vec<_> = kfrags
+            .iter()
+            .take(2)
+            .map(|kf| zeph_cipher::reencrypt(&owner_pk, &recipient_pk, &obj, kf).unwrap())
+            .collect();
+        assert_eq!(
+            zeph_cipher::decrypt_granted(&recipient, &owner_pk, &obj, &cfrags).unwrap(),
+            secret,
+            "the recipient decrypts using fragments the app obtained from pre_grant"
+        );
+        // Below threshold (1 < 2) fails — the delegation really is 2-of-3.
+        assert!(
+            zeph_cipher::decrypt_granted(&recipient, &owner_pk, &obj, &cfrags[..1]).is_err(),
+            "one fragment is below the 2-of-3 threshold → no decrypt"
+        );
+    }
+
+    // THE GATE: pre_grant is bound ONLY under a grant containing Pre. The deterministic profile omits
+    // it, so a pre_grant-importing program fails to instantiate (link-time capability gating).
+    #[tokio::test]
+    async fn pre_capability_gates_pre_grant() {
+        let rt = TransitionRuntime::new().unwrap();
+        let backend: Arc<dyn AppBackend> = Arc::new(MockPre {
+            owner: zeph_cipher::EncKeypair::from_identity_seed(&[1u8; 32]),
+        });
+        let ctx = TransitionCtx::new(
+            Vec::new(),
+            zeph_cipher::EncKeypair::from_identity_seed(&[2u8; 32])
+                .public()
+                .to_bytes(),
+            [0u8; 32],
+            "share".into(),
+            0,
+            Some(backend),
+        );
+        // Deterministic profile (no Pre) → the `pre_grant` import can't resolve → instantiate fails.
+        let err = rt
+            .run_program(
+                PRE_GRANT_WAT,
+                "run",
+                ctx,
+                DEFAULT_FUEL,
+                &CapabilityGrant::deterministic(),
+            )
+            .await;
+        assert!(
+            err.is_err(),
+            "pre_grant is not bound without the Pre capability → fails to instantiate"
         );
     }
 
