@@ -45,9 +45,15 @@ Phases (each: build+test+gate+commit):
       authorizes → attest true; sub-threshold rejected + persists nothing (reopen confirms). noded 13,
       workspace builds, clippy/fmt clean. (propose/cosign/bootstrap/submit are the P3-2 control-plane
       API — #[allow(dead_code)] in the bin until the CLI wires them.)
-- [ ] P3-2 cross-node: tag::ATTEST to solicit remote members' cosigns + gossip/resolve the program
-      chain (like governance's DHT-publish + pull); a control-plane CLI (attest-bootstrap/propose/
-      cosign/submit). Then P4.
+- [x] P3-2 control plane DONE 2026-07-14. The cross-node COLLECTION is manual hex-passing (like
+      governance's multi-governor flow), so NO new wire/gossip needed for the basic path — the PRODUCER
+      collects: bootstrap the quorum on their node → propose (→ attestation hex) → each member runs
+      attest-cosign on THEIR node (adds their sig to the hex) → producer attest-submit the k-of-n hex
+      to their local chain → invoke the app → attest() checks the LOCAL chain → authorized. control.rs
+      RPCs (attest_bootstrap/propose/cosign/submit/status) + State.attest + main.rs CLI (5 attest-*
+      verbs via cmd_attest/query_unix_params) + AttestStore in State. Workspace builds; noded 13;
+      clippy/fmt clean; CLI verbs present. DEFERRED (P3-2b, optional): tag::ATTEST chain GOSSIP so a
+      NON-collector node also sees is_authorized (not needed when the producer is the collector).
 - [ ] P4 consumer + governance-as-genesis-instance wiring + roll + live smoke.
 OPEN Qs (from the design): what members attest to = arbitrary app statement (the one genuinely new
 piece over gov.rs, DONE in P1's AttestAction::Statement); liveness policy for a closed quorum

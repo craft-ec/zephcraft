@@ -210,6 +210,8 @@ pub struct State {
     pub gov: std::sync::Arc<crate::governance::GovernanceChainStore>,
     /// Generic program accounts — any program's single-writer state (the program is the writer).
     pub accounts: std::sync::Arc<crate::account::ProgramAccountStore>,
+    /// Per-program attestation quorum chains (the `attest` host fn's backend).
+    pub attest: std::sync::Arc<crate::attest::AttestStore>,
 }
 
 impl State {
@@ -463,6 +465,11 @@ async fn handle_rpc(state: &State, line: &str) -> serde_json::Value {
         Some("gov_propose") => rpc_gov_propose(state, &request, id).await,
         Some("gov_sign") => rpc_gov_sign(state, &request, id).await,
         Some("gov_submit") => rpc_gov_submit(state, &request, id).await,
+        Some("attest_bootstrap") => rpc_attest_bootstrap(state, &request, id).await,
+        Some("attest_propose") => rpc_attest_propose(state, &request, id).await,
+        Some("attest_cosign") => rpc_attest_cosign(state, &request, id).await,
+        Some("attest_submit") => rpc_attest_submit(state, &request, id).await,
+        Some("attest_status") => rpc_attest_status(state, &request, id).await,
         Some("programs") => rpc_programs(state, id).await,
         Some("apps") => {
             serde_json::json!({"jsonrpc": "2.0", "id": id, "result": apps_list(state).await})
@@ -1327,6 +1334,131 @@ async fn rpc_gov_submit(
         }
         Err(e) => rpc_err(id, e.to_string()),
     }
+}
+
+// ---- Attestation control plane (per-program quorum authority; Package A manual cosign) ----
+
+async fn rpc_attest_bootstrap(
+    state: &State,
+    req: &serde_json::Value,
+    id: serde_json::Value,
+) -> serde_json::Value {
+    let program = match parse_hex32(req["params"].get("program")) {
+        Ok(p) => p,
+        Err(e) => return rpc_err(id, e),
+    };
+    let Some(list) = req["params"].get("members").and_then(|v| v.as_str()) else {
+        return rpc_err(
+            id,
+            "attest_bootstrap needs 'members' (comma-separated hex)".into(),
+        );
+    };
+    let mut members = Vec::new();
+    for h in list.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()) {
+        match hex::decode(h)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+        {
+            Some(m) => members.push(m),
+            None => return rpc_err(id, format!("bad member hex: {h}")),
+        }
+    }
+    let threshold = req["params"]
+        .get("threshold")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(members.len() as u64) as usize;
+    state.attest.bootstrap(program, members, threshold).await;
+    serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"bootstrapped": true}})
+}
+
+async fn rpc_attest_propose(
+    state: &State,
+    req: &serde_json::Value,
+    id: serde_json::Value,
+) -> serde_json::Value {
+    let program = match parse_hex32(req["params"].get("program")) {
+        Ok(p) => p,
+        Err(e) => return rpc_err(id, e),
+    };
+    let Some(stmt) = req["params"].get("statement").and_then(|v| v.as_str()) else {
+        return rpc_err(id, "attest_propose needs 'statement'".into());
+    };
+    match state
+        .attest
+        .propose(program, stmt.as_bytes().to_vec())
+        .await
+    {
+        Some(att) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":{
+            "attestation": hex::encode(postcard::to_allocvec(&att).unwrap_or_default()),
+            "note": "send to each quorum member for attest-cosign, then attest-submit the k-of-n result"}}),
+        None => rpc_err(id, "no quorum bootstrapped for this program".into()),
+    }
+}
+
+async fn rpc_attest_cosign(
+    state: &State,
+    req: &serde_json::Value,
+    id: serde_json::Value,
+) -> serde_json::Value {
+    let Some(h) = req["params"].get("attestation").and_then(|v| v.as_str()) else {
+        return rpc_err(id, "attest_cosign needs 'attestation' hex".into());
+    };
+    let Ok(mut att) = hex::decode(h.trim())
+        .ok()
+        .and_then(|b| postcard::from_bytes::<zeph_com::Attestation>(&b).ok())
+        .ok_or(())
+    else {
+        return rpc_err(id, "undecodable attestation".into());
+    };
+    state.attest.cosign(&mut att).await;
+    serde_json::json!({"jsonrpc":"2.0","id":id,"result":{
+        "attestation": hex::encode(postcard::to_allocvec(&att).unwrap_or_default())}})
+}
+
+async fn rpc_attest_submit(
+    state: &State,
+    req: &serde_json::Value,
+    id: serde_json::Value,
+) -> serde_json::Value {
+    let program = match parse_hex32(req["params"].get("program")) {
+        Ok(p) => p,
+        Err(e) => return rpc_err(id, e),
+    };
+    let Some(att) = req["params"]
+        .get("attestation")
+        .and_then(|v| v.as_str())
+        .and_then(|h| hex::decode(h.trim()).ok())
+        .and_then(|b| postcard::from_bytes::<zeph_com::Attestation>(&b).ok())
+    else {
+        return rpc_err(
+            id,
+            "attest_submit needs a decodable 'attestation' hex".into(),
+        );
+    };
+    if state.attest.submit(program, att).await {
+        serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"submitted": true}})
+    } else {
+        rpc_err(
+            id,
+            "attestation rejected: bad quorum, wrong seq, or program not bootstrapped".into(),
+        )
+    }
+}
+
+async fn rpc_attest_status(
+    state: &State,
+    req: &serde_json::Value,
+    id: serde_json::Value,
+) -> serde_json::Value {
+    let program = match parse_hex32(req["params"].get("program")) {
+        Ok(p) => p,
+        Err(e) => return rpc_err(id, e),
+    };
+    let Some(stmt) = req["params"].get("statement").and_then(|v| v.as_str()) else {
+        return rpc_err(id, "attest_status needs 'statement'".into());
+    };
+    let authorized = state.attest.is_authorized(&program, stmt.as_bytes()).await;
+    serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"authorized": authorized}})
 }
 
 /// Deploy `bytes` as a system app under `name`: publish a want-based system object,

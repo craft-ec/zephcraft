@@ -23,13 +23,9 @@ use zeph_crypto::NodeIdentity;
 /// Per-program attestation chains. `attest` reads them; the control plane (P3-2) bootstraps a
 /// quorum, proposes statements, and collects the members' cosigns into them.
 pub struct AttestStore {
-    /// Signs this node's cosigns (P3-2 control plane). Unused in the bin until that CLI wiring lands.
-    #[allow(dead_code)]
     identity: Arc<NodeIdentity>,
     /// `program_cid` → that program's quorum-authority chain.
     chains: RwLock<HashMap<[u8; 32], QuorumChain>>,
-    /// Where per-program chains persist (read on `open`; written by the P3-2 control plane).
-    #[allow(dead_code)]
     dir: PathBuf,
 }
 
@@ -70,7 +66,6 @@ impl AttestStore {
         })
     }
 
-    #[allow(dead_code)] // P3-2 control plane (persistence for bootstrap/submit)
     fn chain_path(&self, program_cid: &[u8; 32]) -> PathBuf {
         self.dir.join(format!("{}.chain", hex::encode(program_cid)))
     }
@@ -78,7 +73,6 @@ impl AttestStore {
     /// Bootstrap a program's quorum (genesis members + threshold). Idempotent — if a chain already
     /// exists it is left untouched. (Owner-signature gating of the bootstrap is a P3-2 refinement;
     /// here the caller — the program owner via the control plane — installs it.)
-    #[allow(dead_code)] // P3-2 control plane
     pub async fn bootstrap(&self, program_cid: [u8; 32], members: Vec<[u8; 32]>, threshold: usize) {
         let mut chains = self.chains.write().await;
         let chain = chains
@@ -89,7 +83,6 @@ impl AttestStore {
 
     /// Draft a statement proposal at the program's next seq, signed with THIS node's key (a member
     /// contributes its own signature; more are collected via `cosign`).
-    #[allow(dead_code)] // P3-2 control plane
     pub async fn propose(&self, program_cid: [u8; 32], statement: Vec<u8>) -> Option<Attestation> {
         let seq = self.chains.read().await.get(&program_cid)?.seq() + 1;
         let proposal = AttestProposal {
@@ -103,7 +96,6 @@ impl AttestStore {
     }
 
     /// Add THIS node's signature to an in-flight attestation (a member cosigning — dedup by member).
-    #[allow(dead_code)] // P3-2 control plane
     pub async fn cosign(&self, att: &mut Attestation) {
         let sig = att.proposal.sign(&self.identity);
         if !att.signatures.iter().any(|s| s.member == sig.member) {
@@ -113,7 +105,6 @@ impl AttestStore {
 
     /// Submit a collected attestation: append to the program's chain (iff it validly extends it —
     /// next seq + k-of-n distinct members) and persist. Returns whether it was accepted.
-    #[allow(dead_code)] // P3-2 control plane
     pub async fn submit(&self, program_cid: [u8; 32], att: Attestation) -> bool {
         let mut chains = self.chains.write().await;
         let Some(chain) = chains.get_mut(&program_cid) else {

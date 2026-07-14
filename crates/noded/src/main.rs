@@ -196,6 +196,43 @@ enum Command {
         #[arg(long)]
         set_config: Option<String>,
     },
+    /// Bootstrap a program's attestation quorum (member pubkeys + k-of-n).
+    AttestBootstrap {
+        #[arg(long)]
+        program: String,
+        /// Comma-separated member node-id hexes.
+        #[arg(long)]
+        members: String,
+        #[arg(long)]
+        threshold: Option<u64>,
+    },
+    /// Propose a statement for a program's quorum to authorize (prints the attestation hex to
+    /// pass to each member for `attest-cosign`).
+    AttestPropose {
+        #[arg(long)]
+        program: String,
+        #[arg(long)]
+        statement: String,
+    },
+    /// Add THIS node's signature to an in-flight attestation hex (a quorum member cosigning).
+    AttestCosign {
+        #[arg(long)]
+        attestation: String,
+    },
+    /// Submit a collected k-of-n attestation hex to a program's quorum chain.
+    AttestSubmit {
+        #[arg(long)]
+        program: String,
+        #[arg(long)]
+        attestation: String,
+    },
+    /// Check whether a program's quorum has authorized a statement.
+    AttestStatus {
+        #[arg(long)]
+        program: String,
+        #[arg(long)]
+        statement: String,
+    },
     /// Execute write SQL against your own CraftSQL database `ns`
     /// (commits + publishes the KIND_ROOT head).
     SqlExec {
@@ -458,6 +495,53 @@ async fn main() -> anyhow::Result<()> {
             set_program,
             set_config,
         }) => cmd_gov_propose(&data_dir, add, remove, threshold, set_program, set_config).await,
+        Some(Command::AttestBootstrap {
+            program,
+            members,
+            threshold,
+        }) => {
+            cmd_attest(
+                &data_dir,
+                "attest_bootstrap",
+                serde_json::json!({"program": program, "members": members, "threshold": threshold}),
+            )
+            .await
+        }
+        Some(Command::AttestPropose { program, statement }) => {
+            cmd_attest(
+                &data_dir,
+                "attest_propose",
+                serde_json::json!({"program": program, "statement": statement}),
+            )
+            .await
+        }
+        Some(Command::AttestCosign { attestation }) => {
+            cmd_attest(
+                &data_dir,
+                "attest_cosign",
+                serde_json::json!({"attestation": attestation}),
+            )
+            .await
+        }
+        Some(Command::AttestSubmit {
+            program,
+            attestation,
+        }) => {
+            cmd_attest(
+                &data_dir,
+                "attest_submit",
+                serde_json::json!({"program": program, "attestation": attestation}),
+            )
+            .await
+        }
+        Some(Command::AttestStatus { program, statement }) => {
+            cmd_attest(
+                &data_dir,
+                "attest_status",
+                serde_json::json!({"program": program, "statement": statement}),
+            )
+            .await
+        }
         Some(Command::SqlExec { ns, sql }) => cmd_sql_exec(&data_dir, &ns, &sql).await,
         Some(Command::SqlQuery { ns, sql, owner }) => {
             cmd_sql_query(&data_dir, owner.as_deref(), &ns, &sql).await
@@ -469,6 +553,21 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Files { owner }) => cmd_files(&data_dir, owner.as_deref()).await,
         None => cmd_run(&data_dir, cli.run).await,
     }
+}
+
+/// Generic attestation control-plane command: send `method` + `params` over the control socket and
+/// pretty-print the result (the attest-* CLI verbs all share this shape).
+async fn cmd_attest(
+    data_dir: &Path,
+    method: &str,
+    params: serde_json::Value,
+) -> anyhow::Result<()> {
+    let r = control::query_unix_params(&data_dir.join("zeph.sock"), method, params).await?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&r).unwrap_or_else(|_| r.to_string())
+    );
+    Ok(())
 }
 
 async fn cmd_publish(data_dir: &Path, file: &Path, pin: bool, private: bool) -> anyhow::Result<()> {
@@ -1398,6 +1497,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         registry: head_registry.clone(),
         gov: governance_store.clone(),
         accounts: account_store.clone(),
+        attest: attest_store.clone(),
         settings: {
             let oc = engine.config();
             control::NodeSettings {
