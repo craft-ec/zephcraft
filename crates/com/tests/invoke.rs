@@ -122,6 +122,7 @@ async fn node_b_invokes_an_app_on_node_a_as_a_distinct_identity() {
         host.craftsql.clone(),
         host.engine.clone(),
         Arc::new(Clock::new()),
+        zeph_cipher::EncKeypair::from_identity_seed(&[7u8; 32]),
     ));
     let service = Arc::new(InvokeService::new(
         TransitionRuntime::new().unwrap(),

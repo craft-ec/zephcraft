@@ -47,11 +47,17 @@ overturned the original P2 plan (`pre_rekey`+`pre_reencrypt` raw-key host fns):*
       end-to-end `pre_grant` → real `cipher::grant` fragments → proxy reencrypt → recipient decrypts (owner
       key never leaves the backend), below-threshold fails; + the Pre capability GATE (deterministic profile →
       `pre_grant` unbound → fails to instantiate). clippy+fmt clean, full workspace builds.
-- [ ] P3 noded glue: `CraftBackend::pre_rekey` impl (derive the node identity's `EncKeypair` via
-      `from_identity_seed` → `cipher::grant` → serialize). Storage of the grant row + distributing kfrags to
-      R/proxies is app-orchestrated (existing `sql_execute` + kfrags-as-data, like attestation's hex-passing);
-      reencrypt is pure WASM. Reconcile ENCRYPTION_DESIGN §9b ("grant record = owner-DB row, not a registry
-      record / no single-writer").
+- [x] P3 backend glue DONE 2026-07-15 — `CraftBackend::pre_rekey` (`crates/com/src/craft.rs`): the backend
+      already holds this identity's `EncKeypair` (new field, derived in main.rs from `identity.secret_key_bytes()`
+      like the obj/sql encryption key) → `EncPublicKey::from_bytes(recipient)` (validates) → `cipher::grant` →
+      `postcard::to_allocvec`. Delegates with the node's OWN key (a program can only share ITS OWN data — no
+      cross-owner escalation). `zeph-cipher` moved to com's main deps; all 4 `CraftBackend::new` call sites
+      updated (main.rs prod + 3 integration tests). Live-path GATE test (`craft_backend.rs`): a WASM program
+      calls `pre_grant` against a REAL CraftBackend (not a mock) → real 2-of-3 fragments → proxy reencrypt →
+      recipient decrypts a sealed object under the same owner key (owner secret never leaves the backend).
+      Full workspace builds, com tests pass, clippy+fmt clean. Grant-row storage + kfrag distribution stay
+      app-orchestrated (existing `sql_execute` + kfrags-as-data); reencrypt is pure WASM. (Note: hit + cleared
+      a host disk-full/APFS-snapshot-pinned blocker mid-build; user freed space.)
 - [ ] P4 gate + validate. Additive (new app-profile host fn + a backend method with a default) → mixed-version
       safe, no simultaneous roll; validate a real grant→reencrypt→decrypt on the fleet.
 NOTE: it's "add the re-encryption ops" not merely "expose" — cipher has encrypt/self-open but not the

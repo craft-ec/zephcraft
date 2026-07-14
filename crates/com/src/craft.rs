@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use zeph_cipher::{grant, EncKeypair, EncPublicKey};
 use zeph_core::{hlc::Clock, Cid, NodeId};
 use zeph_obj::{ConsumeMode, ObjEngine};
 use zeph_sql::CraftSql;
@@ -30,11 +31,25 @@ pub struct CraftBackend {
     sql: Arc<CraftSql>,
     obj: Arc<ObjEngine>,
     clock: Arc<Clock>,
+    /// This node's PRE keypair (derived from the identity seed, same as the obj/sql
+    /// encryption key). Used by [`pre_rekey`](AppBackend::pre_rekey) to delegate the
+    /// OWNER's (this identity's) data to a recipient — the secret never leaves here.
+    enc: EncKeypair,
 }
 
 impl CraftBackend {
-    pub fn new(sql: Arc<CraftSql>, obj: Arc<ObjEngine>, clock: Arc<Clock>) -> Self {
-        Self { sql, obj, clock }
+    pub fn new(
+        sql: Arc<CraftSql>,
+        obj: Arc<ObjEngine>,
+        clock: Arc<Clock>,
+        enc: EncKeypair,
+    ) -> Self {
+        Self {
+            sql,
+            obj,
+            clock,
+            enc,
+        }
     }
 }
 
@@ -69,5 +84,28 @@ impl AppBackend for CraftBackend {
 
     fn now_millis(&self) -> u64 {
         self.clock.now().millis()
+    }
+
+    /// Runtime-mediated PRE delegation (K3 sharing): derive nothing new — this backend already
+    /// holds the OWNER's (this node identity's) PRE keypair — and produce the blind Umbral
+    /// re-encryption fragments delegating to `recipient_pk` (`threshold`-of-`shares`). The secret
+    /// key never leaves the backend; the caller (`pre_grant` host fn) receives only the serialized
+    /// fragments. Delegating uses THIS identity's own key, so a program can only ever share ITS
+    /// OWN data — there is no cross-owner escalation. `recipient_pk` is the recipient's raw
+    /// compressed PRE public key (validated here); an invalid key or threshold is a hard error the
+    /// host fn maps to UNAVAILABLE.
+    async fn pre_rekey(
+        &self,
+        recipient_pk: Vec<u8>,
+        threshold: u32,
+        shares: u32,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let recipient = EncPublicKey::from_bytes(&recipient_pk)
+            .map_err(|e| anyhow::anyhow!("recipient PRE public key: {e}"))?;
+        if threshold < 1 || shares < 1 || threshold > shares {
+            anyhow::bail!("invalid PRE threshold {threshold}-of-{shares}");
+        }
+        let kfrags = grant(&self.enc, &recipient, threshold as usize, shares as usize);
+        Ok(Some(postcard::to_allocvec(&kfrags)?))
     }
 }

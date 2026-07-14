@@ -1376,6 +1376,9 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         craftsql.clone(),
         engine.clone(),
         transport.clock(),
+        // The OWNER's PRE keypair (this identity's) — lets the `pre_grant` host fn delegate this
+        // node's data to a recipient without the secret ever leaving the backend (K3 sharing).
+        zeph_cipher::EncKeypair::from_identity_seed(&identity.secret_key_bytes()),
     ));
     // The verification board service is the app runtime's verify() backend (post + await a
     // certificate), and it also serves/gossips/verifies over tag::BOARD (wired further below).

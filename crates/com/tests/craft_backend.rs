@@ -84,8 +84,12 @@ async fn agent_writes_persist_to_craftsql_and_reload() {
     let heads = MemHeads::new();
     let dir = tempfile::tempdir().unwrap();
     let (craftsql, engine) = node(&tracker, dir.path(), &heads).await;
-    let backend: Arc<dyn AppBackend> =
-        Arc::new(CraftBackend::new(craftsql, engine, Arc::new(Clock::new())));
+    let backend: Arc<dyn AppBackend> = Arc::new(CraftBackend::new(
+        craftsql,
+        engine,
+        Arc::new(Clock::new()),
+        zeph_cipher::EncKeypair::from_identity_seed(&[7u8; 32]),
+    ));
 
     // Agent: CREATE a table, then INSERT a row — both via `sql_execute`, both
     // confined (structurally) to (own, "app/feed"). The unified ABI: `run()` takes no
@@ -129,5 +133,85 @@ async fn agent_writes_persist_to_craftsql_and_reload() {
     assert!(
         got.contains('x'),
         "the agent's write persisted + reloaded from the CraftSQL head; got: {got}"
+    );
+}
+
+// K3 P3 GATE — the REAL CraftBackend::pre_rekey (not a mock) delegates THIS identity's data. A WASM
+// program reads a recipient's PRE pubkey from `input` and calls `pre_grant`; the backend derives its
+// OWN PRE key from the identity seed and returns the blind Umbral fragments. The test proves those
+// fragments actually work end-to-end against a sealed object encrypted under the SAME owner key — so
+// the production path (host fn → CraftBackend::pre_rekey → cipher::grant) yields usable delegation,
+// and the owner secret never left the backend.
+const PRE_GRANT_WAT: &[u8] = br#"(module
+  (import "craftcom" "input"     (func $input     (param i32 i32) (result i32)))
+  (import "craftcom" "pre_grant" (func $pre_grant (param i32 i32 i32 i32 i32 i32) (result i32)))
+  (import "craftcom" "commit"    (func $commit    (param i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (func (export "run")
+    (local $n i32)
+    (drop (call $input (i32.const 0) (i32.const 33)))
+    (local.set $n
+      (call $pre_grant (i32.const 0) (i32.const 33) (i32.const 2) (i32.const 3) (i32.const 64) (i32.const 8000)))
+    (drop (call $commit (i32.const 64) (local.get $n)))))"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn craftbackend_pre_grant_delegates_this_identitys_data() {
+    let tracker = start_tracker();
+    let heads = MemHeads::new();
+    let dir = tempfile::tempdir().unwrap();
+    let (craftsql, engine) = node(&tracker, dir.path(), &heads).await;
+
+    // The backend owns the identity whose PRE key is derived from this seed (as in production, where
+    // it is `identity.secret_key_bytes()`).
+    let owner_seed = [7u8; 32];
+    let backend: Arc<dyn AppBackend> = Arc::new(CraftBackend::new(
+        craftsql,
+        engine,
+        Arc::new(Clock::new()),
+        zeph_cipher::EncKeypair::from_identity_seed(&owner_seed),
+    ));
+
+    // A program hands the runtime the recipient's PRE pubkey and asks it to delegate 2-of-3.
+    let recipient = zeph_cipher::EncKeypair::from_identity_seed(&[9u8; 32]);
+    let rt = TransitionRuntime::new().unwrap();
+    let ctx = TransitionCtx::new(
+        Vec::new(),
+        recipient.public().to_bytes(),
+        [0u8; 32],
+        "share".into(),
+        0,
+        Some(backend),
+    );
+    let committed = rt
+        .run_program(
+            PRE_GRANT_WAT,
+            "run",
+            ctx,
+            DEFAULT_FUEL,
+            &CapabilityGrant::full(),
+        )
+        .await
+        .unwrap();
+
+    // Real fragments (2-of-3) minted by the real backend from its own key.
+    let kfrags: Vec<zeph_cipher::ReKeyFrag> = postcard::from_bytes(&committed)
+        .expect("CraftBackend::pre_rekey returns serialized kfrags");
+    assert_eq!(kfrags.len(), 3, "3 shares delegated");
+
+    // End-to-end against a sealed object under the SAME owner key the backend holds: a proxy
+    // re-encrypts with 2 fragments and only the recipient recovers the plaintext.
+    let owner_pk = zeph_cipher::EncKeypair::from_identity_seed(&owner_seed).public();
+    let recipient_pk = recipient.public();
+    let secret = b"delegated by the node's own key, via pre_grant";
+    let obj = zeph_cipher::encrypt(&owner_pk, secret);
+    let cfrags: Vec<_> = kfrags
+        .iter()
+        .take(2)
+        .map(|kf| zeph_cipher::reencrypt(&owner_pk, &recipient_pk, &obj, kf).unwrap())
+        .collect();
+    assert_eq!(
+        zeph_cipher::decrypt_granted(&recipient, &owner_pk, &obj, &cfrags).unwrap(),
+        secret,
+        "the recipient decrypts data the real CraftBackend delegated — owner key never left the backend"
     );
 }

@@ -12,6 +12,7 @@ rand.workspace = true
 wasmtime = { version = "27", features = ["async"] }
 zeph-core.workspace = true
 zeph-crypto.workspace = true
+zeph-cipher.workspace = true
 zeph-sql.workspace = true
 zeph-obj.workspace = true
 zeph-transport.workspace = true
@@ -23,7 +24,6 @@ tokio.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 zeph-crypto.workspace = true
-zeph-cipher.workspace = true
 zeph-routing.workspace = true
 zeph-store.workspace = true
 zeph-testkit.workspace = true

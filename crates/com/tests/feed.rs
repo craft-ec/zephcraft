@@ -113,6 +113,7 @@ async fn node(tracker: &MemNet, dir: &Path, heads: &MemHeads) -> Node {
         craftsql,
         engine.clone(),
         Arc::new(Clock::new()),
+        zeph_cipher::EncKeypair::from_identity_seed(&[7u8; 32]),
     ));
     let service = Arc::new(InvokeService::new(
         TransitionRuntime::new().unwrap(),
