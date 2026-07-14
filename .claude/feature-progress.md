@@ -1,3 +1,101 @@
+# PDP — PROOF OF DATA POSSESSION (K5 / task #3) — vtags approach SHELVED; lattice-LHS = future milestone (2026-07-14)
+
+**OUTCOME: the vtags-based P1-P3 (below) is SHELVED to `git stash` ("K5 PDP (vtags-based) — SHELVED..."),
+NOT committed/rolled.** Adversarial review found it UNSOUND: verification collapses to `vtags::verify`,
+which is only ~8 fixed PUBLIC linear equations → forgeable (all-zero piece, or Gaussian-solve for any
+chosen coding vector) → a lying holder farms receipts storing nothing. vtags is a corruption detector,
+NOT an adversarial possession proof (its own docs say so).
+
+**DESIGN CONCLUSION (worked through with the user):** a sound PDP here must be simultaneously
+(1) sound vs a lying holder, (2) repair-compatible = HOMOMORPHIC (pieces regenerate via recode — so
+ANY publish-time static commitment [Merkle, per-piece tag] is dead; the tag must recode WITH the piece),
+(3) PUBLICLY verifiable / no single-point-of-failure (the protocol deliberately has no privileged/
+required-online verifier — a symmetric homomorphic MAC is REJECTED because its designated-verifier key =
+a SPOF + owner-online dependency), (4) field-compatible (GF(2⁸), no erasure-engine rewrite). Those jointly
+force an ASYMMETRIC homomorphic signature. Two options: pairing (BFKW, mature crypto but needs F_p → the
+GF(2⁸) rewrite, because pairing scalars are prime-order and GF(2⁸) is char 2 — no homomorphism) vs LATTICE
+(Boneh–Freeman "Linearly Homomorphic Signatures over Binary Fields" 2011 — literally for network coding
+over binary fields, public + no field change + post-quantum). **USER CHOSE LATTICE** (future-proof + zero
+change to the mature erasure core; accepted tradeoff = exotic-crypto implementation risk, managed by
+design-first + isolation + adversarial forgery tests + external cryptographer review).
+
+**LIBRARY REALITY (2026-07-14):** `lattirust/lattirust` is NOT usable — it's a ZK-proof/ring-arithmetic
+lib (LaBRADOR/Lova), does NOT implement LHS; its own README: "not audited nor fit for real-world
+deployment. Always consult your trusted cryptographer." No production Rust binary-field-LHS lib exists →
+the lattice route means implementing the scheme (highest crypto risk) → **needs a real cryptographer**,
+not just engineering. **SEPARATE REPO CREATED: `../binfield-lhs`** (sibling of zephcraft; own git repo,
+initial commit d15a66b) — standalone/publishable crypto lib; `docs/DESIGN.md` = the design pass, `src/lib.rs`
+= interface-only skeleton (unimplemented). NEXT STEP = resolve the design-pass open questions with a
+cryptographer: unbounded-recode/noise ceiling
+(make-or-break — does the sig survive arbitrarily many recodes?), signature SIZE/overhead at piece scale,
+SIS params, library/impl plan, integration (per-piece sig field + recode carries it). Reusable from the
+shelved work: the wire challenge/response shape, the rendezvous+jitter auditor loop, `StorageReceipt` —
+only the vtags verification CORE is replaced.
+
+--- SHELVED vtags approach (git stash@ K5 PDP; reference only) ---
+Storage proofs → StorageReceipts (reputation currency). Foundation §PDP: "coefficient vector
+cross-checking" (GF(2⁸) linear algebra), verify possession WITHOUT downloading the full piece, →
+signed StorageReceipt. Reuses RLNC `recode` + `vtags::verify`.
+
+DESIGN (locked with user 2026-07-14):
+- PROOF = coefficient cross-check. Challenge = (cid, nonce/seed). Prover derives GF(2⁸) coeffs from
+  the seed (BLAKE3-keyed PRNG) and `recode`s its held pieces with those coeffs → ONE combined piece
+  + its claimed coding vectors. Verifier: (a) claimed cvs DISTINCT, (b) combined_cv == Σ cᵢ·cvᵢ,
+  (c) `vtags::verify(cid_vtags, combined_piece)`. Sound (a holder missing a challenged piece can't
+  produce valid combined_data — the null-space check fails); cheap (~1 piece, no source).
+- CHALLENGER = rendezvous-elected per (cid, epoch) (reuse `rendezvous_score`), NOT the healthscan
+  (user's K8 boundary: PDP is a SEPARATE fair auditor; healthscan is durability). Fired at a
+  deterministic RANDOM OFFSET within the epoch — `hash(node‖cid‖epoch) mod epoch_ms` — so
+  challengers don't all storm at the epoch boundary (user's explicit refinement).
+- OUTPUT = `StorageReceipt{content_id, storage_node(prover), challenger, segment_index, piece_id,
+  timestamp, nonce, signature}` (foundation shape; challenger-signed; prover signs its proof).
+  Scope = the RECEIPT MECHANISM only. Reputation SCORING is policy "above" it (roadmap) — deferred
+  (thin tally or governed-WASM later). Distinct from K6 verification (compute consistency) + K8
+  availability probe (self-report durability; PDP is the CRYPTOGRAPHIC upgrade of that path).
+
+PHASES (each: build+test):
+- [x] P1 pure proof DONE 2026-07-14 (obj/src/pdp.rs, `pub mod pdp`): `challenge_coeffs(seed,m)`
+      (blake3 keyed XOF, forced non-zero), `prove(seed, held)` → (cvs, combined piece via gf::axpy),
+      `verify(vtags, seed, cvs, combined)` (distinct cvs + combined_cv==Σcᵢcvᵢ + vtags::verify),
+      `StorageReceipt{...}` (foundation shape; sig=Vec<u8> for serde; issue/verify_sig). Added blake3
+      + zeph-crypto to obj deps. 4 tests pass: honest+wrong-seed; missing-piece (partial-combine AND
+      forged-cv both fail); duplicate-cv rejected; receipt sig roundtrip+tamper. clippy clean.
+- [x] P2 wire + responder DONE 2026-07-14. wire: `PdpChallenge{cid,nonce,segment_index}` +
+      `PdpProof{cid,nonce,prover,coding_vectors,piece}` (tags 0x0044/0x0045, append-only; NO prover
+      sig — obj has no identity, the QUIC peer authenticates the prover). obj responder (handle arm):
+      `serve_pieces` → `pdp::prove(nonce, held)` → proof (empty = holds nothing). Challenger-side obj
+      methods `pdp_challenge(cid,addr,nonce)` (round-trip) + `verify_possession(cid, proof)` (loads
+      vtags from the held Generation — challengers are cid holders → have vtags). Round-trip test
+      (`pdp_challenge_proves_then_fails_after_eviction`): honest holder proves + verifies; evicted
+      (alive) holder → empty proof → verify false. clippy clean.
+- [x] P3 challenger loop + receipt DONE 2026-07-14. obj helpers `is_pdp_challenger(cid,epoch,holders)`
+      (rendezvous over holders∪self; must hold the generation→vtags) + `pdp_challenge_offset(cid,epoch,
+      epoch_ms)` (jitter = rendezvous_score[0..8] mod epoch). noded `crates/noded/src/pdp.rs`
+      `PdpAuditor`: periodic tick (every 10s) → per held cid, if past its jittered offset this epoch
+      (PDP_EPOCH_MS=60s) + not done + elected → resolve holders, challenge each (fresh random nonce),
+      verify_possession, issue+persist StorageReceipt to `<data>/pdp/receipts.jsonl`, log. done-set
+      pruned per epoch. Wired in main.rs (spawned loop; logs running total). Builds + clippy clean.
+- [ ] P4 gate + roll + live-validate — **BLOCKED: CRITICAL SOUNDNESS BREAK found by review 2026-07-14.**
+      The coefficient-cross-check verification relies on `vtags::verify`, which only checks ~8 FIXED
+      PUBLIC linear equations — a CORRUPTION detector (random bit-rot), NOT an adversarial possession
+      proof. An adaptive holder forges a passing proof with ZERO real data: trivially all-zeros
+      (coding_vector=[0;k], data=[0], expected=Σcᵢ·0=0, vtags dot(0,·)=0 → passes), OR generally via
+      Gaussian elimination solving the 8 equations for any chosen coding_vector. vtags.rs's OWN docs
+      admit this ("an adaptive attacker who solves the published linear constraints can craft pieces
+      that pass vtags") and name PDP as the intended defense — circular, since our PDP RELIES on vtags.
+      So a dishonest holder could farm valid StorageReceipts storing nothing → poisons the reputation
+      currency. This is a DESIGN gap (foundation's "coefficient cross-checking via vtags" is
+      cryptographically insufficient), not just impl. Also IMPORTANT: the auditor tick loop is an
+      unbounded O(held-cids) DHT-resolve storm every 10s (resolve re-runs for non-won cids every tick;
+      done-set only dedups winners; no pacing) — same class as [[zeph-dht-cutover-thrash]].
+      P1-P3 CODE STANDS (mechanism: challenge/response/receipt/loop is fine; the VERIFICATION is the
+      unsound part). NOT committed, NOT rolled. Needs a DESIGN DECISION on the sound path:
+      (B) homomorphic authenticators (Shacham-Waters PoR / per-piece tag at publish; sound + no-download;
+      heavy new crypto + format change — the vtags-doc upgrade path); (C) Merkle commitment per object +
+      spot-check (sound; needs root committed at publish + format change); (2) REFRAME as a possession
+      LIVENESS check (catches honest eviction/corruption like a stronger availability probe, NOT
+      adversarial) + defer true PDP; or pause K5 until the authenticator infra exists.
+
 # ATTESTATION SUBSTRATE (K7 / task #9) — building (2026-07-14)
 User-defined quorum AUTHORITY per VERIFICATION_ATTESTATION_MODEL.md + ATTESTATION_DESIGN.md: "do the
 specific parties I chose authorize this?" A program declares a named quorum (member pubkeys + k-of-n)
