@@ -16,7 +16,9 @@ use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use serde::{Deserialize, Serialize};
 use umbral_pre::{
-    decrypt_original, encrypt as umbral_encrypt, Capsule, PublicKey, SecretKey, SecretKeyFactory,
+    decrypt_original, decrypt_reencrypted, encrypt as umbral_encrypt, generate_kfrags,
+    reencrypt as umbral_reencrypt, Capsule, CapsuleFrag, KeyFrag, PublicKey, SecretKey,
+    SecretKeyFactory, Signer,
 };
 
 pub const DEK_LEN: usize = 32;
@@ -212,6 +214,98 @@ pub fn decrypt_self(kp: &EncKeypair, obj: &SealedObject) -> Result<Vec<u8>> {
     open(&dek, &obj.ciphertext)
 }
 
+// ─────────────────────────── Sharing — proxy re-encryption (K3) ─────────────────
+//
+// Umbral is a THRESHOLD PRE. To grant a recipient, the owner issues M-of-N re-encryption key
+// fragments (`ReKeyFrag`) to proxy nodes; each proxy transforms the owner's capsule into a
+// `ReCapsuleFrag` WITHOUT learning the DEK; the recipient collects `threshold` cfrags and recovers
+// the DEK with its OWN key. Additive — no change to `SealedObject`/`DekCapsule`. The threshold
+// secret-sharing is intrinsic to Umbral (no separate K4 primitive needed). Revoke = stop
+// re-encrypting / rotate the object's DEK.
+
+/// A re-encryption key fragment (one of an M-of-N grant). Serializable — it travels to a proxy
+/// node. Carries no plaintext and no DEK; useless without the recipient's secret key.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ReKeyFrag(KeyFrag);
+
+/// A re-encrypted capsule fragment produced by one proxy. Serializable — it travels to the
+/// recipient, who needs `threshold` of them.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ReCapsuleFrag(CapsuleFrag);
+
+/// Owner GRANTS access to `recipient_pk`: generate `shares` re-encryption key fragments, any
+/// `threshold` of which let the recipient recover the DEK. The owner's PRE key both delegates and
+/// signs the fragments (so proxies/recipients can verify the grant's origin).
+pub fn grant(
+    owner: &EncKeypair,
+    recipient_pk: &EncPublicKey,
+    threshold: usize,
+    shares: usize,
+) -> Vec<ReKeyFrag> {
+    let signer = Signer::new(owner.sk.clone());
+    generate_kfrags(
+        &owner.sk,
+        &recipient_pk.0,
+        &signer,
+        threshold,
+        shares,
+        true, // sign delegating key → verifiable against the owner
+        true, // sign receiving key → verifiable against the recipient
+    )
+    .iter()
+    .map(|vkf| ReKeyFrag(vkf.clone().unverify()))
+    .collect()
+}
+
+/// A PROXY re-encrypts `obj`'s capsule with one `kfrag` → a cfrag. Verifies the kfrag originated
+/// from `owner_pk` for `recipient_pk` first; learns no plaintext.
+pub fn reencrypt(
+    owner_pk: &EncPublicKey,
+    recipient_pk: &EncPublicKey,
+    obj: &SealedObject,
+    kfrag: &ReKeyFrag,
+) -> Result<ReCapsuleFrag> {
+    let verified = kfrag
+        .0
+        .clone()
+        .verify(&owner_pk.0, Some(&owner_pk.0), Some(&recipient_pk.0))
+        .map_err(|_| CipherError::Malformed("kfrag verify"))?;
+    let vcf = umbral_reencrypt(&obj.capsule.capsule, verified);
+    Ok(ReCapsuleFrag(vcf.unverify()))
+}
+
+/// The RECIPIENT combines `threshold` cfrags with its own key → the DEK → plaintext. Fails if
+/// fewer than `threshold` valid cfrags, if a cfrag is forged, or if this isn't the granted recipient.
+pub fn decrypt_granted(
+    recipient: &EncKeypair,
+    owner_pk: &EncPublicKey,
+    obj: &SealedObject,
+    cfrags: &[ReCapsuleFrag],
+) -> Result<Vec<u8>> {
+    let recipient_pk = recipient.public();
+    let mut verified = Vec::with_capacity(cfrags.len());
+    for cf in cfrags {
+        let v = cf
+            .0
+            .clone()
+            .verify(
+                &obj.capsule.capsule,
+                &owner_pk.0,     // verifying key (the grant's signer)
+                &owner_pk.0,     // delegating key
+                &recipient_pk.0, // receiving key
+            )
+            .map_err(|_| CipherError::Decrypt)?;
+        verified.push(v);
+    }
+    let dek_bytes =
+        decrypt_reencrypted(&recipient.sk, &owner_pk.0, &obj.capsule.capsule, verified, &obj.capsule.enc_dek)
+            .map_err(|_| CipherError::Decrypt)?;
+    let arr: [u8; DEK_LEN] = dek_bytes[..]
+        .try_into()
+        .map_err(|_| CipherError::Malformed("dek length"))?;
+    open(&Dek::from_bytes(arr), &obj.ciphertext)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,6 +374,59 @@ mod tests {
             decrypt_self(&other, &obj),
             Err(CipherError::Decrypt)
         ));
+    }
+
+    #[test]
+    fn grant_lets_a_recipient_decrypt_via_threshold_reencryption() {
+        let owner = EncKeypair::from_identity_seed(&[1u8; 32]);
+        let bob = EncKeypair::from_identity_seed(&[2u8; 32]);
+        let msg = b"shared with bob, proxies never see it";
+        let obj = encrypt(&owner.public(), msg);
+
+        // Owner grants 2-of-3 to Bob (M-of-N kfrags — the threshold is intrinsic to Umbral).
+        let kfrags = grant(&owner, &bob.public(), 2, 3);
+        assert_eq!(kfrags.len(), 3);
+
+        // Two proxies re-encrypt (each learns no plaintext).
+        let cfrags: Vec<ReCapsuleFrag> = kfrags
+            .iter()
+            .take(2)
+            .map(|kf| reencrypt(&owner.public(), &bob.public(), &obj, kf).unwrap())
+            .collect();
+
+        // Bob recovers the plaintext with his own key + the threshold of cfrags.
+        assert_eq!(
+            decrypt_granted(&bob, &owner.public(), &obj, &cfrags).unwrap(),
+            msg
+        );
+
+        // Below threshold (1 of 2 needed) → fails.
+        assert!(decrypt_granted(&bob, &owner.public(), &obj, &cfrags[..1]).is_err());
+
+        // A non-recipient can't decrypt even holding the cfrags (they were made for Bob's key).
+        let carol = EncKeypair::from_identity_seed(&[9u8; 32]);
+        assert!(decrypt_granted(&carol, &owner.public(), &obj, &cfrags).is_err());
+
+        // The owner still self-decrypts (grant is additive, not a handover).
+        assert_eq!(decrypt_self(&owner, &obj).unwrap(), msg);
+    }
+
+    #[test]
+    fn kfrags_and_cfrags_roundtrip_over_the_wire() {
+        let owner = EncKeypair::from_identity_seed(&[4u8; 32]);
+        let bob = EncKeypair::from_identity_seed(&[5u8; 32]);
+        let obj = encrypt(&owner.public(), b"wire-serialized grant");
+
+        // A kfrag serializes (owner → proxy).
+        let kfrag = &grant(&owner, &bob.public(), 2, 2)[0];
+        let kf_bytes = postcard::to_allocvec(kfrag).unwrap();
+        let kfrag2: ReKeyFrag = postcard::from_bytes(&kf_bytes).unwrap();
+
+        // A cfrag serializes (proxy → recipient).
+        let cfrag = reencrypt(&owner.public(), &bob.public(), &obj, &kfrag2).unwrap();
+        let cf_bytes = postcard::to_allocvec(&cfrag).unwrap();
+        let _cfrag2: ReCapsuleFrag = postcard::from_bytes(&cf_bytes).unwrap();
+        assert!(!kf_bytes.is_empty() && !cf_bytes.is_empty());
     }
 
     #[test]

@@ -12,11 +12,16 @@ capsule WITHOUT seeing plaintext; recipient collects M **cfrags** + decrypts wit
 Revoke = stop re-encrypting / rotate. Grants (who may access) = policy on top (app decides).
 
 PHASES (each: build+test):
-- [ ] P1 cipher PRE sharing ops: wrap `umbral_pre::{generate_kfrags, reencrypt, decrypt_reencrypted}` —
-      `grant(owner_sk, recipient_pk, threshold M, n) -> Vec<KeyFrag>`; proxy `reencrypt(capsule, kfrag)
-      -> CapsuleFrag`; recipient `open_reencrypted(recipient_sk, owner_pk, capsule, [cfrags], sealed) ->
-      plaintext`. Offline tests: owner→Bob grant, M-of-N proxies reencrypt, Bob decrypts; < M fails;
-      wrong recipient fails; revoke (no reencrypt) → Bob can't open.
+- [x] P1 cipher PRE sharing ops DONE 2026-07-14 (`crates/cipher/src/lib.rs`): `ReKeyFrag`/`ReCapsuleFrag`
+      (serde-serializable wire types); `grant(owner, recipient_pk, threshold, shares) -> Vec<ReKeyFrag>`
+      (Umbral `generate_kfrags`, owner PRE key delegates+signs); `reencrypt(owner_pk, recipient_pk, obj,
+      kfrag) -> ReCapsuleFrag` (proxy verifies kfrag origin then `umbral_reencrypt`; no plaintext);
+      `decrypt_granted(recipient, owner_pk, obj, cfrags)` (verify cfrags → `decrypt_reencrypted` → DEK →
+      open). Additive — no change to SealedObject/DekCapsule; owner self-decrypt unaffected. 2 tests
+      (8 total pass): 2-of-3 grant→2 proxies reencrypt→Bob decrypts, <threshold fails, non-recipient
+      fails, owner still self-decrypts; kfrag/cfrag postcard roundtrip. clippy clean. Added postcard
+      dev-dep to cipher. NOTE confirmed: crypto-shred (destroy capsule) already in cipher — single-key,
+      K4 not needed.
 - [ ] P2 host ABI: `Capability::Pre` (app/full profile only — non-deterministic key ops), host fns
       `pre_rekey`(owner generates kfrags for recipient_pk) + `pre_reencrypt`(proxy applies a kfrag).
       Mirror the K2/verify/attest host-fn pattern (transition.rs bind + capability.rs grant + test).
