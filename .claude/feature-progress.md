@@ -58,8 +58,20 @@ overturned the original P2 plan (`pre_rekey`+`pre_reencrypt` raw-key host fns):*
       Full workspace builds, com tests pass, clippy+fmt clean. Grant-row storage + kfrag distribution stay
       app-orchestrated (existing `sql_execute` + kfrags-as-data); reencrypt is pure WASM. (Note: hit + cleared
       a host disk-full/APFS-snapshot-pinned blocker mid-build; user freed space.)
-- [ ] P4 gate + validate. Additive (new app-profile host fn + a backend method with a default) → mixed-version
-      safe, no simultaneous roll; validate a real grant→reencrypt→decrypt on the fleet.
+- [x] P4 gate + roll DONE 2026-07-15 — `deploy/gate.sh --quick` 🟢 PASSED (fmt + clippy -D + full workspace
+      tests; A-G skipped, sanctioned for local-logic). STAGGERED roll of all 4 Hetzner nodes (additive/local,
+      wire-unchanged → mixed-version-safe): rsync `crates/` → box build (1m24s, clean) → install → restart
+      zeph2→zeph3→zeph4→zeph one-at-a-time. Every node came back active, NRestarts=0, reconverged to 3 distinct
+      alive peers (the current baseline — Mac node stopped, so 3 not the stale note's "4"), 0 panics. Backup
+      `zeph.bak-20260714-2304`. Commits `54ec26f`/`454752c`/`671d88a` pushed to origin. Mac node skipped (stopped
+      per [[zeph-fleet-deploy]]). No cross-node behavior to live-validate (pre_grant is a local host fn); the
+      real grant→reencrypt→decrypt path is covered by the P3 live-CraftBackend integration test.
+
+**K3 COMPLETE (2026-07-15).** Sharing-via-proxy-re-encryption substrate is built, tested, and live. Mechanism
+in the kernel (cipher PRE ops + `pre_grant` host fn + owner-DB grant model); products (file-share w/ access
+control, followers-only feeds, shared encrypted DBs) are the app layer on top. Deferred follow-ons: a demo
+app for a live cross-node grant (optional — integration test covers the path); ENCRYPTION_DESIGN §9b prose
+reconcile ("grant record = owner-DB row, not a registry record / no single-writer").
 NOTE: it's "add the re-encryption ops" not merely "expose" — cipher has encrypt/self-open but not the
 kfrag/reencrypt side yet (both are in the `umbral_pre` dep, just unwired). Still cheap.
 
