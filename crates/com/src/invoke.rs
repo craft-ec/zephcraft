@@ -74,7 +74,15 @@ impl InvokeService {
     /// publishing an `app.wasm` just works. Apps run under [`CapabilityGrant::full`]
     /// (sql/obj/clock/caller) against this node's identity-bound backend; they have no
     /// account blob, so `prev_state` is empty.
-    pub async fn invoke(&self, req: &InvokeRequest, caller: [u8; 32]) -> anyhow::Result<Vec<u8>> {
+    /// `program_owner` is the app's registry-authenticated owner (the resolved publisher), or `None`
+    /// when invoked by raw cid / remotely — it drives the `attest` host fn's quorum lookup and MUST
+    /// be resolved by this node, never taken from the request (else a caller self-authorizes).
+    pub async fn invoke(
+        &self,
+        req: &InvokeRequest,
+        caller: [u8; 32],
+        program_owner: Option<[u8; 32]>,
+    ) -> anyhow::Result<Vec<u8>> {
         let raw = self.obj.get(Cid(req.wasm_cid), ConsumeMode::Drop).await?;
         let wasm = match zeph_obj::Manifest::decode(&raw) {
             Some(zeph_obj::Manifest::File { content, .. }) => {
@@ -95,6 +103,7 @@ impl InvokeService {
         // Name the program (content cid) so a `verify` call can point verifiers at the same wasm,
         // and hand it the backend that posts + awaits the certificate.
         .with_program(Cid::of(&wasm).0)
+        .with_program_owner(program_owner)
         .with_verify_backend(self.verify_backend.clone())
         .with_attest_backend(self.attest_backend.clone());
         self.runtime
@@ -136,7 +145,10 @@ pub async fn serve_invocations(
             };
             let mut resp = Vec::new();
             match postcard::from_bytes::<InvokeRequest>(&bytes) {
-                Ok(req) => match service.invoke(&req, caller).await {
+                // Remote invocation: the request carries only a cid, so there is no node-authenticated
+                // program owner → `None` (attest reports UNAVAILABLE rather than trust a wire-supplied
+                // owner). Remote attest would need the node to resolve the app NAME itself (future).
+                Ok(req) => match service.invoke(&req, caller, None).await {
                     Ok(out) => {
                         resp.push(0x01);
                         resp.extend_from_slice(&out);

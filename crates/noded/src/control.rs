@@ -1457,8 +1457,20 @@ async fn rpc_attest_status(
     let Some(stmt) = req["params"].get("statement").and_then(|v| v.as_str()) else {
         return rpc_err(id, "attest_status needs 'statement'".into());
     };
-    let authorized = state.attest.is_authorized(&program, stmt.as_bytes()).await;
-    serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"authorized": authorized}})
+    // The quorum is keyed by (owner, program). Default owner = this node (checking a program you
+    // own); pass `owner` (64 hex) to check another owner's quorum for the program.
+    let owner = match req["params"].get("owner").and_then(|v| v.as_str()) {
+        Some(o) => match parse_node_id(o) {
+            Some(n) => n.0,
+            None => return rpc_err(id, "owner must be 64 hex chars".into()),
+        },
+        None => state.attest.owner(),
+    };
+    let authorized = state
+        .attest
+        .is_authorized(&owner, &program, stmt.as_bytes())
+        .await;
+    serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"authorized": authorized, "owner": hex::encode(owner)}})
 }
 
 /// Deploy `bytes` as a system app under `name`: publish a want-based system object,
@@ -1536,7 +1548,11 @@ async fn rpc_invoke(
     let func = p.get("func").and_then(|v| v.as_str()).unwrap_or("run");
     // Resolve the app's WASM cid — by NAME (`<pubhex>/<name>` or `<name>` = own,
     // via the signed KIND_APP head) or by a raw `wasm_cid`.
-    let (wasm_cid, default_ns) = if let Some(nm) = p
+    // `program_owner` = the registry-authenticated publisher when resolved by name — the identity
+    // whose declared quorum `attest` consults. `None` for a raw-cid invoke (no authenticated owner);
+    // it MUST come from this node's own registry resolution, never a caller-supplied field, so an
+    // invoker can't self-authorize.
+    let (wasm_cid, default_ns, program_owner) = if let Some(nm) = p
         .get("name")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
@@ -1552,13 +1568,13 @@ async fn rpc_invoke(
         // resolution (a non-writer queries the designated writer over REGISTRY_ALPN), so
         // there is no DHT/KIND_APP fallback — a `None` here is a genuine not-found.
         match state.registry.resolve(publisher.0, app_name).await {
-            Some(cid) => (cid, app_name.to_string()),
+            Some(cid) => (cid, app_name.to_string(), Some(publisher.0)),
             None => return rpc_err(id, format!("app '{nm}' not found (deploy it first?)")),
         }
     } else {
         let wasm_hex = p.get("wasm_cid").and_then(|v| v.as_str()).unwrap_or("");
         match parse_cid(wasm_hex) {
-            Some(cid) => (cid.0, String::new()),
+            Some(cid) => (cid.0, String::new(), None),
             None => return rpc_err(id, "provide 'name' or a 64-hex 'wasm_cid'".into()),
         }
     };
@@ -1583,7 +1599,7 @@ async fn rpc_invoke(
         func: func.to_string(),
         input,
     };
-    match state.com.invoke(&ireq, caller).await {
+    match state.com.invoke(&ireq, caller, program_owner).await {
         Ok(out) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
             "output": hex::encode(out)
         }}),
@@ -1932,7 +1948,8 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
             func: body.func,
             input: body.input.map(|s| s.into_bytes()).unwrap_or_default(),
         };
-        match ctx.state.com.invoke(&ireq, caller.0).await {
+        // Dashboard invoke is by raw cid → no registry-authenticated owner → attest UNAVAILABLE.
+        match ctx.state.com.invoke(&ireq, caller.0, None).await {
             Ok(out) => axum::Json(serde_json::json!({
                 "output": hex::encode(out)
             }))

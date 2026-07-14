@@ -64,6 +64,60 @@ Phases (each: build+test+gate+commit):
       (attest=1); with an unauthorized statement → committed [00] (attest=0). **ATTESTATION (#9)
       COMPLETE + LIVE.** Deferred enhancements: tag::ATTEST chain gossip (non-collector nodes);
       member-side policy-program auto-signing (the discrete-fact automated niche).
+- [x] P3-2b GLOBAL propagation DONE + LIVE 2026-07-14 (user: "it should be global attestation.
+      governance already is, if it is not, it is a downgrade and governance is broken"). Made
+      attestation cross-node like governance — NOT via tag::ATTEST gossip but via the SAME publish/pull
+      anti-entropy `GovernanceChainStore` uses, per program: `AttestStore` gained `obj`+`routing`+
+      `membership`; `publish(program_cid)` = `obj.publish_system(chain)` + `announce_app("\u{1}attest-
+      chain-<hex cid>", content_cid, seq+1)` (called after bootstrap/submit); `sync(program_cid)` pulls
+      each census peer via `resolve_app`+`obj.get`+File-deref+`QuorumChain::decode`, adopting the longest
+      VALID chain that shares the genesis; `is_authorized`/`attest()` sync-FIRST → any node answers.
+      `open()` +obj+routing; `set_membership` wired in main.rs. Review (feature-dev:code-reviewer)
+      CAUGHT a real bug pre-roll: `local_genesis` snapshotted once before the peer loop (gov-safe since
+      its genesis is fixed at open(); UNSAFE here — per-program genesis starts None) → a later higher-seq
+      peer with a DIFFERENT genesis could overwrite an in-loop adoption; FIXED by re-deriving genesis per
+      iteration. Gate --quick 🟢 (fmt+clippy -D+workspace tests; additive → no A-G needed). STAGGERED
+      roll of all 4 Hetzner nodes: active, NRestarts=0, 0 panics. LIVE GLOBAL SMOKE: collected a 2-of-2
+      {zeph,zeph2} "authorized" attestation ENTIRELY on zeph (submit→publish), then attest-status on
+      NON-member/NON-collector zeph3 AND zeph4 → authorized:true (~6s, they pulled zeph's chain);
+      unauthorized statement → false. Deferred: owner-signature genesis authentication (trust-on-fetch
+      today, honest-fleet-correct; hardening mirrors registry read verification).
+- [x] P3-2c OWNER-SIGNED GENESIS DONE + LIVE 2026-07-14 (user: "yes, build it now" — no downgrade vs gov).
+      Close the trust-on-fetch genesis hole so attestation's genesis trust root = as strong as
+      governance's (gov pins genesis from local CONFIG; attestation pins it to the program's REGISTERED
+      OWNER, reusing the owner-sig-verified registry). DESIGN: the genesis quorum is signed by the app
+      OWNER bound to program_cid (`Quorum::owner_signing_bytes(program_cid)`, domain
+      b"craftec/attest-genesis/1"); propagate an `AttestedChain{owner, owner_sig, chain}` envelope keyed
+      by (owner, program_cid); a fetching node adopts only if `owner_sig` verifies AND owner == the
+      registry-resolved program owner. The owner fed to `attest()` is SERVER-resolved from the
+      authenticated registry (rpc_invoke by-name → publisher = owner), NEVER caller-supplied (else an
+      invoker self-authorizes); raw --wasm invoke or remote invoke → owner None → attest UNAVAILABLE (safe).
+      BATCHES: (1) com/attestation.rs AttestedChain+owner_signing_bytes+verify; (2) com/transition.rs
+      program_owner + AttestBackend::attest(owner,program,stmt) + host fn -1 when owner None; (3)
+      com/invoke.rs invoke(req,caller,owner)+with_program_owner; (4) noded/attest.rs (owner,program) key
+      + envelope + owner-signed genesis + verify-on-adopt; (5) control rpc_invoke threads publisher-owner,
+      attest-status --owner, bootstrap owner=self; (6) gate+review+roll+smoke (real deployed owned app +
+      FORGERY negative: a peer publishing a fake genesis under a wrong owner is rejected).
+      OUTCOME: all 6 batches built; com 76 tests + noded attest 3 tests green (added owner_signed_genesis
+      trust-root test + the invoker-no-owner→UNAVAILABLE case + a persist-reload test). Gate --quick 🟢.
+      SECURITY REVIEW (feature-dev:code-reviewer, adversarial): NO bypass found (≥80) — domain-separated
+      (attest-genesis vs attest), program-cid-bound (no cross-program replay), verify checks owner-sig
+      AND fold, owner server-resolved never caller-supplied, sync rejects wrong-owner/forged, no path
+      traversal; traced the residual assumption (registry.resolve re-verifies owner sig bound to the
+      queried owner) into headreg.rs and CONFIRMED it holds at local + remote boundaries. STAGGERED roll
+      of all 4 nodes (wire-incompatible with P3-2b attest — new head-name + AttestedChain payload — but
+      attestation is ISOLATED/non-load-bearing + governance untouched → staggered safe; old attest chains
+      just fail to load): active, 0 restarts, 0 panics. LIVE SMOKES (all pass): (C) owner-signed GLOBAL —
+      collected a 2-of-2 authorization on zeph, non-collector zeph3 AND zeph4 pulled zeph's OWNER-SIGNED
+      chain, verified the sig, returned authorized:true (false for unauth). (E) anti-forgery owner-binding
+      — zeph2 (a different owner) published a valid self-signed quorum for program Q; on zeph3, Q under
+      owner=zeph → FALSE (no cross-owner forgery), under owner=zeph2 → TRUE. (D) full invoke-by-name on
+      NON-collector zeph3: `<zeph2>/attestapp` input "authorized" → committed 01, "nope" → 00, and RAW
+      --wasm (no registry-resolved owner) → committed ff (UNAVAILABLE) proving an invoker can't
+      self-authorize. **ATTESTATION GENESIS TRUST ROOT = as strong as governance's now.** ORTHOGONAL
+      finding (NOT this change): `deploy` on zeph fails "table heads has no column named sig" while zeph2
+      succeeds → a per-shard registry sig-column migration GAP (registry read-verification, 07-12), not
+      attestation; flagged in STATE_AND_ROADMAP §3.2. Nothing left deferred for attestation.
 OPEN Qs (from the design): what members attest to = arbitrary app statement (the one genuinely new
 piece over gov.rs, DONE in P1's AttestAction::Statement); liveness policy for a closed quorum
 (timeout/fallback); the member-signing policy (P3).

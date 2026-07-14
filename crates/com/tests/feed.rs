@@ -148,8 +148,14 @@ async fn federated_feed_aggregates_across_sovereign_participants() {
         func: "post".into(),
         input: Vec::new(),
     };
-    a.service.invoke(&post("feed"), a.node_id.0).await.unwrap();
-    b.service.invoke(&post("feed"), b.node_id.0).await.unwrap();
+    a.service
+        .invoke(&post("feed"), a.node_id.0, None)
+        .await
+        .unwrap();
+    b.service
+        .invoke(&post("feed"), b.node_id.0, None)
+        .await
+        .unwrap();
 
     // Give the heads a moment to announce so C can resolve them cross-node.
     tokio::time::sleep(std::time::Duration::from_millis(800)).await;
@@ -165,7 +171,7 @@ async fn federated_feed_aggregates_across_sovereign_participants() {
         func: "aggregate".into(),
         input,
     };
-    let out = c.service.invoke(&agg, c.node_id.0).await.unwrap();
+    let out = c.service.invoke(&agg, c.node_id.0, None).await.unwrap();
     assert_eq!(
         out,
         vec![2],

@@ -41,7 +41,7 @@ mod registry;
 mod transition;
 mod verification;
 pub use attestation::{
-    AttestAction, AttestProposal, Attestation, MemberSignature, Quorum, QuorumChain,
+    AttestAction, AttestProposal, Attestation, AttestedChain, MemberSignature, Quorum, QuorumChain,
 };
 pub use capability::{Capability, CapabilityGrant};
 pub use craft::CraftBackend;
@@ -106,5 +106,7 @@ pub trait VerifyBackend: Send + Sync {
 /// part of a re-run pure `f`.
 #[async_trait]
 pub trait AttestBackend: Send + Sync {
-    async fn attest(&self, program_cid: [u8; 32], statement: Vec<u8>) -> bool;
+    /// `owner` is the program's registry-authenticated owner — the quorum consulted is the OWNER's,
+    /// never the caller's. Returns whether the owner's quorum for `program_cid` authorized `statement`.
+    async fn attest(&self, owner: [u8; 32], program_cid: [u8; 32], statement: Vec<u8>) -> bool;
 }

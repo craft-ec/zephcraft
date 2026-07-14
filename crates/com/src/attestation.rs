@@ -26,6 +26,11 @@ use zeph_crypto::NodeIdentity;
 /// Domain tag separating an attestation signature from every other ed25519 use (incl. governance).
 const ATTEST_DOMAIN: &[u8] = b"craftec/attest/1";
 
+/// Domain tag for the OWNER's signature over a quorum's genesis (the global-adoption trust root).
+/// Distinct from `ATTEST_DOMAIN` (member sign-offs) so a member signature can never be replayed as
+/// an owner genesis authorization or vice-versa.
+const GENESIS_DOMAIN: &[u8] = b"craftec/attest-genesis/1";
+
 /// What a quorum authorizes at a given seq. Generalizes `GovAction`: the payload case is an
 /// **opaque, app-defined statement** (the app interprets it); the rest are self-amendment of the
 /// quorum itself (the reconfiguration path, identical to governance).
@@ -118,6 +123,17 @@ impl Quorum {
 
     pub fn is_member(&self, id: &[u8; 32]) -> bool {
         self.members.binary_search(id).is_ok()
+    }
+
+    /// The bytes an app OWNER signs to authenticate this quorum as the genesis for `program_cid`.
+    /// Bound to the program cid so an owner's genesis signature can't be replayed onto a different
+    /// program. This is the global-adoption trust root (see [`AttestedChain`]).
+    pub fn owner_signing_bytes(&self, program_cid: &[u8; 32]) -> Vec<u8> {
+        let mut b = Vec::with_capacity(GENESIS_DOMAIN.len() + 32 + 64);
+        b.extend_from_slice(GENESIS_DOMAIN);
+        b.extend_from_slice(program_cid);
+        b.extend_from_slice(&postcard::to_allocvec(self).unwrap_or_default());
+        b
     }
 
     /// **Shared substrate** (governance + attestation): count DISTINCT valid member signatures over
@@ -274,6 +290,60 @@ impl QuorumChain {
     }
 }
 
+/// A [`QuorumChain`] wrapped with its **owner authentication** — the trust root that makes global
+/// attestation sound WITHOUT trust-on-fetch. The program's owner (the identity that registered the
+/// program in the owner-signed head registry) signs the genesis quorum bound to the program cid;
+/// this signature travels with the chain. A fetching node adopts a chain only if `verify` passes
+/// AND `owner` equals the program owner it independently resolved from the registry — so a malicious
+/// peer can only ever publish a quorum under *its own* key, never spoof the real owner's.
+///
+/// This mirrors how governance authenticates its genesis: governance pins it from local **config**
+/// (operator trust); attestation pins it to the program's registered **owner** (owner trust). Only
+/// the genesis is owner-signed — the chain's *extensions* are already self-authenticating (they fold
+/// against the genesis member keys), so `owner_sig` is fixed as the chain grows.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttestedChain {
+    pub owner: [u8; 32],
+    /// The owner's ed25519 signature over `chain.genesis.owner_signing_bytes(program_cid)`.
+    pub owner_sig: Vec<u8>,
+    pub chain: QuorumChain,
+}
+
+impl AttestedChain {
+    /// The owner signs the chain's genesis (bound to `program_cid`) and wraps it.
+    pub fn new(owner_identity: &NodeIdentity, program_cid: &[u8; 32], chain: QuorumChain) -> Self {
+        let owner_sig = owner_identity
+            .sign(&chain.genesis.owner_signing_bytes(program_cid))
+            .to_vec();
+        Self {
+            owner: owner_identity.node_id().0,
+            owner_sig,
+            chain,
+        }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        postcard::to_allocvec(self).unwrap_or_default()
+    }
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        postcard::from_bytes(bytes).ok()
+    }
+
+    /// The trust-root check: the claimed `owner` really signed this genesis for this `program_cid`,
+    /// AND the chain folds cleanly. The caller additionally checks `owner == expected_owner` (the
+    /// registry-resolved program owner) before adopting a fetched chain.
+    pub fn verify(&self, program_cid: &[u8; 32]) -> bool {
+        let Ok(sig) = <[u8; 64]>::try_from(self.owner_sig.as_slice()) else {
+            return false;
+        };
+        NodeIdentity::verify(
+            &NodeId(self.owner),
+            &self.chain.genesis.owner_signing_bytes(program_cid),
+            &sig,
+        ) && self.chain.current().is_some()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,5 +484,46 @@ mod tests {
         let back = QuorumChain::decode(&chain.encode()).unwrap();
         assert_eq!(back, chain);
         assert!(back.is_authorized(b"ok"));
+    }
+
+    #[test]
+    fn owner_signed_genesis_is_the_only_thing_a_fetcher_adopts() {
+        let ids = members(2);
+        let owner = NodeIdentity::generate();
+        let program: [u8; 32] = [7u8; 32];
+        let chain = QuorumChain::new(quorum(&ids, 2));
+
+        // The real owner's signed envelope verifies for its program.
+        let att = AttestedChain::new(&owner, &program, chain.clone());
+        assert!(att.verify(&program));
+        assert_eq!(att.owner, owner.node_id().0);
+        // Roundtrips over the wire.
+        assert_eq!(AttestedChain::decode(&att.encode()).unwrap(), att);
+
+        // Bound to the program: the same signature does NOT authorize a different program (no replay).
+        let other_program: [u8; 32] = [8u8; 32];
+        assert!(!att.verify(&other_program));
+
+        // An attacker cannot forge the owner's authorization: signing the genesis with a DIFFERENT
+        // key while claiming the real owner's id fails (the sig won't verify against `owner`).
+        let attacker = NodeIdentity::generate();
+        let forged = AttestedChain {
+            owner: owner.node_id().0, // claim the real owner
+            owner_sig: attacker
+                .sign(&chain.genesis.owner_signing_bytes(&program))
+                .to_vec(),
+            chain: chain.clone(),
+        };
+        assert!(!forged.verify(&program), "forged owner signature rejected");
+
+        // A tampered chain (doesn't fold) is rejected even with a valid owner sig.
+        let mut bad_chain = chain.clone();
+        bad_chain.attestations.push(attest(
+            AttestAction::Statement(b"unsigned".to_vec()),
+            1,
+            &[], // zero signers → doesn't fold
+        ));
+        let bad = AttestedChain::new(&owner, &program, bad_chain);
+        assert!(!bad.verify(&program), "non-folding chain rejected");
     }
 }

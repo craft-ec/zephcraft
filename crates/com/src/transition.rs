@@ -66,6 +66,12 @@ pub struct TransitionCtx {
     /// The content cid of the WASM being run — named in a [`VerifyRequest`] so verifiers fetch +
     /// re-run the same program. Set by the invoker via [`Self::with_program`]; default `[0;32]`.
     program_cid: [u8; 32],
+    /// The program's authenticated OWNER, resolved by the invoking node from the (owner-signed)
+    /// registry — the identity whose declared quorum `attest` consults. `None` when the program was
+    /// invoked by raw cid or remotely (no authenticated owner) → `attest` reports UNAVAILABLE, so an
+    /// owner is NEVER caller-supplied (which would let an invoker self-authorize). Set via
+    /// [`Self::with_program_owner`].
+    program_owner: Option<[u8; 32]>,
     /// The node service the `verify` host fn drives (post a request + await the certificate).
     /// `None` on the deterministic/protocol path and during a verifier re-run — so `verify` reports
     /// UNAVAILABLE there. Set by the invoker via [`Self::with_verify_backend`].
@@ -97,6 +103,7 @@ impl TransitionCtx {
             backend,
             verify_mode: false,
             program_cid: [0u8; 32],
+            program_owner: None,
             verify_backend: None,
             attest_backend: None,
         }
@@ -114,6 +121,13 @@ impl TransitionCtx {
     /// [`CapabilityGrant::verifier`].
     pub fn in_verify_mode(mut self) -> Self {
         self.verify_mode = true;
+        self
+    }
+
+    /// Set the program's authenticated owner (the registry-resolved publisher). MUST come from the
+    /// invoking node's own registry resolution, never from a caller-supplied field.
+    pub fn with_program_owner(mut self, owner: Option<[u8; 32]>) -> Self {
+        self.program_owner = owner;
         self
     }
 
@@ -632,8 +646,13 @@ fn bind_granted(linker: &mut Linker<TransitionCtx>, grant: &CapabilityGrant) -> 
                     let Some(ab) = caller.data().attest_backend.clone() else {
                         return -1; // no attest backend wired → UNAVAILABLE
                     };
+                    let Some(owner) = caller.data().program_owner else {
+                        return -1; // no authenticated program owner (raw-cid / remote) → UNAVAILABLE
+                    };
                     let program_cid = caller.data().program_cid;
-                    i32::from(ab.attest(program_cid, statement).await) // 1 authorized / 0 rejected
+                    // The owner is the registry-authenticated program owner, so the quorum consulted
+                    // is the OWNER's, never the caller's — an invoker cannot self-authorize.
+                    i32::from(ab.attest(owner, program_cid, statement).await) // 1 authorized / 0 rejected
                 })
             },
         )?;
@@ -723,7 +742,12 @@ mod tests {
     struct MockAttest(bool);
     #[async_trait::async_trait]
     impl AttestBackend for MockAttest {
-        async fn attest(&self, _program_cid: [u8; 32], _statement: Vec<u8>) -> bool {
+        async fn attest(
+            &self,
+            _owner: [u8; 32],
+            _program_cid: [u8; 32],
+            _statement: Vec<u8>,
+        ) -> bool {
             self.0
         }
     }
@@ -739,8 +763,9 @@ mod tests {
     #[tokio::test]
     async fn attest_producer_path_returns_the_backend_authorization() {
         let rt = TransitionRuntime::new().unwrap();
-        // authorized → 1
+        // authorized → 1 (an authenticated program owner is present)
         let ctx = TransitionCtx::deterministic(vec![], vec![], 0)
+            .with_program_owner(Some([9u8; 32]))
             .with_attest_backend(Some(Arc::new(MockAttest(true))));
         assert_eq!(
             rt.run_program(
@@ -757,6 +782,7 @@ mod tests {
         );
         // rejected → 0
         let ctx = TransitionCtx::deterministic(vec![], vec![], 0)
+            .with_program_owner(Some([9u8; 32]))
             .with_attest_backend(Some(Arc::new(MockAttest(false))));
         assert_eq!(
             rt.run_program(
@@ -772,7 +798,8 @@ mod tests {
             "quorum rejected → 0"
         );
         // no backend → -1 (0xFF)
-        let ctx = TransitionCtx::deterministic(vec![], vec![], 0);
+        let ctx =
+            TransitionCtx::deterministic(vec![], vec![], 0).with_program_owner(Some([9u8; 32]));
         assert_eq!(
             rt.run_program(
                 ATTEST_ORCH_WAT,
@@ -785,6 +812,23 @@ mod tests {
             .unwrap(),
             vec![0xFF],
             "no attest backend → UNAVAILABLE (-1)"
+        );
+        // backend present but NO authenticated owner → -1: an invoker can't self-authorize by
+        // supplying an owner; without a registry-resolved owner, attest is UNAVAILABLE.
+        let ctx = TransitionCtx::deterministic(vec![], vec![], 0)
+            .with_attest_backend(Some(Arc::new(MockAttest(true))));
+        assert_eq!(
+            rt.run_program(
+                ATTEST_ORCH_WAT,
+                "run",
+                ctx,
+                DEFAULT_FUEL,
+                &CapabilityGrant::full()
+            )
+            .await
+            .unwrap(),
+            vec![0xFF],
+            "backend but no authenticated owner → UNAVAILABLE (-1)"
         );
         // inert on a verifier re-run → 2 (attestation is non-deterministic; a re-run must not trigger it)
         let ctx = TransitionCtx::deterministic(vec![], vec![], 0)

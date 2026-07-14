@@ -226,12 +226,16 @@ enum Command {
         #[arg(long)]
         attestation: String,
     },
-    /// Check whether a program's quorum has authorized a statement.
+    /// Check whether a program's quorum has authorized a statement. Defaults to THIS node's own
+    /// quorum for the program; pass `--owner <hex>` to check another owner's.
     AttestStatus {
         #[arg(long)]
         program: String,
         #[arg(long)]
         statement: String,
+        /// Owner node-id hex whose quorum to check (default: this node).
+        #[arg(long)]
+        owner: Option<String>,
     },
     /// Execute write SQL against your own CraftSQL database `ns`
     /// (commits + publishes the KIND_ROOT head).
@@ -534,11 +538,15 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
-        Some(Command::AttestStatus { program, statement }) => {
+        Some(Command::AttestStatus {
+            program,
+            statement,
+            owner,
+        }) => {
             cmd_attest(
                 &data_dir,
                 "attest_status",
-                serde_json::json!({"program": program, "statement": statement}),
+                serde_json::json!({"program": program, "statement": statement, "owner": owner}),
             )
             .await
         }
@@ -1374,8 +1382,10 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let board_service =
         board::BoardService::new(identity.clone(), transport.clone(), engine.clone());
     // The attestation store is the app runtime's attest() backend: per-program quorum chains;
-    // attest() = "is this statement authorized by the program's quorum?" (P3-1 local; P3-2 gossips).
-    let attest_store = attest::AttestStore::open(identity.clone(), data_dir);
+    // attest() = "is this statement authorized by the program's quorum?" GLOBAL like governance —
+    // each chain is published + pulled cross-node (obj + routing), so attest() works on any node.
+    let attest_store =
+        attest::AttestStore::open(identity.clone(), data_dir, engine.clone(), routing.clone());
     let com_service = Arc::new(zeph_com::InvokeService::new(
         zeph_com::TransitionRuntime::new()?,
         engine.clone(),
@@ -1773,6 +1783,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     governance_store.set_membership(membership.clone()).await;
     head_registry.set_membership(membership.clone()).await;
     board_service.set_membership(membership.clone()).await;
+    attest_store.set_membership(membership.clone()).await;
     head_registry.set_programs(governance_store.clone()).await;
     head_registry.clone().set_jobs(jobs.clone()).await;
 
