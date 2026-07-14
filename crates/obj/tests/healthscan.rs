@@ -159,6 +159,79 @@ async fn content_self_heals_after_holder_death() {
     );
 }
 
+/// K8 — the availability probe reveals a real deficit that an inflated/stale provider record
+/// hides, which the death test + census cannot. A holder that evicts (§31) keeps a lingering
+/// record (48h TTL) while staying ALIVE, and a record can simply claim more pieces than the holder
+/// now stores — the census can't tell (it tracks node liveness, not per-cid holding). Here the
+/// real holders are evicted below the floor while a GHOST stays alive and announces a full
+/// generation it does NOT hold, so the RECORD view sums ABOVE the floor and liveness says "up":
+/// both stale signals say "healthy". Only the AvailabilityProbe — asking each holder for its
+/// ACTUAL count — exposes the deficit. (Neuter `probe_availability` → this test fails, since the
+/// scan then trusts the inflated record and never flags the cid.)
+#[tokio::test]
+async fn availability_probe_reveals_deficit_a_stale_record_hides() {
+    let tracker = start_tracker();
+    let dirs: Vec<tempfile::TempDir> = (0..8).map(|_| tempfile::tempdir().unwrap()).collect();
+
+    let mut holders = Vec::new();
+    for dir in dirs.iter().take(5) {
+        let h = node(&tracker, dir.path()).await;
+        h.routing.announce_node(0, 0).await.unwrap();
+        // Census wired (as production): every node below stays ALIVE, so liveness alone says
+        // "healthy" — the probe is the only signal that reveals the missing pieces.
+        h.engine.set_liveness(std::sync::Arc::new(tracker.peers()));
+        holders.push(h);
+    }
+    let publisher = node(&tracker, dirs[6].path()).await;
+    let payload: Vec<u8> = (0..120_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 11) as u8)
+        .collect();
+    let cid = publisher.engine.publish(&payload, false).await.unwrap().cid;
+    holders[0].engine.want(cid).await.unwrap(); // WANTed → maintained (else it just fades)
+    let floor = 32usize; // n = target_pieces(K=8)
+    let spread = wait_have(&holders, cid, floor).await;
+    assert!(spread >= floor, "pushed the full generation across holders");
+    assert!(
+        holders[0].engine.store().piece_count(&cid) >= 2,
+        "scanner (holder 0) must hold pieces to scan"
+    );
+
+    // GHOST joins AFTER distribution, so it never receives real pieces. It's alive and will
+    // announce a fat record it does not back with any stored pieces.
+    let ghost = node(&tracker, dirs[5].path()).await;
+    ghost.routing.announce_node(0, 0).await.unwrap();
+    ghost
+        .engine
+        .set_liveness(std::sync::Arc::new(tracker.peers()));
+
+    // REAL deficit: evict every holder but holder 0 — they stay ALIVE (no kill), so their records
+    // and census entries are unchanged; only their pieces are gone.
+    for h in &holders[1..5] {
+        h.engine.store().forget(&cid).unwrap();
+    }
+    let real = verified_have(&holders, cid).await;
+    assert!(
+        real < floor,
+        "real availability {real} must be below the floor {floor}"
+    );
+
+    // The ghost announces a FULL generation it does not hold → the record-based total is now back
+    // above the floor. Records + census both say "healthy".
+    ghost
+        .routing
+        .announce(cid, floor as u32, false)
+        .await
+        .unwrap();
+
+    // Holder 0 scans once. Without the probe it sums the inflated records → not at risk. With the
+    // probe it asks each holder for its real count (evicted → 0, ghost → 0) → sees the deficit.
+    holders[0].engine.health_scan().await;
+    assert!(
+        holders[0].engine.is_at_risk(&cid),
+        "the availability probe must expose the real deficit the inflated record hid"
+    );
+}
+
 /// FADE demand dimension: content with recent FETCH activity (within the grace
 /// window) stays alive and is repaired — even with no pin and no want. This is
 /// the contrast to unwanted_content_fades (same setup, minus the fetch).

@@ -20,6 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use futures::StreamExt;
 use rand::rngs::OsRng;
 use zeph_core::{Cid, NodeId};
 use zeph_erasure::{encode, recode, target_pieces, vtags, CodedPiece, Decoder};
@@ -50,6 +51,11 @@ const INGEST_ANNOUNCE_DEBOUNCE_MS: u64 = 2000;
 const ALIVE_CACHE: Duration = Duration::from_secs(10);
 /// Timeout for a liveness probe (a connect attempt) when no membership source is wired.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+/// Max concurrent availability probes issued for ONE cid's holders (K8). Caps the fan-out per
+/// elected scan; combined with the elected-scan gate + the coordinator's bounded pool, total
+/// in-flight probes stay small. Probes are cheap mux requests (no piece transfer) on the shared
+/// per-peer connection, so this never churns connections.
+const PROBE_CONCURRENCY: usize = 16;
 /// Cids processed per chunk in the health-scan sweep + re-announce refresh. Between chunks the
 /// loop sleeps `ObjConfig::pace_delay`, bounding in-flight DHT ops and trickling the load
 /// instead of an O(N) burst — so both scale to thousands of cids without storming the overlay.
@@ -1483,6 +1489,24 @@ impl ObjEngine {
         alive
     }
 
+    /// GROUND-TRUTH availability (K8): ask `holder` how many pieces of `cid` it CURRENTLY holds.
+    /// A provider RECORD carries only a stale CLAIM (announced count, 48h TTL) — this asks the
+    /// holder to answer from its actual store. `None` on timeout / error / a non-ack reply (an
+    /// old peer that doesn't understand the probe): the caller then falls back to the record.
+    /// Cheap: one mux request/reply, no piece transfer. Also the issue-and-collect path the PDP
+    /// challenge (K5) extends from "do you have it?" into "prove it".
+    async fn probe_availability(
+        &self,
+        cid: Cid,
+        holder: &PeerAddr,
+    ) -> Option<wire::AvailabilityAck> {
+        let msg = wire::Message::AvailabilityProbe(wire::AvailabilityProbe { cid: cid.0 });
+        match request(&self.transport, holder, &msg, self.config.probe_timeout).await {
+            Ok(wire::Message::AvailabilityAck(ack)) => Some(ack),
+            _ => None,
+        }
+    }
+
     /// Scan ONE small chunk of cids — a coordinator-managed unit. Callers submit many of these,
     /// paced, so no single job sweeps the whole set or holds a slot while it sleeps. Verdicts
     /// roll into the engine's persistent at-risk / fading sets, so `report.at_risk`/`fading` are
@@ -1515,8 +1539,9 @@ impl ObjEngine {
             report.scanned += 1;
             let floor = target_pieces(gen.k as usize);
 
-            // Availability from live provider records (no per-cid probe). Record holders
-            // (addr + count) to both elect a repairer and target one.
+            // Availability = VERIFIED holdings (K8): self from the local store, each live provider
+            // by an AvailabilityProbe (below). Record holders (addr + count) to elect + target a
+            // repairer.
             let mut have = 0usize;
             let mut capable: Vec<NodeId> = Vec::new();
             let mut live: Vec<(NodeId, PeerAddr, u32, bool)> = Vec::new();
@@ -1531,30 +1556,49 @@ impl ObjEngine {
                     }
                 }
             }
-            // Read provider RECORDS directly — NO per-cid network probe. `resolve` already
-            // returns only live (non-expired) provider records with their piece counts, so
-            // probing each turned a single pass into 186 x providers x 2s timeouts. A repair
-            // PUSH verifies a holder's reachability at the moment it matters, so records are
-            // the right, fast signal for a periodic maintenance scan.
-            for p in &providers {
-                if p.node_id == me {
-                    continue;
+            // GROUND-TRUTH availability (K8). A provider RECORD carries only a stale CLAIM
+            // (announced count, 48h TTL). The census (`alive_set`) already drops DEAD holders fast
+            // (SWIM); the residual gap is an ALIVE holder that silently EVICTED the cid (§31) whose
+            // record lingers, inflating `have` and suppressing a needed repair — which the census
+            // cannot see (it tracks node liveness, not per-cid holding). So verify each census-live
+            // holder's ACTUAL holding with an AvailabilityProbe, CONCURRENTLY over the mux. (The old
+            // per-cid probe stormed because it was SEQUENTIAL 2s dials AND ran before the
+            // elected-scan gate existed; now only the elected scanner reaches here, for ONE cid, and
+            // the fan-out is capped + connection-reusing.) This is also the issue-and-collect path
+            // the PDP challenge (K5) extends. `has=false`/count 0 → evicted (drop); a probe that
+            // can't be answered → fall back to the record (WITH a census, a slow-but-alive holder it
+            // vouched for; WITHOUT one — tests — treat unreachable as gone, like `probe_alive`).
+            let has_census = alive_set.is_some();
+            // Owned (id, addr, claimed_count, claimed_pinned) for each census-live holder — owned so
+            // the concurrent probe futures don't borrow the provider records across an await.
+            let candidates: Vec<(NodeId, PeerAddr, u32, bool)> = providers
+                .iter()
+                .filter(|p| p.node_id != me)
+                .filter(|p| alive_set.as_ref().is_none_or(|s| s.contains(&p.node_id)))
+                .map(|p| (p.node_id, p.addr.clone(), p.piece_count, p.pinned))
+                .collect();
+            let verified: Vec<(NodeId, PeerAddr, u32, bool)> = futures::stream::iter(candidates)
+                .map(|(id, addr, rec_count, rec_pinned)| async move {
+                    let (count, pinned) = match self.probe_availability(cid, &addr).await {
+                        Some(ack) if ack.has => (ack.piece_count, ack.pinned), // verified truth
+                        Some(_) => (0, false),                                 // alive but evicted
+                        None if has_census => (rec_count, rec_pinned), // slow → trust record
+                        None => (0, false), // no census → unreachable = gone
+                    };
+                    (id, addr, count, pinned)
+                })
+                .buffer_unordered(PROBE_CONCURRENCY)
+                .collect()
+                .await;
+            for (id, addr, count, pinned) in verified {
+                if count == 0 && !pinned {
+                    continue; // verified non-holder (evicted / unreachable) — don't count
                 }
-                // Skip holders no longer alive: a dead holder's record lingers until TTL but its
-                // pieces are gone, so counting it would suppress a needed repair. Use the wired
-                // liveness source (membership) if present, else fall back to a cached probe.
-                let is_alive = match &alive_set {
-                    Some(set) => set.contains(&p.node_id),
-                    None => self.probe_alive(p.node_id, &p.addr).await,
-                };
-                if !is_alive {
-                    continue;
+                have += count as usize;
+                if count >= 2 || pinned {
+                    capable.push(id);
                 }
-                have += p.piece_count as usize;
-                if p.piece_count >= 2 || p.pinned {
-                    capable.push(p.node_id);
-                }
-                live.push((p.node_id, p.addr.clone(), p.piece_count, p.pinned));
+                live.push((id, addr, count, pinned));
             }
             // Include self if we hold but aren't (yet) in the provider records.
             if !seen_self {
