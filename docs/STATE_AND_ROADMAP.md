@@ -47,7 +47,7 @@ Transport substrate (mux/choke/offer-grant, §2); compute 0–4; DB-roots-on-reg
 ### 3.2 Real gaps — specced, not (fully) built (deferred by design unless noted)
 - **Membership death-detection [K10] — DONE + LIVE (2026-07-12).** Full SWIM active detection: per-member incarnation + Alive/Suspect/Dead ride the gossiped member map (SWIM merge ordering), indirect PING-REQ rules out one-hop blips, suspect→dead promotion, refutation-by-incarnation (also handles restarted-node rejoin), Dead census-excluded immediately + shown "down" fleet-wide. Deaths converge in ~seconds via gossip instead of the old ~30-120s TTL aging. Rolled simultaneously (wire-incompatible) + live-validated (kill→Dead ~35s; restart→rejoin).
 - PDP / storage receipts (M3) [K5]. Open computation verification (VERIFICATION_DESIGN) [K6/K7]. Crypto-shred Tier-0 [K4] — only best-effort fade shipped.
-- `random` capability declared but no host fn bound [K2] — bind or drop.
+- ~~`random` capability declared but no host fn bound [K2] — bind or drop.~~ **DONE 2026-07-14** — bound (chose bind: COMPUTE_EXECUTION_DESIGN puts `random` in the app profile alongside `wall_clock`). `random(out,len)` fills OS-CSPRNG bytes (≤64 KiB), granted in `full()` ONLY — the deterministic + verifier profiles deny it (tested: a deterministic-profile module importing `random` fails to instantiate), so consensus/verified programs still can't observe randomness.
 - File segmentation / K=32 (publish is a single whole-object generation at k=8); SIMD GF(2⁸) (scalar today); ephemeral ConsumeMode (aliased to Drop); `SIGNED_WRITE`/RPC-write CAS/delegation absent from the sql crate.
 - General anchor dispatcher [K1] — no governed-WASM program exists today (registry validation went native), so no plural anchor table is needed yet.
 - **Registry `sig`-column migration gap (found 2026-07-14).** `deploy` on the live `zeph` node fails `sqlite: table heads has no column named sig` while the SAME binary deploys fine on `zeph2` — a per-shard coverage gap in the read-verification `sig BLOB` idempotent `ADD COLUMN` migration (2026-07-12): a shard `heads` DB that predates the column, and whose node was the writer, wasn't migrated on open. Not an attestation issue (surfaced while smoke-testing owner-signed attestation). Fix: ensure the `ADD COLUMN` migration runs on EVERY shard DB open (incl. writer-elected takeovers), not only newly-created ones.
@@ -100,7 +100,7 @@ The minimal-kernel bet is largely won: the substrate (account model + unified ru
 | # | Primitive | Kind | Unlocks | Status |
 |---|---|---|---|---|
 | **K1** | Anchor dispatcher + config registry | substrate | governed protocol programs; governed config | **Config half DONE** (`SetConfig` consumed → `shard_bits`). Anchor half **reframed** — registry validation went native; a plural anchor table is only needed when a genuinely governed-WASM program appears. |
-| **K2** | `random` host fn | capability | full-profile apps needing randomness | Declared, unbound. Trivial — bind or drop. |
+| **K2** | `random` host fn | capability | full-profile apps needing randomness | **DONE + tested 2026-07-14.** Bound `random(out,len)` → OS-CSPRNG bytes (≤64 KiB), app (`full`) profile only; deterministic + verifier profiles deny it (a consensus/verified program can't observe randomness). |
 | **K3** | Proxy re-encryption ops (PRE rekey + reencrypt) | capability | **sharing / grants** | `cipher` has Umbral PRE; expose as host fns. Grants are policy on top. |
 | **K4** | Threshold secret-sharing (split/combine/destroy) | capability | key-share crypto-shred; k-of-n secrets | Only path to *probabilistic* deletion (a trust, not a proof). |
 | **K5** | PDP challenge/response (+ holder proof over pieces) | wire+storage | storage proofs → reputation; M3 | Holder proof relates to vtags; reputation is policy above it. |
@@ -120,7 +120,7 @@ Cross-references kernel primitives as **[Kn]**.
 
 **Tier 0 — reconciliation & hygiene (now; cheap, low-risk):**
 - Doc-reconciliation sweep of the stale *design* docs in §3.4 — purge attested/committee/tracker/Pkarr/fixed-shard framing; fix ENCRYPTION §8's impossible "guaranteed shred"; fix the writer-election docstring.
-- Hygiene: bind-or-drop `random` [K2]; commit `guestbook-wasm`; tick the done boxes.
+- Hygiene: ~~bind-or-drop `random` [K2]~~ (DONE — bound, app-profile only); commit `guestbook-wasm`; tick the done boxes.
 
 **Tier 1 — registry scaling ceiling — ✅ COMPLETE:** census election + state migration, dynamic sharding [K9], SQL-backed registry + O(held) loops, and digest/delta membership gossip [S1] (O(1) steady-state) all landed and proven live (§2, §5). Residual (secondary): coalesce head publishes at very high write rates; churn hysteresis.
 

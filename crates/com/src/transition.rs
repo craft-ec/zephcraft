@@ -26,6 +26,10 @@ use crate::{AppBackend, AttestBackend, Capability, CapabilityGrant, VerifyBacken
 /// namespace with the capability runtime, but exposes only `input` + `commit` + `state`).
 const TRANSITION_HOST_MODULE: &str = "craftcom";
 
+/// Max bytes a single `random` call fills — bounds the host-side allocation so a caller can't
+/// request a huge buffer (a DoS). Ample for keys/nonces/seeds; an app needing more loops.
+const MAX_RANDOM: i32 = 1 << 16;
+
 /// A deterministic WASM runner. Restricted ABI: the program reads `input` and declares
 /// its `output` via `commit` — and nothing else — so every honest node computes the
 /// identical output. Async, fuel-metered `Engine` (async so this unified runtime can await
@@ -568,6 +572,31 @@ fn bind_granted(linker: &mut Linker<TransitionCtx>, grant: &CapabilityGrant) -> 
                         Some(backend) => backend.now_millis() as i64,
                         None => 0,
                     }
+                })
+            },
+        )?;
+    }
+    if grant.allows(Capability::Random) {
+        // `random(out_ptr, len) -> i32` — fill `len` bytes at `out_ptr` with cryptographically
+        // secure random from the node's OS CSPRNG. Non-reproducible, so it binds ONLY under the app
+        // (full) profile — never the deterministic or verifier profiles — so a consensus/verified
+        // program can't import it (its output must be a pure function of its inputs). Returns the
+        // number of bytes written, or `-1` on a negative/oversized `len` or an out-of-bounds
+        // destination. Never panics.
+        linker.func_wrap_async(
+            TRANSITION_HOST_MODULE,
+            "random",
+            |mut caller: Caller<'_, TransitionCtx>, (out, len): (i32, i32)| {
+                Box::new(async move {
+                    if !(0..=MAX_RANDOM).contains(&len) {
+                        return -1i32;
+                    }
+                    let Some(mem) = det_memory(&mut caller) else {
+                        return -1;
+                    };
+                    let mut buf = vec![0u8; len as usize];
+                    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut buf);
+                    det_write(&mut caller, &mem, out, len, &buf)
                 })
             },
         )?;
@@ -1186,6 +1215,54 @@ mod tests {
             .await
             .is_err(),
             "deterministic profile must NOT bind the real per-node wall_clock"
+        );
+    }
+
+    // Fills 16 bytes via `random` and commits them — the producer path for the RNG host fn.
+    const RANDOM_WAT: &[u8] = br#"(module
+      (import "craftcom" "random" (func $random (param i32 i32) (result i32)))
+      (import "craftcom" "commit" (func $commit (param i32 i32) (result i32)))
+      (memory (export "memory") 1)
+      (func (export "run")
+        (drop (call $random (i32.const 0) (i32.const 16)))
+        (drop (call $commit (i32.const 0) (i32.const 16)))))"#;
+
+    #[tokio::test]
+    async fn random_fills_bytes_under_full_and_is_denied_under_deterministic() {
+        let rt = TransitionRuntime::new().unwrap();
+        // full profile: `random` is bound → 16 fresh bytes, and two runs differ (not a fixed buffer).
+        let run = || async {
+            rt.run_program(
+                RANDOM_WAT,
+                "run",
+                TransitionCtx::deterministic(vec![], vec![], 0),
+                DEFAULT_FUEL,
+                &CapabilityGrant::full(),
+            )
+            .await
+            .unwrap()
+        };
+        let a = run().await;
+        let b = run().await;
+        assert_eq!(a.len(), 16, "random wrote the requested 16 bytes");
+        assert_ne!(
+            a, b,
+            "two draws differ (astronomically unlikely to collide)"
+        );
+
+        // deterministic profile: `random` is NOT bound → the module fails to instantiate. This is the
+        // safety property — a consensus/verified program can never observe randomness.
+        assert!(
+            rt.run_program(
+                RANDOM_WAT,
+                "run",
+                TransitionCtx::deterministic(vec![], vec![], 0),
+                DEFAULT_FUEL,
+                &CapabilityGrant::deterministic(),
+            )
+            .await
+            .is_err(),
+            "deterministic profile must NOT bind random"
         );
     }
 }

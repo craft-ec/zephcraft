@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+rand.workspace = true
 wasmtime = { version = "27", features = ["async"] }
 zeph-core.workspace = true
 zeph-crypto.workspace = true
