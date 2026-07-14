@@ -1,3 +1,32 @@
+# K3 — SHARING via PROXY RE-ENCRYPTION (task #4) — TEED UP, next build (2026-07-14)
+The encrypted-grants substrate. `cipher` (`crates/cipher/src/lib.rs`) already has the OWNER side: `Dek`
++ `seal`/`open` (XChaCha20), `EncSecretKey`/`EncPublicKey` (PRE keypair, `from_identity_seed`),
+`DekCapsule` + `encapsulate` (the DEK encapsulated under the owner's key via `umbral_pre::encrypt`),
+self-open via `decrypt_original`. Crypto-shred = destroy the capsule → DEK unrecoverable (single-key,
+already the design — confirms K4 not needed for shred). MISSING = the SHARING (re-encryption) ops.
+
+DESIGN (decided 2026-07-14): sharing = **Umbral threshold PRE** — the whole substrate; K4 NOT needed
+(Umbral's M-of-N kfrags ARE the threshold secret-sharing, built in). Owner encrypts once; to grant a
+recipient, owner issues M-of-N **kfrags** (re-encryption key fragments) to proxy nodes who transform the
+capsule WITHOUT seeing plaintext; recipient collects M **cfrags** + decrypts with their own key.
+Revoke = stop re-encrypting / rotate. Grants (who may access) = policy on top (app decides).
+
+PHASES (each: build+test):
+- [ ] P1 cipher PRE sharing ops: wrap `umbral_pre::{generate_kfrags, reencrypt, decrypt_reencrypted}` —
+      `grant(owner_sk, recipient_pk, threshold M, n) -> Vec<KeyFrag>`; proxy `reencrypt(capsule, kfrag)
+      -> CapsuleFrag`; recipient `open_reencrypted(recipient_sk, owner_pk, capsule, [cfrags], sealed) ->
+      plaintext`. Offline tests: owner→Bob grant, M-of-N proxies reencrypt, Bob decrypts; < M fails;
+      wrong recipient fails; revoke (no reencrypt) → Bob can't open.
+- [ ] P2 host ABI: `Capability::Pre` (app/full profile only — non-deterministic key ops), host fns
+      `pre_rekey`(owner generates kfrags for recipient_pk) + `pre_reencrypt`(proxy applies a kfrag).
+      Mirror the K2/verify/attest host-fn pattern (transition.rs bind + capability.rs grant + test).
+- [ ] P3 wire + node glue if grants/kfrags travel over the network (a proxy node receives a kfrag +
+      reencrypts on request) — OR keep P2 app-orchestrated (kfrags passed as data, like attestation's
+      hex-passing). Decide app-orchestrated vs node-service at P3.
+- [ ] P4 gate + (roll if a wire/node service added; else it's additive/inert) + validate.
+NOTE: it's "add the re-encryption ops" not merely "expose" — cipher has encrypt/self-open but not the
+kfrag/reencrypt side yet (both are in the `umbral_pre` dep, just unwired). Still cheap.
+
 # PDP — PROOF OF DATA POSSESSION (K5 / task #3) — vtags approach SHELVED; lattice-LHS = future milestone (2026-07-14)
 
 **OUTCOME: the vtags-based P1-P3 (below) is SHELVED to `git stash` ("K5 PDP (vtags-based) — SHELVED..."),
