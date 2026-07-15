@@ -79,8 +79,10 @@ file's segments — CO §76/§286/§298).
       `get_private` fetch segments with bounded read-ahead concurrency (`buffered(SEGMENT_PREFETCH=8)`,
       order-preserving). (3) **CLI range read:** `zeph get <cid> -o <path> --offset N --length M` → control
       RPC → `fetch_file_range`/`get_private_range` (private auto-detected via the envelope). obj tests pass,
-      clippy+fmt clean, workspace builds. (Host-fn range read for WASM apps remains a small further step —
-      needs an AppBackend obj-range method.)
+      clippy+fmt clean, workspace builds. (4) **WASM host-fn range read DONE:** `AppBackend::obj_get_range`
+      (default errors; `CraftBackend` → `fetch_file_range`) + the `obj_get_range(cid, offset, len, out, cap)`
+      host fn under `Capability::Obj`. Test: a WASM program reads a file slice `[10,30)` by manifest cid →
+      correct bytes. **FILE SEGMENTATION fully complete — all follow-ups closed.**
 
 ---
 

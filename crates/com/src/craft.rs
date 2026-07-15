@@ -82,6 +82,11 @@ impl AppBackend for CraftBackend {
         self.obj.get(Cid(cid), ConsumeMode::Drop).await
     }
 
+    async fn obj_get_range(&self, cid: [u8; 32], offset: u64, len: u64) -> anyhow::Result<Vec<u8>> {
+        // A range read follows the FILE manifest and fetches only the covering segments.
+        self.obj.fetch_file_range(Cid(cid), offset, len).await
+    }
+
     fn now_millis(&self) -> u64 {
         self.clock.now().millis()
     }

@@ -29,6 +29,8 @@
 //!   app namespace of `owner` (own if `owner_len==0`); result-JSON length written.
 //! - `obj_put(ptr, len, out, cap) -> i32` — store bytes; writes the 32-byte CID.
 //! - `obj_get(cid_ptr, out, cap) -> i32` — fetch by CID; content length written.
+//! - `obj_get_range(cid_ptr, offset, len, out, cap) -> i32` — range/partial read of a FILE by its
+//!   manifest cid; writes `[offset, offset+len)`, fetching only the covering segments.
 
 use async_trait::async_trait;
 
@@ -83,6 +85,18 @@ pub trait AppBackend: Send + Sync {
     async fn obj_put(&self, data: &[u8]) -> anyhow::Result<[u8; 32]>;
     /// Fetch an app object by CID.
     async fn obj_get(&self, cid: [u8; 32]) -> anyhow::Result<Vec<u8>>;
+    /// Range/partial read of a FILE by its manifest cid — returns the bytes in
+    /// `[offset, offset+len)`, fetching only the covering segments (streaming/seek over large
+    /// files, CRAFTOBJ §416). Default errors — backends that don't wire it report unavailable;
+    /// the noded backend overrides it with `ObjEngine::fetch_file_range`.
+    async fn obj_get_range(
+        &self,
+        _cid: [u8; 32],
+        _offset: u64,
+        _len: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        anyhow::bail!("obj range read not supported by this backend")
+    }
     /// Current HLC time in millis (sync — no IO).
     fn now_millis(&self) -> u64;
     /// Runtime-mediated PRE delegation (K3 sharing, `ENCRYPTION_DESIGN §9b/§13`): derive THIS

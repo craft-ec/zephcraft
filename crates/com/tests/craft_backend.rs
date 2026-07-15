@@ -215,3 +215,65 @@ async fn craftbackend_pre_grant_delegates_this_identitys_data() {
         "the recipient decrypts data the real CraftBackend delegated — owner key never left the backend"
     );
 }
+
+// The `obj_get_range` host fn: a WASM program reads a byte RANGE of a FILE (by its manifest cid,
+// passed as input) through the real CraftBackend → ObjEngine::fetch_file_range, and commits it.
+const OBJ_RANGE_WAT: &[u8] = br#"(module
+  (import "craftcom" "input"         (func $input (param i32 i32) (result i32)))
+  (import "craftcom" "obj_get_range" (func $range (param i32 i64 i64 i32 i32) (result i32)))
+  (import "craftcom" "commit"        (func $commit (param i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (func (export "run")
+    (local $n i32)
+    (drop (call $input (i32.const 0) (i32.const 32)))
+    (local.set $n
+      (call $range (i32.const 0) (i64.const 10) (i64.const 20) (i32.const 64) (i32.const 8000)))
+    (drop (call $commit (i32.const 64) (local.get $n)))))"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wasm_obj_get_range_reads_a_file_slice() {
+    let tracker = start_tracker();
+    let heads = MemHeads::new();
+    let dir = tempfile::tempdir().unwrap();
+    let (craftsql, engine) = node(&tracker, dir.path(), &heads).await;
+
+    // Publish a file (distinct bytes so a slice is meaningful) → manifest cid.
+    let data: Vec<u8> = (0..5000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 11) as u8)
+        .collect();
+    let fp = engine
+        .publish_file("f.bin", "application/octet-stream", &data, true)
+        .await
+        .unwrap();
+
+    let backend: Arc<dyn AppBackend> = Arc::new(CraftBackend::new(
+        craftsql,
+        engine,
+        Arc::new(Clock::new()),
+        zeph_cipher::EncKeypair::from_identity_seed(&[7u8; 32]),
+    ));
+    let rt = TransitionRuntime::new().unwrap();
+    let ctx = TransitionCtx::new(
+        Vec::new(),
+        fp.manifest_cid.0.to_vec(), // input: the file's manifest cid
+        [0u8; 32],
+        "app".into(),
+        0,
+        Some(backend),
+    );
+    let out = rt
+        .run_program(
+            OBJ_RANGE_WAT,
+            "run",
+            ctx,
+            DEFAULT_FUEL,
+            &CapabilityGrant::full(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        out,
+        data[10..30],
+        "obj_get_range returned the file slice [10, 30)"
+    );
+}

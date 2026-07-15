@@ -542,6 +542,40 @@ fn bind_granted(linker: &mut Linker<TransitionCtx>, grant: &CapabilityGrant) -> 
                 })
             },
         )?;
+        // `obj_get_range(cid_ptr, offset, len, out, cap) -> i32` — RANGE/partial read of a FILE by its
+        // manifest cid: writes the bytes in `[offset, offset+len)`, fetching only the covering segments
+        // (streaming/seek over large files). Negative offset/len or no backend → -1; else the byte
+        // length written (or -1 if it exceeds `cap`). Never panics.
+        linker.func_wrap_async(
+            TRANSITION_HOST_MODULE,
+            "obj_get_range",
+            |mut caller: Caller<'_, TransitionCtx>,
+             (cid_ptr, offset, len, out, cap): (i32, i64, i64, i32, i32)| {
+                Box::new(async move {
+                    if offset < 0 || len < 0 {
+                        return -1i32;
+                    }
+                    let Some(mem) = det_memory(&mut caller) else {
+                        return -1;
+                    };
+                    let cid = match det_read(&caller, &mem, cid_ptr, 32) {
+                        Some(b) if b.len() == 32 => {
+                            let mut a = [0u8; 32];
+                            a.copy_from_slice(&b);
+                            a
+                        }
+                        _ => return -1,
+                    };
+                    let Some(backend) = caller.data().backend.clone() else {
+                        return -1;
+                    };
+                    match backend.obj_get_range(cid, offset as u64, len as u64).await {
+                        Ok(data) => det_write(&mut caller, &mem, out, cap, &data),
+                        Err(_) => -1,
+                    }
+                })
+            },
+        )?;
     }
     if grant.allows(Capability::Clock) {
         // `clock() -> i64` — the CONSENSUS timestamp (`ctx.now`): the writer's HLC value,
