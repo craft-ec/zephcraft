@@ -67,11 +67,17 @@ Phases (each: build+test → design-check → review → commit):
         node's OWN account (account==self.me()); multi-member writes ride `submit` with a pre-authored write.
         Tests: forged/impostor/garbage-sig write refused (com `an_unauthenticated_write_is_never_ordered`);
         store tests author writes. Gates: com 85 tests + noded 22, fmt, clippy, `cargo build --workspace`.
-  - [ ] **P4b — Multi-member auto-collection** (the leaderless sig-accumulate): members auto-sign a well-formed,
-        owner-authentic, non-equivocating proposal as it propagates cross-node; commit at k. The structural
+  - [x] **P4b-1 — owner_sig ABI DONE 2026-07-15.** `sequence(account_ptr, nonce, payload_ptr, len,
+        owner_sig_ptr) -> i32` now takes a PRE-AUTHORED write (the account owner's 64-byte owner_sig read at
+        owner_sig_ptr); `SequenceBackend::sequence(owner, program, SequencedWrite)`; the store orders ANY
+        owner-authentic write (dropped the account==self restriction) as a quorum member. Test: a node orders
+        alice's pre-authored write; a spoofed (wrong-signer) write is refused. Gates: com 9 seq + transition
+        producer, noded 5 seq, fmt, clippy, `cargo build --workspace`.
+  - [ ] **P4b-2 — Multi-member auto-collection** (the leaderless sig-accumulate): a new sign-solicitation wire
+        (collector → each quorum member → auto-signed ORDERING sig back), pending-proposal accumulation, commit
+        at k, + a persistent per-member signed-set for cross-restart non-equivocation. The structural
         non-equivocation invariant (`SequencerMember`) already refuses a 2nd conflicting `(account,nonce)`.
-        Needs: a sign-solicitation/gossip wire + pending-proposal accumulation + the owner_sig ABI to convey a
-        pre-authored write through the `sequence` host fn. (Until then: `submit` with explicitly-gathered sigs.)
+        (Until then: k=1 auto-commits; k>1 uses `submit` with explicitly-gathered sigs.)
 
 ---
 

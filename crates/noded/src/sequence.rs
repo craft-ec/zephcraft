@@ -293,30 +293,24 @@ fn parse32(hex: &str) -> Option<[u8; 32]> {
 
 #[async_trait::async_trait]
 impl SequenceBackend for SequenceStore {
-    /// The `sequence` host fn's write path: order `(account, nonce, payload)` under `owner`'s quorum.
-    /// P3 auto-commits a threshold-1 (self) quorum this node is a member of; multi-member automatic
-    /// collection is the deferred auto-sign hook (P4), so a k>1 write here returns `false` (not yet
-    /// committed) — use `submit` with gathered signatures until P4.
+    /// The `sequence` host fn's write path: order a PRE-AUTHORED `write` under `owner`'s quorum. The
+    /// write carries the account owner's `owner_sig` (authored client-side), so any account's write can
+    /// be ordered — this node, as a quorum member, only adds the ORDERING signature. Owner-authenticity
+    /// is enforced in `submit` → `append` → `authorizes`. P4b auto-commits a threshold-1 quorum this
+    /// node is a member of; multi-member automatic collection (soliciting the other members' ordering
+    /// signatures) is the next step, so a k>1 write returns `false` — use `submit` with gathered sigs.
     async fn sequence(
         &self,
         owner: [u8; 32],
         program_cid: [u8; 32],
-        account: [u8; 32],
-        nonce: u64,
-        payload: Vec<u8>,
+        write: SequencedWrite,
     ) -> bool {
         let Some(quorum) = self.quorums.current_quorum(&owner, &program_cid).await else {
             return false;
         };
-        // Auto-commit only a self-signable threshold-1 quorum, AND only for THIS node's OWN account —
-        // the owner-authenticity gate: a node can author (owner-sign) writes only for its own key.
-        // (A pre-authored write for another account rides the `submit` path carrying the owner's
-        // signature; conveying that owner_sig through the `sequence` host fn is a follow-up ABI
-        // extension. Multi-member automatic collection is the deferred auto-sign accumulate.)
-        if quorum.threshold != 1 || !quorum.is_member(&self.me()) || account != self.me() {
+        if quorum.threshold != 1 || !quorum.is_member(&self.me()) {
             return false;
         }
-        let write = SequencedWrite::author(&self.identity, nonce, payload);
         let commit = SequencedCommit {
             signatures: vec![write.sign(&self.identity)],
             write,
@@ -443,19 +437,31 @@ mod tests {
         attest.bootstrap(program, vec![owner], 1).await;
 
         assert!(
-            seq.sequence(owner, program, account, 0, b"pay alice".to_vec())
-                .await,
+            seq.sequence(
+                owner,
+                program,
+                SequencedWrite::author(&node, 0, b"pay alice".to_vec())
+            )
+            .await,
             "self-quorum commits the write at nonce 0"
         );
         // Wrong next nonce is refused (nonce 0 is filled; next is 1).
         assert!(
-            !seq.sequence(owner, program, account, 0, b"pay bob".to_vec())
-                .await,
+            !seq.sequence(
+                owner,
+                program,
+                SequencedWrite::author(&node, 0, b"pay bob".to_vec())
+            )
+            .await,
             "a second write at nonce 0 is refused"
         );
         assert!(
-            seq.sequence(owner, program, account, 1, b"pay bob".to_vec())
-                .await,
+            seq.sequence(
+                owner,
+                program,
+                SequencedWrite::author(&node, 1, b"pay bob".to_vec())
+            )
+            .await,
             "nonce 1 commits"
         );
 
@@ -463,6 +469,36 @@ mod tests {
         assert_eq!(log.payload_at(0), Some(&b"pay alice"[..]));
         assert_eq!(log.payload_at(1), Some(&b"pay bob"[..]));
         assert_eq!(log.next_nonce(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_pre_authored_write_for_another_account_is_ordered() {
+        // The ABI unblocks the general case: a write authored by SOMEONE ELSE (their owner_sig), ordered
+        // by this node as the sole quorum member — account != the node.
+        let (node, attest, seq, _dir) = open_stores().await;
+        let owner = node.node_id().0;
+        let program = [11u8; 32];
+        let alice = NodeIdentity::generate();
+        let alice_acct = alice.node_id().0;
+        // A 1-of-1 quorum whose member is THIS node (the orderer), NOT alice.
+        attest.bootstrap(program, vec![owner], 1).await;
+
+        let w = SequencedWrite::author(&alice, 0, b"alice's write".to_vec());
+        assert!(
+            seq.sequence(owner, program, w).await,
+            "the node orders alice's pre-authored write"
+        );
+        let log = seq.sequence_of(owner, program, alice_acct).await.unwrap();
+        assert_eq!(log.payload_at(0), Some(&b"alice's write"[..]));
+
+        // A write claiming alice's account but signed by an IMPOSTOR is refused (not owner-authentic).
+        let impostor = NodeIdentity::generate();
+        let mut spoof = SequencedWrite::author(&impostor, 1, b"forged".to_vec());
+        spoof.account = alice_acct;
+        assert!(
+            !seq.sequence(owner, program, spoof).await,
+            "a spoofed write (wrong signer) is refused"
+        );
     }
 
     #[tokio::test]
@@ -559,8 +595,12 @@ mod tests {
             let (attest, seq) = build_stores(node.clone(), dir.path()).await;
             attest.bootstrap(program, vec![owner], 1).await;
             assert!(
-                seq.sequence(owner, program, account, 0, b"durable".to_vec())
-                    .await
+                seq.sequence(
+                    owner,
+                    program,
+                    SequencedWrite::author(&node, 0, b"durable".to_vec())
+                )
+                .await
             );
         }
         // Reopen from disk — the committed sequence reloads.

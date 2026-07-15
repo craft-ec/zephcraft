@@ -21,8 +21,8 @@ use zeph_core::{Cid, NodeId};
 use zeph_crypto::NodeIdentity;
 
 use crate::{
-    AppBackend, AttestBackend, Capability, CapabilityGrant, SequenceBackend, VerifyBackend,
-    VerifyRequest,
+    AppBackend, AttestBackend, Capability, CapabilityGrant, SequenceBackend, SequencedWrite,
+    VerifyBackend, VerifyRequest,
 };
 
 /// Import module the restricted deterministic ABI is bound under (shares the `craftcom`
@@ -735,16 +735,20 @@ fn bind_granted(linker: &mut Linker<TransitionCtx>, grant: &CapabilityGrant) -> 
         )?;
     }
     if grant.allows(Capability::Sequence) {
-        // `sequence(account_ptr, nonce, payload_ptr, payload_len) -> i32` — a program's orchestration
-        // call into the ORDERING SEQUENCER (uniqueness): "commit this write at (account, nonce),
-        // serialized through my quorum." `2` INERT on a verifier re-run (`ctx.verify_mode`) —
-        // sequencing is non-deterministic, so a re-run must not re-order; `-1` UNAVAILABLE (no backend
-        // / no authenticated owner / malformed / negative nonce); else `1` committed / `0` rejected
-        // (the nonce was not next, or the quorum did not authorize). Never panics.
+        // `sequence(account_ptr, nonce, payload_ptr, payload_len, owner_sig_ptr) -> i32` — a program's
+        // orchestration call into the ORDERING SEQUENCER (uniqueness): "commit this PRE-AUTHORED write
+        // at (account, nonce), serialized through my quorum." The write is authored by the account
+        // owner (the 64-byte `owner_sig` at `owner_sig_ptr`, over `(account, nonce, payload)`) — the
+        // app passes the owner-signed write; the backend verifies that authenticity before ordering.
+        // `2` INERT on a verifier re-run (`ctx.verify_mode`) — sequencing is non-deterministic, so a
+        // re-run must not re-order; `-1` UNAVAILABLE (no backend / no authenticated owner / malformed /
+        // negative nonce); else `1` committed / `0` rejected (not owner-authentic, nonce not next, or
+        // the quorum did not authorize). Never panics.
         linker.func_wrap_async(
             TRANSITION_HOST_MODULE,
             "sequence",
-            |mut caller: Caller<'_, TransitionCtx>, (ap, nonce, pp, pl): (i32, i64, i32, i32)| {
+            |mut caller: Caller<'_, TransitionCtx>,
+             (ap, nonce, pp, pl, sp): (i32, i64, i32, i32, i32)| {
                 Box::new(async move {
                     if caller.data().verify_mode {
                         return 2i32;
@@ -755,9 +759,10 @@ fn bind_granted(linker: &mut Linker<TransitionCtx>, grant: &CapabilityGrant) -> 
                     let Some(mem) = det_memory(&mut caller) else {
                         return -1i32;
                     };
-                    let (Some(account_bytes), Some(payload)) = (
+                    let (Some(account_bytes), Some(payload), Some(owner_sig)) = (
                         det_read(&caller, &mem, ap, 32),
                         det_read(&caller, &mem, pp, pl),
+                        det_read(&caller, &mem, sp, 64), // the account owner's 64-byte authorization
                     ) else {
                         return -1;
                     };
@@ -771,12 +776,15 @@ fn bind_granted(linker: &mut Linker<TransitionCtx>, grant: &CapabilityGrant) -> 
                         return -1; // no authenticated program owner (raw-cid / remote) → UNAVAILABLE
                     };
                     let program_cid = caller.data().program_cid;
-                    // The owner is the registry-authenticated program owner, so the quorum that ORDERS
-                    // the write is the OWNER's, never the caller's — an invoker cannot self-order.
-                    i32::from(
-                        sb.sequence(owner, program_cid, account, nonce as u64, payload)
-                            .await,
-                    ) // 1 committed / 0 rejected
+                    let write = SequencedWrite {
+                        account,
+                        nonce: nonce as u64,
+                        payload,
+                        owner_sig,
+                    };
+                    // `owner` is the registry-authenticated program owner, so the quorum that ORDERS the
+                    // write is the OWNER's; the WRITE itself is authorized by the account's `owner_sig`.
+                    i32::from(sb.sequence(owner, program_cid, write).await) // 1 committed / 0 rejected
                 })
             },
         )?;
@@ -1038,22 +1046,20 @@ mod tests {
             &self,
             _owner: [u8; 32],
             _program_cid: [u8; 32],
-            _account: [u8; 32],
-            _nonce: u64,
-            _payload: Vec<u8>,
+            _write: SequencedWrite,
         ) -> bool {
             self.0
         }
     }
 
-    // account_ptr=0 (32 zero bytes of linear memory), nonce=0, payload=(0,0); store the i32 result at
-    // offset 0 and commit that 1 byte. `sequence` reads the account BEFORE the result overwrites it.
+    // account_ptr=0 (32 zero bytes), nonce=0, payload=(0,0), owner_sig_ptr=0 (64 zero bytes); store the
+    // i32 result at offset 0 and commit that 1 byte. The mock ignores the write, so zeros are fine.
     const SEQUENCE_ORCH_WAT: &[u8] = br#"(module
-      (import "craftcom" "sequence" (func $sequence (param i32 i64 i32 i32) (result i32)))
+      (import "craftcom" "sequence" (func $sequence (param i32 i64 i32 i32 i32) (result i32)))
       (import "craftcom" "commit" (func $commit (param i32 i32) (result i32)))
       (memory (export "memory") 1)
       (func (export "run")
-        (i32.store8 (i32.const 0) (call $sequence (i32.const 0) (i64.const 0) (i32.const 0) (i32.const 0)))
+        (i32.store8 (i32.const 0) (call $sequence (i32.const 0) (i64.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
         (drop (call $commit (i32.const 0) (i32.const 1)))))"#;
 
     #[tokio::test]

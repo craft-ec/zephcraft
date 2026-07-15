@@ -147,23 +147,19 @@ pub trait AttestBackend: Send + Sync {
     async fn attest(&self, owner: [u8; 32], program_cid: [u8; 32], statement: Vec<u8>) -> bool;
 }
 
-/// The node service the `sequence` host fn calls to COMMIT one ordered write: submit
-/// `(account, nonce, payload)` to the account's quorum, gather its k-of-n sign-offs, and append it
-/// to the account's [`SequencedWrite`](crate::SequencedWrite) sequence — returning whether it
-/// committed. Injected the same way [`AttestBackend`] is (identity-bound, per-node). The `sequence`
-/// host fn maps the result to `1` (committed) / `0` (rejected — the nonce was not next, or the
-/// quorum did not authorize). Ordering is the one thing verification cannot give (UNIQUENESS, not
+/// The node service the `sequence` host fn calls to COMMIT one ordered write: submit the (already
+/// owner-authored) [`SequencedWrite`] to its account's quorum, gather the k-of-n sign-offs, and append
+/// it to the account's sequence — returning whether it committed. The write is **pre-authored** by the
+/// account owner (`write.owner_sig` over `(account, nonce, payload)`); the backend verifies that
+/// owner-authenticity before ordering (a third party can't order into an account it doesn't own).
+/// Injected the same way [`AttestBackend`] is (identity-bound, per-node). The `sequence` host fn maps
+/// the result to `1` (committed) / `0` (rejected — not owner-authentic, nonce not next, or the quorum
+/// did not authorize). Ordering is the one thing verification cannot give (UNIQUENESS, not
 /// consistency), so it is app-profile orchestration, never part of a re-run pure `f`
 /// (`ECONOMIC_LAYER_DESIGN.md` §4). `owner` is the program's registry-authenticated owner, so the
-/// quorum consulted is the OWNER's, never the caller's — an invoker cannot self-order.
+/// quorum consulted is the OWNER's, never the caller's.
 #[async_trait]
 pub trait SequenceBackend: Send + Sync {
-    async fn sequence(
-        &self,
-        owner: [u8; 32],
-        program_cid: [u8; 32],
-        account: [u8; 32],
-        nonce: u64,
-        payload: Vec<u8>,
-    ) -> bool;
+    async fn sequence(&self, owner: [u8; 32], program_cid: [u8; 32], write: SequencedWrite)
+        -> bool;
 }
