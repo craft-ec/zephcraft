@@ -61,7 +61,13 @@ file's segments — CO §76/§286/§298).
       shape changed): each active, NRestarts=0, 3 peers, 0 panics. **Live cross-node validation:** a 20 MB file
       (3 segments) published on node `zeph` → fetched by cid alone on `zeph2` (DHT-resolved, cid-verified) →
       byte-identical. Backup `zeph.bak-20260715-0320`. Remaining follow-ups (non-blocking): private-file
-      segmentation (encrypt-then-chunk), sequential-scan prefetch for streaming, CLI/host-fn range-read wiring.
+      segmentation — **CHUNK-then-ENCRYPT** (NOT encrypt-then-chunk: a single whole-file AEAD tag would
+      block per-segment integrity → no streaming). Chunk the PLAINTEXT into ≤8 MiB segments, seal EACH
+      independently (one DEK, per-segment nonce) → each ciphertext segment is independently
+      fetchable/decryptable/verifiable → `fetch_file_range` streams over sealed segments; `cid =
+      BLAKE3(segment_ciphertext)`; crypto-shred (destroy DEK) still nukes all. Sub-decision (as SQL #3):
+      deterministic per-segment nonce (block-dedup within key, leaks equality) vs random (no dedup, max
+      privacy) — default deterministic. Plus: sequential-scan prefetch for streaming, CLI/host-fn range-read.
 
 ---
 
