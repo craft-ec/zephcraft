@@ -457,13 +457,16 @@ beyond the cap, relay draws tokens. The allowance cap is a policy knob (§10).
 ## 8. Cold-start & the free tier — tit-for-tat reciprocity (not a subsidised token)
 
 **Revised 2026-07-16.** A new account has zero tokens (demand-side cold-start), and we want a
-*permanent* free tier for adoption. But the free tier is **not** a subsidised token or a monthly
-allowance — it is **global tit-for-tat reciprocity**: you consume for free to the extent you
-*contribute*, accounted per identity. It is §7's credit band promoted to the whole network — your
-free headroom is `served − consumed` (bytes you served *anyone*, minus bytes you fetched from
-*anyone*). Net-positive → your consumption is balanced by your service → **the network pays nothing**
-(genuinely free because it is *reciprocal*, not subsidised). Net-deficit beyond the band → you settle
-it in tokens (the paid tier) or throttle.
+*permanent* free tier for adoption. The key realisation: **reciprocity is the base for *everyone*,
+not a free-only tier.** The SWAP credit band (§7) nets reciprocal byte-exchange to zero for *any*
+account — paid or not — so **tokens (or a grant) only ever settle the *deficit*: the net imbalance
+between what you served and what you consumed.** Your reciprocity position is `total_earned −
+consumed` (bytes you served *anyone*, minus bytes you fetched from *anyone*, globally):
+- **Net-positive (served ≥ consumed) → free, for everyone.** Consumption is balanced by service;
+  cheques net out; the network pays nothing. Genuinely free because it is *reciprocal*, not
+  subsidised — there is no "free allowance," just reciprocity.
+- **Net-deficit (consumed > served) → settle the deficit.** *This* is the only place paid and free
+  diverge (below).
 
 **There is no "credit balance."** A non-transferable, consume-only, expiring balance is a *quota
 wearing a token's clothes* — strip transferability, persistence, and tradeability and what's left is
@@ -471,30 +474,42 @@ a reciprocity limit, not a currency. So: **one token balance + a reciprocity pos
 accounting we already collect** — `total_earned` (serving side) minus issued cheques (consuming
 side). Nothing new to store; nothing about the free tier in the token standard.
 
-**Two separate accountings — the paid/free asymmetry.** They are backed by different things, so they
-are *checked* at different times:
+**Paid vs free = how your *deficit* settles (not two consumption systems).** The reciprocal part of
+everyone's usage is free and un-gated (cheques net to zero). Only the deficit is settled, and *that*
+is where the two diverge — because it is backed by different things:
 
-| | Paid (token accounting) | Free (reciprocity accounting) |
-|---|---|---|
-| backed by | escrowed tokens (real value locked) | a reciprocity promise (nothing locked) |
-| denominated in | tokens | bytes (served vs. consumed) |
-| check timing | **retroactive** at settlement (`allocate_quota`, by timestamp) | **real-time** at the admission gate |
-| exposure if abused | none — escrow covers it | bounded wasted bandwidth → *why* it must gate live |
+| | reciprocal part (≤ your contribution) | deficit — paid (has tokens) | deficit — free (no tokens) |
+|---|---|---|---|
+| settles via | nothing — cheques net to zero | **tokens**, against escrow | bounded **cold-start grant**, else throttle |
+| backed by | your own service | escrowed tokens (real value locked) | a reciprocity promise (nothing locked) |
+| check timing | none (free for all) | **retroactive** at settlement (`allocate_quota`) | **real-time** at the admission gate |
+| exposure if abused | none | none — escrow covers it | bounded wasted bandwidth → *why* it must gate live |
 
-Escrow buys the paid lane its laziness (locked value → reconcile after the fact); the free lane has
-nothing locked, so it **must gate up front** on the reciprocity position. *Pre-funded → check late;
-un-funded → check live.* So the admission gate is a **free-lane** mechanism; for paid it is only an
-escrow-solvency check, and there is **no consumption-time free/paid decision** for a paid user (the
-split is purely the retroactive timestamp settlement of §7/§10.8).
+Escrow buys the paid deficit its laziness (locked value → reconcile after the fact); the free deficit
+has nothing locked, so it **must gate up front**. *Pre-funded → check late; un-funded → check live.*
+The admission gate therefore fires only on an **unbacked deficit** — a paid user consumes
+reciprocity-first and hits *no* gate even when they run a deficit (escrow backs it), so there is **no
+consumption-time free/paid decision** for them; the deficit resolves at the retroactive timestamp
+settlement of §7/§10.8.
 
 **Subsidy shrinks to cold-start only.** The one case reciprocity can't cover is a brand-new account
 that has served nothing yet — a read-only newcomer needs a small **starting grant** of reciprocity
 headroom to begin. That bootstrap (identity-gated, small, one-time-ish) is the *only* thing the pool
 funds for the free tier — not a standing allowance draining it forever.
 
-**Downstream detail (pin at step 4):** served bytes credit **either** the reciprocity position (free
-lane) **or** a token reward (paid lane), never both — the same contribution can't be counted in two
-denominations.
+**Downstream details (pin at step 4):**
+- **Reciprocity offset applies *before* tokens.** At settlement, your `total_earned` first reduces
+  what you owe; **then** `allocate_quota` settles only the *remaining* deficit in tokens by timestamp.
+  As built, `allocate_quota` doesn't net against serving — so settlement needs a reciprocity-offset
+  step in front of it.
+- **Global is the position; bilateral is a fast-path.** The raw SWAP cheque nets *bilaterally*
+  (per-pair). The authoritative reciprocity position is **global** (`total_earned − consumed` across
+  everyone — serve anyone, consume from anyone); bilateral netting between mutual peers is a trustless
+  settlement optimisation on top.
+- **No double-count (reciprocity first, surplus rewarded).** Your serving first offsets your *own*
+  consumption (reciprocity, no tokens); only the **surplus** (served beyond consumed) earns a token
+  reward (mint). The offsetting bytes are not also rewarded — the same contribution is never counted
+  in two denominations.
 
 **Free vs paid — the product boundary (what actually differs).** The free tier is *not* "paid,
 subsidised" — it is a deliberately **bounded, consume-only, reciprocity-gated** slice. The limits *are*

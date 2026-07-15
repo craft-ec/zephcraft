@@ -73,9 +73,13 @@ model). From the free/paid Q&A:**
   non-transferable-credit model** → ONE token balance + a derived reciprocity position. §7's tit-for-tat credit band IS
   the free tier now (§7/§8 merged). Subsidy shrinks to a **cold-start grant only**; free-tier farming is now largely
   **intrinsic** (can't consume free without contributing) → §10.6/§10.7 revised.
-- **Two separate accountings (paid/free asymmetry):** paid = escrow-backed → retroactive settlement (allocate_quota),
-  NO consumption-time check; free = unbacked reciprocity → REAL-TIME admission-gate check. "Pre-funded → check late;
-  un-funded → check live." The admission gate is a FREE-lane mechanism.
+- **Reciprocity is UNIVERSAL, not free-only (refined 2026-07-16):** the SWAP credit band nets reciprocal byte-exchange
+  to zero for EVERYONE (paid or not), so tokens/grant settle only the DEFICIT (`consumed − served`). Paid vs free =
+  how the deficit settles: paid deficit → tokens against escrow (retroactive, NO gate); free deficit → bounded
+  cold-start grant else throttle (REAL-TIME admission gate — fires only on an UNBACKED deficit). "Pre-funded → check
+  late; un-funded → check live." Settlement mechanics (step 4): reciprocity offset applies BEFORE allocate_quota;
+  GLOBAL position is authoritative, bilateral netting = trustless fast-path; surplus serving (beyond own consumption)
+  earns a token reward — no double-count (reciprocity first, surplus rewarded).
 - **Balances = SELF-CUSTODIAL account-chains, NOT PDAs** (§3): balance = fold of the owner's own single-writer chain,
   re-executed for validity; user signs, the token PROGRAM only CONSTRAINS to valid transitions (verification rejects
   else — the reserved-namespace write model). A malicious custom program has ZERO authority over the token namespace
