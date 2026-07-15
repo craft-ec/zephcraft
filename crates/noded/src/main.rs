@@ -105,6 +105,13 @@ enum Command {
         /// Output path.
         #[arg(short, long)]
         output: PathBuf,
+        /// Partial/range read: byte offset to start at (streaming/seek). Requires --length.
+        /// Only the covering 8 MiB segments are fetched — cheap for large files.
+        #[arg(long)]
+        offset: Option<u64>,
+        /// Partial/range read: number of bytes to fetch from --offset.
+        #[arg(long)]
+        length: Option<u64>,
     },
     /// Pin a CID (hold whole content, exempt from eviction).
     Pin { cid: String },
@@ -454,7 +461,12 @@ async fn main() -> anyhow::Result<()> {
             no_pin,
             private,
         }) => cmd_publish(&data_dir, &file, !no_pin, private).await,
-        Some(Command::Get { cid, output }) => cmd_get(&data_dir, &cid, &output).await,
+        Some(Command::Get {
+            cid,
+            output,
+            offset,
+            length,
+        }) => cmd_get(&data_dir, &cid, &output, offset, length).await,
         Some(Command::Pin { cid }) => cmd_cid_op(&data_dir, "pin", &cid).await,
         Some(Command::Unpin { cid }) => cmd_cid_op(&data_dir, "unpin", &cid).await,
         Some(Command::Want { cid }) => cmd_cid_op(&data_dir, "want", &cid).await,
@@ -609,16 +621,33 @@ async fn cmd_publish(data_dir: &Path, file: &Path, pin: bool, private: bool) -> 
     Ok(())
 }
 
-async fn cmd_get(data_dir: &Path, cid: &str, output: &Path) -> anyhow::Result<()> {
+async fn cmd_get(
+    data_dir: &Path,
+    cid: &str,
+    output: &Path,
+    offset: Option<u64>,
+    length: Option<u64>,
+) -> anyhow::Result<()> {
     let abs = std::path::absolute(output).unwrap_or_else(|_| output.to_path_buf());
-    let params = serde_json::json!({"cid": cid, "output": abs.to_string_lossy()});
+    let mut params = serde_json::json!({"cid": cid, "output": abs.to_string_lossy()});
+    if let (Some(o), Some(l)) = (offset, length) {
+        params["offset"] = serde_json::json!(o);
+        params["length"] = serde_json::json!(l);
+    }
     let r = control::query_unix_params(&data_dir.join("zeph.sock"), "get", params).await?;
     let path = r
         .get("path")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .unwrap_or_else(|| output.display().to_string());
-    if r.get("is_dir").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if r.get("range").and_then(|v| v.as_bool()).unwrap_or(false) {
+        println!(
+            "fetched range [{}..+{}] → {path} ({} bytes, only covering segments)",
+            offset.unwrap_or(0),
+            length.unwrap_or(0),
+            r.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0),
+        );
+    } else if r.get("is_dir").and_then(|v| v.as_bool()).unwrap_or(false) {
         println!(
             "restored folder → {path} ({} files, cids verified)",
             r.get("files").and_then(|v| v.as_u64()).unwrap_or(0),

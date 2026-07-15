@@ -1,13 +1,20 @@
 //! Encrypted objects (ENCRYPTION_DESIGN.md phase 2).
 //!
-//! A private file is published as two objects: the **ciphertext** (opaque content,
-//! erasure-coded like anything else) and a small **envelope** that carries the DEK
-//! capsule + a pointer to the ciphertext. The network sees only these; only a key
-//! holder decrypts. The envelope is what a reader resolves (the "manifest" of a
-//! private object).
+//! A private file is **chunk-then-encrypt**: the PLAINTEXT is split into ≤8 MiB
+//! segments and EACH is sealed independently under one file DEK (per-segment AEAD),
+//! then published as an opaque ciphertext object (erasure-coded like anything else).
+//! A small **envelope** carries the DEK capsule + the ordered ciphertext-segment
+//! list + the sealed name/mime. Because each segment is independently decryptable +
+//! verifiable, a private file is **streamable/seekable** (fetch + decrypt only the
+//! covering segments) — which a single whole-file AEAD tag (encrypt-then-chunk) would
+//! preclude. The envelope is what a reader resolves (the "manifest" of a private
+//! object); only a key holder decrypts. Crypto-shred = destroy the DEK (one per file
+//! → every segment unreadable).
 
 use serde::{Deserialize, Serialize};
 use zeph_cipher::DekCapsule;
+
+use crate::manifest::Segment;
 
 /// Magic prefix identifying an encrypted envelope (distinct from `MANIFEST_MAGIC`).
 pub const ENVELOPE_MAGIC: &[u8] = b"ZENVELP1";
@@ -26,10 +33,17 @@ pub struct Recipient {
 /// The public envelope for a private object.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct EncryptedEnvelope {
-    /// DEK encapsulated under the owner's PRE key.
+    /// DEK encapsulated under the owner's PRE key (one DEK for the whole file).
     pub capsule: DekCapsule,
-    /// CID of the ciphertext content object.
-    pub ciphertext_cid: [u8; 32],
+    /// Ordered ciphertext SEGMENTS: `cid` = BLAKE3(sealed segment), `len` = the
+    /// segment's PLAINTEXT length. The file is the concatenation of the decrypted
+    /// segments; identical plaintext segments dedup (deterministic per-segment seal).
+    pub segments: Vec<Segment>,
+    /// Sealed `PlainMeta {name, mime}` (under the DEK) — name/mime stay private, as
+    /// they were inside the ciphertext before segmentation.
+    pub meta: Vec<u8>,
+    /// Total plaintext size (== sum of segment `len`s).
+    pub size: u64,
     /// Owner identity (capsule resolution / sharing).
     pub owner: [u8; 32],
     /// Sharing grants — empty in v1 (reserved).
@@ -51,18 +65,18 @@ impl EncryptedEnvelope {
     }
 }
 
-/// The plaintext payload of a private file (encrypted as one blob — name/mime are
-/// hidden inside the ciphertext, not the envelope).
+/// The private name/mime of a file — sealed under the file DEK and stored in the
+/// envelope's `meta`, so they stay hidden like the content (the content itself now
+/// rides the separately-sealed segments, not this struct).
 #[derive(Clone, Serialize, Deserialize)]
-pub struct PlainFile {
+pub struct PlainMeta {
     pub name: String,
     pub mime: String,
-    pub content: Vec<u8>,
 }
 
-impl PlainFile {
+impl PlainMeta {
     pub fn encode(&self) -> Vec<u8> {
-        postcard::to_allocvec(self).expect("serialize plainfile")
+        postcard::to_allocvec(self).expect("serialize plainmeta")
     }
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         postcard::from_bytes(bytes).ok()

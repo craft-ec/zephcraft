@@ -889,6 +889,28 @@ async fn rpc_get(
     let Some(cid) = parse_cid(cid_hex) else {
         return rpc_err(id, "cid must be 64 hex chars".into());
     };
+    // Partial/RANGE read: fetch + (for a private file, decrypt) ONLY the segments overlapping
+    // [offset, offset+length) — cheap streaming/seek over a large file.
+    if let (Some(offset), Some(length)) = (
+        param(req, "offset").and_then(|v| v.as_u64()),
+        param(req, "length").and_then(|v| v.as_u64()),
+    ) {
+        let bytes = match state.engine.get(cid, zeph_obj::ConsumeMode::Drop).await {
+            Ok(b) if zeph_obj::EncryptedEnvelope::is_envelope(&b) => {
+                state.engine.get_private_range(cid, offset, length).await
+            }
+            _ => state.engine.fetch_file_range(cid, offset, length).await,
+        };
+        return match bytes {
+            Ok(bytes) => match std::fs::write(output, &bytes) {
+                Ok(()) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
+                    "path": output, "range": true, "bytes": bytes.len(),
+                }}),
+                Err(e) => rpc_err(id, format!("writing {output}: {e}")),
+            },
+            Err(e) => rpc_err(id, format!("range read failed: {e}")),
+        };
+    }
     // Encrypted? An envelope CID decrypts (owner only) to the private file.
     if let Ok(bytes) = state.engine.get(cid, zeph_obj::ConsumeMode::Drop).await {
         if zeph_obj::EncryptedEnvelope::is_envelope(&bytes) {

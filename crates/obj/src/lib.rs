@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use rand::rngs::OsRng;
 use zeph_core::{Cid, NodeId};
 use zeph_erasure::{encode, recode, target_pieces, vtags, CodedPiece, Decoder};
@@ -33,7 +33,7 @@ mod active_set;
 mod encrypted;
 mod manifest;
 pub use active_set::{ActiveGuard, ActiveSet};
-pub use encrypted::{EncryptedEnvelope, PlainFile, Recipient, ENVELOPE_MAGIC};
+pub use encrypted::{EncryptedEnvelope, PlainMeta, Recipient, ENVELOPE_MAGIC};
 pub use manifest::{Entry, Manifest, Segment};
 
 /// ALPN for piece exchange.
@@ -70,6 +70,10 @@ const FILE_SEGMENT_BYTES: usize = 8 * 1024 * 1024;
 /// (CRAFTOBJ §71/§73; n = k·ceil(2+16/k) = 96). Distinct from `ObjConfig::k` (the default for
 /// small/opaque objects like app blobs); files opt into the higher K for a 256 KiB piece size.
 const FILE_K: usize = 32;
+/// Segments fetched CONCURRENTLY (read-ahead prefetch) when reassembling a whole multi-segment
+/// file — bounded so memory stays ~N segments, not the whole file (CRAFTOBJ §415 sequential-scan
+/// prefetch; TF §1205's "8 concurrent segment decodes"). `buffered` keeps output order.
+const SEGMENT_PREFETCH: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsumeMode {
@@ -258,7 +262,6 @@ pub enum EngineWork {
 /// shareable id is `envelope_cid`; resolving it (with the owner's key) decrypts.
 pub struct PrivatePublish {
     pub envelope_cid: Cid,
-    pub ciphertext_cid: Cid,
     pub size: u64,
     pub durable: bool,
 }
@@ -458,9 +461,11 @@ impl ObjEngine {
         let _ = self.enc.set(kp);
     }
 
-    /// Publish a PRIVATE file: encrypt {name,mime,data} under the owner's key,
-    /// store the ciphertext (erasure-coded like anything else), and publish a
-    /// small envelope pointing at it. The network sees only ciphertext + envelope.
+    /// Publish a PRIVATE file (chunk-then-encrypt): generate ONE file DEK, seal the name/mime + each
+    /// ≤8 MiB plaintext SEGMENT independently under it (per-segment AEAD → each is streamable +
+    /// verifiable), publish every ciphertext segment (erasure-coded like anything else), and publish a
+    /// small envelope listing them. The network sees only ciphertext + the envelope; only a key holder
+    /// decrypts. Crypto-shred = destroy the DEK (one per file → every segment unreadable).
     pub async fn publish_private(
         &self,
         name: &str,
@@ -472,52 +477,122 @@ impl ObjEngine {
             .enc
             .get()
             .ok_or_else(|| anyhow::anyhow!("no encryption keypair set"))?;
-        let plain = encrypted::PlainFile {
-            name: name.to_string(),
-            mime: mime.to_string(),
-            content: data.to_vec(),
-        };
-        let sealed = zeph_cipher::encrypt(&enc.public(), &plain.encode());
-        let ct = self.publish(&sealed.ciphertext, pin).await?;
+        let dek = zeph_cipher::Dek::generate();
+        let capsule = zeph_cipher::encapsulate(&enc.public(), &dek);
+        // Chunk the PLAINTEXT; seal each segment under the DEK (deterministic → identical plaintext
+        // segments dedup) and publish the ciphertext as its own K=32 generation.
+        let mut segments = Vec::new();
+        let mut durable = true;
+        for chunk in data.chunks(self.config.file_segment_bytes.max(1)) {
+            let ct = zeph_cipher::seal_deterministic(&dek, chunk);
+            let r = self
+                .publish_impl(&ct, pin, false, self.config.file_k)
+                .await?;
+            durable &= r.durable;
+            segments.push(Segment {
+                cid: r.cid.0,
+                len: chunk.len() as u64, // PLAINTEXT length (for range mapping)
+            });
+        }
+        // Name/mime stay private: seal them under the DEK into the envelope's meta.
+        let meta = zeph_cipher::seal_deterministic(
+            &dek,
+            &encrypted::PlainMeta {
+                name: name.to_string(),
+                mime: mime.to_string(),
+            }
+            .encode(),
+        );
         let envelope = encrypted::EncryptedEnvelope {
-            capsule: sealed.capsule,
-            ciphertext_cid: ct.cid.0,
+            capsule,
+            segments,
+            meta,
+            size: data.len() as u64,
             owner: self.transport.node_id().0,
             recipients: Vec::new(),
         };
         let er = self.publish(&envelope.encode(), pin).await?;
         Ok(PrivatePublish {
             envelope_cid: er.cid,
-            ciphertext_cid: ct.cid,
             size: data.len() as u64,
-            durable: ct.durable,
+            durable,
         })
     }
 
-    /// Resolve + decrypt a private object by its envelope CID (needs our key).
+    /// Resolve + decrypt a private file by its envelope CID (needs our key). Fetches every ciphertext
+    /// segment, decrypts each under the file DEK, and concatenates.
     pub async fn get_private(&self, envelope_cid: Cid) -> anyhow::Result<PlainFileOut> {
+        let (dek, env, meta) = self.open_private_envelope(envelope_cid).await?;
+        let dek = &dek;
+        // Fetch + decrypt segments with bounded read-ahead concurrency (prefetch), IN ORDER. Stream
+        // over OWNED cids (not borrowed `&Segment`) so the futures stay `Send` for callers' tasks.
+        let seg_cids: Vec<[u8; 32]> = env.segments.iter().map(|s| s.cid).collect();
+        let parts: Vec<Vec<u8>> = futures::stream::iter(seg_cids)
+            .map(|cid| async move {
+                let ct = self.get(Cid(cid), ConsumeMode::Seed).await?;
+                Ok::<Vec<u8>, anyhow::Error>(zeph_cipher::open(dek, &ct)?)
+            })
+            .buffered(SEGMENT_PREFETCH)
+            .try_collect()
+            .await?;
+        Ok(PlainFileOut {
+            name: meta.name,
+            mime: meta.mime,
+            content: parts.concat(),
+        })
+    }
+
+    /// Read a byte RANGE of a private file — fetches + decrypts ONLY the covering segments (private
+    /// streaming/seek; each segment is an independent AEAD unit). Returns `[offset, min(offset+len,
+    /// size))`.
+    pub async fn get_private_range(
+        &self,
+        envelope_cid: Cid,
+        offset: u64,
+        len: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        let (dek, env, _meta) = self.open_private_envelope(envelope_cid).await?;
+        let end = offset.saturating_add(len);
+        let mut out = Vec::new();
+        let mut seg_start = 0u64;
+        for seg in &env.segments {
+            let seg_end = seg_start + seg.len;
+            if seg_start < end && seg_end > offset {
+                let ct = self.get(Cid(seg.cid), ConsumeMode::Seed).await?;
+                let plain = zeph_cipher::open(&dek, &ct)?;
+                let lo = (offset.saturating_sub(seg_start) as usize).min(plain.len());
+                let hi = ((end - seg_start) as usize).min(plain.len());
+                out.extend_from_slice(&plain[lo..hi]);
+            }
+            seg_start = seg_end;
+            if seg_start >= end {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Fetch a private envelope and unwrap its DEK + name/mime — the shared bootstrap for
+    /// `get_private` / `get_private_range`.
+    async fn open_private_envelope(
+        &self,
+        envelope_cid: Cid,
+    ) -> anyhow::Result<(
+        zeph_cipher::Dek,
+        encrypted::EncryptedEnvelope,
+        encrypted::PlainMeta,
+    )> {
         let enc = self
             .enc
             .get()
             .ok_or_else(|| anyhow::anyhow!("no encryption keypair set"))?;
         let ebytes = self.get(envelope_cid, ConsumeMode::Drop).await?;
-        let envelope = encrypted::EncryptedEnvelope::decode(&ebytes)
+        let env = encrypted::EncryptedEnvelope::decode(&ebytes)
             .ok_or_else(|| anyhow::anyhow!("not an encrypted envelope"))?;
-        let ct = self
-            .get(Cid(envelope.ciphertext_cid), ConsumeMode::Drop)
-            .await?;
-        let sealed = zeph_cipher::SealedObject {
-            capsule: envelope.capsule,
-            ciphertext: ct,
-        };
-        let plaintext = zeph_cipher::decrypt_self(enc, &sealed)?;
-        let pf = encrypted::PlainFile::decode(&plaintext)
-            .ok_or_else(|| anyhow::anyhow!("corrupt plaintext"))?;
-        Ok(PlainFileOut {
-            name: pf.name,
-            mime: pf.mime,
-            content: pf.content,
-        })
+        let dek = zeph_cipher::open_capsule(enc, &env.capsule)?;
+        let meta = encrypted::PlainMeta::decode(&zeph_cipher::open(&dek, &env.meta)?)
+            .ok_or_else(|| anyhow::anyhow!("corrupt private meta"))?;
+        Ok((dek, env, meta))
     }
 
     pub fn store(&self) -> &Arc<Store> {
@@ -779,12 +854,14 @@ impl ObjEngine {
                 segments,
                 ..
             } => {
-                // Fetch each segment (its cid verifies its bytes) and concatenate in order.
-                let mut bytes = Vec::new();
-                for seg in segments {
-                    bytes.extend(self.get(Cid(seg.cid), ConsumeMode::Seed).await?);
-                }
-                Ok((name, mime, bytes))
+                // Fetch segments with bounded read-ahead concurrency (prefetch), reassembled IN ORDER
+                // (`buffered` preserves order). Each segment cid self-verifies.
+                let parts: Vec<Vec<u8>> = futures::stream::iter(segments)
+                    .map(|seg| self.get(Cid(seg.cid), ConsumeMode::Seed))
+                    .buffered(SEGMENT_PREFETCH)
+                    .try_collect()
+                    .await?;
+                Ok((name, mime, parts.concat()))
             }
             Manifest::Dir { name, .. } => {
                 anyhow::bail!("'{name}' is a folder, not a file")
@@ -804,11 +881,12 @@ impl ObjEngine {
         let raw = self.get(cid, mode).await?;
         match Manifest::decode(&raw) {
             Some(Manifest::File { segments, .. }) => {
-                let mut bytes = Vec::new();
-                for seg in segments {
-                    bytes.extend(self.get(Cid(seg.cid), mode).await?);
-                }
-                Ok(bytes)
+                let parts: Vec<Vec<u8>> = futures::stream::iter(segments)
+                    .map(|seg| self.get(Cid(seg.cid), mode))
+                    .buffered(SEGMENT_PREFETCH)
+                    .try_collect()
+                    .await?;
+                Ok(parts.concat())
             }
             _ => Ok(raw),
         }
@@ -3183,7 +3261,7 @@ fn guard_not_system(store: &Store, cid: &Cid) -> anyhow::Result<()> {
 /// for cascading pin/unpin/forget over a whole file/folder chain.
 fn chain_children(bytes: &[u8]) -> Vec<Cid> {
     if let Some(env) = EncryptedEnvelope::decode(bytes) {
-        return vec![Cid(env.ciphertext_cid)];
+        return env.segments.iter().map(|s| Cid(s.cid)).collect();
     }
     match Manifest::decode(bytes) {
         Some(Manifest::File { segments, .. }) => segments.iter().map(|s| Cid(s.cid)).collect(),

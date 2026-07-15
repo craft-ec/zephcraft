@@ -68,6 +68,19 @@ file's segments — CO §76/§286/§298).
       BLAKE3(segment_ciphertext)`; crypto-shred (destroy DEK) still nukes all. Sub-decision (as SQL #3):
       deterministic per-segment nonce (block-dedup within key, leaks equality) vs random (no dedup, max
       privacy) — default deterministic. Plus: sequential-scan prefetch for streaming, CLI/host-fn range-read.
+- [x] **All 3 follow-ups DONE 2026-07-15.** (1) **Private-file segmentation (chunk-then-encrypt):**
+      `publish_private` chunks the PLAINTEXT into ≤8 MiB segments + seals each independently under one DEK
+      (`seal_deterministic` → within-file block dedup) → publishes each ciphertext segment; the envelope
+      (`EncryptedEnvelope`) now lists `segments: Vec<Segment>` + sealed `meta` (name/mime stay private) +
+      `size` (was `ciphertext_cid`; `PlainFile`→`PlainMeta`). `get_private` reassembles; new
+      `get_private_range` streams (fetch+decrypt only covering segments). `chain_children` walks env
+      segments. Test: 3 sealed segments, identical blocks dedup to one cid, whole round-trip, boundary-
+      spanning range read, foreign-can't-decrypt. (2) **Prefetch:** `fetch_file`/`get_following_manifest`/
+      `get_private` fetch segments with bounded read-ahead concurrency (`buffered(SEGMENT_PREFETCH=8)`,
+      order-preserving). (3) **CLI range read:** `zeph get <cid> -o <path> --offset N --length M` → control
+      RPC → `fetch_file_range`/`get_private_range` (private auto-detected via the envelope). obj tests pass,
+      clippy+fmt clean, workspace builds. (Host-fn range read for WASM apps remains a small further step —
+      needs an AppBackend obj-range method.)
 
 ---
 
