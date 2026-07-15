@@ -55,6 +55,16 @@ transfer, mint-from-receipts, egress settlement via `allocate_quota`, free-tier 
 [K6] + the sequencer. Mechanism-first with governed policy (issuance §10.3, quorum (n,k) §10.4, fee/allowance §10.6);
 the rotating-epoch-committee selection (§10.5) is its heaviest part, genesis-committee-bootstrapped.
 
+**DESIGN CAPTURE (2026-07-15) — step-4 spec written into docs/ECONOMIC_LAYER_DESIGN.md** (from the free/paid Q&A):
+(1) §7 settlement across many providers — the COMPLETE-cheque-set rule (allocate_quota's paid cap is global →
+completeness enforced by reconciliation/monotonic-max-per-pair + unilateral provider settlement, not trust);
+(2) §8 the FREE/PAID product boundary (scale/reliability/durability/value) + conversion drivers ("free lets you
+USE the network; paid lets you BUILD on it"); (3) §8 the ENFORCEMENT-POINT MAP (cheque = tier-blind METER not
+enforcer; rules enforced at settlement [authoritative] + fetch-admission gate + pin/publish gate [real-time]) +
+the ledger-STATE-vs-ledger-PROGRAM(policy)-vs-MECHANISM frame; (4) §5 the K1 coupling — the canonical-token-program
+pin IS a K1 anchor + the governed knobs are K1 config; K1's deferred anchor-dispatcher half is exactly what step 4
+(first governed-WASM program) requires. Litmus: hard invariants native, swappable policy governed-WASM behind an anchor.
+
 ---
 
 # ECONOMIC LAYER — ORDERING SEQUENCER (§11 step 1 of docs/ECONOMIC_LAYER_DESIGN.md) — SEQUENCER COMPLETE (P1–P4b-2, 2026-07-15)

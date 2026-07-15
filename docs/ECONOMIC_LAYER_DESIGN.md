@@ -192,6 +192,16 @@ binary are the facts a program cannot observe for itself (serving receipts, fuel
 metering) and the non-equivocation safety invariant. The binary owns the *invariant*;
 the program owns *discretion*.
 
+**The anchor that makes it swappable = K1.** The "canonical-token-program pin" is a **K1
+anchor** (the anchor dispatcher + config registry), and the governed numeric knobs (fee φ,
+allowance, `(n,k)`, issuance schedule) are **K1 config** values. K1's config half is live; its
+**anchor-dispatcher half is deferred** *"until a genuinely governed-WASM protocol program
+exists"* — and the token ledger (§11 step 4) is precisely that first program, so building it is
+what requires K1's deferred half. K1's own litmus governs the split above: **hard invariants go
+native, genuine swappable policy goes governed-WASM behind an anchor** — a governed hook on a
+safety invariant (e.g. non-equivocation) would be kernel bloat, the exact mistake K1's history
+warned against.
+
 ---
 
 ## 6. Managing the inversion — the accounting pipeline
@@ -322,9 +332,21 @@ egress from distinct paying consumers*, so self-payment earns zero metric credit
 **Reuses:** segments (payment chunks + per-chunk verification), the mux stream (carries
 cheques inline), the ledger + sequencer (escrow + settlement), receipts (= the cheques).
 
-Open (→ §10): swarm-fetch payment across *many* providers (a prepaid egress balance /
-per-peer accounting rather than a channel-open per provider); escrow/channel lifecycle
-(top-up, close, reclaim on timeout, disputes); cheque granularity; the credit-band size.
+**Settlement across many providers (decided §10.8).** A swarm fetch collects cheques from
+*many* providers against **one** prepaid per-consumer egress balance — not a channel per
+provider. At epoch close, settlement runs `allocate_quota` over the consumer's cheque set to
+split it into (paid, subsidy), total paid capped at the escrowed balance. Because that cap is
+*global* across providers, the set must be **complete** — a consumer that hid cheques to make
+each provider look "first-come" by timestamp could otherwise double-allocate its quota.
+Completeness is enforced by **reconciliation, not trust**: every provider independently holds
+and submits its own cheque, and the ledger takes the **monotonic max per (provider, consumer)
+pair** — so a cheque the consumer omits is supplied by the provider, and one the consumer
+inflates is bounded by its own signature. A provider left out of the consumer's set simply
+**settles unilaterally** from the escrow. Net: the consumer gains nothing by hiding cheques and
+is incentivised to submit the full set to release its escrow cleanly.
+
+Open (→ §10.9): escrow/channel lifecycle (top-up, close, reclaim on timeout, disputes);
+cheque granularity; the credit-band size.
 
 ### Relay bandwidth — the same cheques, one hop at a time
 
@@ -403,6 +425,59 @@ From the consumer's token balance (paid tier) or from the **subsidy pool** (free
 credit); the spent credit is then burned. So providers happily serve free-tier traffic
 (they still get real tokens), and the free tier's cost is *socialized* rather than dumped
 on whoever happens to serve a free user.
+
+**Free vs paid — the product boundary (what actually differs).** The free tier is *not* "paid,
+subsidised" — it is a deliberately **bounded, consume-only, pool-gated** slice. The limits *are*
+the product boundary, and the reason anyone pays:
+
+| Axis | Free (credit) | Paid (tokens) |
+|---|---|---|
+| **Scale** | small allowance per identity/epoch, expires | buy any volume |
+| **Reliability** | pool-subsidised → throttled / best-effort under pool pressure | self-funded → always admitted, never pool-gated |
+| **Durability / publish** | consume-only — *read* the shared pool | owner-pays-pin: publish + persist your own data, run a service |
+| **Value** | non-transferable, expiring voucher | liquid — transferable, earnable (serve-to-earn), withdrawable |
+
+The reliability gap is **not** provider discrimination (the cheque is tier-blind, §7) — it is at
+*admission*: a free fetch is gated on allowance + pool health, a paid fetch is not. **What drives
+conversion:** you pay the moment you need *scale* (outgrow the allowance), *reliability* (can't be
+throttled), *durability* (publish/persist your own data — the north-star product; free is
+consume-only and can host nothing), or *to earn/transact* (free credit can't be earned,
+transferred, or withdrawn). One line: **free lets you *use* the network; paid lets you *build on*
+it.** The tier is kept thin on purpose — enough to hook, not to substitute — and sized to pool
+health so it can't be drained; that thinness is what makes the freemium self-funding (paid funds
+free).
+
+**Where the tier rules are enforced (not in the cheque).** The serving-cheque is a **meter, not
+an enforcer** — it only records "C received N bytes from P," tier-blind by design (so a provider
+can't cherry-pick paid fetchers, which would starve the free tier). Enforcement lives *downstream*,
+at the points where value changes hands or a resource is committed:
+
+| Rule enforced | Where | Timing |
+|---|---|---|
+| non-transferability of credit | ledger program transition (a `transfer` rejects a credit source) | authoritative (re-run by verification) |
+| paid/subsidy split + allowance cap | ledger **settlement** (`allocate_quota` + tokens-vs-credit burn; over-spend not honored) | authoritative, retroactive |
+| real-time tier decision (draw tokens / draw credit / throttle) | consumer-side **fetch-admission gate** at `get`-initiation | real-time |
+| reliability (free is pool-gated) | same admission gate (allowance + pool health) | real-time |
+| durability (consume-only vs owner-pays-pin) | a **separate pin / publish-admission gate** on the distribute path | real-time |
+
+Two are retroactive-but-authoritative (settlement, re-checked by verification [K6]); the rest are
+real-time gates. Durability is enforced on the **store** path — a different code path from serving
+entirely.
+
+This is the §5 seam applied to tiers, and it sharpens *"the ledger is the policy"*: distinguish
+**ledger state** (economic data — balances, pool, epoch) from the **ledger program** (the
+transition function — *that* is the policy: tiers, split, non-transferability, mint). The program
+is not a consensus engine; it *rides on* three mechanism primitives it does not contain — the
+sequencer (ordering), verification (validity, by re-running it), attestation (custody). The
+**binary** provides the enforcement *points* (the meter, the admission gate, the pin gate, the
+account-state store, and the non-equivocation invariant); the **program** provides the *rules*;
+nothing economic lives in the binary. The mechanism that makes the ledger program *the* swappable
+policy behind a stable anchor — and turns the governed numeric knobs (fee φ, allowance, `(n,k)`,
+issuance schedule) into config values — is **K1 (the anchor dispatcher + config registry)**: its
+config half is live, and its deferred anchor-dispatcher half is exactly what the token-ledger app
+(§11 step 4, the first genuinely governed-WASM program) requires. The litmus is K1's own rule:
+**hard invariants go native, genuine swappable policy goes governed-WASM behind an anchor** — so
+non-equivocation + the meter are native, while tier / allowance / reward are program + config.
 
 **Farming resistance — the threat model.** Three *distinct* threats, easily conflated:
 
