@@ -170,6 +170,11 @@ impl CraftSql {
         let src = source.as_ref();
         let root_bytes = ensure(&store, src, owner, root).await?;
         let ri = crate::pager::decode_root(&root_bytes)?;
+        // Private db: unwrap the DEK from the plaintext `wrapped_dek` so we can decrypt the sealed
+        // structural meta + index nodes as we walk the tree. Only the OWNER's own key unwraps here;
+        // a foreign reader gets None → `decode_meta` fails → it cannot even map a private db (correct
+        // — grantee reads over a K3 grant deliver the DEK separately, not wired into sync yet).
+        let cipher = unwrap_dek(&root_bytes, self.enc.as_deref());
         if ri.depth == 0 {
             return Ok(());
         }
@@ -180,7 +185,9 @@ impl CraftSql {
             let mut next = Vec::new();
             for (level, node_cid) in frontier {
                 let node_bytes = ensure(&store, src, owner, node_cid).await?;
-                for child in crate::pager::decode_node(&node_bytes)?.into_values() {
+                for child in
+                    crate::pager::decode_node_sealed(cipher.as_ref(), &node_bytes)?.into_values()
+                {
                     if level == 0 {
                         // Leaf children are page objects — fetch them only in
                         // eager mode; a lazy reader pulls them per-read.
@@ -360,6 +367,14 @@ impl CraftSql {
                 None
             },
             store_dir: self.store_dir.clone(),
+            // The DB DEK (private db) so the durability sweep can decrypt the sealed index. Registered
+            // into `ciphers` above by `register_cipher_{existing,new}`; None for a public db.
+            dek: self
+                .ciphers
+                .lock()
+                .expect("ciphers")
+                .get(&key)
+                .map(|(d, _)| d.clone()),
             key,
             namespace: namespace.to_string(),
             seq,
@@ -433,6 +448,12 @@ impl CraftSql {
                 .map(Cid)
                 .ok_or_else(|| SqlError::Sqlite("no head to compact".into()))?,
         };
+        // Unwrap the DEK (private db) so compaction can decrypt the sealed index while enumerating
+        // the live object set; None for a public db.
+        let cipher = open_db_store(&self.store_dir, &key)
+            .ok()
+            .and_then(|s| s.get(&root))
+            .and_then(|b| unwrap_dek(&b, self.enc.as_deref()));
         run_compaction(
             &self.store_dir,
             &key,
@@ -440,6 +461,7 @@ impl CraftSql {
             root,
             durable,
             &self.manifests,
+            cipher.as_ref(),
         )
         .await
     }
@@ -456,6 +478,9 @@ pub struct CraftDb {
     key: String,
     namespace: String,
     seq: u64,
+    /// The DB DEK for a PRIVATE db (None = public). Held so the durability sweep can
+    /// decrypt the sealed index while enumerating reachable objects (ENCRYPTION §7).
+    dek: Option<zeph_cipher::Dek>,
 }
 
 impl CraftDb {
@@ -517,13 +542,13 @@ impl CraftDb {
             return Ok(());
         }
         let prev: std::collections::HashSet<Cid> = match manifest.last_root {
-            Some(r) => crate::pager::reachable(&store, Cid(r))?
+            Some(r) => crate::pager::reachable(&store, Cid(r), self.dek.as_ref())?
                 .into_iter()
                 .collect(),
             None => std::collections::HashSet::new(),
         };
         let mut fresh = Vec::new();
-        for cid in crate::pager::reachable(&store, root)? {
+        for cid in crate::pager::reachable(&store, root, self.dek.as_ref())? {
             if !prev.contains(&cid) {
                 if let Some(bytes) = store.get(&cid) {
                     fresh.push((cid, bytes));
@@ -571,6 +596,7 @@ impl CraftDb {
                 root,
                 durable,
                 &self.manifests,
+                self.dek.as_ref(),
             )
             .await?;
         }
@@ -654,6 +680,22 @@ async fn ensure(
 /// the objects reachable from `root`, drop the old generations (unpin → fade),
 /// and GC superseded page objects from the local store. Bounds storage to ~the
 /// live DB size instead of growing with write history.
+/// Unwrap a DB's DEK from its root's plaintext `wrapped_dek` using `enc` (None for a public db, a
+/// foreign db we can't unwrap, or no keypair) — so the sweep/compaction/sync paths can decrypt the
+/// sealed index while walking the tree (ENCRYPTION §7).
+fn unwrap_dek(
+    root_bytes: &[u8],
+    enc: Option<&zeph_cipher::EncKeypair>,
+) -> Option<zeph_cipher::Dek> {
+    let ri = crate::pager::decode_root(root_bytes).ok()?;
+    if ri.wrapped_dek.is_empty() {
+        return None;
+    }
+    let cap: zeph_cipher::DekCapsule = postcard::from_bytes(&ri.wrapped_dek).ok()?;
+    zeph_cipher::open_capsule(enc?, &cap).ok()
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_compaction(
     store_dir: &Path,
     key: &str,
@@ -661,14 +703,16 @@ async fn run_compaction(
     root: Cid,
     durable: &Arc<dyn DurableStore>,
     manifests: &Option<Arc<dyn ManifestStore>>,
+    cipher: Option<&zeph_cipher::Dek>,
 ) -> Result<usize> {
     let store = open_db_store(store_dir, key)?;
     let mut manifest = load_manifest(store_dir, key);
     if manifest.generations.len() <= 1 {
         return Ok(0);
     }
-    let live: std::collections::HashSet<Cid> =
-        crate::pager::reachable(&store, root)?.into_iter().collect();
+    let live: std::collections::HashSet<Cid> = crate::pager::reachable(&store, root, cipher)?
+        .into_iter()
+        .collect();
     // Pack the live object set into one fresh base generation.
     let live_objs: Vec<(Cid, Vec<u8>)> = live
         .iter()
@@ -1125,7 +1169,9 @@ mod tests {
         let (root, _) = heads.resolve(owner_id, "big").await.unwrap().unwrap();
         let big_key = format!("{}_{}", &owner_id.to_hex()[..16], "big");
         let owner_store = open_db_store(owner_dir.path(), &big_key).unwrap();
-        let total = crate::pager::reachable(&owner_store, root).unwrap().len();
+        let total = crate::pager::reachable(&owner_store, root, None)
+            .unwrap()
+            .len();
         assert!(total > 10, "DB should span many objects, got {total}");
 
         // Lazy reader: a point query should fetch far fewer than every object.

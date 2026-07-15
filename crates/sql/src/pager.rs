@@ -16,19 +16,26 @@ const FANOUT: u64 = 256;
 pub(crate) type NodeMap = BTreeMap<u8, [u8; 32]>;
 
 /// The root object — a tiny header pointing at the index tree. Its CID is the DB
-/// ROOT (the `KIND_ROOT` head). A commit rewrites only the tree nodes on the
-/// path to changed pages, so unchanged subtrees keep their CIDs (dedup), and the
-/// index cost is O(changed · depth), not O(total pages).
+/// ROOT (the `KIND_ROOT` head). A commit rewrites only the tree nodes on the path
+/// to changed pages, so unchanged subtrees keep their CIDs (dedup), and the index
+/// cost is O(changed · depth), not O(total pages). PRIVACY (ENCRYPTION §7): for a
+/// PRIVATE db every index NODE is sealed under the DB DEK, so a holder learns
+/// neither the page CIDs nor the tree shape. This root header stays PLAINTEXT and
+/// byte-identical to a public root (so public DBs — incl. the registry shards —
+/// are wire-unchanged): `root_cid` points at a SEALED node → it reveals no
+/// structure; only `page_count`/`depth` remain visible (a coarse size hint that a
+/// holder can already infer from the stored piece count).
 #[derive(Serialize, Deserialize)]
 pub(crate) struct RootIndex {
     pub page_count: u32,
     /// Tree depth (0 = empty DB; else levels of nodes above the page objects).
     pub depth: u8,
-    /// CID of the top node (meaningless if depth == 0).
+    /// CID of the top node (meaningless if depth == 0). For a private db this
+    /// points at a SEALED node — opaque without the DEK.
     pub root_cid: [u8; 32],
     /// Wrapped DB data-key (serialized PRE capsule) for a PRIVATE db; empty = the
-    /// db is public (plaintext pages). Rides the root object (plaintext), so any
-    /// node resolving the head can retrieve it and — with the owner key — unwrap.
+    /// db is public. Plaintext — the bootstrap the owner unwraps to get the DEK
+    /// that then decrypts the sealed index nodes.
     pub wrapped_dek: Vec<u8>,
 }
 
@@ -36,8 +43,38 @@ pub(crate) fn decode_root(bytes: &[u8]) -> Result<RootIndex> {
     postcard::from_bytes(bytes).map_err(|e| SqlError::CorruptIndex(e.to_string()))
 }
 
+/// Seal an index node blob for storage: sealed deterministically under the DB DEK
+/// for a private db (so identical index nodes still dedup to one CID), plaintext
+/// for a public db.
+fn seal_index(cipher: Option<&zeph_cipher::Dek>, plain: &[u8]) -> Vec<u8> {
+    match cipher {
+        Some(dek) => zeph_cipher::seal_deterministic(dek, plain),
+        None => plain.to_vec(),
+    }
+}
+
+/// Inverse of [`seal_index`]: decrypt an index blob with the DB DEK for a private
+/// db. A private index object is unreadable without the key (its structure stays
+/// confidential), so a `None`/wrong key on sealed bytes is a hard `CorruptIndex`.
+fn open_index(cipher: Option<&zeph_cipher::Dek>, stored: &[u8]) -> Result<Vec<u8>> {
+    match cipher {
+        Some(dek) => zeph_cipher::open(dek, stored)
+            .map_err(|_| SqlError::CorruptIndex("index decrypt (wrong key?)".into())),
+        None => Ok(stored.to_vec()),
+    }
+}
+
 pub(crate) fn decode_node(bytes: &[u8]) -> Result<NodeMap> {
     postcard::from_bytes(bytes).map_err(|e| SqlError::CorruptIndex(e.to_string()))
+}
+
+/// Decrypt (private db) + decode an index-node blob — the DEK-aware `decode_node`
+/// for callers that walk the tree from raw stored bytes (`db.rs` sync/sweep paths).
+pub(crate) fn decode_node_sealed(
+    cipher: Option<&zeph_cipher::Dek>,
+    stored: &[u8],
+) -> Result<NodeMap> {
+    decode_node(&open_index(cipher, stored)?)
 }
 
 /// Depth needed to hold `page_count` pages (1 level per 256×).
@@ -73,9 +110,10 @@ pub struct Pager {
     /// For lazy readers: fetch a missing page's bytes from the network on demand
     /// (the index is already local; only page contents are pulled per-read).
     remote: Option<crate::fetch::Fetcher>,
-    /// If set, PAGE contents are encrypted (deterministic) before storage and
-    /// decrypted on read — a private DB. Index nodes + root stay plaintext (they
-    /// carry only ciphertext-page CIDs, revealing structure not content).
+    /// If set, this is a PRIVATE db: page contents, index nodes, AND the root's
+    /// structural header are all encrypted (deterministic seal) before storage and
+    /// decrypted on read (ENCRYPTION §7) — so a holder learns neither content nor
+    /// structure. Only the root's `wrapped_dek` stays plaintext (the bootstrap).
     cipher: Option<zeph_cipher::Dek>,
     /// Serialized wrapped DB key (PRE capsule) written into the root on commit;
     /// empty for a public db. Loaded from the root on open.
@@ -99,7 +137,10 @@ impl Pager {
     }
 
     /// Open the snapshot at `root`, materializing the page map + node-CID cache.
-    pub fn open(store: ObjectStore, root: Cid) -> Result<Self> {
+    /// For a PRIVATE db, `cipher` (the DB DEK — unwrapped by the caller from the
+    /// root's plaintext `wrapped_dek`) is REQUIRED: the structural header and every
+    /// index node are sealed, so a `None`/wrong key can't even read the DB's shape.
+    pub fn open(store: ObjectStore, root: Cid, cipher: Option<zeph_cipher::Dek>) -> Result<Self> {
         let bytes = store
             .get(&root)
             .ok_or_else(|| SqlError::RootNotFound(root.to_hex()))?;
@@ -109,6 +150,7 @@ impl Pager {
         if ri.depth > 0 {
             load_subtree(
                 &store,
+                cipher.as_ref(),
                 ri.depth - 1,
                 0,
                 Cid(ri.root_cid),
@@ -125,8 +167,8 @@ impl Pager {
             page_count: ri.page_count,
             depth: ri.depth,
             remote: None,
-            cipher: None,
-            wrapped_dek: Vec::new(),
+            cipher,
+            wrapped_dek: ri.wrapped_dek,
         })
     }
 
@@ -263,6 +305,9 @@ impl Pager {
                 .get(&(self.depth - 1, 0))
                 .unwrap_or(&[0u8; 32])
         };
+        // The root header is PLAINTEXT (byte-identical to a public root → registry/public DBs
+        // unchanged). `root_cid` points at a sealed node for a private db, so it leaks no structure;
+        // the index nodes below carry the confidentiality.
         let ri = RootIndex {
             page_count: self.page_count,
             depth: self.depth,
@@ -302,7 +347,11 @@ impl Pager {
                 } else {
                     let blob = postcard::to_allocvec(&children)
                         .map_err(|e| SqlError::Serde(e.to_string()))?;
-                    self.node_cids.insert((level, nk), self.store.put(&blob)?.0);
+                    // Seal the index node under the DEK for a private db (ENCRYPTION §7) — hides the
+                    // page CIDs + tree structure. Deterministic → an unchanged node keeps its CID (dedup).
+                    let stored = seal_index(self.cipher.as_ref(), &blob);
+                    self.node_cids
+                        .insert((level, nk), self.store.put(&stored)?.0);
                 }
                 next.insert((nk as u64 / FANOUT) as u32);
             }
@@ -312,8 +361,10 @@ impl Pager {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_subtree(
     store: &ObjectStore,
+    cipher: Option<&zeph_cipher::Dek>,
     level: u8,
     node_key: u32,
     node_cid: Cid,
@@ -324,12 +375,21 @@ fn load_subtree(
     let bytes = store
         .get(&node_cid)
         .ok_or_else(|| SqlError::CorruptIndex(format!("missing node {}", node_cid.to_hex())))?;
-    for (idx, child) in decode_node(&bytes)? {
+    let plain = open_index(cipher, &bytes)?;
+    for (idx, child) in decode_node(&plain)? {
         let child_key = (node_key as u64 * FANOUT + idx as u64) as u32;
         if level == 0 {
             pages.insert(child_key, child);
         } else {
-            load_subtree(store, level - 1, child_key, Cid(child), pages, node_cids)?;
+            load_subtree(
+                store,
+                cipher,
+                level - 1,
+                child_key,
+                Cid(child),
+                pages,
+                node_cids,
+            )?;
         }
     }
     Ok(())
@@ -338,7 +398,14 @@ fn load_subtree(
 /// Every object CID reachable from `root` — the root header, all index-tree
 /// nodes, and all page objects. Used by the durability sweep to know the DB's
 /// full object set (for generation diffing) and by recovery to verify coverage.
-pub(crate) fn reachable(store: &ObjectStore, root: Cid) -> Result<Vec<Cid>> {
+/// For a PRIVATE db, `cipher` (the DB DEK) is required to decrypt the sealed root
+/// meta + index nodes and walk the tree — the owner's sweep has it; a holder never
+/// enumerates the index (it repairs generations via the manifest instead).
+pub(crate) fn reachable(
+    store: &ObjectStore,
+    root: Cid,
+    cipher: Option<&zeph_cipher::Dek>,
+) -> Result<Vec<Cid>> {
     let mut out = vec![root];
     let bytes = store
         .get(&root)
@@ -355,7 +422,8 @@ pub(crate) fn reachable(store: &ObjectStore, root: Cid) -> Result<Vec<Cid>> {
             let nb = store
                 .get(&ncid)
                 .ok_or_else(|| SqlError::CorruptIndex(format!("missing node {}", ncid.to_hex())))?;
-            for child in decode_node(&nb)?.into_values() {
+            let plain = open_index(cipher, &nb)?;
+            for child in decode_node(&plain)?.into_values() {
                 if level == 0 {
                     out.push(Cid(child));
                 } else {
@@ -410,18 +478,27 @@ mod tests {
             "plaintext marker absent from the ciphertext page"
         );
 
-        // Reopen WITH the key → reads back.
-        let mut owner = Pager::open(store_at(dir.path()), root).unwrap();
-        owner.set_cipher(dek);
+        // Reopen WITH the key → reads back (the DEK now also decrypts the sealed index nodes).
+        let owner = Pager::open(store_at(dir.path()), root, Some(dek.clone())).unwrap();
         assert_eq!(owner.read_page(0), secret);
 
-        // Reopen WITHOUT the key → cannot recover the plaintext.
-        let foreign = Pager::open(store_at(dir.path()), root).unwrap();
-        assert_ne!(
-            foreign.read_page(0),
-            secret,
-            "no key → cannot read plaintext"
+        // §7: the INDEX is private too. The leaf index node is ciphertext — it does NOT expose the
+        // plaintext page CIDs, so a holder learns neither content nor the tree's structure (v1 left
+        // the index plaintext; now only the coarse `page_count` in the root header remains visible).
+        let page0_cid = *p.pages.get(&0).unwrap();
+        let leaf_cid = owner.node_cids[&(0, 0)];
+        let raw_node = p.store.get(&Cid(leaf_cid)).unwrap();
+        assert!(
+            !raw_node.windows(32).any(|w| w == page0_cid),
+            "index node is sealed — page CIDs are not exposed in plaintext"
         );
+
+        // A foreign reader WITHOUT the key can't recover the real content: it may fail to decode the
+        // sealed index and error, or open to a garbage index — either way it never reads the plaintext.
+        match Pager::open(store_at(dir.path()), root, None) {
+            Err(_) => {}
+            Ok(foreign) => assert_ne!(foreign.read_page(0), secret, "no key → no plaintext"),
+        }
     }
 
     #[test]
@@ -435,10 +512,10 @@ mod tests {
         let root2 = p.commit().unwrap();
         assert_ne!(root1, root2);
 
-        let old = Pager::open(store_at(dir.path()), root1).unwrap();
+        let old = Pager::open(store_at(dir.path()), root1, None).unwrap();
         assert_eq!(old.read_page(1), page(2));
         assert_eq!(old.read_page(0), page(1));
-        let new = Pager::open(store_at(dir.path()), root2).unwrap();
+        let new = Pager::open(store_at(dir.path()), root2, None).unwrap();
         assert_eq!(new.read_page(1), page(9));
         assert_eq!(old.pages[&0], new.pages[&0], "unchanged page shared");
         assert_ne!(old.pages[&1], new.pages[&1], "changed page differs");
@@ -447,7 +524,7 @@ mod tests {
     #[test]
     fn unknown_root_errors_and_unwritten_page_is_zero() {
         let dir = tempdir().unwrap();
-        assert!(Pager::open(store_at(dir.path()), Cid::of(b"nope")).is_err());
+        assert!(Pager::open(store_at(dir.path()), Cid::of(b"nope"), None).is_err());
         let p = Pager::create(store_at(dir.path()));
         assert_eq!(p.read_page(5), vec![0u8; PAGE_SIZE]);
     }
@@ -464,21 +541,21 @@ mod tests {
         assert_eq!(p.page_count(), 300);
 
         // Reopen from the tree root → every page reads back.
-        let p1 = Pager::open(store_at(dir.path()), root1).unwrap();
+        let p1 = Pager::open(store_at(dir.path()), root1, None).unwrap();
         for i in 0..300u32 {
             assert_eq!(p1.read_page(i), page((i % 251) as u8), "page {i}");
         }
 
         // Change ONE page deep in the tree, commit → new root.
-        let mut p2 = Pager::open(store_at(dir.path()), root1).unwrap();
+        let mut p2 = Pager::open(store_at(dir.path()), root1, None).unwrap();
         p2.write_page(150, page(200));
         let root2 = p2.commit().unwrap();
         assert_ne!(root1, root2);
 
         // Old snapshot intact; new snapshot has the change; the OTHER leaf's node
         // is shared (incremental — only the path to page 150 was rewritten).
-        let old = Pager::open(store_at(dir.path()), root1).unwrap();
-        let new = Pager::open(store_at(dir.path()), root2).unwrap();
+        let old = Pager::open(store_at(dir.path()), root1, None).unwrap();
+        let new = Pager::open(store_at(dir.path()), root2, None).unwrap();
         assert_eq!(old.read_page(150), page(150));
         assert_eq!(new.read_page(150), page(200));
         assert_eq!(old.pages[&0], new.pages[&0], "untouched page shared");

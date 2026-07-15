@@ -99,18 +99,27 @@ impl Vfs for CraftVfs {
             // guard) — a bad namespace fails the open here rather than escaping `dir`.
             let store = ObjectStore::open_db_component(&self.dir, db, &self.dir)?;
             let roots = self.roots.clone();
+            // Look up the per-db cipher UP FRONT: a private db's index nodes + root meta are sealed,
+            // so `Pager::open` needs the DEK to decrypt the tree while materializing it.
+            let cipher = self.ciphers.lock().expect("ciphers").get(db).cloned();
             let mut pager = match roots.lock().expect("roots").get(db).copied() {
-                Some(root) => Pager::open(store, Cid(root)).map_err(to_io)?,
+                Some(root) => Pager::open(
+                    store,
+                    Cid(root),
+                    cipher.as_ref().map(|(dek, _)| dek.clone()),
+                )
+                .map_err(to_io)?,
                 None => Pager::create(store),
             };
             // Lazy reader: pull page contents on demand via the registered fetcher.
             if let Some(f) = self.fetchers.lock().expect("fetchers").get(db) {
                 pager.set_remote(f.clone());
             }
-            // Private db: apply the page cipher + wrapped-DEK registered by open_as.
-            if let Some((dek, wrapped)) = self.ciphers.lock().expect("ciphers").get(db) {
-                pager.set_cipher(dek.clone());
-                pager.set_wrapped_dek(wrapped.clone());
+            // Private db: (re-)apply the page cipher + wrapped-DEK. Redundant on the open path (open
+            // set them), but this is what makes a freshly-CREATEd private db seal its writes.
+            if let Some((dek, wrapped)) = cipher {
+                pager.set_cipher(dek);
+                pager.set_wrapped_dek(wrapped);
             }
             Ok(CraftHandle {
                 inner: Inner::Db {
