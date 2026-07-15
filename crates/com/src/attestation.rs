@@ -125,6 +125,30 @@ impl Quorum {
         self.members.binary_search(id).is_ok()
     }
 
+    /// Whether this quorum is **intersection-sized**: any two `threshold`-subsets of the members
+    /// share at least one member, i.e. `2·threshold > n`. This is the minimal safety precondition a
+    /// SEQUENCER quorum must meet — without it, two conflicting writes could each gather a *disjoint*
+    /// `k` and both commit (equivocation).
+    ///
+    /// The shared member refuses to sign a second conflicting write, so only one reaches `k` — but
+    /// only if that shared member is HONEST. Two quorums share `2k−n` members, so this tolerates up
+    /// to [`byzantine_tolerance`](Self::byzantine_tolerance) = `2k−n−1` equivocating members. For a
+    /// target of `f` Byzantine faults, size `2k > n + f` (the design's `k > (n+f)/2`; classic
+    /// `2f+1`-of-`3f+1` yields exactly `f`); `2k > n` alone is the `f = 0` floor (a trusted
+    /// committee). Attestation's authority use does NOT require this (a `Statement` is authorized
+    /// once, not raced), so it stays a distinct, opt-in check rather than a genesis clamp.
+    pub fn is_intersection_sized(&self) -> bool {
+        2 * self.threshold > self.members.len()
+    }
+
+    /// The number of equivocating (Byzantine) members this quorum's sizing tolerates while still
+    /// guaranteeing an HONEST member in every quorum-intersection: `2k − n − 1`, saturating at 0.
+    /// `0` means intersection holds only against crash faults (an honest-but-offline member), not a
+    /// double-signer. `n = 3f+1, k = 2f+1` yields exactly `f`.
+    pub fn byzantine_tolerance(&self) -> usize {
+        (2 * self.threshold).saturating_sub(self.members.len() + 1)
+    }
+
     /// The bytes an app OWNER signs to authenticate this quorum as the genesis for `program_cid`.
     /// Bound to the program cid so an owner's genesis signature can't be replayed onto a different
     /// program. This is the global-adoption trust root (see [`AttestedChain`]).

@@ -1,3 +1,42 @@
+# ECONOMIC LAYER — ORDERING SEQUENCER (§11 step 1 of docs/ECONOMIC_LAYER_DESIGN.md) — ACTIVE (started 2026-07-15)
+
+Design settled in docs/ECONOMIC_LAYER_DESIGN.md (§4/§5). Building the first no-dependency piece of the economic
+layer: finish the deferred K7 attestation auto-signing and extend the attestation substrate into a per-account,
+non-equivocating, quorum-intersection-sized ORDERING SEQUENCER — the mechanism the token ledger sits on
+(validity = verification [K6]; ORDERING = this sequencer; custody = attestation [K7]). Reuses the attestation
+substrate (crates/com/src/attestation.rs): `Quorum`, `count_signers`, `MemberSignature`, the `QuorumChain` fold.
+
+Current state (Explore map 2026-07-15): `QuorumChain`'s strict-seq fold is already a non-equivocating serializer
+for the quorum CONFIG (not per-account nonces). Missing pieces: (a) a per-account nonce distinct from quorum-config
+seq; (b) an intersection constraint on threshold (`2k>n` — absent; threshold only clamped `1..=n`); (c) a
+quorum-gated append-at-nonce WRITE path (the `attest` host fn is read-only `is_authorized`); (d) the structural
+non-equivocation invariant + the auto-sign policy hook (Package B — deferred, not in code).
+
+Phases (each: build+test → design-check → review → commit):
+- [x] **P1 — Sequencer core DONE 2026-07-15 (commit pending)** (pure offline, `crates/com/src/sequencer.rs`): `SequencedWrite{account,nonce,payload}`,
+      `SequencedCommit{write,sigs}`, `AccountSequence` log (sequential-nonce fold), `Quorum::is_intersection_sized`
+      (`2k>n`), `SequencerMember` structural non-equivocation (a member signs ≤1 write per `(account,nonce)`;
+      idempotent for the identical write). Unit tests: intersection sizing; member refuses conflicting same-nonce;
+      two conflicting writes can't BOTH reach k under intersection+honest-refusal; account binding; fold/tamper
+      reject; encode/decode roundtrip. NO wire/host/node changes.
+      **Landed:** `crates/com/src/sequencer.rs` (new) + `Quorum::is_intersection_sized`/`byzantine_tolerance`
+      (attestation.rs, additive) + lib.rs exports. **Design-check fix:** `2k>n` is the intersection FLOOR
+      (tolerates `f = 2k−n−1` Byzantine double-signers, `=f` for the classic `n=3f+1`/`k=2f+1`); added
+      `byzantine_tolerance()` + a test proving 2-of-3 forks under 1 Byzantine while 3-of-4 does not. **Gates
+      all green:** 82 zeph-com tests + 8 new sequencer tests, fmt, clippy `--all-targets`, `cargo build
+      --workspace` (noded compiles). Core safety proven: `two_conflicting_writes_cannot_both_commit`.
+- [ ] **P2 — Backend + host fn**: `Capability::Sequence`, a `sequence(account_ptr, nonce, payload_ptr, len) -> i32`
+      host fn (mirror `attest`), a `SequenceBackend` trait, wired through transition/invoke. Node serializes the
+      write through the per-account quorum. owner/quorum server-resolved (like `attest`, never caller-supplied).
+- [ ] **P3 — Node service + cross-node propagation**: per-account sequence chains publish/pull cross-node (mirror
+      `AttestStore` anti-entropy over a reserved DHT name); non-equivocation guard generalized per-`(account,nonce)`;
+      any node serves the sequenced order (sync-first).
+- [ ] **P4 — Auto-signing policy hook** (deferred Package B): member-side policy-program auto-sign; the
+      non-equivocation invariant enforced STRUCTURALLY by the binary (the hook refuses a 2nd conflicting
+      `(account,nonce)` regardless of policy) — program owns discretion, binary owns the invariant (§5).
+
+---
+
 # FILE SEGMENTATION — large-file chunking (design-check DONE 2026-07-15; chosen: Model B) — ACTIVE
 
 **Design-check verdict:** CRAFTOBJ_DESIGN is internally inconsistent — §80–92 (one `content_cid`, segments

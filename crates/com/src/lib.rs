@@ -40,6 +40,7 @@ mod craft;
 mod gov;
 mod invoke;
 mod registry;
+mod sequencer;
 mod transition;
 mod verification;
 pub use attestation::{
@@ -55,6 +56,7 @@ pub use registry::{
     registry_program_cid, ConfigRegistryState, HeadEntry, HeadSubmission, NativeProgram,
     ProgramRegistryState, RegistryProgram, RegistryState,
 };
+pub use sequencer::{AccountSequence, SequencedCommit, SequencedWrite, SequencerMember};
 pub use transition::{pda, TransitionCtx, TransitionRuntime};
 pub use verification::{
     produce, verify_locally, Board, BoardSnapshot, PostedRequest, Verdict, Verifier, VerifierSet,
