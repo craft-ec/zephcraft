@@ -21,9 +21,20 @@ Phases:
       non-consumer-signed refused; monotonic + stale refused; wrong-server refused; multi-consumer sum; load
       roundtrip; **quota allocation caps paid at quota by timestamp** (+ quota=0 → all subsidy). Gates: build,
       7 tests, fmt, clippy. (Settlement — calling `allocate_quota` + paying providers from tokens/pool — is step 4.)
-- [ ] **P2 — Transport hook**: emit/collect cheques on the piece-serving path (obj serve over `tag::PIECE`) — the
-      consumer issues a cheque per served chunk, the provider records it; + the SWAP settlement threshold (§7).
-      (obj adds `zeph-cheque` dep; register `zeph-cheque` in the root workspace.dependencies.)
+- [x] **P2 — Transport hook DONE 2026-07-15** (DECOUPLED model — the piece hot-path stays untouched; cheques ride
+      their OWN mux tag). obj gained a `ByteMeter` trait + `set_byte_meter`/`meter_bytes`, fired inline in
+      `ObjEngine::get` for each VERIFIED piece (post-vtag `wp.data.len()`), crediting the provider it came from
+      (the fetch fanout now carries `p.node_id` out via a `(node_id, result)` tuple). New `noded::cheque::ChequeService`
+      (`crates/noded/src/cheque.rs`) `impl ByteMeter`: accumulates per-provider against a CREDIT_BAND (4 MiB); at the
+      band it issues a cumulative `ServingCheque` (`ChequeIssuer::issue`, HLC-ms timestamp from `transport.clock()`) and
+      ENQUEUES a fire-and-forget push over new `tag::CHEQUE = 10` (non-blocking `try_send` → `run_pusher` resolves the
+      provider addr via `membership.member_addr` + `request_tagged`). Provider side: `serve(tag::CHEQUE)` records inbound
+      cheques into a `ChequeBook` (→ `total_earned`, the measurement). Wired in main.rs (construct + `set_byte_meter`
+      + handler registration + `serve`/`run_pusher` spawns + `set_membership`); `zeph-cheque` added to root
+      workspace.deps + noded. Fire-and-forget like `tag::BOARD` (serve finishes the stream, sender ignores the reply).
+      2 noded tests (credit-band batches into a cumulative cheque + verifies; provider records inbound → earnings).
+      Gates: build (workspace), tests, fmt, clippy all green. (Cross-node push/record is compile-verified +
+      fleet-validatable, matching how attest/sequencer shipped — not unit-tested cross-node.)
 - [ ] **P3 — Measurement collection**: expose the provider's `total_earned` (per-counterparty cheques) as the
       serving-contribution signal for the (future) participation metric (§6); count PAID egress from distinct payers.
 

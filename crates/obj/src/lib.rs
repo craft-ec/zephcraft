@@ -302,6 +302,14 @@ pub trait PeerSource: Send + Sync {
     async fn peers(&self) -> Vec<(NodeId, PeerAddr)>;
 }
 
+/// Fetch byte-meter (§11 step 2): notified `(provider, bytes)` for each VERIFIED piece this node
+/// fetches from a provider. The node wires the serving-cheque service here (via
+/// [`ObjEngine::set_byte_meter`]); it accumulates per-provider bytes and issues cumulative cheques.
+/// Must be non-blocking (called inline in the fetch loop) — the impl enqueues, it does not do IO here.
+pub trait ByteMeter: Send + Sync {
+    fn on_bytes_received(&self, provider: NodeId, bytes: u64);
+}
+
 /// Elected-scan per-cid snapshot: (last_scan_ms, capable holder ids).
 type ScanSnapshot = (u64, Vec<NodeId>);
 
@@ -381,6 +389,10 @@ pub struct ObjEngine {
     /// high → only the durability-critical class (and just 1), otherwise a
     /// bounded batch. Unwired (tests/library), every offer is granted in full.
     grant_gate: std::sync::OnceLock<Arc<dyn Fn(u8, u16) -> u16 + Send + Sync>>,
+    /// Set by the node (§11 step 2): a metering hook fired with `(provider, bytes)` for each VERIFIED
+    /// piece this node FETCHES from a provider, so the serving-cheque service can issue cumulative
+    /// cheques. Unwired (tests/library), fetch metering is a no-op.
+    byte_meter: std::sync::OnceLock<Arc<dyn ByteMeter>>,
     /// Liveness source (set by the node = membership; a test source in tests). The health scan
     /// filters provider records by this so a DIED holder — whose record lingers until TTL — stops
     /// inflating a cid's effective count, and repair fires. None → no filtering (legacy).
@@ -435,6 +447,7 @@ impl ObjEngine {
             work_trigger: std::sync::OnceLock::new(),
             shed_gate: std::sync::OnceLock::new(),
             grant_gate: std::sync::OnceLock::new(),
+            byte_meter: std::sync::OnceLock::new(),
             liveness: Mutex::new(None),
             alive_cache: Mutex::new(None),
             node_liveness: Mutex::new(HashMap::new()),
@@ -1066,17 +1079,18 @@ impl ObjEngine {
             }
             let excl: Vec<[u8; 32]> = exclude.iter().copied().collect();
             let futs = providers.iter().take(FANOUT).map(|p| {
+                let node_id = p.node_id;
                 let msg = wire::Message::PieceRequest(wire::PieceRequest {
                     cid: cid.0,
                     exclude: excl.clone(),
                     max_pieces: 1,
                 });
-                async move { self.request(&p.addr, &msg).await }
+                async move { (node_id, self.request(&p.addr, &msg).await) }
             });
             let results = futures::future::join_all(futs).await;
 
             let mut progressed = false;
-            for res in results {
+            for (provider, res) in results {
                 let Ok(wire::Message::PieceResponse(resp)) = res else {
                     continue;
                 };
@@ -1091,6 +1105,7 @@ impl ObjEngine {
                 let tags_ref = tags.as_ref().expect("set");
                 let decoder_ref = decoder.as_mut().expect("set");
                 for wp in resp.pieces {
+                    let bytes = wp.data.len() as u64;
                     let piece = CodedPiece {
                         coding_vector: wp.coding_vector,
                         data: wp.data,
@@ -1101,6 +1116,9 @@ impl ObjEngine {
                     );
                     if exclude.insert(piece.piece_id()) {
                         decoder_ref.add_piece(&piece)?;
+                        // Meter VERIFIED bytes fetched from this provider (serving-cheque, §11 step 2):
+                        // the consumer acknowledges the bandwidth it received + verified, per provider.
+                        self.meter_bytes(provider, bytes);
                         progressed = true;
                     }
                 }
@@ -2468,6 +2486,19 @@ impl ObjEngine {
     /// Wire the inbound-intake shed gate (typically `ResourceGauge::critical`).
     pub fn set_shed_gate(&self, gate: Arc<dyn Fn() -> bool + Send + Sync>) {
         let _ = self.shed_gate.set(gate);
+    }
+
+    /// Wire the fetch byte-meter (§11 step 2) — fired with `(provider, verified_bytes)` for each piece
+    /// this node fetches, so a serving-cheque service can issue cumulative cheques. Set once.
+    pub fn set_byte_meter(&self, meter: Arc<dyn ByteMeter>) {
+        let _ = self.byte_meter.set(meter);
+    }
+
+    /// Fire the byte-meter for `bytes` verified from `provider` (no-op if unwired).
+    fn meter_bytes(&self, provider: NodeId, bytes: u64) {
+        if let Some(m) = self.byte_meter.get() {
+            m.on_bytes_received(provider, bytes);
+        }
     }
 
     /// Wire the graded admission gate for offer/grant (TRANSFER_PLANE_V2 §3):

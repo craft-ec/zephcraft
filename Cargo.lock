@@ -5908,6 +5908,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "zeph-cheque",
  "zeph-cipher",
  "zeph-com",
  "zeph-core",

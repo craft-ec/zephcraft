@@ -42,6 +42,9 @@ pub mod tag {
     /// Ordering-sequencer sign solicitation (a collector asks a quorum member to sign a `SequencedWrite`;
     /// the member auto-signs if owner-authentic + non-equivocating). Additive → mixed-version-safe.
     pub const SIGN_SOLICIT: u8 = 9;
+    /// Serving-cheque push (a consumer fire-and-forgets a cumulative `ServingCheque` to a provider it
+    /// fetched from; the provider records it). Fire-and-forget like `BOARD`. Additive → mixed-version-safe.
+    pub const CHEQUE: u8 = 10;
 }
 
 /// An inbound muxed bi-stream, already tag-dispatched: the remote's NodeId

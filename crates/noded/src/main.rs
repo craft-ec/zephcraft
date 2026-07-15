@@ -37,6 +37,7 @@ pub static malloc_conf: &[u8] = b"dirty_decay_ms:1000,muzzy_decay_ms:0\0";
 mod account;
 mod attest;
 mod board;
+mod cheque;
 mod control;
 mod governance;
 mod headreg;
@@ -1461,6 +1462,13 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         Some(attest_store.clone()),
         Some(sequence_store.clone()),
     ));
+    // The serving-cheque service (ECONOMIC_LAYER_DESIGN §7; §11 step 2): obj meters the verified bytes
+    // this node fetches from each provider (ByteMeter); at a credit band we issue a cumulative SWAP
+    // cheque and push it fire-and-forget over tag::CHEQUE. Inbound cheques are recorded as this node's
+    // serving MEASUREMENT (total_earned). Decoupled from the piece hot-path — cheques ride their own tag.
+    let (cheque_service, cheque_push_rx) =
+        cheque::ChequeService::new(identity.clone(), transport.clock(), transport.clone());
+    engine.set_byte_meter(cheque_service.clone());
 
     tracing::info!(
         node_id = %identity.node_id().to_hex(),
@@ -1720,6 +1728,9 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // Ordering-sequencer sign solicitations (a collector asks this node, as a quorum member, to sign).
     let (sign_stream_tx, sign_stream_rx) = tokio::sync::mpsc::channel(32);
     stream_handlers.push((zeph_transport::tag::SIGN_SOLICIT, sign_stream_tx));
+    // Serving-cheque pushes (a consumer sends us a cumulative cheque for bytes we served it).
+    let (cheque_stream_tx, cheque_stream_rx) = tokio::sync::mpsc::channel(32);
+    stream_handlers.push((zeph_transport::tag::CHEQUE, cheque_stream_tx));
     let server = transport.clone();
     tokio::spawn(async move { server.serve(stream_handlers).await });
     tokio::spawn(engine.clone().serve(piece_stream_rx));
@@ -1733,6 +1744,9 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // Serve + gossip + verify the verification board.
     tokio::spawn(board_service.clone().serve(board_stream_rx));
     tokio::spawn(sequence_store.clone().serve(sign_stream_rx));
+    // Record inbound cheques (provider side) + drain the outbound push queue (consumer side).
+    tokio::spawn(cheque_service.clone().serve(cheque_stream_rx));
+    tokio::spawn(cheque_service.clone().run_pusher(cheque_push_rx));
     // "Pending distribution" completion (per-incomplete-cid DHT resolve + deficit pushes)
     // — network fan-out, so it runs THROUGH the coordinator (Distribution priority,
     // deduped: a slow pass coalesces with the next tick instead of stacking). This loop
@@ -1845,6 +1859,8 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         },
     );
     membership.start(peers, member_stream_rx);
+    // The cheque pusher resolves a provider's address through membership before pushing a cheque.
+    cheque_service.set_membership(membership.clone()).await;
     state.set_boot_stage("census-settling").await;
     {
         let (st, reg) = (state.clone(), head_registry.clone());
