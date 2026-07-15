@@ -35,8 +35,25 @@ Phases:
       2 noded tests (credit-band batches into a cumulative cheque + verifies; provider records inbound → earnings).
       Gates: build (workspace), tests, fmt, clippy all green. (Cross-node push/record is compile-verified +
       fleet-validatable, matching how attest/sequencer shipped — not unit-tested cross-node.)
-- [ ] **P3 — Measurement collection**: expose the provider's `total_earned` (per-counterparty cheques) as the
-      serving-contribution signal for the (future) participation metric (§6); count PAID egress from distinct payers.
+- [x] **P3 — DISSOLVED into step 4 (2026-07-15).** With §10 resolved, the participation metric is dissolved
+      (§10.2: paid demand *is* the metric — no standalone contribution oracle). So P3's "surface the measurement
+      for the metric" has no separate consumer: `total_earned`/`allocate_quota` are consumed directly by the
+      token-ledger's settlement (step 4). No standalone observability built (would have been a to-be-reshaped
+      interface with no consumer — CLAUDE.md "no speculative breadth"). `total_earned` keeps its documented
+      `#[allow(dead_code)]` until the ledger reads it.
+
+**§10 RESOLVED (2026-07-15) — economic policy locked; see docs/ECONOMIC_LAYER_DESIGN.md §10 (reconciled in place).**
+Decisions: #1 reward ∝ paid demand (DECIDED, the spine); #2 participation metric DISSOLVED; #3 token issuance/genesis
+= GOVERNED PARAMETER (native default fair-launch, no premine); #4 finality (n,k) = program param, default n=4/k=3
+(f=1); #5 sequencer quorum selection = ROTATING EPOCH COMMITTEE (deterministic per-epoch rendezvous selection from
+live membership — the heaviest step-4 sub-build: epoch clock + committee fn + cross-epoch sequence hand-off);
+#6–#11 models decided, numeric params governed-at-launch; #12 PDP deferred (cryptographer). Doc header + §3/§4/§5/§11
+reconciled to match.
+
+**NEXT BUILD = §11 step 4: the TOKEN-LEDGER APP** (now unblocked). Two balances (tokens + non-transferable credit),
+transfer, mint-from-receipts, egress settlement via `allocate_quota`, free-tier credit redemption — on verification
+[K6] + the sequencer. Mechanism-first with governed policy (issuance §10.3, quorum (n,k) §10.4, fee/allowance §10.6);
+the rotating-epoch-committee selection (§10.5) is its heaviest part, genesis-committee-bootstrapped.
 
 ---
 

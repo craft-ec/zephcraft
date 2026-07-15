@@ -1,10 +1,11 @@
 # Economic Layer & Participation Metrics — design
 
-Status: DESIGN (2026-07-15). Captures the design decisions from the 2026-07-15
-economic-layer discussion. **No code yet.** The distribution policy is explicitly
-UNDECIDED (§10) — this document defines the *measurement substrate*, the *accounting
-pipeline*, and the *token/ordering architecture* that a distribution policy will later
-plug into, not the policy itself.
+Status: DESIGN + PARTIAL BUILD (updated 2026-07-15). Captures the 2026-07-15 economic-layer
+decisions. **§10 is now RESOLVED:** the distribution policy is **reward ∝ paid demand**, and
+token issuance/genesis, quorum sizing `(n,k)`, and the free-tier parameters ship as **governed
+parameters** (native default fair-launch), not baked constants. Mechanism is **built**: the
+ordering sequencer (§4) and the serving-cheque + measurement substrate (§7) are live (§11 steps
+1–2). The **token-ledger app** (§11 step 4) is the active next build.
 
 Governing principle (per `MINIMAL_KERNEL_DESIGN.md`): the node **measures and
 meters** (mechanism, in the binary); the **economy** — the participation metric,
@@ -110,6 +111,10 @@ North-star-consistent: **no global-lockstep chain, no BFT-committee-per-block.**
   measurement evidence → a deterministic reward function (the distribution policy §10.1,
   run by the accounting pipeline §6) → verification [K6] re-runs it to confirm the mint
   amount → tokens minted. Receipts / evidence are single-use (can't be re-minted).
+- **Issuance & genesis = a governed policy program (§10.3), default fair-launch.** No premine
+  in the default: tokens are earned by contribution from genesis, a bootstrap-issuance curve
+  tapers as paid demand grows, and steady state is fee-recycled. The schedule, supply-cap-vs-
+  inflation, and any genesis split are governance parameters — not baked into the binary.
 - **Custody / treasury / multisig = attestation quorums [K7]** — "attestation for
   custody, not validity," exactly the split the VISION calls for.
 
@@ -147,9 +152,14 @@ lacks:
    to the policy program.
 2. **Quorum-intersection sizing** — any two quorums must share an honest member, else
    →Alice and →Bob each gather a *disjoint* k and both commit. Forces `k > (n+f)/2`
-   (classic 2f+1 of 3f+1), not an arbitrary k-of-n.
+   (classic 2f+1 of 3f+1), not an arbitrary k-of-n. **Decided (§10.4):** `(n,k)` is a
+   ledger-program parameter, default **n=4, k=3** (f=1), `2k>n` enforced structurally.
 3. **Per-account (or per-shard) scoping** — the quorum attests one account's nonce
-   sequence, so ordering load shards with the registry.
+   sequence, so ordering load shards with the registry. **Decided (§10.5):** the quorum is
+   a **rotating epoch committee** — each epoch its n members are deterministically selected
+   from live membership (rendezvous rank over `(shard, epoch)`), not a fixed declared set;
+   commits bind to their epoch's committee and the next committee continues from the account's
+   durable committed nonce head.
 
 **Tradeoff (the finality decision, §10.4):** this puts an attestation round on every
 token transaction's path — latency + a liveness dependency on the quorum. That is the
@@ -166,7 +176,8 @@ mechanism. Same split already used for governance, the registry, and attestation
 |---|---|---|
 | **Token ledger** — balances, transfer, mint/reward math, supply schedule, fee/burn, staking | **Program** (WASM financial-chain app) | Pure policy; validity by verification [K6]. Governance-upgradeable without a binary roll. |
 | **Discretionary attestation policy** — "should this tx be attested at all" | **Program** (the deferred K7 auto-sign) | Swappable policy. |
-| **Reward valuation** — measurement → token amount; quorum membership/sizing | **Program** | Economic knobs, governed. |
+| **Reward valuation** — measurement → token amount; quorum **sizing** `(n,k)` | **Program** | Economic knobs, governed (default n=4/k=3, §10.4). |
+| **Sequencer quorum membership** — which live nodes form the epoch committee | **Binary** (rotating epoch committee, §10.5) | Deterministic per-epoch selection from membership (node's view + rendezvous rank) — agreement machinery, not a program knob. |
 | **Attestation rounds + auto-sign host hook** | **Binary** (extends K7) | Agreement machinery. |
 | **Non-equivocation invariant** — never sign two conflicting statements at one `(account, nonce)` | **Binary, structural** | SAFETY, not policy (like the namespace gate). A buggy/malicious policy can only *decline* to sign — never cause a double-spend. |
 | **Per-account nonce/attestation state store** | **Binary** (registry / CraftSQL) | The sequencer's memory. |
@@ -543,85 +554,106 @@ keeping a *standing* subsidy from being drained.
 
 ---
 
-## 10. Open decisions — NOT decided (must precede build of the dependent layer)
+## 10. Decisions — RESOLVED 2026-07-15 (economic models locked; numeric parameters governed-at-launch)
 
-**Economics / policy:**
-1. **The distribution policy** — the reward function `contribution → tokens`.
-   *Leaning (2026-07-15): **reward ∝ paid demand** (paid egress + paid pinning + paid relay)
-   — the market prices real demand directly (self-payment zero-sum), which is simpler and
-   auto-farm-resistant vs a scored contribution oracle (§8 "simplest primary defense").
-   Then: cold storage via **owner-pays-pin**, consensus work **fee-funded**, bootstrap
-   **subsidized** (the three axes paid-egress alone misses). Free-tier serving is
-   cost-reimbursed, not profit-rewarded. **Two hard conditions (§8):** reward = direct
-   **revenue**, not a contribution-**pool split**, and **linear in revenue** (no
-   volume/reputation superlinearity → self-inflation-proof); and **metered/quota-bounded,
-   never truly unlimited** (flat-unlimited makes the marginal self-fetch free → farmable).
-   **Resolved consumer shape:** metered-reward with subsidized overflow — reward capped
-   per-consumer at paid usage; overflow cost-reimbursed + throttled/pool-bounded (the free
-   tier is this with a zero paid-quota). See §8.*
-2. **The participation-metric formula** — *largely dissolved by the §10.1 leaning:* if
-   reward ∝ **paid demand**, the market is the metric and no rich multi-signal contribution
-   score (with its sybil-normalization + organic-demand weighting) is needed — paid demand
-   *is* the direct, self-standing (zero-sum) real-demand measure. **Organic-demand weighting
-   is demoted to optional defense-in-depth**, relevant only if reward is *not* restricted to
-   paid demand (then: scale serving reward by a per-cid organic-demand score — distinct
-   paying > distinct gated-free consumers > independent-holder replication > anti-burst
-   decay — and it compounds with producer randomization, §8-A). Open only if the pure
-   paid-demand model proves too narrow: how much to reward non-paid signals (repair,
-   verification, attestation) beyond their own fee streams.
-3. **Token economics** — issuance schedule (mint rate), supply cap vs perpetual
-   inflation, genesis distribution. *Fees leaning **recycle-to-pool, not burn** (§8) — the
-   free-tier funding; also funds the shadow-mode retroactive reward (§6).*
-4. **Finality model** — quorum size per account, how many confirmations = "settled," the
-   payment latency that implies (the UX-critical number).
-5. **Sequencer quorum selection** — how an account's ordering quorum is chosen and
-   rotated.
+The economic *models* below are decided. Where a decision is a **number** (a rate, a cadence,
+a committee size), it ships as a **governed parameter** with the default noted — mechanism-first
+per the minimal-kernel principle (native default at genesis, governance-swappable without a
+binary roll). Committing to a *shape* rather than a magic constant is itself the resolution of
+#3/#4.
 
-**Free tier / egress (mechanism decided §7–§8; parameters open):**
-6. **Free-tier funding** — *model decided* (recycled fee-skim φ + tapering bootstrap
-   issuance, self-balancing dynamic allowance, §8); open are the **fee rate φ**, the
-   **issuance-taper schedule**, and the **allowance function** (how it tracks pool health).
-7. **Free-tier farming defenses + allowance.** Anti-*value-mint*: **protocol-picked producer
-   + enforced piece placement** so a self-dealer can't ensure its node is the one paid (§8-A)
-   — *the* primary defense; open is the placement guarantee + organic-demand/independent-holder
-   weighting for the holding-monopolization residual. Anti-*inflation*: counterparty-signed
-   cheques (§8-B — mechanism, done). Cost bound: the **identity gate** (stake / invite / PoP)
-   + allowance size + refresh cadence + pool-health sizing (§8-C). Optional extra safety:
-   route free-serving through the sybil-normalized metric (§10.2), trading instant provider
-   reward for sybil-resistance.
-8. **Swarm-fetch payment** across many providers — a prepaid egress balance / per-peer
-   accounting rather than a channel-open per provider (§7).
-9. **Escrow / channel lifecycle** — top-up, close, reclaim-on-timeout, disputes; cheque
-   granularity; credit-band size (§7). **Relay** (metered *separately* from egress —
-   decided §7): open are the **free-tier relay allowance cap** (access-fairness for NAT'd
-   users vs pool-protection), the per-hop margin schedule, bidirectional metering,
-   lazy-relay market pressure, and the who-pays-whom privacy leak (§7 "Relay bandwidth").
+**Economics / policy — DECIDED:**
+1. **Distribution policy — DECIDED: reward ∝ paid demand.** Metered-reward with subsidized
+   overflow. Reward is direct **revenue** (not a contribution-pool split) and **linear in
+   revenue** (no volume/reputation superlinearity → self-inflation-proof); **metered /
+   quota-bounded**, never flat-unlimited (a flat-unlimited marginal self-fetch is free →
+   farmable). Reward is capped per-consumer at paid usage; overflow is cost-reimbursed +
+   pool-bounded (the free tier is this with a zero paid-quota). Cold storage = **owner-pays-pin**;
+   consensus work = **fee-funded**; bootstrap = **subsidized**. The market prices real demand
+   directly and is auto-farm-resistant (§8). *This is the spine.*
+2. **Participation-metric formula — DECIDED: dissolved.** Paid demand *is* the metric; no
+   rich multi-signal contribution oracle (with sybil-normalization + organic-demand weighting)
+   is built. Organic-demand weighting is retained only as **optional defense-in-depth** (§8-A),
+   off by default — reachable only if the pure paid-demand model proves too narrow (then: how
+   much to reward non-paid signals — repair, verification, attestation — beyond their own fee
+   streams). Not on the critical path.
+3. **Token economics — DECIDED: genesis + issuance are a GOVERNED PARAMETER; native default =
+   fair-launch.** No premine in the default: every token is earned by contribution from genesis;
+   a bootstrap-issuance curve tapers as paid demand grows; steady state is **fee-recycled**
+   (fees **recycle-to-pool, not burn** — funds the free tier §8 + the shadow-mode retroactive
+   reward §6). The exact issuance schedule, supply-cap-vs-perpetual-inflation, and any genesis
+   split are set by the governed issuance-policy program at launch (default fair-launch), not
+   baked into the binary — so the number is a governance decision, not a release.
+4. **Finality — DECIDED: (n,k) is a ledger-program parameter; default n=4, k=3 (f=1).** A
+   write is settled once k of n commit — fork-impossible at commit (§4); one quorum round-trip
+   = finality. `2k>n` is enforced structurally; governance raises (n,k) as stakes/fleet grow.
+5. **Sequencer quorum selection — DECIDED: rotating epoch committee.** An account's (or shard's)
+   ordering quorum is NOT a fixed declared set: each epoch the n members are **deterministically
+   selected from live membership** (rendezvous rank over `(shard, epoch)`, §58 ranking) — every
+   node computes the same committee with no election messages, and it rotates each epoch. Commits
+   bind to their epoch's committee; verification checks signers ∈ that epoch's committee; the next
+   committee continues from the account's durable committed nonce head (cross-epoch hand-off).
+   Size/threshold come from #4 (governed); **membership becomes a binary mechanism** (it moves
+   out of the §5 "program knob" row). *Cost: this is the heaviest remaining build — an epoch
+   clock, a deterministic committee function, and boundary hand-off of in-flight sequences —
+   chosen over the declared-set MVP for maximal decentralization. Build it once the ledger
+   mechanism is otherwise proven; a genesis committee is the degenerate 1-epoch case to bootstrap.*
 
-**Accounting:**
-10. **Epoch model** — window length + claim cadence; the shadow→active cutover (§6).
-11. **Storage parameters** — checkpoint cadence, spent-set/evidence pruning window, and the
-    ledger-state durability/pin level (§6 "Data capture & storage").
+**Free tier / egress — models decided (§7–§8); numeric parameters GOVERNED-at-launch:**
+6. **Free-tier funding — DECIDED shape:** recycled fee-skim φ + tapering bootstrap issuance,
+   the allowance a self-balancing function of pool health. The **fee rate φ**, the
+   **issuance-taper schedule**, and the **allowance function** are governance parameters set at
+   launch (not baked).
+7. **Free-tier farming defenses — DECIDED:** primary = **protocol-picked producer + enforced
+   piece placement** (§8-A) so a self-dealer can't guarantee its node is the paid one;
+   anti-inflation = counterparty-signed cheques (§8-B — built, step 2). Cost bound = the
+   **identity gate** (stake / invite / PoP) + allowance size + refresh cadence + pool-health
+   sizing (§8-C): the gate mechanism is chosen at launch (governed), allowance refreshes per
+   epoch. Optional extra safety (route free-serving through the sybil-normalized metric §10.2)
+   stays off unless needed.
+8. **Swarm-fetch payment — DECIDED:** a single prepaid **per-consumer egress balance** settled
+   across all providers by `allocate_quota` (built, step 2 P1) — NOT a channel-open per provider.
+9. **Escrow / relay — DECIDED:** relay is metered **separately** from egress (§7). The cheque
+   **credit-band**, the **free-tier relay cap**, and the **per-hop margin** are governed
+   parameters (defaults at launch); reclaim-on-timeout + the dispute lifecycle are deferred to
+   the ledger build.
 
-**Crypto:**
-12. **PDP soundness** — the lattice-LHS milestone (needs a cryptographer). Gates only the
-    direct cold-storage-at-rest reward, not the rest of the economy.
+**Accounting — models decided; cadences GOVERNED-at-launch:**
+10. **Epoch model — DECIDED shape:** fixed-window epochs; per-epoch claim; shadow→active cutover
+    after a governed number of shadow epochs. Window length is governed (default set at launch
+    to the settlement cadence).
+11. **Storage — DECIDED shape:** per-epoch checkpoint; spent-set/evidence pruned on a governed
+    window; ledger state pinned at the full erasure set (the durability gate). Exact cadences
+    governed.
+
+**Crypto — DEFERRED (unchanged):**
+12. **PDP soundness** — the lattice-LHS milestone (needs a cryptographer). Gates ONLY the direct
+    cold-storage-at-rest reward; the rest of the economy ships without it.
 
 ---
 
-## 11. Proposed sequencing (not committed)
+## 11. Sequencing — status (updated 2026-07-15, §10 resolved)
 
-1. **Finish K7 auto-signing** → non-equivocating, intersection-sized, per-account
-   **sequencer** (the ordering mechanism). *Independent of the distribution decision.*
+1. **Sequencer** (finish K7 auto-signing → non-equivocating, intersection-sized, per-account
+   ordering mechanism). **DONE** (P1–P4b-2). Currently binds to a program's declared quorum;
+   §10.5 upgrades selection to a rotating epoch committee (folded into step 4).
 2. **Serving-cheque transport hook + measurement collection** — the measurement + egress
-   substrate (§6/§7). *Also independent of the distribution decision.*
-3. **Participation metric** (governed WASM), run in **shadow mode** first (§6) —
-   **blocked on decisions §10.1/§10.2** for activation.
-4. **Token ledger app** — two balances (tokens + credit), transfer, mint, egress
-   settlement, free-tier voucher redemption — on verification + the sequencer.
-   **Blocked on §10.3/§10.4 + the free-tier params §10.6/§10.7.**
-5. **PDP [K5]** later — hardens the cold-storage measurement; **blocked on §10.12
-   (cryptographer).**
+   substrate (§6/§7). **DONE** (P1 cheque core + P2 transport hook). Providers record cheques →
+   `total_earned`; `allocate_quota` settles a consumer's paid quota across providers. Surfacing
+   the measurement folds into the ledger (step 4), not a standalone metric.
+3. ~~Participation metric (governed WASM, shadow mode)~~ — **DISSOLVED (§10.2):** paid demand
+   *is* the metric; no separate contribution-oracle app. The shadow→active accounting
+   (§6/§10.10) lives inside the ledger's settlement, not a standalone scorer. Organic-demand
+   weighting stays available as optional defense-in-depth (§8-A), off by default.
+4. **Token ledger app** — the active next build, now **UNBLOCKED** (§10 resolved). Two balances
+   (tokens + credit), transfer, mint from measurement-justified receipts, egress settlement via
+   `allocate_quota`, free-tier credit redemption — on verification [K6] + the sequencer. Ships
+   mechanism-first with governed policy: issuance/genesis (§10.3, default fair-launch), quorum
+   `(n,k)` (§10.4, default 4/3), fee φ + allowance (§10.6). Its heaviest sub-part is the
+   **rotating epoch committee** for sequencer selection (§10.5) — epoch clock + deterministic
+   committee fn + cross-epoch sequence hand-off; a genesis committee bootstraps it.
+5. **PDP [K5]** later — hardens the cold-storage measurement; **deferred on §10.12
+   (cryptographer).** Gates only the direct cold-storage-at-rest reward.
 
-Steps 1–2 (mechanism: sequencer + measurement/egress substrate) can proceed *before* the
-distribution policy is decided; steps 3–5 wait on the §10 decisions. That keeps the
-buildable mechanism moving while the economic-policy questions are settled separately.
+Mechanism (steps 1–2) is complete. With §10 resolved, **step 4 (the token-ledger app) is the
+active next build**; step 3 dissolved into it; step 5 stays deferred.
