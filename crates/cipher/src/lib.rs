@@ -285,21 +285,25 @@ pub fn decrypt_granted(
     let recipient_pk = recipient.public();
     let mut verified = Vec::with_capacity(cfrags.len());
     for cf in cfrags {
-        let v = cf
-            .0
-            .clone()
-            .verify(
-                &obj.capsule.capsule,
-                &owner_pk.0,     // verifying key (the grant's signer)
-                &owner_pk.0,     // delegating key
-                &recipient_pk.0, // receiving key
-            )
-            .map_err(|_| CipherError::Decrypt)?;
+        let v =
+            cf.0.clone()
+                .verify(
+                    &obj.capsule.capsule,
+                    &owner_pk.0,     // verifying key (the grant's signer)
+                    &owner_pk.0,     // delegating key
+                    &recipient_pk.0, // receiving key
+                )
+                .map_err(|_| CipherError::Decrypt)?;
         verified.push(v);
     }
-    let dek_bytes =
-        decrypt_reencrypted(&recipient.sk, &owner_pk.0, &obj.capsule.capsule, verified, &obj.capsule.enc_dek)
-            .map_err(|_| CipherError::Decrypt)?;
+    let dek_bytes = decrypt_reencrypted(
+        &recipient.sk,
+        &owner_pk.0,
+        &obj.capsule.capsule,
+        verified,
+        &obj.capsule.enc_dek,
+    )
+    .map_err(|_| CipherError::Decrypt)?;
     let arr: [u8; DEK_LEN] = dek_bytes[..]
         .try_into()
         .map_err(|_| CipherError::Malformed("dek length"))?;
