@@ -803,6 +803,42 @@ impl ObjEngine {
         }
     }
 
+    /// Read a byte RANGE `[offset, offset+len)` of a file WITHOUT fetching the whole thing —
+    /// only the segments that overlap the range are fetched + decoded (CRAFTOBJ §416: "range
+    /// requests fetch only covering segments"). Returns the bytes in `[offset, min(offset+len,
+    /// size))`; an `offset` at/past EOF (or `len == 0`) yields empty. This is what makes
+    /// streaming/seek over large files cheap — a media scrub or a partial download touches only
+    /// the covering 8 MiB segments, not the entire object.
+    pub async fn fetch_file_range(
+        &self,
+        manifest_cid: Cid,
+        offset: u64,
+        len: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        let segments = match self.fetch_manifest(manifest_cid).await? {
+            Manifest::File { segments, .. } => segments,
+            Manifest::Dir { name, .. } => anyhow::bail!("'{name}' is a folder, not a file"),
+        };
+        let end = offset.saturating_add(len);
+        let mut out = Vec::new();
+        let mut seg_start = 0u64;
+        for seg in &segments {
+            let seg_end = seg_start + seg.len;
+            // Fetch this segment ONLY if [seg_start, seg_end) overlaps the requested [offset, end).
+            if seg_start < end && seg_end > offset {
+                let bytes = self.get(Cid(seg.cid), ConsumeMode::Seed).await?;
+                let lo = (offset.saturating_sub(seg_start) as usize).min(bytes.len());
+                let hi = ((end - seg_start) as usize).min(bytes.len());
+                out.extend_from_slice(&bytes[lo..hi]);
+            }
+            seg_start = seg_end;
+            if seg_start >= end {
+                break; // the whole range is covered — no later segment can overlap
+            }
+        }
+        Ok(out)
+    }
+
     /// Set (edit) this node's metadata envelope comment for `cid`. Preserves
     /// the original `published_at` if this node already has an envelope.
     pub async fn set_meta(&self, cid: Cid, comment: Option<String>) -> anyhow::Result<()> {

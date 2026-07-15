@@ -261,11 +261,18 @@ async fn pin_unpin_forget_cascade_the_whole_file_chain() {
 
 // ─────────────────── File segmentation (Model B: segment = sub-cid) ───────────────────
 
-/// Deterministic pseudo-random bytes of length `n` (distinct per `seed`), so segment
-/// boundaries carry different content and CIDs are meaningful.
+/// Deterministic pseudo-random bytes of length `n` (distinct per `seed`) from a sequential LCG —
+/// a true non-repeating stream, so distinct segments get distinct CIDs (a simple `i`-indexed hash
+/// can alias at power-of-two segment boundaries, making segments accidentally identical).
 fn bytes_of(n: usize, seed: u32) -> Vec<u8> {
+    let mut s = 0x243F_6A88_85A3_08D3u64 ^ ((seed as u64) << 32);
     (0..n)
-        .map(|i| ((i as u32).wrapping_mul(2_654_435_761).wrapping_add(seed) >> 13) as u8)
+        .map(|_| {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (s >> 56) as u8
+        })
         .collect()
 }
 
@@ -356,5 +363,98 @@ async fn identical_segments_dedup_by_cid() {
     assert_ne!(
         fa.manifest_cid, fb.manifest_cid,
         "the files themselves differ"
+    );
+}
+
+// ─────────────────── P2: range / partial reads ───────────────────
+
+#[tokio::test]
+async fn range_reads_return_the_exact_slice() {
+    let tracker = start_tracker();
+    let dir = tempfile::tempdir().unwrap();
+    let owner = owner_node(&tracker, dir.path()).await;
+
+    let seg = 8 * 1024 * 1024u64;
+    let data = bytes_of(17 * 1024 * 1024, 3); // 3 segments: 8 / 8 / 1 MiB
+    let size = data.len() as u64;
+    let fp = owner
+        .publish_file("v.bin", "application/octet-stream", &data, true)
+        .await
+        .unwrap();
+
+    // A helper: fetch_file_range must equal the corresponding plaintext slice (EOF-clamped).
+    let check = |off: u64, len: u64| {
+        let (m, d) = (fp.manifest_cid, data.clone());
+        let owner = owner.clone();
+        async move {
+            let got = owner.fetch_file_range(m, off, len).await.unwrap();
+            let end = (off + len).min(size) as usize;
+            let lo = (off as usize).min(d.len());
+            assert_eq!(got, d[lo..end.max(lo)], "range off={off} len={len}");
+        }
+    };
+    check(0, size).await; // whole file
+    check(100, 500).await; // inside segment 0
+    check(seg - 200, 400).await; // spanning the seg0→seg1 boundary
+    check(seg + 1000, 500).await; // inside segment 1
+    check(16 * 1024 * 1024 + 100, 500).await; // inside the last (partial) segment 2
+    check(size - 100, 500).await; // extends past EOF → clamped
+    check(size + 10, 100).await; // entirely past EOF → empty
+    check(1000, 0).await; // zero length → empty
+}
+
+#[tokio::test]
+async fn range_read_fetches_only_covering_segments() {
+    let tracker = start_tracker();
+    let dir = tempfile::tempdir().unwrap();
+    let owner = owner_node(&tracker, dir.path()).await;
+
+    let seg = 8 * 1024 * 1024usize;
+    let data = bytes_of(17 * 1024 * 1024, 9); // segments 0/1/2
+    let fp = owner
+        .publish_file("v.bin", "application/octet-stream", &data, true)
+        .await
+        .unwrap();
+    let segs: Vec<_> = owner
+        .fetch_manifest(fp.manifest_cid)
+        .await
+        .unwrap()
+        .file_segments()
+        .unwrap()
+        .to_vec();
+    assert_eq!(segs.len(), 3);
+    assert_ne!(
+        segs[0].cid, segs[1].cid,
+        "distinct segments have distinct cids"
+    );
+
+    // Drop the NON-covering segments locally (single node → no network fallback). A range read
+    // inside segment 1 must still succeed (it only needs seg1) and must NOT fetch seg0/seg2.
+    owner.store().forget(&zeph_core::Cid(segs[0].cid)).unwrap();
+    owner.store().forget(&zeph_core::Cid(segs[2].cid)).unwrap();
+
+    let lo = (seg + 100) as u64;
+    let got = owner
+        .fetch_file_range(fp.manifest_cid, lo, 500)
+        .await
+        .unwrap();
+    assert_eq!(
+        got,
+        data[lo as usize..lo as usize + 500],
+        "range within segment 1 reads correctly using only that segment"
+    );
+    assert!(
+        owner
+            .store()
+            .content(&zeph_core::Cid(segs[0].cid))
+            .is_none(),
+        "segment 0 was NOT fetched by a segment-1 range read"
+    );
+    assert!(
+        owner
+            .store()
+            .content(&zeph_core::Cid(segs[2].cid))
+            .is_none(),
+        "segment 2 was NOT fetched by a segment-1 range read"
     );
 }

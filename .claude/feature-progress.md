@@ -29,9 +29,17 @@ file's segments — CO §76/§286/§298).
       files. Full workspace builds; obj (6+17+7+1) + com pass; clippy+fmt clean. KNOWN FOLLOW-UP: private files
       (`publish_private` → encrypt-then-publish ONE object) are NOT yet segmented — chunk the ciphertext in a
       follow-up (encrypt-then-chunk, one DEK). Wire-compatible (no piece/wire change; only the manifest shape).
-- [ ] **P2 range/partial reads:** map `(offset,len)` → covering segment indices via the manifest's per-segment
-      lens; a range fetch that decodes ONLY covering segments; sequential-prefetch streaming. Test (counting
-      source): a mid-file range fetches only the covering segments, not the whole file.
+- [x] **P2 range/partial reads DONE 2026-07-15.** `ObjEngine::fetch_file_range(manifest_cid, offset, len)`
+      (obj/lib.rs): fetches the manifest, walks segments accumulating byte offsets, and `get`s ONLY the
+      segments overlapping `[offset, offset+len)` — slicing each to the requested window + EOF-clamping;
+      early-breaks once the range is covered. Tests (obj green): exact-slice correctness across all boundaries
+      (whole / inside a segment / spanning the seg0→seg1 boundary / last partial segment / past-EOF-clamped /
+      past-EOF-empty / zero-len); and an EFFICIENCY proof — forget the non-covering segments locally, a
+      segment-1 range still reads correctly and never fetches seg0/seg2. (Debugging surfaced that the test's
+      `i`-indexed data generator aliased at the 8 MiB power-of-two boundary → identical segments — a neat
+      accidental proof dedup works; switched to a sequential LCG stream for distinct segments.) Follow-up
+      (not P2-blocking): sequential-scan PREFETCH for smooth streaming (fetch the next segment ahead); wiring
+      the range read to the CLI/host-fn.
 - [ ] **P3 lifecycle over segments:** pin/want/forget/health/repair walk the manifest segment list
       (`chain_children` already walks manifest children → extend to `File.segments`); each segment repaired
       independently by the existing per-cid machinery. Test: kill a holder of ONE segment → only that segment
