@@ -65,6 +65,29 @@ the ledger-STATE-vs-ledger-PROGRAM(policy)-vs-MECHANISM frame; (4) §5 the K1 co
 pin IS a K1 anchor + the governed knobs are K1 config; K1's deferred anchor-dispatcher half is exactly what step 4
 (first governed-WASM program) requires. Litmus: hard invariants native, swappable policy governed-WASM behind an anchor.
 
+**DESIGN REVISION (2026-07-16) — reconciled into docs/ECONOMIC_LAYER_DESIGN.md in place (supersedes the "credit token"
+model). From the free/paid Q&A:**
+- **Free tier is NOT a token/second balance — it is GLOBAL TIT-FOR-TAT reciprocity** (§8 rewritten). Free headroom =
+  `total_earned − consumed` (byte reciprocity), derived from accounting already collected; net-positive = free (network
+  pays nothing, reciprocal not subsidised), deficit beyond band = pay tokens or throttle. **KILLED the two-balance /
+  non-transferable-credit model** → ONE token balance + a derived reciprocity position. §7's tit-for-tat credit band IS
+  the free tier now (§7/§8 merged). Subsidy shrinks to a **cold-start grant only**; free-tier farming is now largely
+  **intrinsic** (can't consume free without contributing) → §10.6/§10.7 revised.
+- **Two separate accountings (paid/free asymmetry):** paid = escrow-backed → retroactive settlement (allocate_quota),
+  NO consumption-time check; free = unbacked reciprocity → REAL-TIME admission-gate check. "Pre-funded → check late;
+  un-funded → check live." The admission gate is a FREE-lane mechanism.
+- **Balances = SELF-CUSTODIAL account-chains, NOT PDAs** (§3): balance = fold of the owner's own single-writer chain,
+  re-executed for validity; user signs, the token PROGRAM only CONSTRAINS to valid transitions (verification rejects
+  else — the reserved-namespace write model). A malicious custom program has ZERO authority over the token namespace
+  (canonical cid pinned in the trust root, verification re-runs THAT, never a caller-supplied cid). Shared state (pool/
+  issuance/epoch) = a governance-owned chain (the lone PDA-analog). Recipient-credit = claim-vs-fold, pinned at step 4.
+- **Token INTERFACE STANDARD (§5 new "Protocol standards"):** the token is a **protocol program, not a user app**;
+  publish a versioned ABI, not the impl. **Layer 0** = core fungible interface (transfer/balance/total_supply, every
+  asset incl. user-issued); **Layer 1** = protocol privileges (claim/settle) — native/canonical ONLY, gated to the
+  canonical cid by the trust root (user assets CAN'T adopt it). Native token = reference impl of L0+L1; user asset = L0
+  only. Discovery/versioning via the anchor registry (name → cid + interface_version). Formal "ZIP" process DEFERRED
+  (governance + K1 anchors already give binding ratification). Suggested name: CTS-1. This is what step 4 builds against.
+
 ---
 
 # ECONOMIC LAYER — ORDERING SEQUENCER (§11 step 1 of docs/ECONOMIC_LAYER_DESIGN.md) — SEQUENCER COMPLETE (P1–P4b-2, 2026-07-15)

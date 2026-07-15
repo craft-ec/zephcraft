@@ -1,11 +1,14 @@
 # Economic Layer & Participation Metrics — design
 
-Status: DESIGN + PARTIAL BUILD (updated 2026-07-15). Captures the 2026-07-15 economic-layer
+Status: DESIGN + PARTIAL BUILD (updated 2026-07-16). Captures the 2026-07-15/16 economic-layer
 decisions. **§10 is now RESOLVED:** the distribution policy is **reward ∝ paid demand**, and
 token issuance/genesis, quorum sizing `(n,k)`, and the free-tier parameters ship as **governed
 parameters** (native default fair-launch), not baked constants. Mechanism is **built**: the
 ordering sequencer (§4) and the serving-cheque + measurement substrate (§7) are live (§11 steps
-1–2). The **token-ledger app** (§11 step 4) is the active next build.
+1–2). The **token ledger — a canonical *protocol program*, not a user app** (§11 step 4), published
+against the Layer-0/Layer-1 interface standard (§5) — is the active next build. Free tier = **global
+tit-for-tat reciprocity**, not a credit token (§8); balances are **self-custodial account-chains**,
+not PDAs (§3).
 
 Governing principle (per `MINIMAL_KERNEL_DESIGN.md`): the node **measures and
 meters** (mechanism, in the binary); the **economy** — the participation metric,
@@ -101,10 +104,25 @@ North-star-consistent: **no global-lockstep chain, no BFT-committee-per-block.**
   single-writer-per-identity state). A transfer is a **signed debit** on the sender's
   chain. Validity ("do they have the balance?") is confirmed by **verification [K6]** —
   k nodes re-execute the sender's chain and agree. This is the VISION's *"validity by
-  re-execution, not a committee."*
-- **Two balance types per account** — liquid **tokens** (transferable, earnable,
-  withdrawable) and non-transferable consume-only **credit** (the free tier, §8).
-  Consumption draws credit-first, then tokens.
+  re-execution, not a committee."* The **recipient's** credit lands by either **claim** (recipient
+  sweeps the debit onto its own chain) or **fold** (its balance = claimed-ins − debits-out,
+  referencing the sender's ordered debit) — the one thing the self-chain model must specify that a
+  program-owned account (PDA) would get for free (atomic dual-side write); pinned at step 4.
+- **One balance per account: liquid tokens** (transferable, earnable, withdrawable). The free
+  tier is **not** a second balance — it is a **reciprocity position** (§8) *derived* from the
+  account's own serving vs. consumption (`total_earned − consumed`), not a stored "credit" token.
+  A non-transferable, consume-only, expiring balance is a quota wearing a token's clothes; we don't
+  mint one.
+- **Balances are self-custodial account-chains, not program-owned accounts (not PDAs).** A balance
+  is the fold of the owner's *own* single-writer chain, re-executed for validity — not a
+  program-derived account the ledger owns (contrast Solana, where your SPL balance sits in a
+  Token-Program-owned account). The user signs their own writes; the token *program* only
+  **constrains** them to valid transitions (verification rejects anything else — see §5). What a
+  PDA buys Solana (program-controlled writes, ordering, atomicity) is unbundled here into the
+  **sequencer** (non-equivocation/ordering) + **verification** (validity) + the recipient-credit
+  rule. Genuinely *shared* state — the subsidy pool, issuance counter, epoch clock — is the lone
+  exception: it lives on a **governance-owned chain** (the one PDA-analog), touched at epoch
+  cadence, not per transfer.
 - **Ordering / uniqueness = attestation sequencer [K7]** (§4) — the one thing
   verification cannot provide.
 - **Mint = measurement-justified issuance.** A provider submits its signed receipts /
@@ -201,6 +219,37 @@ what requires K1's deferred half. K1's own litmus governs the split above: **har
 native, genuine swappable policy goes governed-WASM behind an anchor** — a governed hook on a
 safety invariant (e.g. non-equivocation) would be kernel bloat, the exact mistake K1's history
 warned against.
+
+### Protocol standards — publish the interface, not the implementation
+
+Because the token is a **governed program behind a K1 anchor**, callers must depend on a **stable,
+versioned interface**, never the implementation — that is what lets governance swap the program
+without breaking wallets and apps (the ERC-20 lesson: a stable interface is what makes an ecosystem).
+So the token ships with a published **interface standard**, layered:
+
+- **Layer 0 — core fungible interface** (every token/asset, incl. user-issued): `transfer`,
+  `balance(owner) → tokens`, `total_supply`, `metadata`; reserved `approve`/`transfer_from`
+  (delegation) + `burn`. It is **message-schema + transition-semantics**, not function signatures —
+  a versioned set of postcard messages the invoke runtime dispatches, with the invariants that give
+  it teeth (nonce strictly monotonic via the sequencer; amounts are integer base units).
+- **Layer 1 — protocol privileges** (the native token / canonical programs **only**): mint-from-
+  contribution (`claim`) and egress `settle`. These are **gated to the canonical cid by the trust
+  root** — a user asset *can't* adopt them (verification rejects a non-canonical program touching
+  protocol receipts/pool, §5/§8) and has nothing to plug into semantically (the binary's meters feed
+  the *native* economy). A user-issued asset implements **Layer 0 only**; the native token is the
+  **reference implementation** of Layer 0 + Layer 1.
+
+Discovery/versioning rides existing plumbing: the **anchor registry** maps a canonical name → current
+program cid + `interface_version`; callers resolve the anchor, never the implementation. This is what
+"the token is a **protocol program**, not a user app" means concretely — network-level machinery
+(closer to governance than to the tracker), decomposable into separate programs (reward /
+ledger-transfer / settlement) behind separate anchors.
+
+**Process — defer.** A formal BIP/EIP-style change process (a "ZIP") is *not* needed yet: design docs
++ governance suffice while the contributor set is small, and governance + K1 anchors already give
+**binding** ratification + atomic deployment (a proposal names a program cid; ratifying it *is* the
+anchor swap — tighter than a purely-social BIP). Formalise it when *development* decentralises. Name
+the fungible standard e.g. **CTS-1** (Craftec Token Standard); reference impl = the native token.
 
 ---
 
@@ -321,8 +370,9 @@ side wants to pay/serve first). The answer is *incremental, content-verified* ex
   crosses the band. This closes tit-for-tat's three classic holes — seeders now *earn*
   (serve-to-earn) instead of pure altruism, free-riding is capped by the band + forced
   settlement (no gaming the optimistic-unchoke slot), and credit is *global and
-  persistent*, not forgotten per swarm. It is a *settlement optimization*, **distinct
-  from the free tier (§8), which is a real subsidy.**
+  persistent*, not forgotten per swarm. Promoted to **global** per-account reciprocity, this
+  band *is* the **free tier (§8)**: staying net-balanced is free, a deficit settles in tokens.
+  The only pool subsidy is the cold-start grant, not standing free serving.
 
 **Anti-farming:** a cheque draws *real escrowed consumer tokens*, so it can't conjure
 value — it only moves value that already exists. A self-serving sybil drains its own
@@ -404,48 +454,68 @@ beyond the cap, relay draws tokens. The allowance cap is a policy knob (§10).
 
 ---
 
-## 8. Cold-start & the free tier — non-transferable consume-only credit
+## 8. Cold-start & the free tier — tit-for-tat reciprocity (not a subsidised token)
 
-**Decided 2026-07-15.** A new account has zero tokens (demand-side cold-start), and we
-want a *permanent* free tier for adoption — not just a one-time faucet. Decision: a
-**recurring, non-transferable, consume-only credit allowance per identity, subsidized by
-the general network** (freemium — paid users and token holders fund the free users).
+**Revised 2026-07-16.** A new account has zero tokens (demand-side cold-start), and we want a
+*permanent* free tier for adoption. But the free tier is **not** a subsidised token or a monthly
+allowance — it is **global tit-for-tat reciprocity**: you consume for free to the extent you
+*contribute*, accounted per identity. It is §7's credit band promoted to the whole network — your
+free headroom is `served − consumed` (bytes you served *anyone*, minus bytes you fetched from
+*anyone*). Net-positive → your consumption is balanced by your service → **the network pays nothing**
+(genuinely free because it is *reciprocal*, not subsidised). Net-deficit beyond the band → you settle
+it in tokens (the paid tier) or throttle.
 
-**Two balances per account** (see §3):
+**There is no "credit balance."** A non-transferable, consume-only, expiring balance is a *quota
+wearing a token's clothes* — strip transferability, persistence, and tradeability and what's left is
+a reciprocity limit, not a currency. So: **one token balance + a reciprocity position derived from
+accounting we already collect** — `total_earned` (serving side) minus issued cheques (consuming
+side). Nothing new to store; nothing about the free tier in the token standard.
 
-| Balance | Properties |
-|---|---|
-| **tokens** | liquid, transferable, earnable, withdrawable — the real unit of value |
-| **credit** | non-transferable, consume-only, per-identity allowance, network-funded, refreshed per epoch |
+**Two separate accountings — the paid/free asymmetry.** They are backed by different things, so they
+are *checked* at different times:
 
-Consumption draws **credit-first, then tokens**.
+| | Paid (token accounting) | Free (reciprocity accounting) |
+|---|---|---|
+| backed by | escrowed tokens (real value locked) | a reciprocity promise (nothing locked) |
+| denominated in | tokens | bytes (served vs. consumed) |
+| check timing | **retroactive** at settlement (`allocate_quota`, by timestamp) | **real-time** at the admission gate |
+| exposure if abused | none — escrow covers it | bounded wasted bandwidth → *why* it must gate live |
 
-**Credit is a network-honored voucher — the provider is *always* paid in real tokens.**
-From the consumer's token balance (paid tier) or from the **subsidy pool** (free-tier
-credit); the spent credit is then burned. So providers happily serve free-tier traffic
-(they still get real tokens), and the free tier's cost is *socialized* rather than dumped
-on whoever happens to serve a free user.
+Escrow buys the paid lane its laziness (locked value → reconcile after the fact); the free lane has
+nothing locked, so it **must gate up front** on the reciprocity position. *Pre-funded → check late;
+un-funded → check live.* So the admission gate is a **free-lane** mechanism; for paid it is only an
+escrow-solvency check, and there is **no consumption-time free/paid decision** for a paid user (the
+split is purely the retroactive timestamp settlement of §7/§10.8).
+
+**Subsidy shrinks to cold-start only.** The one case reciprocity can't cover is a brand-new account
+that has served nothing yet — a read-only newcomer needs a small **starting grant** of reciprocity
+headroom to begin. That bootstrap (identity-gated, small, one-time-ish) is the *only* thing the pool
+funds for the free tier — not a standing allowance draining it forever.
+
+**Downstream detail (pin at step 4):** served bytes credit **either** the reciprocity position (free
+lane) **or** a token reward (paid lane), never both — the same contribution can't be counted in two
+denominations.
 
 **Free vs paid — the product boundary (what actually differs).** The free tier is *not* "paid,
-subsidised" — it is a deliberately **bounded, consume-only, pool-gated** slice. The limits *are*
+subsidised" — it is a deliberately **bounded, consume-only, reciprocity-gated** slice. The limits *are*
 the product boundary, and the reason anyone pays:
 
-| Axis | Free (credit) | Paid (tokens) |
+| Axis | Free (reciprocity) | Paid (tokens) |
 |---|---|---|
-| **Scale** | small allowance per identity/epoch, expires | buy any volume |
-| **Reliability** | pool-subsidised → throttled / best-effort under pool pressure | self-funded → always admitted, never pool-gated |
+| **Scale** | headroom = your reciprocity balance (`served − consumed`) + a small cold-start grant | buy any volume |
+| **Reliability** | reciprocity-gated in real time; throttles at the deficit band | escrow-backed → always admitted, settled retroactively |
 | **Durability / publish** | consume-only — *read* the shared pool | owner-pays-pin: publish + persist your own data, run a service |
-| **Value** | non-transferable, expiring voucher | liquid — transferable, earnable (serve-to-earn), withdrawable |
+| **Value** | nothing tradeable — reciprocity is a *position*, not an asset you hold | liquid — transferable, earnable (serve-to-earn), withdrawable |
 
 The reliability gap is **not** provider discrimination (the cheque is tier-blind, §7) — it is at
-*admission*: a free fetch is gated on allowance + pool health, a paid fetch is not. **What drives
-conversion:** you pay the moment you need *scale* (outgrow the allowance), *reliability* (can't be
-throttled), *durability* (publish/persist your own data — the north-star product; free is
-consume-only and can host nothing), or *to earn/transact* (free credit can't be earned,
-transferred, or withdrawn). One line: **free lets you *use* the network; paid lets you *build on*
-it.** The tier is kept thin on purpose — enough to hook, not to substitute — and sized to pool
-health so it can't be drained; that thinness is what makes the freemium self-funding (paid funds
-free).
+*admission*: a free fetch is gated in real time on your reciprocity position, a paid fetch is
+escrow-backed and never gated. **What drives conversion:** you pay the moment you need *scale*
+(consume beyond what you contribute), *reliability* (can't be throttled at the deficit band),
+*durability* (publish/persist your own data — the north-star product; free is consume-only and can
+host nothing), or *to earn/transact* (reciprocity can't be transferred, sold, or withdrawn — only
+tokens can). One line: **free lets you *use* the network; paid lets you *build on* it.** And the free
+tier is **self-funding by construction** — reciprocal users serve their own keep, so only the
+cold-start grant is pool-funded.
 
 **Where the tier rules are enforced (not in the cheque).** The serving-cheque is a **meter, not
 an enforcer** — it only records "C received N bytes from P," tier-blind by design (so a provider
@@ -479,7 +549,11 @@ config half is live, and its deferred anchor-dispatcher half is exactly what the
 **hard invariants go native, genuine swappable policy goes governed-WASM behind an anchor** — so
 non-equivocation + the meter are native, while tier / allowance / reward are program + config.
 
-**Farming resistance — the threat model.** Three *distinct* threats, easily conflated:
+**Farming resistance — the threat model.** *Under the tit-for-tat model above, most free-tier farming
+is intrinsically defended: you cannot consume free without contributing equal service, so a pure
+leecher hits the deficit band and must pay — there is no standing subsidy to mint from. The threats
+below now chiefly guard the two remaining pool-funded surfaces — the **cold-start grant** and the
+**paid-overflow subsidy** (§10.1).* Three *distinct* threats, easily conflated:
 
 **(A) Producer-side self-dealing** — an attacker owns both a free-consumer *and* the provider
 that gets paid, converting free credit into liquid tokens. **Primary defense: the *protocol*,
@@ -675,17 +749,18 @@ binary roll). Committing to a *shape* rather than a magic constant is itself the
    mechanism is otherwise proven; a genesis committee is the degenerate 1-epoch case to bootstrap.*
 
 **Free tier / egress — models decided (§7–§8); numeric parameters GOVERNED-at-launch:**
-6. **Free-tier funding — DECIDED shape:** recycled fee-skim φ + tapering bootstrap issuance,
-   the allowance a self-balancing function of pool health. The **fee rate φ**, the
-   **issuance-taper schedule**, and the **allowance function** are governance parameters set at
-   launch (not baked).
-7. **Free-tier farming defenses — DECIDED:** primary = **protocol-picked producer + enforced
-   piece placement** (§8-A) so a self-dealer can't guarantee its node is the paid one;
-   anti-inflation = counterparty-signed cheques (§8-B — built, step 2). Cost bound = the
-   **identity gate** (stake / invite / PoP) + allowance size + refresh cadence + pool-health
-   sizing (§8-C): the gate mechanism is chosen at launch (governed), allowance refreshes per
-   epoch. Optional extra safety (route free-serving through the sybil-normalized metric §10.2)
-   stays off unless needed.
+6. **Free-tier funding — DECIDED (revised 2026-07-16):** the free tier is **tit-for-tat** (§8), so
+   it is *self-funding* — reciprocal users serve their own keep. The pool funds only the **cold-start
+   grant** for brand-new accounts (plus the paid-overflow subsidy). Governed parameters: the
+   **cold-start grant size + refresh**, the fee-skim **φ** that refills the pool, and the
+   **pool-health limit** on overflow subsidy — *not* a standing free allowance.
+7. **Free-tier farming defenses — DECIDED (revised 2026-07-16):** tit-for-tat makes free-tier farming
+   **largely intrinsic** — you can't consume free without contributing equal service (§8), so a pure
+   leecher hits the deficit band and must pay. The residual defenses guard only the **cold-start
+   grant** + paid-overflow subsidy: the **identity gate** (stake / invite / PoP) bounds cold-start
+   cost; counterparty-signed cheques (§8-B — built) prevent inflation; protocol-picked producer +
+   enforced placement (§8-A) stay as defense-in-depth for the overflow subsidy. Gate mechanism + grant
+   size are governed at launch.
 8. **Swarm-fetch payment — DECIDED:** a single prepaid **per-consumer egress balance** settled
    across all providers by `allocate_quota` (built, step 2 P1) — NOT a channel-open per provider.
 9. **Escrow / relay — DECIDED:** relay is metered **separately** from egress (§7). The cheque
