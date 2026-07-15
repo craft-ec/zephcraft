@@ -1,3 +1,26 @@
+# ECONOMIC LAYER — SERVING-CHEQUE + MEASUREMENT SUBSTRATE (§11 step 2) — ACTIVE (started 2026-07-15)
+
+SWAP-style egress cheques (docs/ECONOMIC_LAYER_DESIGN.md §7): a CONSUMER signs a running cumulative of bytes
+received from a PROVIDER; the provider accumulates (one per consumer, monotonic); the sum = payment basis +
+serving MEASUREMENT (the cheque is payment instrument + fair-exchange proof + measurement evidence — one
+artifact, three roles). No dependency on the §10 policy decisions — the buildable-now measurement substrate.
+
+Phases:
+- [x] **P1 — Cheque core DONE 2026-07-15** (new crate `crates/cheque`, pure offline; deps zeph-core + zeph-crypto):
+      `ServingCheque{server, consumer, cumulative_bytes, consumer_sig}` (domain `craftec/serving-cheque/1`;
+      `sign`/`verify`), `ChequeIssuer` (consumer side — `issue` monotonic cheques per server, `owed_to`),
+      `ChequeBook` (provider side — `record` iff addressed-to-me + valid-sig + STRICTLY-higher cumulative;
+      `total_earned` = the serving measurement; `load`/`cheques()` for persistence). 6 tests: sign/verify +
+      tamper (cumulative/server/sig); non-consumer-signed refused; monotonic accumulate + stale refused;
+      wrong-server refused; multi-consumer sum; load roundtrip. Gates: build, 6 tests, fmt, clippy.
+- [ ] **P2 — Transport hook**: emit/collect cheques on the piece-serving path (obj serve over `tag::PIECE`) — the
+      consumer issues a cheque per served chunk, the provider records it; + the SWAP settlement threshold (§7).
+      (obj adds `zeph-cheque` dep; register `zeph-cheque` in the root workspace.dependencies.)
+- [ ] **P3 — Measurement collection**: expose the provider's `total_earned` (per-counterparty cheques) as the
+      serving-contribution signal for the (future) participation metric (§6); count PAID egress from distinct payers.
+
+---
+
 # ECONOMIC LAYER — ORDERING SEQUENCER (§11 step 1 of docs/ECONOMIC_LAYER_DESIGN.md) — SEQUENCER COMPLETE (P1–P4b-2, 2026-07-15)
 
 Design settled in docs/ECONOMIC_LAYER_DESIGN.md (§4/§5). Building the first no-dependency piece of the economic

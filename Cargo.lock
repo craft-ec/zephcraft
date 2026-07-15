@@ -5763,6 +5763,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeph-cheque"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "zeph-core",
+ "zeph-crypto",
+]
+
+[[package]]
 name = "zeph-cipher"
 version = "0.1.0"
 dependencies = [
