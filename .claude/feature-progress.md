@@ -83,6 +83,12 @@ file's segments — CO §76/§286/§298).
       (default errors; `CraftBackend` → `fetch_file_range`) + the `obj_get_range(cid, offset, len, out, cap)`
       host fn under `Capability::Obj`. Test: a WASM program reads a file slice `[10,30)` by manifest cid →
       correct bytes. **FILE SEGMENTATION fully complete — all follow-ups closed.**
+- [x] **Follow-ups ROLLED + LIVE 2026-07-15.** Full gate 🟢 (A-G + clippy + workspace tests), staggered roll
+      of all 4 Hetzner nodes (each active, 0 restarts, 3 peers, 0 panics; backup `zeph.bak-20260715-0505`).
+      Live-validated on the fleet: a 20 MB PUBLIC file → cross-node whole fetch (zeph→zeph2) byte-identical +
+      `zeph get --offset 10M --length 1000` range read (only covering segments) matches; a 20 MB PRIVATE file
+      (chunk-then-encrypt) → owner whole fetch byte-identical + private `--offset/--length` range read matches.
+      Commits `184fd6e` + `5281565`.
 
 ---
 
