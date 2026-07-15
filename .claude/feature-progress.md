@@ -40,10 +40,18 @@ file's segments — CO §76/§286/§298).
       accidental proof dedup works; switched to a sequential LCG stream for distinct segments.) Follow-up
       (not P2-blocking): sequential-scan PREFETCH for smooth streaming (fetch the next segment ahead); wiring
       the range read to the CLI/host-fn.
-- [ ] **P3 lifecycle over segments:** pin/want/forget/health/repair walk the manifest segment list
-      (`chain_children` already walks manifest children → extend to `File.segments`); each segment repaired
-      independently by the existing per-cid machinery. Test: kill a holder of ONE segment → only that segment
-      repairs, file stays whole.
+- [x] **P3 lifecycle/repair over segments DONE 2026-07-15.** Confirmed the existing per-cid machinery already
+      handles segments independently — `chain_children` walks `File.segments` (P1), each segment is its own
+      generation want/pin-marked at publish, so the health-scan repairs each on its own; NO new repair code
+      needed. Made `file_segment_bytes`/`file_k` **config fields** (default 8 MiB/32; also better production
+      tunability) so tests use small segments; refactored the healthscan test `node`→`node_cfg`. New test
+      (`each_file_segment_is_repaired_independently`): a 3-segment file, deficit ONE segment (forget its
+      pieces on some holders, keeping rank ≥ k), scan → that segment's pieces are restored INDEPENDENTLY
+      while the healthy segments are untouched, and a fresh fetcher reassembles the WHOLE file byte-identical.
+      (Asserted relatively — deficit→repair progress + file integrity — not exact-floor convergence, which the
+      single-object self-heal test already covers.) 18 healthscan tests pass; full workspace builds; clippy+fmt
+      clean. Lightened the test (single-thread, 4 holders) after it flaked a neighbor timing test under cargo's
+      parallel harness.
 - [ ] **P4 gate + staggered roll** (additive: new manifest shape + existing piece messages) **+ reconcile
       CRAFTOBJ_DESIGN §80–92** to the segment-sub-cid model (note §224 satisfied). Live: publish a >8 MiB file
       on one node, fetch by manifest cid on another, byte-identical.

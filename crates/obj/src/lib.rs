@@ -117,6 +117,13 @@ pub struct ObjConfig {
     /// time (BitTorrent active-set bound). Others wait as cheap candidates and
     /// rotate in as active pushes drain. Default 4. 0 disables the choke.
     pub active_set_k: usize,
+    /// Large-file segmentation: a file is chunked into segments of at most this many bytes, each
+    /// its own erasure generation + cid (`Manifest::File.segments`). Default 8 MiB (32 × 256 KiB
+    /// pieces at [`Self::file_k`]); tests set it small for fast multi-segment coverage.
+    pub file_segment_bytes: usize,
+    /// Generation size (k) for FILE segments — default 32 (256 KiB pieces per 8 MiB segment).
+    /// Distinct from [`Self::k`] (the default for small/opaque objects).
+    pub file_k: usize,
 }
 
 impl Default for ObjConfig {
@@ -132,6 +139,8 @@ impl Default for ObjConfig {
             eviction_cooldown: Duration::from_secs(30 * 24 * 60 * 60),
             pace_delay: Duration::from_secs(1),
             active_set_k: 4,
+            file_segment_bytes: FILE_SEGMENT_BYTES,
+            file_k: FILE_K,
         }
     }
 }
@@ -700,8 +709,10 @@ impl ObjEngine {
         // dedup by cid (§224). An empty file yields zero segments → restored as empty bytes.
         let mut segments = Vec::new();
         let mut durable = true;
-        for chunk in data.chunks(FILE_SEGMENT_BYTES.max(1)) {
-            let r = self.publish_impl(chunk, pin, false, FILE_K).await?;
+        for chunk in data.chunks(self.config.file_segment_bytes.max(1)) {
+            let r = self
+                .publish_impl(chunk, pin, false, self.config.file_k)
+                .await?;
             durable &= r.durable;
             segments.push(Segment {
                 cid: r.cid.0,

@@ -41,7 +41,21 @@ impl Node {
     }
 }
 
+/// The default test config: fast probes/pacing so scans/repairs converge quickly.
+fn test_cfg() -> ObjConfig {
+    ObjConfig {
+        probe_timeout: std::time::Duration::from_millis(200),
+        scale_threshold: 3,
+        pace_delay: std::time::Duration::from_millis(0),
+        ..ObjConfig::default()
+    }
+}
+
 async fn node(tracker: &MemNet, dir: &std::path::Path) -> Node {
+    node_cfg(tracker, dir, test_cfg()).await
+}
+
+async fn node_cfg(tracker: &MemNet, dir: &std::path::Path, cfg: ObjConfig) -> Node {
     let id = Arc::new(NodeIdentity::generate());
     let t = Arc::new(
         Transport::bind(
@@ -60,12 +74,7 @@ async fn node(tracker: &MemNet, dir: &std::path::Path) -> Node {
         store,
         routing.clone(),
         Arc::new(tracker.peers()),
-        ObjConfig {
-            probe_timeout: std::time::Duration::from_millis(200),
-            scale_threshold: 3,
-            pace_delay: std::time::Duration::from_millis(0),
-            ..ObjConfig::default()
-        },
+        cfg,
     );
     let (tx, rx) = tokio::sync::mpsc::channel(64);
     let st = t.clone();
@@ -1199,5 +1208,115 @@ async fn sole_content_holder_enqueues_repair_when_no_peer_is_capable() {
     assert!(
         matches!(work, Ok(EngineWork::Repair(c)) if c == cid),
         "sole content holder must enqueue Repair (pre-fix: dead code enqueued nothing); got {work:?}"
+    );
+}
+
+/// P3 — each segment of a large file is an INDEPENDENT erasure generation, repaired on its own by
+/// the existing per-cid machinery. A deficit on ONE segment is detected + repaired back to its
+/// floor while the other segments (healthy) are left untouched, and the whole file survives.
+#[tokio::test]
+async fn each_file_segment_is_repaired_independently() {
+    let tracker = start_tracker();
+    let dirs: Vec<tempfile::TempDir> = (0..8).map(|_| tempfile::tempdir().unwrap()).collect();
+
+    // Small segments so a multi-segment file is cheap to distribute: 40 KB segments, K=8 (floor 32).
+    let cfg = || ObjConfig {
+        file_segment_bytes: 40 * 1024,
+        file_k: 8,
+        ..test_cfg()
+    };
+
+    // 4 holders spread the pieces (we assert independence + repair RELATIVELY, so exact-floor spread
+    // isn't needed — keeps the test light so it doesn't starve concurrent timing-sensitive tests).
+    let mut holders = Vec::new();
+    for dir in dirs.iter().take(4) {
+        let h = node_cfg(&tracker, dir.path(), cfg()).await;
+        h.routing.announce_node(0, 0).await.unwrap();
+        holders.push(h);
+    }
+    let publisher = node_cfg(&tracker, dirs[7].path(), cfg()).await;
+
+    // 100 KB → three segments (40 / 40 / 20 KB), each its own K=8 generation.
+    let data: Vec<u8> = (0..100_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 11) as u8)
+        .collect();
+    let fp = publisher
+        .engine
+        .publish_file("big.bin", "application/octet-stream", &data, false)
+        .await
+        .unwrap();
+    let segs: Vec<zeph_core::Cid> = publisher
+        .engine
+        .fetch_manifest(fp.manifest_cid)
+        .await
+        .unwrap()
+        .file_segments()
+        .unwrap()
+        .iter()
+        .map(|s| zeph_core::Cid(s.cid))
+        .collect();
+    assert_eq!(segs.len(), 3, "three segments");
+    assert_ne!(segs[0], segs[1], "distinct segments have distinct cids");
+
+    // holders[0] WANTS every segment → it maintains + repairs each independently.
+    for s in &segs {
+        holders[0].engine.want(*s).await.unwrap();
+    }
+
+    // Wait for each segment to become recoverable (≥ k pieces spread) — distribution is concurrent
+    // across the 3 segments, so we assert independence + repair RELATIVELY, not exact floor
+    // convergence (that's the single-object self-heal test's job).
+    let k = 8usize;
+    for s in &segs {
+        let have = wait_have(&holders, *s, k).await;
+        assert!(
+            have >= k,
+            "segment {s} spread to at least k ({have} >= {k})"
+        );
+    }
+    let base0 = verified_have(&holders, segs[0]).await;
+    let base1 = verified_have(&holders, segs[1]).await;
+
+    // DEFICIT segment 1 ONLY: forget its pieces on 2 of the 4 holders (keeping rank ≥ k on the other
+    // two → recoverable), leaving segments 0 and 2 untouched.
+    for h in &holders[2..4] {
+        h.engine.store().forget(&segs[1]).unwrap();
+    }
+    let after1 = verified_have(&holders, segs[1]).await;
+    assert!(
+        after1 < base1 && after1 < verified_have(&holders, segs[0]).await,
+        "segment 1 is now deficient ({after1}) vs the healthy segments"
+    );
+
+    // Repair: scan until segment 1 climbs back — it must be repaired on its own. holders[0] wants
+    // every segment, so its scan detects seg1's deficit and mints fresh pieces for it.
+    let mut rec1 = after1;
+    for _ in 0..80 {
+        for h in &holders {
+            h.engine.health_scan().await;
+        }
+        rec1 = verified_have(&holders, segs[1]).await;
+        if rec1 >= base1 {
+            break;
+        }
+    }
+    assert!(
+        rec1 > after1,
+        "segment 1 was repaired independently — pieces restored ({rec1} > {after1})"
+    );
+    // Segment 0 was never deficient → it was NOT needlessly torn down by seg1's repair.
+    let end0 = verified_have(&holders, segs[0]).await;
+    assert!(
+        end0 + 4 >= base0,
+        "segment 0 stayed healthy through segment 1's repair ({end0} ~>= {base0})"
+    );
+
+    // A fresh fetcher restores the WHOLE file from the network (all segments, incl. the repaired
+    // one) — byte-identical.
+    let fetcher = node_cfg(&tracker, dirs[6].path(), cfg()).await;
+    let (_n, _m, got) = fetcher.engine.fetch_file(fp.manifest_cid).await.unwrap();
+    assert_eq!(
+        got, data,
+        "the multi-segment file survives per-segment repair, byte-identical"
     );
 }

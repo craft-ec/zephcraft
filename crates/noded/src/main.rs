@@ -1294,6 +1294,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
             eviction_cooldown: Duration::from_secs(cfg.eviction_cooldown_secs),
             pace_delay: Duration::from_secs(cfg.pace_delay_secs),
             active_set_k: 4, // element 2 choke: K distinct active push peers (default)
+            ..ObjConfig::default()  // file segmentation (8 MiB / K=32) — defaults
         },
     );
     // The owner's encryption keypair (PRE), derived from the identity seed —
