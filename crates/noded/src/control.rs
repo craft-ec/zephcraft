@@ -212,6 +212,8 @@ pub struct State {
     pub accounts: std::sync::Arc<crate::account::ProgramAccountStore>,
     /// Per-program attestation quorum chains (the `attest` host fn's backend).
     pub attest: std::sync::Arc<crate::attest::AttestStore>,
+    /// Per-(owner,program,account) ordered-write logs (the `sequence` host fn's backend).
+    pub sequence: std::sync::Arc<crate::sequence::SequenceStore>,
 }
 
 impl State {
@@ -470,6 +472,7 @@ async fn handle_rpc(state: &State, line: &str) -> serde_json::Value {
         Some("attest_cosign") => rpc_attest_cosign(state, &request, id).await,
         Some("attest_submit") => rpc_attest_submit(state, &request, id).await,
         Some("attest_status") => rpc_attest_status(state, &request, id).await,
+        Some("sequence_log") => rpc_sequence_log(state, &request, id).await,
         Some("programs") => rpc_programs(state, id).await,
         Some("apps") => {
             serde_json::json!({"jsonrpc": "2.0", "id": id, "result": apps_list(state).await})
@@ -1499,6 +1502,43 @@ async fn rpc_attest_status(
         .is_authorized(&owner, &program, stmt.as_bytes())
         .await;
     serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"authorized": authorized, "owner": hex::encode(owner)}})
+}
+
+/// Read an account's committed ordered-write log — the sequencer's cross-node serve path. Keyed by
+/// `(owner, program, account)`; default owner = this node, `owner` (64 hex) reads another owner's.
+/// Syncs from peers first, so ANY node returns the same committed order. Returns the length + each
+/// nonce's payload (hex).
+async fn rpc_sequence_log(
+    state: &State,
+    req: &serde_json::Value,
+    id: serde_json::Value,
+) -> serde_json::Value {
+    let program = match parse_hex32(req["params"].get("program")) {
+        Ok(p) => p,
+        Err(e) => return rpc_err(id, e),
+    };
+    let account = match parse_hex32(req["params"].get("account")) {
+        Ok(a) => a,
+        Err(e) => return rpc_err(id, e),
+    };
+    let owner = match req["params"].get("owner").and_then(|v| v.as_str()) {
+        Some(o) => match parse_node_id(o) {
+            Some(n) => n.0,
+            None => return rpc_err(id, "owner must be 64 hex chars".into()),
+        },
+        None => state.attest.owner(),
+    };
+    let (len, entries) = match state.sequence.sequence_of(owner, program, account).await {
+        Some(log) => {
+            let entries: Vec<String> = (0..log.next_nonce())
+                .map(|n| hex::encode(log.payload_at(n).unwrap_or_default()))
+                .collect();
+            (log.next_nonce(), entries)
+        }
+        None => (0, vec![]),
+    };
+    serde_json::json!({"jsonrpc":"2.0","id":id,"result":{
+        "owner": hex::encode(owner), "len": len, "entries": entries}})
 }
 
 /// Deploy `bytes` as a system app under `name`: publish a want-based system object,

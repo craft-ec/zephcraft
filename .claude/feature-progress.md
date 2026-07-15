@@ -36,9 +36,24 @@ Phases (each: build+test → design-check → review → commit):
       in the invoke path; the 3 `InvokeService::new` call sites (noded main + feed/invoke tests) pass the 6th arg
       (noded `None` until P3). **Test:** `sequence_producer_path_returns_the_commit_outcome` proves 1/0/-1/2.
       **Gates:** 84 zeph-com tests + integration tests, fmt, clippy `--all-targets`, `cargo build --workspace`.
-- [ ] **P3 — Node service + cross-node propagation**: per-account sequence chains publish/pull cross-node (mirror
-      `AttestStore` anti-entropy over a reserved DHT name); non-equivocation guard generalized per-`(account,nonce)`;
-      any node serves the sequenced order (sync-first).
+- [x] **P3 — Node service + cross-node propagation DONE 2026-07-15 (model 1: leaderless gossip)**: per-account
+      sequence chains publish/pull cross-node (mirror `AttestStore` anti-entropy over a reserved DHT name);
+      non-equivocation guard generalized per-`(account,nonce)`; any node serves the sequenced order (sync-first).
+      **Landed:** `crates/noded/src/sequence.rs` — `SequenceStore` implementing `SequenceBackend`: one
+      `AccountSequence` per (owner,program,account), persisted `<dir>/sequence/*.seq`, published as durable
+      content + a reserved `\u{1}sequence-<o>-<p>-<a>` DHT head, pulled cross-node (`sync` adopts only a
+      strictly-longer sequence that EXTENDS our committed prefix — `extends()` refuses a fork; requires the
+      quorum intersection-sized). REUSES the program's attestation quorum (`AttestStore::current_quorum`, new
+      method — one program, one quorum for both authority + ordering). `submit(owner,program,commit)` = the
+      k-of-n write path (syncs first, then `AccountSequence::append`). `sequence()` backend auto-commits a
+      threshold-1 (self) quorum; k>1 → `false` (needs the P4 auto-sign accumulate). Wired into `InvokeService`
+      (main.rs, replaces the P2 `None`) + `set_membership`; control-plane read `sequence_log` RPC + `zeph
+      sequence-log --program --account [--owner]` CLI (`control.rs`/main.rs) so any node serves the order.
+      **Tests (4):** self-quorum commit+read-back; submit k-of-n orders + refuses forks/gaps/sub-threshold;
+      non-intersection-sized (2-of-4) refused; persistence reload. **Gates:** full zeph-noded suite (22) + fmt +
+      clippy + `cargo build --workspace`. **Deferred to P4:** the leaderless *sig-accumulate gossip* (pending
+      proposals gathering k signatures cross-node) pairs with member auto-sign — until then multi-member writes
+      use `submit` with explicitly-gathered signatures.
 - [ ] **P4 — Auto-signing policy hook** (deferred Package B): member-side policy-program auto-sign; the
       non-equivocation invariant enforced STRUCTURALLY by the binary (the hook refuses a 2nd conflicting
       `(account,nonce)` regardless of policy) — program owns discretion, binary owns the invariant (§5).

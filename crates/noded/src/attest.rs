@@ -212,6 +212,20 @@ impl AttestStore {
             .is_some_and(|a| a.chain.is_authorized(statement))
     }
 
+    /// The CURRENT folded quorum for `(owner, program_cid)` — syncing from peers first, so any node
+    /// sees the same declared members + threshold. This is the shared quorum a program declares once
+    /// (via [`bootstrap`](Self::bootstrap)) and reuses for BOTH authority (`attest`) and ordering (the
+    /// sequencer, `SequenceStore`): one program, one quorum. `None` if the program has not declared one
+    /// or the chain does not fold.
+    pub async fn current_quorum(&self, owner: &[u8; 32], program_cid: &[u8; 32]) -> Option<Quorum> {
+        self.sync(owner, program_cid).await;
+        self.chains
+            .read()
+            .await
+            .get(&(*owner, *program_cid))
+            .and_then(|a| a.chain.current())
+    }
+
     /// Publish an (owner, program) chain: durable content + a per-(owner,program) DHT head (version =
     /// seq + 1, strictly increasing). Publishes the owner-signed envelope. Mirrors governance's
     /// `publish`.

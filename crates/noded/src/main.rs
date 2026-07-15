@@ -43,6 +43,7 @@ mod headreg;
 mod peers;
 mod registry_heads;
 mod registry_net;
+mod sequence;
 mod shard_root;
 
 use std::path::{Path, PathBuf};
@@ -241,6 +242,16 @@ enum Command {
         #[arg(long)]
         statement: String,
         /// Owner node-id hex whose quorum to check (default: this node).
+        #[arg(long)]
+        owner: Option<String>,
+    },
+    /// Read an account's committed ordered-write log from the sequencer (cross-node; syncs first).
+    SequenceLog {
+        #[arg(long)]
+        program: String,
+        #[arg(long)]
+        account: String,
+        /// Owner node-id hex whose program to read (default: this node).
         #[arg(long)]
         owner: Option<String>,
     },
@@ -559,6 +570,18 @@ async fn main() -> anyhow::Result<()> {
                 &data_dir,
                 "attest_status",
                 serde_json::json!({"program": program, "statement": statement, "owner": owner}),
+            )
+            .await
+        }
+        Some(Command::SequenceLog {
+            program,
+            account,
+            owner,
+        }) => {
+            cmd_attest(
+                &data_dir,
+                "sequence_log",
+                serde_json::json!({"program": program, "account": account, "owner": owner}),
             )
             .await
         }
@@ -1419,13 +1442,23 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // each chain is published + pulled cross-node (obj + routing), so attest() works on any node.
     let attest_store =
         attest::AttestStore::open(identity.clone(), data_dir, engine.clone(), routing.clone());
+    // sequence() = the ordering sequencer (uniqueness): quorum-serialized per-account writes, the
+    // mechanism the token ledger rides on. Reuses the program's attestation quorum (one program, one
+    // quorum) + the same cross-node anti-entropy attestation uses.
+    let sequence_store = sequence::SequenceStore::open(
+        identity.clone(),
+        data_dir,
+        engine.clone(),
+        routing.clone(),
+        attest_store.clone(),
+    );
     let com_service = Arc::new(zeph_com::InvokeService::new(
         zeph_com::TransitionRuntime::new()?,
         engine.clone(),
         com_backend,
         Some(board_service.clone()),
         Some(attest_store.clone()),
-        None, // sequence_backend — the ordering sequencer's node store is wired in P3
+        Some(sequence_store.clone()),
     ));
 
     tracing::info!(
@@ -1542,6 +1575,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         gov: governance_store.clone(),
         accounts: account_store.clone(),
         attest: attest_store.clone(),
+        sequence: sequence_store.clone(),
         settings: {
             let oc = engine.config();
             control::NodeSettings {
@@ -1818,6 +1852,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     head_registry.set_membership(membership.clone()).await;
     board_service.set_membership(membership.clone()).await;
     attest_store.set_membership(membership.clone()).await;
+    sequence_store.set_membership(membership.clone()).await;
     head_registry.set_programs(governance_store.clone()).await;
     head_registry.clone().set_jobs(jobs.clone()).await;
 
