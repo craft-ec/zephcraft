@@ -1,4 +1,4 @@
-# ECONOMIC LAYER — ORDERING SEQUENCER (§11 step 1 of docs/ECONOMIC_LAYER_DESIGN.md) — ACTIVE (started 2026-07-15)
+# ECONOMIC LAYER — ORDERING SEQUENCER (§11 step 1 of docs/ECONOMIC_LAYER_DESIGN.md) — SEQUENCER COMPLETE (P1–P4b-2, 2026-07-15)
 
 Design settled in docs/ECONOMIC_LAYER_DESIGN.md (§4/§5). Building the first no-dependency piece of the economic
 layer: finish the deferred K7 attestation auto-signing and extend the attestation substrate into a per-account,
@@ -73,11 +73,21 @@ Phases (each: build+test → design-check → review → commit):
         owner-authentic write (dropped the account==self restriction) as a quorum member. Test: a node orders
         alice's pre-authored write; a spoofed (wrong-signer) write is refused. Gates: com 9 seq + transition
         producer, noded 5 seq, fmt, clippy, `cargo build --workspace`.
-  - [ ] **P4b-2 — Multi-member auto-collection** (the leaderless sig-accumulate): a new sign-solicitation wire
-        (collector → each quorum member → auto-signed ORDERING sig back), pending-proposal accumulation, commit
-        at k, + a persistent per-member signed-set for cross-restart non-equivocation. The structural
-        non-equivocation invariant (`SequencerMember`) already refuses a 2nd conflicting `(account,nonce)`.
-        (Until then: k=1 auto-commits; k>1 uses `submit` with explicitly-gathered sigs.)
+  - [x] **P4b-2 — Multi-member auto-collection DONE 2026-07-15 (leaderless solicit-RPC).** New
+        `tag::SIGN_SOLICIT` mux protocol (transport, additive). `SequenceStore` gains: `sign_write_locally`
+        (member auto-sign — quorum-member + owner-authentic + non-equivocation via a PERSISTENT signed-set
+        `<dir>/sequence/signed.set` for cross-restart safety); `solicit_member` (`request_tagged` to a member's
+        `member_addr`); `collect` (self-sign + solicit the rest → k sigs → `submit`; leaderless — any node
+        collects); `serve` (inbound solicitation handler). `sequence()` now COLLECTS k (not just k=1). Wired in
+        main.rs (`open` takes transport; `serve` spawned on `SIGN_SOLICIT`). Test:
+        `member_auto_signs_and_refuses_equivocation_across_restart` (idempotent sign + conflict refusal + survives
+        restart); k=1 self path proven via `self_quorum...` (now through `collect`). Gates: noded 6 seq, fmt,
+        clippy, `cargo build --workspace`. Cross-node k>1 solicit = compile-verified + fleet-validatable.
+
+**★ ORDERING SEQUENCER (§11 step 1) COMPLETE — P1→P4b-2, 7 commits.** The mechanism the token ledger sits on is
+built end-to-end: per-account non-equivocating quorum-ordered writes, owner-authenticated, cross-node propagated
++ served, fork-impossible at commit, automatic multi-member collection. Next in §11: step 2 (serving-cheque +
+measurement substrate) / step 3 (participation metric, blocked on §10 policy) / step 4 (token-ledger app).
 
 ---
 

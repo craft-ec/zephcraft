@@ -1451,6 +1451,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         engine.clone(),
         routing.clone(),
         attest_store.clone(),
+        transport.clone(),
     );
     let com_service = Arc::new(zeph_com::InvokeService::new(
         zeph_com::TransitionRuntime::new()?,
@@ -1716,6 +1717,9 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // verifies over tag::BOARD (additive — old nodes drop it).
     let (board_stream_tx, board_stream_rx) = tokio::sync::mpsc::channel(32);
     stream_handlers.push((zeph_transport::tag::BOARD, board_stream_tx));
+    // Ordering-sequencer sign solicitations (a collector asks this node, as a quorum member, to sign).
+    let (sign_stream_tx, sign_stream_rx) = tokio::sync::mpsc::channel(32);
+    stream_handlers.push((zeph_transport::tag::SIGN_SOLICIT, sign_stream_tx));
     let server = transport.clone();
     tokio::spawn(async move { server.serve(stream_handlers).await });
     tokio::spawn(engine.clone().serve(piece_stream_rx));
@@ -1728,6 +1732,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     tokio::spawn(head_registry.clone().serve(registry_stream_rx));
     // Serve + gossip + verify the verification board.
     tokio::spawn(board_service.clone().serve(board_stream_rx));
+    tokio::spawn(sequence_store.clone().serve(sign_stream_rx));
     // "Pending distribution" completion (per-incomplete-cid DHT resolve + deficit pushes)
     // — network fan-out, so it runs THROUGH the coordinator (Distribution priority,
     // deduped: a slow pass coalesces with the next tick instead of stacking). This loop

@@ -39,6 +39,9 @@ pub mod tag {
     /// Verification board gossip (a `BoardSnapshot` push). Additive: a node without this handler
     /// drops the stream, so board gossip is mixed-version-safe (a staggered roll, not simultaneous).
     pub const BOARD: u8 = 8;
+    /// Ordering-sequencer sign solicitation (a collector asks a quorum member to sign a `SequencedWrite`;
+    /// the member auto-signs if owner-authentic + non-equivocating). Additive → mixed-version-safe.
+    pub const SIGN_SOLICIT: u8 = 9;
 }
 
 /// An inbound muxed bi-stream, already tag-dispatched: the remote's NodeId

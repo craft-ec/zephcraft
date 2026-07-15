@@ -14,25 +14,49 @@
 //! so ANY node reads the ordered log. On adoption a node NEVER accepts a sequence that diverges from
 //! its committed prefix (a fork) — it adopts only a strictly-longer one that EXTENDS what it holds.
 //!
-//! **Signature COLLECTION:** [`submit`](SequenceStore::submit) appends a pre-collected k-of-n commit
-//! (the write path — a collector, or the k=1 self path). Automatic multi-member collection — each
-//! member auto-signing a proposal as it propagates (the leaderless accumulate) — is the deferred
-//! auto-sign hook (P4); until then [`sequence`](SequenceBackend::sequence) auto-commits only a
-//! threshold-1 (self) quorum, and multi-member writes go through `submit` with gathered signatures.
+//! **Signature COLLECTION (P4b-2, leaderless solicit-RPC):** [`sequence`](SequenceBackend::sequence)
+//! COLLECTS the quorum's k ordering-signatures — this node signs locally (if a member) and solicits the
+//! rest on `tag::SIGN_SOLICIT`; each member auto-signs a valid, non-equivocating proposal
+//! ([`serve`](SequenceStore::serve) → `sign_write_locally`, guarded by a PERSISTENT signed-set for
+//! cross-restart non-equivocation) — then `submit`s. Any node can be the collector (no leader).
+//! [`submit`](SequenceStore::submit) remains the path for a pre-gathered k-of-n commit.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
-use tokio::sync::RwLock;
-use zeph_com::{AccountSequence, SequenceBackend, SequencedCommit, SequencedWrite};
-use zeph_core::NodeId;
+use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc, RwLock};
+use zeph_com::{
+    AccountSequence, MemberSignature, SequenceBackend, SequencedCommit, SequencedWrite,
+};
+use zeph_core::{Cid, NodeId};
 use zeph_crypto::NodeIdentity;
 use zeph_membership::Membership;
 use zeph_obj::{ConsumeMode, ObjEngine};
 use zeph_routing::ContentRouting;
+use zeph_transport::{tag, TaggedStream, Transport};
 
 use crate::attest::AttestStore;
+
+/// How long a collector waits for one member's sign-solicitation reply before moving on.
+const SOLICIT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Max solicitation request / reply frame (a `SequencedWrite` / a `MemberSignature`).
+const MAX_SOLICIT_FRAME: usize = 64 * 1024;
+
+/// A sign-solicitation: a collector asks a quorum member to add its ORDERING signature to this
+/// pre-authored write. The member resolves `(owner, program_cid)`'s quorum, checks it is a member and
+/// the write is owner-authentic + non-equivocating, and returns its [`MemberSignature`] (or refuses).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SignSolicit {
+    owner: [u8; 32],
+    program_cid: [u8; 32],
+    write: SequencedWrite,
+}
+
+/// Persistent non-equivocation key: `(owner, program, account, nonce)`.
+type SignedKey = ([u8; 32], [u8; 32], [u8; 32], u64);
 
 /// Reserved DHT app-name for a committed account-sequence head, keyed by owner + program + account so
 /// each account's log resolves independently. The leading control char keeps it out of app-name space.
@@ -58,6 +82,11 @@ pub struct SequenceStore {
     membership: RwLock<Option<Arc<Membership>>>,
     /// The shared quorum source — a program declares one quorum (via attestation), reused here.
     quorums: Arc<AttestStore>,
+    /// For soliciting ORDERING signatures from remote quorum members (the collector path).
+    transport: Arc<Transport>,
+    /// This member's PERSISTENT signed-set — `(owner, program, account, nonce) → hash(write)` it has
+    /// signed — so it never equivocates (signs two different writes at one nonce), even across restart.
+    signed: RwLock<HashMap<SignedKey, [u8; 32]>>,
 }
 
 impl SequenceStore {
@@ -68,6 +97,7 @@ impl SequenceStore {
         obj: Arc<ObjEngine>,
         routing: Arc<dyn ContentRouting>,
         quorums: Arc<AttestStore>,
+        transport: Arc<Transport>,
     ) -> Arc<Self> {
         let dir = data_dir.join("sequence");
         let _ = std::fs::create_dir_all(&dir);
@@ -94,6 +124,11 @@ impl SequenceStore {
                 }
             }
         }
+        // The persistent signed-set (cross-restart non-equivocation) — a postcard map, empty if absent.
+        let signed = std::fs::read(dir.join("signed.set"))
+            .ok()
+            .and_then(|b| postcard::from_bytes(&b).ok())
+            .unwrap_or_default();
         Arc::new(Self {
             identity,
             sequences: RwLock::new(sequences),
@@ -102,6 +137,8 @@ impl SequenceStore {
             routing,
             membership: RwLock::new(None),
             quorums,
+            transport,
+            signed: RwLock::new(signed),
         })
     }
 
@@ -266,6 +303,150 @@ impl SequenceStore {
             }
         }
     }
+
+    /// The MEMBER's auto-sign: add THIS node's ORDERING signature to `write` iff the node is a member of
+    /// `(owner, program_cid)`'s intersection-sized quorum, the write is owner-authentic, and signing does
+    /// not equivocate (the persistent [`signed`](Self::signed) set holds no DIFFERENT write at this
+    /// `(account, nonce)`; idempotent for the identical write). This is the structural non-equivocation
+    /// invariant, made crash-safe by persistence — no signing policy can override it.
+    async fn sign_write_locally(
+        &self,
+        owner: [u8; 32],
+        program_cid: [u8; 32],
+        write: &SequencedWrite,
+    ) -> Option<MemberSignature> {
+        let quorum = self.quorums.current_quorum(&owner, &program_cid).await?;
+        if !quorum.is_member(&self.me())
+            || !quorum.is_intersection_sized()
+            || !write.owner_authentic()
+        {
+            return None;
+        }
+        let key = (owner, program_cid, write.account, write.nonce);
+        let h = Cid::of(&write.signing_bytes()).0;
+        let snapshot = {
+            let mut signed = self.signed.write().await;
+            match signed.get(&key) {
+                Some(prev) if *prev != h => return None, // equivocation — hard refusal
+                _ => {
+                    signed.insert(key, h);
+                }
+            }
+            signed.clone()
+        };
+        self.persist_signed(&snapshot);
+        Some(write.sign(&self.identity))
+    }
+
+    /// Solicit ONE remote quorum member's ordering signature over `solicit.write` (a mux request/reply on
+    /// `tag::SIGN_SOLICIT`). `None` on unreachable / timeout / refusal.
+    async fn solicit_member(
+        &self,
+        member: [u8; 32],
+        solicit: &SignSolicit,
+    ) -> Option<MemberSignature> {
+        let addr = {
+            let m = self.membership.read().await;
+            m.as_ref()?.member_addr(NodeId(member)).await?
+        };
+        let bytes = postcard::to_allocvec(solicit).ok()?;
+        let resp = tokio::time::timeout(
+            SOLICIT_TIMEOUT,
+            self.transport
+                .request_tagged(&addr, tag::SIGN_SOLICIT, &bytes, MAX_SOLICIT_FRAME),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        match resp.split_first() {
+            Some((0x01, sig)) => postcard::from_bytes::<MemberSignature>(sig).ok(),
+            _ => None, // 0x00 refusal / empty
+        }
+    }
+
+    /// Gather `quorum.threshold` ORDERING signatures for `write` (self signs locally; remote members are
+    /// solicited on `tag::SIGN_SOLICIT`), then `submit` the assembled commit. Leaderless — any node can
+    /// be the collector. Returns whether it committed (false if the threshold couldn't be reached).
+    async fn collect(
+        &self,
+        owner: [u8; 32],
+        program_cid: [u8; 32],
+        write: SequencedWrite,
+        quorum: &zeph_com::Quorum,
+    ) -> bool {
+        let solicit = SignSolicit {
+            owner,
+            program_cid,
+            write: write.clone(),
+        };
+        let mut sigs: Vec<MemberSignature> = Vec::new();
+        for member in &quorum.members {
+            if sigs.len() >= quorum.threshold {
+                break;
+            }
+            let sig = if *member == self.me() {
+                self.sign_write_locally(owner, program_cid, &write).await
+            } else {
+                self.solicit_member(*member, &solicit).await
+            };
+            if let Some(s) = sig {
+                if !sigs.iter().any(|x| x.member == s.member) {
+                    sigs.push(s);
+                }
+            }
+        }
+        if sigs.len() < quorum.threshold {
+            return false; // members offline / refused → couldn't reach threshold
+        }
+        self.submit(
+            owner,
+            program_cid,
+            SequencedCommit {
+                write,
+                signatures: sigs,
+            },
+        )
+        .await
+    }
+
+    /// Serve inbound sign-solicitations (`tag::SIGN_SOLICIT`): auto-sign each valid, non-equivocating
+    /// proposal (via [`sign_write_locally`](Self::sign_write_locally)) and reply `0x01 + sig`, else `0x00`
+    /// to refuse. The soliciting caller is the QUIC-authenticated `remote` (no extra auth needed — the
+    /// member signs based on the quorum + owner-authenticity, not on who asked).
+    pub async fn serve(self: Arc<Self>, mut streams: mpsc::Receiver<TaggedStream>) {
+        while let Some(TaggedStream {
+            mut send, mut recv, ..
+        }) = streams.recv().await
+        {
+            let me = self.clone();
+            tokio::spawn(async move {
+                let Ok(bytes) = recv.read_to_end(MAX_SOLICIT_FRAME).await else {
+                    return;
+                };
+                let mut resp = vec![0x00u8]; // default: refuse
+                if let Ok(s) = postcard::from_bytes::<SignSolicit>(&bytes) {
+                    if let Some(sig) = me
+                        .sign_write_locally(s.owner, s.program_cid, &s.write)
+                        .await
+                    {
+                        if let Ok(sb) = postcard::to_allocvec(&sig) {
+                            resp = Vec::with_capacity(1 + sb.len());
+                            resp.push(0x01);
+                            resp.extend_from_slice(&sb);
+                        }
+                    }
+                }
+                let _ = send.write_all(&resp).await;
+                let _ = send.finish();
+            });
+        }
+    }
+
+    fn persist_signed(&self, signed: &HashMap<SignedKey, [u8; 32]>) {
+        if let Ok(bytes) = postcard::to_allocvec(signed) {
+            let _ = std::fs::write(self.dir.join("signed.set"), bytes);
+        }
+    }
 }
 
 /// Whether `longer` extends `base` — identical commits on `base`'s prefix (no fork).
@@ -293,12 +474,11 @@ fn parse32(hex: &str) -> Option<[u8; 32]> {
 
 #[async_trait::async_trait]
 impl SequenceBackend for SequenceStore {
-    /// The `sequence` host fn's write path: order a PRE-AUTHORED `write` under `owner`'s quorum. The
-    /// write carries the account owner's `owner_sig` (authored client-side), so any account's write can
-    /// be ordered — this node, as a quorum member, only adds the ORDERING signature. Owner-authenticity
-    /// is enforced in `submit` → `append` → `authorizes`. P4b auto-commits a threshold-1 quorum this
-    /// node is a member of; multi-member automatic collection (soliciting the other members' ordering
-    /// signatures) is the next step, so a k>1 write returns `false` — use `submit` with gathered sigs.
+    /// The `sequence` host fn's write path: order a PRE-AUTHORED `write` under `owner`'s quorum by
+    /// COLLECTING the quorum's k ordering-signatures — this node signs locally (if a member) and solicits
+    /// the rest on `tag::SIGN_SOLICIT` — then submits (P4b-2, leaderless: any node collects).
+    /// Owner-authenticity + intersection sizing are checked here; per-member non-equivocation is enforced
+    /// in `sign_write_locally`. Returns false if the threshold can't be reached (members offline/refused).
     async fn sequence(
         &self,
         owner: [u8; 32],
@@ -308,14 +488,10 @@ impl SequenceBackend for SequenceStore {
         let Some(quorum) = self.quorums.current_quorum(&owner, &program_cid).await else {
             return false;
         };
-        if quorum.threshold != 1 || !quorum.is_member(&self.me()) {
+        if !quorum.is_intersection_sized() || !write.owner_authentic() {
             return false;
         }
-        let commit = SequencedCommit {
-            signatures: vec![write.sign(&self.identity)],
-            write,
-        };
-        self.submit(owner, program_cid, commit).await
+        self.collect(owner, program_cid, write, &quorum).await
     }
 }
 
@@ -394,7 +570,7 @@ mod tests {
         );
         let store = Arc::new(Store::open(dir.path()).unwrap());
         let engine = ObjEngine::with_peer_source(
-            transport,
+            transport.clone(),
             store,
             Arc::new(NullRouting),
             Arc::new(NullPeers),
@@ -412,6 +588,7 @@ mod tests {
             engine,
             Arc::new(NullRouting),
             attest.clone(),
+            transport,
         );
         (node, attest, seq, dir)
     }
@@ -498,6 +675,47 @@ mod tests {
         assert!(
             !seq.sequence(owner, program, spoof).await,
             "a spoofed write (wrong signer) is refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn member_auto_signs_and_refuses_equivocation_across_restart() {
+        // The member auto-sign (P4b-2): a quorum member signs a valid proposal, is idempotent for the
+        // identical write, and REFUSES a conflicting write at the same (account, nonce) — even after a
+        // restart, via the persistent signed-set. This is the structural non-equivocation invariant.
+        let dir = tempfile::tempdir().unwrap();
+        let node = Arc::new(NodeIdentity::generate());
+        let owner = node.node_id().0;
+        let program = [12u8; 32];
+        let alice = NodeIdentity::generate();
+        let a = SequencedWrite::author(&alice, 0, b"A".to_vec());
+        let b = SequencedWrite::author(&alice, 0, b"B".to_vec()); // same (account, nonce), different
+
+        {
+            let (attest, seq) = build_stores(node.clone(), dir.path()).await;
+            let (m2, m3) = (NodeIdentity::generate(), NodeIdentity::generate());
+            // A 2-of-3 quorum this node is a member of (intersection-sized).
+            attest
+                .bootstrap(program, vec![owner, m2.node_id().0, m3.node_id().0], 2)
+                .await;
+            assert!(
+                seq.sign_write_locally(owner, program, &a).await.is_some(),
+                "member signs A"
+            );
+            assert!(
+                seq.sign_write_locally(owner, program, &a).await.is_some(),
+                "idempotent re-sign of A"
+            );
+            assert!(
+                seq.sign_write_locally(owner, program, &b).await.is_none(),
+                "refuses conflicting B at the same nonce"
+            );
+        }
+        // Reopen — the quorum reloads from disk AND the persistent signed-set still refuses B.
+        let (_attest, seq) = build_stores(node, dir.path()).await;
+        assert!(
+            seq.sign_write_locally(owner, program, &b).await.is_none(),
+            "still refuses B after a restart (persistent non-equivocation)"
         );
     }
 
@@ -625,14 +843,21 @@ mod tests {
         );
         let store = Arc::new(Store::open(dir).unwrap());
         let engine = ObjEngine::with_peer_source(
-            transport,
+            transport.clone(),
             store,
             Arc::new(NullRouting),
             Arc::new(NullPeers),
             ObjConfig::default(),
         );
         let attest = AttestStore::open(node.clone(), dir, engine.clone(), Arc::new(NullRouting));
-        let seq = SequenceStore::open(node, dir, engine, Arc::new(NullRouting), attest.clone());
+        let seq = SequenceStore::open(
+            node,
+            dir,
+            engine,
+            Arc::new(NullRouting),
+            attest.clone(),
+            transport,
+        );
         (attest, seq)
     }
 }
