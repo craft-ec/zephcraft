@@ -21,8 +21,8 @@ use zeph_obj::{ConsumeMode, ObjEngine};
 use zeph_transport::{tag, PeerAddr, TaggedStream, Transport};
 
 use crate::{
-    AppBackend, AttestBackend, CapabilityGrant, TransitionCtx, TransitionRuntime, VerifyBackend,
-    DEFAULT_FUEL,
+    AppBackend, AttestBackend, CapabilityGrant, SequenceBackend, TransitionCtx, TransitionRuntime,
+    VerifyBackend, DEFAULT_FUEL,
 };
 
 /// ALPN for remote app invocation.
@@ -49,6 +49,9 @@ pub struct InvokeService {
     verify_backend: Option<Arc<dyn VerifyBackend>>,
     /// Drives the `attest` host fn (solicit the quorum + await). `None` → `attest` is UNAVAILABLE.
     attest_backend: Option<Arc<dyn AttestBackend>>,
+    /// Drives the `sequence` host fn (submit an ordered write + await the commit). `None` →
+    /// `sequence` is UNAVAILABLE.
+    sequence_backend: Option<Arc<dyn SequenceBackend>>,
 }
 
 impl InvokeService {
@@ -58,6 +61,7 @@ impl InvokeService {
         backend: Arc<dyn AppBackend>,
         verify_backend: Option<Arc<dyn VerifyBackend>>,
         attest_backend: Option<Arc<dyn AttestBackend>>,
+        sequence_backend: Option<Arc<dyn SequenceBackend>>,
     ) -> Self {
         Self {
             runtime,
@@ -65,6 +69,7 @@ impl InvokeService {
             backend,
             verify_backend,
             attest_backend,
+            sequence_backend,
         }
     }
 
@@ -102,7 +107,8 @@ impl InvokeService {
         .with_program(Cid::of(&wasm).0)
         .with_program_owner(program_owner)
         .with_verify_backend(self.verify_backend.clone())
-        .with_attest_backend(self.attest_backend.clone());
+        .with_attest_backend(self.attest_backend.clone())
+        .with_sequence_backend(self.sequence_backend.clone());
         self.runtime
             .run_program(
                 &wasm,

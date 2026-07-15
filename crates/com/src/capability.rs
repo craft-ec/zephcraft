@@ -60,6 +60,15 @@ pub enum Capability {
     /// re-run — attestation is non-deterministic, so a verifiable pure `f` never calls it), NOT the
     /// deterministic profile. Distinct from verification (consistency).
     Attest,
+    /// `sequence` — a program's orchestration call into the **ordering sequencer** (uniqueness:
+    /// "commit this write at `(account, nonce)`, serialized through my quorum"). Like
+    /// [`Attest`](Capability::Attest) it is app (`full`) profile + the
+    /// [`verifier`](CapabilityGrant::verifier) re-run grant (bound inert on a re-run — sequencing is
+    /// non-deterministic, so a verifiable pure `f` never calls it), NOT the deterministic profile.
+    /// Distinct from attestation: attestation AUTHORIZES a statement (a read); the sequencer ORDERS a
+    /// write (append-at-nonce), the mechanism the token ledger's account-chains ride on
+    /// (`ECONOMIC_LAYER_DESIGN.md` §4).
+    Sequence,
     /// `pre_grant` — a program's runtime-mediated **proxy re-encryption delegation** (sharing,
     /// kernel primitive K3). The backend derives THIS identity's PRE key and returns the *blind*
     /// re-encryption fragments delegating to a recipient (Umbral `generate_kfrags`); the app never
@@ -119,6 +128,7 @@ impl CapabilityGrant {
         g.caps.insert(Capability::Random);
         g.caps.insert(Capability::Verify);
         g.caps.insert(Capability::Attest);
+        g.caps.insert(Capability::Sequence);
         g.caps.insert(Capability::Pre);
         g
     }
@@ -133,6 +143,7 @@ impl CapabilityGrant {
         let mut g = Self::deterministic();
         g.caps.insert(Capability::Verify);
         g.caps.insert(Capability::Attest);
+        g.caps.insert(Capability::Sequence);
         g.caps.insert(Capability::Pre);
         g
     }
@@ -191,6 +202,10 @@ mod tests {
             !g.allows(Capability::Pre),
             "pre_grant (sharing delegation) is not in the deterministic profile"
         );
+        assert!(
+            !g.allows(Capability::Sequence),
+            "sequence (ordering) orchestration is not in the deterministic profile"
+        );
     }
 
     #[test]
@@ -215,6 +230,10 @@ mod tests {
             g.allows(Capability::Pre),
             "full grants pre_grant (app-profile only)"
         );
+        assert!(
+            g.allows(Capability::Sequence),
+            "full grants sequence (ordering) orchestration"
+        );
         assert!(g.allows(Capability::Commit), "full ⊇ deterministic");
     }
 
@@ -232,6 +251,10 @@ mod tests {
         assert!(
             g.allows(Capability::Pre),
             "the re-run grant also binds pre_grant (inert), so a share-importing module links"
+        );
+        assert!(
+            g.allows(Capability::Sequence),
+            "the re-run grant also binds sequence (inert), so a sequence-importing module links"
         );
         assert!(g.allows(Capability::Commit), "verifier ⊇ deterministic");
         // The re-run must stay reproducible: no host-varying wall-clock.

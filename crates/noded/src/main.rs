@@ -1425,6 +1425,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         com_backend,
         Some(board_service.clone()),
         Some(attest_store.clone()),
+        None, // sequence_backend — the ordering sequencer's node store is wired in P3
     ));
 
     tracing::info!(

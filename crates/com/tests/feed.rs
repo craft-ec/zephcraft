@@ -121,6 +121,7 @@ async fn node(tracker: &MemNet, dir: &Path, heads: &MemHeads) -> Node {
         backend,
         None,
         None,
+        None,
     ));
     tokio::spawn(serve_invocations(invoke_rx, service.clone()));
     Node {

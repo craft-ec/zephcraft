@@ -25,9 +25,17 @@ Phases (each: build+test → design-check → review → commit):
       `byzantine_tolerance()` + a test proving 2-of-3 forks under 1 Byzantine while 3-of-4 does not. **Gates
       all green:** 82 zeph-com tests + 8 new sequencer tests, fmt, clippy `--all-targets`, `cargo build
       --workspace` (noded compiles). Core safety proven: `two_conflicting_writes_cannot_both_commit`.
-- [ ] **P2 — Backend + host fn**: `Capability::Sequence`, a `sequence(account_ptr, nonce, payload_ptr, len) -> i32`
+- [x] **P2 — Backend + host fn DONE 2026-07-15** : `Capability::Sequence`, a `sequence(account_ptr, nonce, payload_ptr, len) -> i32`
       host fn (mirror `attest`), a `SequenceBackend` trait, wired through transition/invoke. Node serializes the
       write through the per-account quorum. owner/quorum server-resolved (like `attest`, never caller-supplied).
+      **Landed** (mirrors the `attest` machinery exactly): `Capability::Sequence` (capability.rs, in `full()` +
+      `verifier()` inert, NOT `deterministic()`; 3 profile tests updated); `SequenceBackend` trait (lib.rs);
+      `sequence(account_ptr,nonce:i64,payload_ptr,len)->i32` host fn (transition.rs — `2` inert / `-1` no-backend
+      or no-owner or malformed/neg-nonce / `1` committed / `0` rejected; owner server-resolved so no self-order) +
+      `sequence_backend` ctx field + `with_sequence_backend`; `InvokeService` field/param + `.with_sequence_backend`
+      in the invoke path; the 3 `InvokeService::new` call sites (noded main + feed/invoke tests) pass the 6th arg
+      (noded `None` until P3). **Test:** `sequence_producer_path_returns_the_commit_outcome` proves 1/0/-1/2.
+      **Gates:** 84 zeph-com tests + integration tests, fmt, clippy `--all-targets`, `cargo build --workspace`.
 - [ ] **P3 — Node service + cross-node propagation**: per-account sequence chains publish/pull cross-node (mirror
       `AttestStore` anti-entropy over a reserved DHT name); non-equivocation guard generalized per-`(account,nonce)`;
       any node serves the sequenced order (sync-first).

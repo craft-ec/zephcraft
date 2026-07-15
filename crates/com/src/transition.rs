@@ -20,7 +20,10 @@ use wasmtime::{Caller, Config, Engine, Extern, Linker, Memory, Module, Store};
 use zeph_core::{Cid, NodeId};
 use zeph_crypto::NodeIdentity;
 
-use crate::{AppBackend, AttestBackend, Capability, CapabilityGrant, VerifyBackend, VerifyRequest};
+use crate::{
+    AppBackend, AttestBackend, Capability, CapabilityGrant, SequenceBackend, VerifyBackend,
+    VerifyRequest,
+};
 
 /// Import module the restricted deterministic ABI is bound under (shares the `craftcom`
 /// namespace with the capability runtime, but exposes only `input` + `commit` + `state`).
@@ -83,6 +86,9 @@ pub struct TransitionCtx {
     /// The node service the `attest` host fn drives (solicit the quorum's sign-offs + await
     /// authorization). `None` → `attest` reports UNAVAILABLE. Set via [`Self::with_attest_backend`].
     attest_backend: Option<Arc<dyn AttestBackend>>,
+    /// The node service the `sequence` host fn drives (submit a write to the account's quorum + await
+    /// the commit). `None` → `sequence` reports UNAVAILABLE. Set via [`Self::with_sequence_backend`].
+    sequence_backend: Option<Arc<dyn SequenceBackend>>,
 }
 
 impl TransitionCtx {
@@ -110,6 +116,7 @@ impl TransitionCtx {
             program_owner: None,
             verify_backend: None,
             attest_backend: None,
+            sequence_backend: None,
         }
     }
 
@@ -153,6 +160,13 @@ impl TransitionCtx {
     /// reports UNAVAILABLE.
     pub fn with_attest_backend(mut self, backend: Option<Arc<dyn AttestBackend>>) -> Self {
         self.attest_backend = backend;
+        self
+    }
+
+    /// Inject the [`SequenceBackend`] the `sequence` host fn drives (submit + await the commit).
+    /// Absent → `sequence` reports UNAVAILABLE.
+    pub fn with_sequence_backend(mut self, backend: Option<Arc<dyn SequenceBackend>>) -> Self {
+        self.sequence_backend = backend;
         self
     }
 }
@@ -720,6 +734,53 @@ fn bind_granted(linker: &mut Linker<TransitionCtx>, grant: &CapabilityGrant) -> 
             },
         )?;
     }
+    if grant.allows(Capability::Sequence) {
+        // `sequence(account_ptr, nonce, payload_ptr, payload_len) -> i32` — a program's orchestration
+        // call into the ORDERING SEQUENCER (uniqueness): "commit this write at (account, nonce),
+        // serialized through my quorum." `2` INERT on a verifier re-run (`ctx.verify_mode`) —
+        // sequencing is non-deterministic, so a re-run must not re-order; `-1` UNAVAILABLE (no backend
+        // / no authenticated owner / malformed / negative nonce); else `1` committed / `0` rejected
+        // (the nonce was not next, or the quorum did not authorize). Never panics.
+        linker.func_wrap_async(
+            TRANSITION_HOST_MODULE,
+            "sequence",
+            |mut caller: Caller<'_, TransitionCtx>, (ap, nonce, pp, pl): (i32, i64, i32, i32)| {
+                Box::new(async move {
+                    if caller.data().verify_mode {
+                        return 2i32;
+                    }
+                    if nonce < 0 {
+                        return -1i32; // a nonce is a u64 slot index; a negative arg is malformed
+                    }
+                    let Some(mem) = det_memory(&mut caller) else {
+                        return -1i32;
+                    };
+                    let (Some(account_bytes), Some(payload)) = (
+                        det_read(&caller, &mem, ap, 32),
+                        det_read(&caller, &mem, pp, pl),
+                    ) else {
+                        return -1;
+                    };
+                    let Ok(account) = <[u8; 32]>::try_from(account_bytes.as_slice()) else {
+                        return -1;
+                    };
+                    let Some(sb) = caller.data().sequence_backend.clone() else {
+                        return -1; // no sequence backend wired → UNAVAILABLE
+                    };
+                    let Some(owner) = caller.data().program_owner else {
+                        return -1; // no authenticated program owner (raw-cid / remote) → UNAVAILABLE
+                    };
+                    let program_cid = caller.data().program_cid;
+                    // The owner is the registry-authenticated program owner, so the quorum that ORDERS
+                    // the write is the OWNER's, never the caller's — an invoker cannot self-order.
+                    i32::from(
+                        sb.sequence(owner, program_cid, account, nonce as u64, payload)
+                            .await,
+                    ) // 1 committed / 0 rejected
+                })
+            },
+        )?;
+    }
     if grant.allows(Capability::Pre) {
         // `pre_grant(recipient_ptr, recipient_len, threshold, shares, out_ptr, out_cap) -> i32` — a
         // program's runtime-mediated PROXY RE-ENCRYPTION delegation (K3 sharing). The backend derives
@@ -965,6 +1026,121 @@ mod tests {
             .unwrap(),
             vec![2],
             "attest is INERT on a re-run"
+        );
+    }
+
+    // Producer-path sequence() test — mirrors attest(): a mock sequencer backend returns a fixed
+    // commit outcome, and a program calling sequence() + committing the result proves 1 / 0 / -1 / 2.
+    struct MockSequence(bool);
+    #[async_trait::async_trait]
+    impl SequenceBackend for MockSequence {
+        async fn sequence(
+            &self,
+            _owner: [u8; 32],
+            _program_cid: [u8; 32],
+            _account: [u8; 32],
+            _nonce: u64,
+            _payload: Vec<u8>,
+        ) -> bool {
+            self.0
+        }
+    }
+
+    // account_ptr=0 (32 zero bytes of linear memory), nonce=0, payload=(0,0); store the i32 result at
+    // offset 0 and commit that 1 byte. `sequence` reads the account BEFORE the result overwrites it.
+    const SEQUENCE_ORCH_WAT: &[u8] = br#"(module
+      (import "craftcom" "sequence" (func $sequence (param i32 i64 i32 i32) (result i32)))
+      (import "craftcom" "commit" (func $commit (param i32 i32) (result i32)))
+      (memory (export "memory") 1)
+      (func (export "run")
+        (i32.store8 (i32.const 0) (call $sequence (i32.const 0) (i64.const 0) (i32.const 0) (i32.const 0)))
+        (drop (call $commit (i32.const 0) (i32.const 1)))))"#;
+
+    #[tokio::test]
+    async fn sequence_producer_path_returns_the_commit_outcome() {
+        let rt = TransitionRuntime::new().unwrap();
+        // committed → 1 (an authenticated program owner is present)
+        let ctx = TransitionCtx::deterministic(vec![], vec![], 0)
+            .with_program_owner(Some([9u8; 32]))
+            .with_sequence_backend(Some(Arc::new(MockSequence(true))));
+        assert_eq!(
+            rt.run_program(
+                SEQUENCE_ORCH_WAT,
+                "run",
+                ctx,
+                DEFAULT_FUEL,
+                &CapabilityGrant::full()
+            )
+            .await
+            .unwrap(),
+            vec![1],
+            "quorum committed → 1"
+        );
+        // rejected → 0
+        let ctx = TransitionCtx::deterministic(vec![], vec![], 0)
+            .with_program_owner(Some([9u8; 32]))
+            .with_sequence_backend(Some(Arc::new(MockSequence(false))));
+        assert_eq!(
+            rt.run_program(
+                SEQUENCE_ORCH_WAT,
+                "run",
+                ctx,
+                DEFAULT_FUEL,
+                &CapabilityGrant::full()
+            )
+            .await
+            .unwrap(),
+            vec![0],
+            "quorum rejected → 0"
+        );
+        // no backend → -1 (0xFF)
+        let ctx =
+            TransitionCtx::deterministic(vec![], vec![], 0).with_program_owner(Some([9u8; 32]));
+        assert_eq!(
+            rt.run_program(
+                SEQUENCE_ORCH_WAT,
+                "run",
+                ctx,
+                DEFAULT_FUEL,
+                &CapabilityGrant::full()
+            )
+            .await
+            .unwrap(),
+            vec![0xFF],
+            "no sequence backend → UNAVAILABLE (-1)"
+        );
+        // backend present but NO authenticated owner → -1: an invoker can't self-order.
+        let ctx = TransitionCtx::deterministic(vec![], vec![], 0)
+            .with_sequence_backend(Some(Arc::new(MockSequence(true))));
+        assert_eq!(
+            rt.run_program(
+                SEQUENCE_ORCH_WAT,
+                "run",
+                ctx,
+                DEFAULT_FUEL,
+                &CapabilityGrant::full()
+            )
+            .await
+            .unwrap(),
+            vec![0xFF],
+            "backend but no authenticated owner → UNAVAILABLE (-1)"
+        );
+        // inert on a verifier re-run → 2 (sequencing is non-deterministic; a re-run must not re-order)
+        let ctx = TransitionCtx::deterministic(vec![], vec![], 0)
+            .in_verify_mode()
+            .with_sequence_backend(Some(Arc::new(MockSequence(true))));
+        assert_eq!(
+            rt.run_program(
+                SEQUENCE_ORCH_WAT,
+                "run",
+                ctx,
+                DEFAULT_FUEL,
+                &CapabilityGrant::verifier()
+            )
+            .await
+            .unwrap(),
+            vec![2],
+            "sequence is INERT on a re-run"
         );
     }
 
