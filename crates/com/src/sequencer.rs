@@ -30,30 +30,86 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use zeph_core::Cid;
+use zeph_core::{Cid, NodeId};
 use zeph_crypto::NodeIdentity;
 
 use crate::attestation::{MemberSignature, Quorum};
 
-/// Domain tag separating a sequencer signature from every other ed25519 use (attestation member
-/// sign-offs, owner genesis, governance). A sequencer sig can never be replayed as an attestation.
+/// Domain tag separating a quorum-member ORDERING signature from every other ed25519 use (attestation
+/// member sign-offs, owner genesis, governance). A sequencer member sig can never be replayed elsewhere.
 const SEQUENCER_DOMAIN: &[u8] = b"craftec/sequencer/1";
 
-/// One proposed write to an account's nonce slot — the unit the quorum orders. `payload` is opaque
-/// (e.g. a token-ledger transaction); the sequencer only orders it, never interprets it.
+/// Domain tag for the ACCOUNT OWNER's authorization signature over a write. Distinct from
+/// `SEQUENCER_DOMAIN` so an owner authorization can never be replayed as a quorum-member ordering sig.
+const OWNER_DOMAIN: &[u8] = b"craftec/sequencer-owner/1";
+
+/// One write to an account's nonce slot — the unit the quorum orders. `payload` is opaque (e.g. a
+/// token-ledger transaction); the sequencer only orders it, never interprets it. `owner_sig` is the
+/// ACCOUNT owner's signature authorizing this write (the account IS an ed25519 pubkey) — the
+/// **owner-authenticity gate**: only the owner's writes enter the account's sequence, so a third
+/// party cannot front-run / grief the account's nonces (`ECONOMIC_LAYER_DESIGN.md` §4; like Ethereum's
+/// signed-by-sender rule). App-specific validity (e.g. sufficient balance) is NOT checked here — that
+/// is the program's transition fn, enforced by verification. (A program-derived account with no
+/// backing key needs a different, future authorization path — `owner_authentic` will reject it.)
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SequencedWrite {
-    /// The account whose nonce sequence this write extends.
+    /// The account whose nonce sequence this write extends — an ed25519 public key.
     pub account: [u8; 32],
     /// The slot this write claims — must equal the account's current length (the next free nonce).
     pub nonce: u64,
     /// The opaque write payload (the sequencer orders it; the app interprets it).
     pub payload: Vec<u8>,
+    /// The account owner's ed25519 signature over `(account, nonce, payload)` — the authorization that
+    /// this write is really from the account. Checked by [`owner_authentic`](Self::owner_authentic).
+    pub owner_sig: Vec<u8>,
+}
+
+/// The bytes the ACCOUNT OWNER signs to authorize a write — domain-tagged, covering
+/// `(account, nonce, payload)` but NOT `owner_sig` itself (which would be circular).
+fn authored_bytes(account: &[u8; 32], nonce: u64, payload: &[u8]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(OWNER_DOMAIN.len() + 40 + payload.len());
+    b.extend_from_slice(OWNER_DOMAIN);
+    b.extend_from_slice(account);
+    b.extend_from_slice(&nonce.to_le_bytes());
+    b.extend_from_slice(payload);
+    b
 }
 
 impl SequencedWrite {
-    /// The bytes a quorum member signs to commit this write. Domain-tagged and covering
-    /// `(account, nonce, payload)`, so a signature authorizes exactly this write at exactly this slot.
+    /// Author a write AS the account owner: `account` = the signer's identity, `owner_sig` = the
+    /// owner's signature over `(account, nonce, payload)`. Only the holder of the account key can
+    /// produce this — the owner-authenticity gate. (The token-ledger flow: the user signs their own
+    /// transfer client-side; the app hands the authored write to the sequencer.)
+    pub fn author(account_identity: &NodeIdentity, nonce: u64, payload: Vec<u8>) -> Self {
+        let account = account_identity.node_id().0;
+        let owner_sig = account_identity
+            .sign(&authored_bytes(&account, nonce, &payload))
+            .to_vec();
+        Self {
+            account,
+            nonce,
+            payload,
+            owner_sig,
+        }
+    }
+
+    /// Whether `owner_sig` is a valid signature by `account` (the pubkey) over this write — the
+    /// owner-authenticity check the sequencer runs before ordering. `false` for an unauthenticated or
+    /// forged write, or an `account` that is not a real pubkey (a program-derived address, which needs
+    /// a different — future — authorization path).
+    pub fn owner_authentic(&self) -> bool {
+        let Ok(sig) = <[u8; 64]>::try_from(self.owner_sig.as_slice()) else {
+            return false;
+        };
+        NodeIdentity::verify(
+            &NodeId(self.account),
+            &authored_bytes(&self.account, self.nonce, &self.payload),
+            &sig,
+        )
+    }
+
+    /// The bytes a quorum member signs to ORDER this write — domain-tagged, covering the whole authored
+    /// write (including `owner_sig`), so a member orders exactly this authenticated write at this slot.
     pub fn signing_bytes(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(SEQUENCER_DOMAIN.len() + 40 + self.payload.len());
         b.extend_from_slice(SEQUENCER_DOMAIN);
@@ -61,7 +117,7 @@ impl SequencedWrite {
         b
     }
 
-    /// A quorum member signs this write directly. Non-equivocation is enforced by [`SequencerMember`],
+    /// A quorum member signs this write to order it. Non-equivocation is enforced by [`SequencerMember`],
     /// not here — this is the raw signature (ed25519 is deterministic, so it is idempotent per member).
     pub fn sign(&self, identity: &NodeIdentity) -> MemberSignature {
         MemberSignature {
@@ -79,12 +135,13 @@ pub struct SequencedCommit {
 }
 
 impl SequencedCommit {
-    /// Authorized against `q` iff the quorum is **intersection-sized** AND ≥ `q.threshold` distinct
-    /// members signed this exact write. Intersection sizing is REQUIRED here (unlike attestation's
-    /// authority use): it is the property that stops two conflicting writes from each gathering a
-    /// disjoint `k` and both committing.
+    /// Authorized against `q` iff the write is **owner-authentic** (signed by the account), the quorum
+    /// is **intersection-sized**, AND ≥ `q.threshold` distinct members signed this exact write. The
+    /// owner-authenticity gate keeps a third party from ordering writes into an account it doesn't own;
+    /// intersection sizing stops two conflicting writes from each gathering a disjoint `k`.
     pub fn authorizes(&self, q: &Quorum) -> bool {
-        q.is_intersection_sized()
+        self.write.owner_authentic()
+            && q.is_intersection_sized()
             && q.count_signers(&self.write.signing_bytes(), &self.signatures) >= q.threshold
     }
 }
@@ -187,6 +244,9 @@ impl SequencerMember {
     /// DIFFERENT write at `(account, nonce)` (idempotent for the identical write); `None` — a hard
     /// refusal — if it already signed a conflicting one. This is the structural invariant.
     pub fn sign(&mut self, write: &SequencedWrite) -> Option<MemberSignature> {
+        if !write.owner_authentic() {
+            return None; // not authorized by the account owner — never order it
+        }
         let slot = (write.account, write.nonce);
         match self.signed.get(&slot) {
             Some(prev) if prev != write => None, // equivocation — hard refusal
@@ -208,12 +268,12 @@ mod tests {
     fn quorum(ids: &[NodeIdentity], k: usize) -> Quorum {
         Quorum::genesis(ids.iter().map(|i| i.node_id().0).collect(), k)
     }
-    fn write(account: [u8; 32], nonce: u64, payload: &[u8]) -> SequencedWrite {
-        SequencedWrite {
-            account,
-            nonce,
-            payload: payload.to_vec(),
-        }
+    fn account() -> NodeIdentity {
+        NodeIdentity::generate()
+    }
+    /// Author an owner-authentic write as `owner` (the account = `owner`'s pubkey).
+    fn write(owner: &NodeIdentity, nonce: u64, payload: &[u8]) -> SequencedWrite {
+        SequencedWrite::author(owner, nonce, payload.to_vec())
     }
     /// A commit where `signers` each sign `w` directly (no non-equivocation tracking).
     fn commit(w: &SequencedWrite, signers: &[&NodeIdentity]) -> SequencedCommit {
@@ -261,9 +321,9 @@ mod tests {
             "5-of-7 (2f+1 of 3f+1, f=2)"
         );
 
-        let acct = [9u8; 32];
-        let a = write(acct, 0, b"alice");
-        let b = write(acct, 0, b"bob");
+        let acct = account();
+        let a = write(&acct, 0, b"alice");
+        let b = write(&acct, 0, b"bob");
 
         // n=3, k=2 (f=0): a single Byzantine double-signer forces a fork — honest m0 signs A, honest
         // m1 signs B, Byzantine m2 signs BOTH, so both commits reach k=2. Two nodes could each adopt
@@ -293,8 +353,8 @@ mod tests {
     #[test]
     fn commit_requires_intersection_sized_quorum() {
         let ids = members(3);
-        let acct = [1u8; 32];
-        let w = write(acct, 0, b"pay alice");
+        let acct = account();
+        let w = write(&acct, 0, b"pay alice");
         // 1-of-3 is NOT intersection-sized → a commit is refused even with a valid signature.
         let non_iso = quorum(&ids, 1);
         assert!(
@@ -310,9 +370,9 @@ mod tests {
     #[test]
     fn member_refuses_to_equivocate_but_is_idempotent() {
         let mut m = SequencerMember::new(NodeIdentity::generate());
-        let acct = [2u8; 32];
-        let a = write(acct, 0, b"pay alice");
-        let b = write(acct, 0, b"pay bob"); // SAME (account, nonce), different payload
+        let acct = account();
+        let a = write(&acct, 0, b"pay alice");
+        let b = write(&acct, 0, b"pay bob"); // SAME (account, nonce), different payload
 
         let sig_a = m.sign(&a).expect("first sign at (acct,0) allowed");
         // idempotent: signing the identical write again returns the same signature.
@@ -327,7 +387,7 @@ mod tests {
             "member must refuse a conflicting same-nonce write"
         );
         // a different nonce is fine.
-        assert!(m.sign(&write(acct, 1, b"pay bob")).is_some());
+        assert!(m.sign(&write(&acct, 1, b"pay bob")).is_some());
     }
 
     #[test]
@@ -336,9 +396,9 @@ mod tests {
         // members (each refuses to double-sign), only one can reach k=2 → the fork is impossible.
         let ids = members(3);
         let q = quorum(&ids, 2);
-        let acct = [3u8; 32];
-        let a = write(acct, 0, b"pay alice");
-        let b = write(acct, 0, b"pay bob");
+        let acct = account();
+        let a = write(&acct, 0, b"pay alice");
+        let b = write(&acct, 0, b"pay bob");
         let mut m: Vec<SequencerMember> = ids.into_iter().map(SequencerMember::new).collect();
 
         // Write A gathers m0, m1.
@@ -374,23 +434,23 @@ mod tests {
     fn account_sequence_enforces_sequential_nonce_and_binding() {
         let ids = members(3);
         let q = quorum(&ids, 2);
-        let acct = [4u8; 32];
-        let mut seq = AccountSequence::new(acct);
+        let acct = account();
+        let mut seq = AccountSequence::new(acct.node_id().0);
 
         // nonce 0 appends.
-        assert!(seq.append(commit(&write(acct, 0, b"n0"), &[&ids[0], &ids[1]]), &q));
+        assert!(seq.append(commit(&write(&acct, 0, b"n0"), &[&ids[0], &ids[1]]), &q));
         // a second write claiming nonce 0 (a fork) is refused — the slot is filled.
-        assert!(!seq.append(commit(&write(acct, 0, b"fork"), &[&ids[1], &ids[2]]), &q));
+        assert!(!seq.append(commit(&write(&acct, 0, b"fork"), &[&ids[1], &ids[2]]), &q));
         // skipping to nonce 2 is refused (must be sequential).
-        assert!(!seq.append(commit(&write(acct, 2, b"gap"), &[&ids[0], &ids[1]]), &q));
+        assert!(!seq.append(commit(&write(&acct, 2, b"gap"), &[&ids[0], &ids[1]]), &q));
         // nonce 1 appends.
-        assert!(seq.append(commit(&write(acct, 1, b"n1"), &[&ids[1], &ids[2]]), &q));
+        assert!(seq.append(commit(&write(&acct, 1, b"n1"), &[&ids[1], &ids[2]]), &q));
         assert_eq!(seq.next_nonce(), 2);
 
         // a commit for a DIFFERENT account is refused.
-        let other = [5u8; 32];
+        let other = account();
         assert!(!seq.append(
-            commit(&write(other, 2, b"wrong-acct"), &[&ids[0], &ids[1]]),
+            commit(&write(&other, 2, b"wrong-acct"), &[&ids[0], &ids[1]]),
             &q
         ));
 
@@ -404,9 +464,9 @@ mod tests {
     fn tampered_sequence_fails_verify() {
         let ids = members(3);
         let q = quorum(&ids, 2);
-        let acct = [6u8; 32];
-        let mut seq = AccountSequence::new(acct);
-        assert!(seq.append(commit(&write(acct, 0, b"real"), &[&ids[0], &ids[1]]), &q));
+        let acct = account();
+        let mut seq = AccountSequence::new(acct.node_id().0);
+        assert!(seq.append(commit(&write(&acct, 0, b"real"), &[&ids[0], &ids[1]]), &q));
         assert!(seq.verify(&q));
 
         // flip a signature byte → the k-of-n count drops below threshold → verify rejects.
@@ -427,12 +487,46 @@ mod tests {
     fn encode_decode_roundtrips() {
         let ids = members(3);
         let q = quorum(&ids, 2);
-        let acct = [7u8; 32];
-        let mut seq = AccountSequence::new(acct);
-        seq.append(commit(&write(acct, 0, b"x"), &[&ids[0], &ids[1]]), &q);
+        let acct = account();
+        let mut seq = AccountSequence::new(acct.node_id().0);
+        seq.append(commit(&write(&acct, 0, b"x"), &[&ids[0], &ids[1]]), &q);
         let back = AccountSequence::decode(&seq.encode()).unwrap();
         assert_eq!(back, seq);
         assert!(back.verify(&q));
         assert_eq!(back.root(), seq.root());
+    }
+
+    #[test]
+    fn an_unauthenticated_write_is_never_ordered() {
+        let ids = members(3);
+        let q = quorum(&ids, 2);
+        let acct = account();
+        // A write whose owner_sig is garbage is NOT owner-authentic.
+        let mut forged = write(&acct, 0, b"steal");
+        forged.owner_sig = vec![0u8; 64];
+        assert!(
+            !forged.owner_authentic(),
+            "a bad owner_sig fails authenticity"
+        );
+        // Even a full k-of-n of member signatures does not authorize it — the gate refuses it.
+        let c = commit(&forged, &[&ids[0], &ids[1]]);
+        assert!(
+            !c.authorizes(&q),
+            "the owner-authenticity gate refuses an unauthenticated write"
+        );
+        // A member also refuses to sign it.
+        let mut m = SequencerMember::new(NodeIdentity::generate());
+        assert!(
+            m.sign(&forged).is_none(),
+            "a member never orders an unauthenticated write"
+        );
+        // A write signed by a DIFFERENT key than the account (an impostor claiming `acct`) is refused.
+        let impostor = account();
+        let mut spoof = SequencedWrite::author(&impostor, 0, b"spoof".to_vec());
+        spoof.account = acct.node_id().0; // claim acct, but the sig is the impostor's
+        assert!(
+            !spoof.owner_authentic(),
+            "a write signed by a non-owner is refused"
+        );
     }
 }

@@ -308,16 +308,15 @@ impl SequenceBackend for SequenceStore {
         let Some(quorum) = self.quorums.current_quorum(&owner, &program_cid).await else {
             return false;
         };
-        // Only a self-signable threshold-1 quorum auto-commits in P3 (a fork is still impossible: a
-        // 1-of-1 quorum is trivially intersection-sized, so `append` accepts it).
-        if quorum.threshold != 1 || !quorum.is_member(&self.me()) {
+        // Auto-commit only a self-signable threshold-1 quorum, AND only for THIS node's OWN account —
+        // the owner-authenticity gate: a node can author (owner-sign) writes only for its own key.
+        // (A pre-authored write for another account rides the `submit` path carrying the owner's
+        // signature; conveying that owner_sig through the `sequence` host fn is a follow-up ABI
+        // extension. Multi-member automatic collection is the deferred auto-sign accumulate.)
+        if quorum.threshold != 1 || !quorum.is_member(&self.me()) || account != self.me() {
             return false;
         }
-        let write = SequencedWrite {
-            account,
-            nonce,
-            payload,
-        };
+        let write = SequencedWrite::author(&self.identity, nonce, payload);
         let commit = SequencedCommit {
             signatures: vec![write.sign(&self.identity)],
             write,
@@ -423,12 +422,9 @@ mod tests {
         (node, attest, seq, dir)
     }
 
-    fn write(account: [u8; 32], nonce: u64, payload: &[u8]) -> SequencedWrite {
-        SequencedWrite {
-            account,
-            nonce,
-            payload: payload.to_vec(),
-        }
+    /// Author an owner-authentic write as `owner` (account = `owner`'s pubkey).
+    fn write(owner: &NodeIdentity, nonce: u64, payload: &[u8]) -> SequencedWrite {
+        SequencedWrite::author(owner, nonce, payload.to_vec())
     }
     fn commit(w: &SequencedWrite, signers: &[&NodeIdentity]) -> SequencedCommit {
         SequencedCommit {
@@ -442,8 +438,8 @@ mod tests {
         let (node, attest, seq, _dir) = open_stores().await;
         let owner = node.node_id().0;
         let program = [9u8; 32];
-        let account = [1u8; 32];
-        // A 1-of-1 quorum whose sole member is THIS node → sequence() auto-commits.
+        let account = owner; // sequence() authors for the node's OWN account
+                             // A 1-of-1 quorum whose sole member is THIS node → sequence() auto-commits.
         attest.bootstrap(program, vec![owner], 1).await;
 
         assert!(
@@ -474,7 +470,8 @@ mod tests {
         let (node, attest, seq, _dir) = open_stores().await;
         let owner = node.node_id().0;
         let program = [2u8; 32];
-        let account = [7u8; 32];
+        let acct = NodeIdentity::generate();
+        let account = acct.node_id().0;
         let (a, b, c) = (
             NodeIdentity::generate(),
             NodeIdentity::generate(),
@@ -491,38 +488,30 @@ mod tests {
 
         // nonce 0 commits with 2 sigs.
         assert!(
-            seq.submit(owner, program, commit(&write(account, 0, b"n0"), &[&a, &b]))
+            seq.submit(owner, program, commit(&write(&acct, 0, b"n0"), &[&a, &b]))
                 .await
         );
         // a conflicting write at nonce 0 (a fork) is refused — the slot is filled.
         assert!(
-            !seq.submit(
-                owner,
-                program,
-                commit(&write(account, 0, b"fork"), &[&b, &c])
-            )
-            .await,
+            !seq.submit(owner, program, commit(&write(&acct, 0, b"fork"), &[&b, &c]))
+                .await,
             "fork at a committed nonce refused"
         );
         // skipping to nonce 2 is refused (must be sequential).
         assert!(
-            !seq.submit(
-                owner,
-                program,
-                commit(&write(account, 2, b"gap"), &[&a, &b])
-            )
-            .await,
+            !seq.submit(owner, program, commit(&write(&acct, 2, b"gap"), &[&a, &b]))
+                .await,
             "non-sequential nonce refused"
         );
         // a sub-threshold (1 sig) commit is refused.
         assert!(
-            !seq.submit(owner, program, commit(&write(account, 1, b"n1"), &[&a]))
+            !seq.submit(owner, program, commit(&write(&acct, 1, b"n1"), &[&a]))
                 .await,
             "1-of-3 sub-threshold refused"
         );
         // nonce 1 commits with 2 sigs.
         assert!(
-            seq.submit(owner, program, commit(&write(account, 1, b"n1"), &[&b, &c]))
+            seq.submit(owner, program, commit(&write(&acct, 1, b"n1"), &[&b, &c]))
                 .await
         );
 
@@ -536,7 +525,7 @@ mod tests {
         let (node, attest, seq, _dir) = open_stores().await;
         let owner = node.node_id().0;
         let program = [3u8; 32];
-        let account = [8u8; 32];
+        let acct = NodeIdentity::generate();
         let (a, b, c, d) = (
             NodeIdentity::generate(),
             NodeIdentity::generate(),
@@ -552,7 +541,7 @@ mod tests {
             )
             .await;
         assert!(
-            !seq.submit(owner, program, commit(&write(account, 0, b"x"), &[&a, &b]))
+            !seq.submit(owner, program, commit(&write(&acct, 0, b"x"), &[&a, &b]))
                 .await,
             "a valid 2-of-4 signature set is still refused — the quorum can equivocate"
         );
@@ -564,7 +553,7 @@ mod tests {
         let node = Arc::new(NodeIdentity::generate());
         let owner = node.node_id().0;
         let program = [4u8; 32];
-        let account = [5u8; 32];
+        let account = owner; // sequence() authors for the node's OWN account
 
         {
             let (attest, seq) = build_stores(node.clone(), dir.path()).await;

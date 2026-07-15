@@ -54,9 +54,24 @@ Phases (each: build+test → design-check → review → commit):
       clippy + `cargo build --workspace`. **Deferred to P4:** the leaderless *sig-accumulate gossip* (pending
       proposals gathering k signatures cross-node) pairs with member auto-sign — until then multi-member writes
       use `submit` with explicitly-gathered signatures.
-- [ ] **P4 — Auto-signing policy hook** (deferred Package B): member-side policy-program auto-sign; the
-      non-equivocation invariant enforced STRUCTURALLY by the binary (the hook refuses a 2nd conflicting
-      `(account,nonce)` regardless of policy) — program owns discretion, binary owns the invariant (§5).
+- **P4 — Owner-authenticity gate + multi-member auto-collection (approach (b): PURE ORDERING, decided 2026-07-15).**
+  Design settled over a design discussion: the sequencer stays PURE ORDERING; owner-authenticity is a cheap
+  owner-SIGNATURE gate (like Ethereum's signed-by-sender — prevents nonce front-running/griefing), NOT a member
+  policy-program (the quorum membership IS the policy). App-VALIDITY (e.g. balance) stays in the program's
+  transition fn, enforced by verification. The ledger COMPOSES sequence (order) + transition fn (validity) +
+  verify (certify) — three substrates, one program (order+validity are separate, like Ethereum base-layer vs EVM).
+  - [x] **P4a — Owner-signature gate DONE 2026-07-15.** `SequencedWrite` gains `owner_sig` (account owner's
+        ed25519 sig over (account,nonce,payload), domain `craftec/sequencer-owner/1`, distinct from the member
+        ORDERING domain); `SequencedWrite::author()` + `owner_authentic()`; `SequencedCommit::authorizes` AND
+        `SequencerMember::sign` both REFUSE a non-authentic write; the store's `sequence()` authors for the
+        node's OWN account (account==self.me()); multi-member writes ride `submit` with a pre-authored write.
+        Tests: forged/impostor/garbage-sig write refused (com `an_unauthenticated_write_is_never_ordered`);
+        store tests author writes. Gates: com 85 tests + noded 22, fmt, clippy, `cargo build --workspace`.
+  - [ ] **P4b — Multi-member auto-collection** (the leaderless sig-accumulate): members auto-sign a well-formed,
+        owner-authentic, non-equivocating proposal as it propagates cross-node; commit at k. The structural
+        non-equivocation invariant (`SequencerMember`) already refuses a 2nd conflicting `(account,nonce)`.
+        Needs: a sign-solicitation/gossip wire + pending-proposal accumulation + the owner_sig ABI to convey a
+        pre-authored write through the `sequence` host fn. (Until then: `submit` with explicitly-gathered sigs.)
 
 ---
 
