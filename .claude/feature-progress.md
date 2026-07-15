@@ -52,9 +52,16 @@ file's segments — CO §76/§286/§298).
       single-object self-heal test already covers.) 18 healthscan tests pass; full workspace builds; clippy+fmt
       clean. Lightened the test (single-thread, 4 holders) after it flaked a neighbor timing test under cargo's
       parallel harness.
-- [ ] **P4 gate + staggered roll** (additive: new manifest shape + existing piece messages) **+ reconcile
-      CRAFTOBJ_DESIGN §80–92** to the segment-sub-cid model (note §224 satisfied). Live: publish a >8 MiB file
-      on one node, fetch by manifest cid on another, byte-identical.
+- [x] **P4 gate + staggered roll + doc reconcile DONE 2026-07-15. FILE SEGMENTATION COMPLETE + LIVE.**
+      Reconciled CRAFTOBJ_DESIGN (craftec `1ebe4aa`): §80–92 piece struct (dropped in-piece
+      `segment_index`/`segment_count` → segment = sub-cid), the Manifest model (`content_cid` → `segments:
+      Vec<Segment>`), and marked §224 (chunked block-tree + range reads + block-level dedup) BUILT. Full gate:
+      A-G harness + clippy + workspace tests all ✅ (a fmt-only failure on the DST-harness comment alignment,
+      fixed `ffa1a86`, re-gated 🟢). Staggered roll of all 4 Hetzner nodes (wire-compatible — only the manifest
+      shape changed): each active, NRestarts=0, 3 peers, 0 panics. **Live cross-node validation:** a 20 MB file
+      (3 segments) published on node `zeph` → fetched by cid alone on `zeph2` (DHT-resolved, cid-verified) →
+      byte-identical. Backup `zeph.bak-20260715-0320`. Remaining follow-ups (non-blocking): private-file
+      segmentation (encrypt-then-chunk), sequential-scan prefetch for streaming, CLI/host-fn range-read wiring.
 
 ---
 
