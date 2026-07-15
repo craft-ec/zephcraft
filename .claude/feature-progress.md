@@ -7,12 +7,20 @@ artifact, three roles). No dependency on the §10 policy decisions — the build
 
 Phases:
 - [x] **P1 — Cheque core DONE 2026-07-15** (new crate `crates/cheque`, pure offline; deps zeph-core + zeph-crypto):
-      `ServingCheque{server, consumer, cumulative_bytes, consumer_sig}` (domain `craftec/serving-cheque/1`;
-      `sign`/`verify`), `ChequeIssuer` (consumer side — `issue` monotonic cheques per server, `owed_to`),
-      `ChequeBook` (provider side — `record` iff addressed-to-me + valid-sig + STRICTLY-higher cumulative;
-      `total_earned` = the serving measurement; `load`/`cheques()` for persistence). 6 tests: sign/verify +
-      tamper (cumulative/server/sig); non-consumer-signed refused; monotonic accumulate + stale refused;
-      wrong-server refused; multi-consumer sum; load roundtrip. Gates: build, 6 tests, fmt, clippy.
+      `ServingCheque{server, consumer, cumulative_bytes, timestamp, consumer_sig}` (domain
+      `craftec/serving-cheque/1`, cheques are per-`(server,consumer)` pair, CUMULATIVE across all cids —
+      content-agnostic — because a node holds few pieces over many cids; `sign`/`verify`), `ChequeIssuer`
+      (consumer — `issue` monotonic timestamped cheques per server, `owed_to`), `ChequeBook` (provider —
+      `record` iff addressed-to-me + valid-sig + STRICTLY-higher cumulative; `total_earned` = serving
+      measurement; `load`/`cheques()`). **Design decision (2026-07-15): NO per-pair cap** — instead
+      `allocate_quota(cheques, quota)` splits each provider's owed into (paid, subsidy), the consumer's single
+      paid quota allocated FIRST-COME by timestamp; total PAID ≤ quota (= what the consumer paid) → self-dealing
+      zero-sum, per-pair cap unneeded; overflow = subsidy. Free quota isn't rewarded (nothing to inflate); the
+      cap protects the PAID distribution. Timestamp is signed (integrity) but gaming it can't inflate the total,
+      only reorder paid-vs-subsidy. 7 tests: sign/verify + tamper (cumulative/server/**timestamp**/sig);
+      non-consumer-signed refused; monotonic + stale refused; wrong-server refused; multi-consumer sum; load
+      roundtrip; **quota allocation caps paid at quota by timestamp** (+ quota=0 → all subsidy). Gates: build,
+      7 tests, fmt, clippy. (Settlement — calling `allocate_quota` + paying providers from tokens/pool — is step 4.)
 - [ ] **P2 — Transport hook**: emit/collect cheques on the piece-serving path (obj serve over `tag::PIECE`) — the
       consumer issues a cheque per served chunk, the provider records it; + the SWAP settlement threshold (§7).
       (obj adds `zeph-cheque` dep; register `zeph-cheque` in the root workspace.dependencies.)
