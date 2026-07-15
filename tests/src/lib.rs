@@ -213,6 +213,7 @@ impl TestNode {
                 eviction_cooldown: Duration::from_secs(30 * 24 * 60 * 60),
                 pace_delay: Duration::from_secs(1),
                 active_set_k: 4, // element 2 choke — production default
+                ..ObjConfig::default() // file segmentation (8 MiB / K=32) — defaults
             },
         );
 
