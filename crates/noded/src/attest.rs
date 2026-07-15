@@ -28,7 +28,7 @@ use tokio::sync::RwLock;
 use zeph_com::{
     AttestAction, AttestBackend, AttestProposal, Attestation, AttestedChain, Quorum, QuorumChain,
 };
-use zeph_core::{Cid, NodeId};
+use zeph_core::NodeId;
 use zeph_crypto::NodeIdentity;
 use zeph_membership::Membership;
 use zeph_obj::{ConsumeMode, ObjEngine};
@@ -250,13 +250,11 @@ impl AttestStore {
         if rec.version <= local_seq + 1 {
             return None;
         }
-        let raw = self.obj.get(rec.wasm_cid, ConsumeMode::Drop).await.ok()?;
-        let bytes = match zeph_obj::Manifest::decode(&raw) {
-            Some(zeph_obj::Manifest::File { content, .. }) => {
-                self.obj.get(Cid(content), ConsumeMode::Drop).await.ok()?
-            }
-            _ => raw,
-        };
+        let bytes = self
+            .obj
+            .get_following_manifest(rec.wasm_cid, ConsumeMode::Drop)
+            .await
+            .ok()?;
         AttestedChain::decode(&bytes)
     }
 
@@ -335,6 +333,7 @@ impl AttestBackend for AttestStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeph_core::Cid;
     use zeph_obj::{ObjConfig, PeerSource};
     use zeph_routing::{MetaRecord, ProviderRecord};
     use zeph_store::Store;

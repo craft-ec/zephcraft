@@ -554,10 +554,16 @@ fn reconstruct(
 ) -> RestoreFut {
     Box::pin(async move {
         match engine.fetch_manifest(manifest_cid).await? {
-            zeph_obj::Manifest::File { content, .. } => {
-                let bytes = engine
-                    .get(zeph_core::Cid(content), zeph_obj::ConsumeMode::Seed)
-                    .await?;
+            zeph_obj::Manifest::File { segments, .. } => {
+                // Concatenate the file's segments in order (each cid verifies its bytes).
+                let mut bytes = Vec::new();
+                for seg in segments {
+                    bytes.extend(
+                        engine
+                            .get(zeph_core::Cid(seg.cid), zeph_obj::ConsumeMode::Seed)
+                            .await?,
+                    );
+                }
                 if let Some(parent) = dest.parent() {
                     std::fs::create_dir_all(parent)?;
                 }

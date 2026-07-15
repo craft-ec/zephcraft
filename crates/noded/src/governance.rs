@@ -15,7 +15,7 @@ use zeph_com::{
     registry_program_cid, GovAction, GovernanceApproval, GovernanceChain, GovernanceProposal,
     GovernanceSet,
 };
-use zeph_core::{Cid, NodeId};
+use zeph_core::NodeId;
 use zeph_crypto::NodeIdentity;
 use zeph_membership::Membership;
 use zeph_obj::{ConsumeMode, ObjEngine};
@@ -216,13 +216,11 @@ impl GovernanceChainStore {
         if rec.version <= local_seq + 1 {
             return None; // peer's chain is not longer than ours — nothing to adopt
         }
-        let raw = self.obj.get(rec.wasm_cid, ConsumeMode::Drop).await.ok()?;
-        let bytes = match zeph_obj::Manifest::decode(&raw) {
-            Some(zeph_obj::Manifest::File { content, .. }) => {
-                self.obj.get(Cid(content), ConsumeMode::Drop).await.ok()?
-            }
-            _ => raw,
-        };
+        let bytes = self
+            .obj
+            .get_following_manifest(rec.wasm_cid, ConsumeMode::Drop)
+            .await
+            .ok()?;
         GovernanceChain::decode(&bytes)
     }
 

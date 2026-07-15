@@ -83,13 +83,10 @@ impl InvokeService {
         caller: [u8; 32],
         program_owner: Option<[u8; 32]>,
     ) -> anyhow::Result<Vec<u8>> {
-        let raw = self.obj.get(Cid(req.wasm_cid), ConsumeMode::Drop).await?;
-        let wasm = match zeph_obj::Manifest::decode(&raw) {
-            Some(zeph_obj::Manifest::File { content, .. }) => {
-                self.obj.get(Cid(content), ConsumeMode::Drop).await?
-            }
-            _ => raw,
-        };
+        let wasm = self
+            .obj
+            .get_following_manifest(Cid(req.wasm_cid), ConsumeMode::Drop)
+            .await?;
         let ctx = TransitionCtx::new(
             Vec::new(), // apps have no account blob
             req.input.clone(),

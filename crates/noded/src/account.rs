@@ -63,13 +63,10 @@ impl ProgramAccountStore {
 
     /// Fetch a program's WASM bytes by cid (following a File manifest to its content).
     async fn fetch_program(&self, cid: [u8; 32]) -> Option<Vec<u8>> {
-        let raw = self.obj.get(Cid(cid), ConsumeMode::Drop).await.ok()?;
-        match zeph_obj::Manifest::decode(&raw) {
-            Some(zeph_obj::Manifest::File { content, .. }) => {
-                self.obj.get(Cid(content), ConsumeMode::Drop).await.ok()
-            }
-            _ => Some(raw),
-        }
+        self.obj
+            .get_following_manifest(Cid(cid), ConsumeMode::Drop)
+            .await
+            .ok()
     }
 
     /// Run the program on `(prev, request)`. `None` = the program rejected the request

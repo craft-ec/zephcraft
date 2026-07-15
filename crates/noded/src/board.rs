@@ -203,13 +203,10 @@ impl BoardService {
 
     /// Fetch a program's wasm by cid (following a `File` manifest to its content), per `account.rs`.
     async fn fetch_program(&self, cid: [u8; 32]) -> Option<Vec<u8>> {
-        let raw = self.obj.get(Cid(cid), ConsumeMode::Drop).await.ok()?;
-        match zeph_obj::Manifest::decode(&raw) {
-            Some(zeph_obj::Manifest::File { content, .. }) => {
-                self.obj.get(Cid(content), ConsumeMode::Drop).await.ok()
-            }
-            _ => Some(raw),
-        }
+        self.obj
+            .get_following_manifest(Cid(cid), ConsumeMode::Drop)
+            .await
+            .ok()
     }
 }
 

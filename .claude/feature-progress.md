@@ -1,4 +1,48 @@
-# K3 — SHARING via PROXY RE-ENCRYPTION (task #4) — TEED UP, next build (2026-07-14)
+# FILE SEGMENTATION — large-file chunking (design-check DONE 2026-07-15; chosen: Model B) — ACTIVE
+
+**Design-check verdict:** CRAFTOBJ_DESIGN is internally inconsistent — §80–92 (one `content_cid`, segments
+internal, pieces self-describe `segment_index`) vs §224 (chunked block-tree + range reads + block-level
+dedup). The code keys EVERYTHING by cid alone (one generation per cid; `CodedPiece = {coding_vector,data}`,
+no segment fields — erasure docstring says segment identity belongs in the obj wrapper). **CHOSE Model B
+(segment = sub-cid, IPFS-UnixFS DAG):** `Manifest::File` lists ordered segment cids, each segment its own
+K=32 generation. **Wire-COMPATIBLE** (staggered roll — corrects the earlier "wire-incompatible" assumption),
+reuses ALL per-cid repair/health/distribute/store machinery unchanged, gives block-level dedup (§224), and
+solves the doc's two unspecified gaps for free (per-segment digest = the segment cid; per-segment vtags =
+each segment's own vtags blob). Deviation from §80–92 → reconcile that section in P4.
+
+**Params (from CO §71/§73 + TF §352–359):** segment 8 MiB = 32×256 KiB; files **K=32** → n = k·ceil(2+16/k)
+= 96 pieces (3×, 64 parity); piece 256 KiB. SQL stays K=8/16 KB (untouched). Encryption = layer-above /
+**encrypt-then-chunk** (segments are opaque ciphertext chunks, CID=BLAKE3(ciphertext), one DEK across a
+file's segments — CO §76/§286/§298).
+
+- [x] **P1 core segmentation DONE 2026-07-15.** `FILE_SEGMENT_BYTES=8 MiB` + `FILE_K=32` consts (obj/lib.rs);
+      `publish_impl` gained a `k` param (files use K=32, other objects keep `config.k`); `split_sources` takes
+      `k`. `Manifest::File.content ([u8;32])` → `segments: Vec<Segment{cid,len}>` (+ `Segment` type,
+      `file_segments()`). `publish_file` chunks into ≤8 MiB segments, publishes each as its own generation
+      (K=32) → segment cids → manifest; `fetch_file` fetches + concatenates segments IN ORDER (each cid
+      self-verifies). `chain_children` walks `File.segments` (pin/want/forget cascade over all segments). New
+      `ObjEngine::get_following_manifest(cid,mode)` centralizes "resolve bytes behind a possibly-multi-segment
+      file manifest" → the 6 program-fetch callers (com/invoke, noded/account/governance/board/attest/control)
+      now use it (correct for multi-segment wasm). DECISION taken: **broke old single-cid file manifests**
+      (pre-1.0, no compat variant). Tests (obj green): small file = 1 segment + round-trips (parity); 17 MiB →
+      3 ordered segments, byte-identical concat; identical leading 8 MiB segment **dedups to one cid** across
+      files. Full workspace builds; obj (6+17+7+1) + com pass; clippy+fmt clean. KNOWN FOLLOW-UP: private files
+      (`publish_private` → encrypt-then-publish ONE object) are NOT yet segmented — chunk the ciphertext in a
+      follow-up (encrypt-then-chunk, one DEK). Wire-compatible (no piece/wire change; only the manifest shape).
+- [ ] **P2 range/partial reads:** map `(offset,len)` → covering segment indices via the manifest's per-segment
+      lens; a range fetch that decodes ONLY covering segments; sequential-prefetch streaming. Test (counting
+      source): a mid-file range fetches only the covering segments, not the whole file.
+- [ ] **P3 lifecycle over segments:** pin/want/forget/health/repair walk the manifest segment list
+      (`chain_children` already walks manifest children → extend to `File.segments`); each segment repaired
+      independently by the existing per-cid machinery. Test: kill a holder of ONE segment → only that segment
+      repairs, file stays whole.
+- [ ] **P4 gate + staggered roll** (additive: new manifest shape + existing piece messages) **+ reconcile
+      CRAFTOBJ_DESIGN §80–92** to the segment-sub-cid model (note §224 satisfied). Live: publish a >8 MiB file
+      on one node, fetch by manifest cid on another, byte-identical.
+
+---
+
+# K3 — SHARING via PROXY RE-ENCRYPTION (task #4) — DONE + LIVE 2026-07-15 (below is the build log)
 The encrypted-grants substrate. `cipher` (`crates/cipher/src/lib.rs`) already has the OWNER side: `Dek`
 + `seal`/`open` (XChaCha20), `EncSecretKey`/`EncPublicKey` (PRE keypair, `from_identity_seed`),
 `DekCapsule` + `encapsulate` (the DEK encapsulated under the owner's key via `umbral_pre::encrypt`),

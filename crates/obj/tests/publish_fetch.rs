@@ -258,3 +258,103 @@ async fn pin_unpin_forget_cascade_the_whole_file_chain() {
         "content object forgotten too — no orphan left behind"
     );
 }
+
+// ─────────────────── File segmentation (Model B: segment = sub-cid) ───────────────────
+
+/// Deterministic pseudo-random bytes of length `n` (distinct per `seed`), so segment
+/// boundaries carry different content and CIDs are meaningful.
+fn bytes_of(n: usize, seed: u32) -> Vec<u8> {
+    (0..n)
+        .map(|i| ((i as u32).wrapping_mul(2_654_435_761).wrapping_add(seed) >> 13) as u8)
+        .collect()
+}
+
+/// A single owner node (no peers needed — the publisher holds its own content, so a local
+/// fetch reads it back without the network).
+async fn owner_node(tracker: &MemNet, dir: &std::path::Path) -> Arc<ObjEngine> {
+    let (engine, routing) = node(tracker, dir).await;
+    routing.announce_node(0, 0).await.unwrap();
+    engine
+}
+
+#[tokio::test]
+async fn small_file_is_one_segment_and_round_trips() {
+    let tracker = start_tracker();
+    let dir = tempfile::tempdir().unwrap();
+    let owner = owner_node(&tracker, dir.path()).await;
+
+    let data = bytes_of(20_000, 1); // < 8 MiB → exactly one segment (parity with pre-segmentation)
+    let fp = owner
+        .publish_file("a.bin", "application/octet-stream", &data, true)
+        .await
+        .unwrap();
+    let m = owner.fetch_manifest(fp.manifest_cid).await.unwrap();
+    assert_eq!(
+        m.file_segments().unwrap().len(),
+        1,
+        "a sub-8-MiB file is a single segment"
+    );
+    let (_n, _mime, got) = owner.fetch_file(fp.manifest_cid).await.unwrap();
+    assert_eq!(got, data, "small file round-trips byte-identical");
+}
+
+#[tokio::test]
+async fn large_file_splits_into_ordered_segments_and_round_trips() {
+    let tracker = start_tracker();
+    let dir = tempfile::tempdir().unwrap();
+    let owner = owner_node(&tracker, dir.path()).await;
+
+    // 17 MiB → three segments (8 + 8 + 1 MiB): tests the split, per-segment cids, and in-ORDER
+    // concatenation on fetch (a middle segment, not just first/last).
+    let data = bytes_of(17 * 1024 * 1024, 7);
+    let fp = owner
+        .publish_file("big.bin", "application/octet-stream", &data, true)
+        .await
+        .unwrap();
+    let m = owner.fetch_manifest(fp.manifest_cid).await.unwrap();
+    let segs = m.file_segments().unwrap();
+    assert_eq!(segs.len(), 3, "17 MiB → three 8/8/1 MiB segments");
+    assert_eq!(
+        segs.iter().map(|s| s.len).sum::<u64>(),
+        data.len() as u64,
+        "segment lengths sum to the file size"
+    );
+    let (_n, _mime, got) = owner.fetch_file(fp.manifest_cid).await.unwrap();
+    assert_eq!(
+        got, data,
+        "large multi-segment file round-trips byte-identical (segments concatenated in order)"
+    );
+}
+
+#[tokio::test]
+async fn identical_segments_dedup_by_cid() {
+    let tracker = start_tracker();
+    let dir = tempfile::tempdir().unwrap();
+    let owner = owner_node(&tracker, dir.path()).await;
+
+    // Two files that share an identical leading 8-MiB segment but differ in the tail.
+    let shared = bytes_of(8 * 1024 * 1024, 42);
+    let mut a = shared.clone();
+    a.extend(bytes_of(1000, 1));
+    let mut b = shared.clone();
+    b.extend(bytes_of(2000, 2));
+
+    let fa = owner.publish_file("a", "", &a, false).await.unwrap();
+    let fb = owner.publish_file("b", "", &b, false).await.unwrap();
+    let ma = owner.fetch_manifest(fa.manifest_cid).await.unwrap();
+    let mb = owner.fetch_manifest(fb.manifest_cid).await.unwrap();
+    let (sa, sb) = (ma.file_segments().unwrap(), mb.file_segments().unwrap());
+
+    assert_eq!(
+        sa[0].cid, sb[0].cid,
+        "the identical leading 8-MiB segment dedups to ONE cid across both files (block-level dedup)"
+    );
+    assert_ne!(
+        sa[1].cid, sb[1].cid,
+        "the differing tails are distinct segments"
+    );
+    assert_ne!(
+        fa.manifest_cid, fb.manifest_cid,
+        "the files themselves differ"
+    );
+}

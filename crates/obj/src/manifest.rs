@@ -11,14 +11,25 @@ use serde::{Deserialize, Serialize};
 /// `get` can tell "restore this file/tree by name" from "hand back raw bytes".
 pub const MANIFEST_MAGIC: &[u8] = b"ZMANIFS1";
 
+/// One segment of a file: an independently erasure-coded CraftOBJ object (its CID)
+/// plus its plaintext byte length. A file is the ordered concatenation of its
+/// segments; identical segments across files share a CID (block-level dedup).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Segment {
+    pub cid: [u8; 32],
+    pub len: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Manifest {
-    /// A single file: its bytes live at `content` (a CraftOBJ object).
+    /// A single file: its bytes are the ordered concatenation of `segments`, each
+    /// an independently erasure-coded CraftOBJ object (≤ the segment size — 8 MiB).
+    /// A small file is one segment; a large file spans several (IPFS-UnixFS style).
     File {
         name: String,
         size: u64,
         mime: String,
-        content: [u8; 32],
+        segments: Vec<Segment>,
     },
     /// A directory: `entries` point to child MANIFEST CIDs (files or subdirs).
     Dir { name: String, entries: Vec<Entry> },
@@ -52,6 +63,15 @@ impl Manifest {
         matches!(self, Manifest::Dir { .. })
     }
 
+    /// The ordered segments of a File manifest (`None` for a Dir). The file's bytes
+    /// are `segments` fetched + concatenated in order.
+    pub fn file_segments(&self) -> Option<&[Segment]> {
+        match self {
+            Manifest::File { segments, .. } => Some(segments),
+            Manifest::Dir { .. } => None,
+        }
+    }
+
     /// Serialize with the magic prefix — the bytes that get published as an
     /// object (the manifest CID is `BLAKE3` of these).
     pub fn encode(&self) -> Vec<u8> {
@@ -78,12 +98,16 @@ mod tests {
             name: "photo.jpg".into(),
             size: 2048,
             mime: "image/jpeg".into(),
-            content: [7u8; 32],
+            segments: vec![Segment {
+                cid: [7u8; 32],
+                len: 2048,
+            }],
         };
         let bytes = m.encode();
         assert_eq!(Manifest::decode(&bytes), Some(m.clone()));
         assert_eq!(m.name(), "photo.jpg");
         assert_eq!(m.size(), 2048);
+        assert_eq!(m.file_segments().unwrap().len(), 1);
         // Raw content (no magic) is not mistaken for a manifest.
         assert!(Manifest::decode(b"just some file bytes").is_none());
         assert!(Manifest::decode(&[0u8; 64]).is_none());

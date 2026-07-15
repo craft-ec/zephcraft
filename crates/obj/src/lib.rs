@@ -34,7 +34,7 @@ mod encrypted;
 mod manifest;
 pub use active_set::{ActiveGuard, ActiveSet};
 pub use encrypted::{EncryptedEnvelope, PlainFile, Recipient, ENVELOPE_MAGIC};
-pub use manifest::{Entry, Manifest};
+pub use manifest::{Entry, Manifest, Segment};
 
 /// ALPN for piece exchange.
 pub const ALPN: &[u8] = b"/craftec/piece/1";
@@ -61,6 +61,15 @@ const PROBE_CONCURRENCY: usize = 16;
 /// instead of an O(N) burst — so both scale to thousands of cids without storming the overlay.
 const PACE_CHUNK: usize = 5;
 const MAX_FRAME: usize = wire::MAX_MESSAGE_SIZE;
+/// Large-file segmentation (CRAFTOBJ §71): a file is chunked into segments of at most this many
+/// bytes, each published as its OWN erasure generation (its own cid) and listed in the file's
+/// `Manifest::File.segments`. 8 MiB = 32 × 256 KiB pieces at [`FILE_K`]. A small file is one
+/// segment; identical segments across files share a cid (block-level dedup, §224).
+const FILE_SEGMENT_BYTES: usize = 8 * 1024 * 1024;
+/// Generation size (k) for FILE segments — 32 source pieces of 256 KiB each per 8 MiB segment
+/// (CRAFTOBJ §71/§73; n = k·ceil(2+16/k) = 96). Distinct from `ObjConfig::k` (the default for
+/// small/opaque objects like app blobs); files opt into the higher K for a 256 KiB piece size.
+const FILE_K: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsumeMode {
@@ -566,9 +575,9 @@ impl ObjEngine {
             .unwrap_or(0)
     }
 
-    fn split_sources(&self, data: &[u8], piece_len: usize) -> Vec<Vec<u8>> {
+    fn split_sources(&self, data: &[u8], piece_len: usize, k: usize) -> Vec<Vec<u8>> {
         let mut sources: Vec<Vec<u8>> = data.chunks(piece_len.max(1)).map(|c| c.to_vec()).collect();
-        while sources.len() < self.config.k {
+        while sources.len() < k {
             sources.push(vec![0u8; piece_len]);
         }
         for s in &mut sources {
@@ -581,7 +590,7 @@ impl ObjEngine {
     /// BACKGROUND, announce providers. Returns immediately with `durable: false`;
     /// the erasure spread completes async (distribute_pending + health scan).
     pub async fn publish(&self, data: &[u8], pin: bool) -> anyhow::Result<PublishReport> {
-        self.publish_impl(data, pin, false).await
+        self.publish_impl(data, pin, false, self.config.k).await
     }
 
     async fn publish_impl(
@@ -589,12 +598,12 @@ impl ObjEngine {
         data: &[u8],
         pin: bool,
         system: bool,
+        k: usize,
     ) -> anyhow::Result<PublishReport> {
         anyhow::ensure!(!data.is_empty(), "refusing to publish empty content");
         let cid = Cid::of(data);
-        let k = self.config.k;
         let piece_len = data.len().div_ceil(k).max(1);
-        let sources = self.split_sources(data, piece_len);
+        let sources = self.split_sources(data, piece_len, k);
 
         let mut rng = OsRng;
         let tags = vtags::generate(&sources, &mut rng)?;
@@ -686,12 +695,27 @@ impl ObjEngine {
         data: &[u8],
         pin: bool,
     ) -> anyhow::Result<FilePublish> {
-        let cr = self.publish(data, pin).await?;
+        // Chunk into ≤ FILE_SEGMENT_BYTES segments, each its OWN erasure generation at FILE_K
+        // (K=32 → 256 KiB pieces). A small file is one segment; identical segments across files
+        // dedup by cid (§224). An empty file yields zero segments → restored as empty bytes.
+        let mut segments = Vec::new();
+        let mut durable = true;
+        for chunk in data.chunks(FILE_SEGMENT_BYTES.max(1)) {
+            let r = self.publish_impl(chunk, pin, false, FILE_K).await?;
+            durable &= r.durable;
+            segments.push(Segment {
+                cid: r.cid.0,
+                len: chunk.len() as u64,
+            });
+        }
+        // `content_cid` is retained (cosmetic / dashboard) as the FIRST segment's cid — for the
+        // common single-segment file it IS the whole content, as before.
+        let content_cid = Cid(segments.first().map(|s| s.cid).unwrap_or([0u8; 32]));
         let m = Manifest::File {
             name: name.to_string(),
             size: data.len() as u64,
             mime: mime.to_string(),
-            content: cr.cid.0,
+            segments,
         };
         let mr = self.publish(&m.encode(), pin).await?;
         // Attach an editable metadata envelope (published_at = now) to the
@@ -702,9 +726,9 @@ impl ObjEngine {
             .await;
         Ok(FilePublish {
             manifest_cid: mr.cid,
-            content_cid: cr.cid,
+            content_cid,
             size: data.len() as u64,
-            durable: cr.durable,
+            durable,
             pinned: pin,
         })
     }
@@ -741,15 +765,41 @@ impl ObjEngine {
             Manifest::File {
                 name,
                 mime,
-                content,
+                segments,
                 ..
             } => {
-                let bytes = self.get(Cid(content), ConsumeMode::Seed).await?;
+                // Fetch each segment (its cid verifies its bytes) and concatenate in order.
+                let mut bytes = Vec::new();
+                for seg in segments {
+                    bytes.extend(self.get(Cid(seg.cid), ConsumeMode::Seed).await?);
+                }
                 Ok((name, mime, bytes))
             }
             Manifest::Dir { name, .. } => {
                 anyhow::bail!("'{name}' is a folder, not a file")
             }
+        }
+    }
+
+    /// Fetch the raw bytes behind `cid`, transparently following a `File` manifest to the
+    /// concatenation of its segments. If `cid` is raw content (or a `Dir`), returns it as-is.
+    /// The DEK-free counterpart the com/noded program-fetch paths use to resolve a wasm/blob
+    /// that may be wrapped in a (possibly multi-segment) file manifest.
+    pub async fn get_following_manifest(
+        &self,
+        cid: Cid,
+        mode: ConsumeMode,
+    ) -> anyhow::Result<Vec<u8>> {
+        let raw = self.get(cid, mode).await?;
+        match Manifest::decode(&raw) {
+            Some(Manifest::File { segments, .. }) => {
+                let mut bytes = Vec::new();
+                for seg in segments {
+                    bytes.extend(self.get(Cid(seg.cid), mode).await?);
+                }
+                Ok(bytes)
+            }
+            _ => Ok(raw),
         }
     }
 
@@ -1177,7 +1227,7 @@ impl ObjEngine {
     /// alive network-wide so it never fades; the `system` marker excludes it from
     /// user commands + local eviction. Returns its CID.
     pub async fn publish_system(&self, data: &[u8]) -> anyhow::Result<Cid> {
-        let report = self.publish_impl(data, false, true).await?;
+        let report = self.publish_impl(data, false, true, self.config.k).await?;
         Ok(report.cid)
     }
 
@@ -3089,7 +3139,7 @@ fn chain_children(bytes: &[u8]) -> Vec<Cid> {
         return vec![Cid(env.ciphertext_cid)];
     }
     match Manifest::decode(bytes) {
-        Some(Manifest::File { content, .. }) => vec![Cid(content)],
+        Some(Manifest::File { segments, .. }) => segments.iter().map(|s| Cid(s.cid)).collect(),
         Some(Manifest::Dir { entries, .. }) => entries.iter().map(|e| Cid(e.cid)).collect(),
         None => Vec::new(),
     }
