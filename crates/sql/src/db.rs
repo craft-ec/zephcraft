@@ -47,8 +47,10 @@ const COMPACT_THRESHOLD: usize = 16;
 pub trait RootStore: Send + Sync {
     /// Current head for `owner`'s DB (None if never published).
     async fn resolve(&self, owner: NodeId, namespace: &str) -> Result<Option<(Cid, u64)>>;
-    /// Publish MY new head via compare-and-swap: `prev` must be the current root
-    /// (None = expect none) and `seq` must strictly advance, else `Conflict`.
+    /// Publish MY new head. `seq` must strictly advance (last-writer-wins by seq — the
+    /// registry has no synchronous arbiter). `prev` is retained for causal ordering only;
+    /// the production impl does NOT enforce it as a CAS gate (there is no synchronous
+    /// `Conflict` under single-writer — the head publish is fire-and-forget, LWW-by-seq).
     async fn publish(&self, namespace: &str, root: Cid, prev: Option<Cid>, seq: u64) -> Result<()>;
 }
 
