@@ -90,12 +90,15 @@ root. Instead the anchor's `program_owner` resolves to a deterministic **sentine
 `EpochCommitteeSource`/governance, **not** `AttestStore`. This keeps the attestation trust model (owner-signed
 genesis) untouched for *user* programs while anchored protocol programs get authority from committee computation —
 matching §5's "sequencer quorum membership = binary/rotating epoch committee, agreement machinery, not a program knob."
-**Flag for a design-check before shipping 4a** — first time `program_owner` isn't a real registry-resolved keyholder.
+**Settled (2026-07-16):** this *is* the epoch committee (§10.5 / phase 4e) — the same mechanism, not a separate
+authority model. The alternative (a designated owner key controlling the ledger's ordering quorum) was rejected as a
+central capture point that contradicts the #5 rotating-committee decision. During 4a, just confirm the sentinel-owner
+plumbing routes `(sentinel, ledger_cid)` to the committee quorum source.
 
 ## 4. Phase 4b — ledger core (Layer-0 ABI + account-chain model)
 
 Schemas (`crates/ledger`): `TransferOp{to,amount,memo}`, `ClaimOp{debit:SequencedCommitRef,amount}`,
-`LedgerBalanceState{balance, processed_claims:BTreeSet<(sender,nonce)>, checkpoint_root}`. `SequencedCommitRef`
+`LedgerBalanceState{balance, processed_claims:BTreeSet<(sender,nonce)>, minted_watermark:BTreeMap<consumer,u64>}`. `SequencedCommitRef`
 carries the full `SequencedCommit` (write + k-of-n sigs) inline → a claim re-runs without a live network round-trip.
 
 - **Balance = fold of the owner's own `AccountSequence`.** A transfer is `SequencedWrite::author(sender, next_nonce,
@@ -109,24 +112,38 @@ carries the full `SequencedCommit` (write + k-of-n sigs) inline → a claim re-r
   on **its own** account (`owner_authentic` structurally blocks anyone else); (3) the transition validates
   self-contained — `debit.authorizes(quorum_at_that_epoch)`, `TransferOp.to == me`, `(sender,N) ∉ processed_claims`.
   "No double-credit" becomes an ordinary same-chain duplicate check; zero new storage.
-- **Verification = periodic CHECKPOINTING, not per-transfer.** Determinism gives per-transfer validity for free (any
-  node re-folds the public quorum-ordered sequence). K6/Board's role: once per epoch (lazily — gap #4), a `verify()`
-  asks k nodes to re-fold from the last checkpoint to head + sign off; the verdict becomes the new
-  `checkpoint_root`, bounding re-execution cost and letting a wallet/claim trust "balance ≥ X as of checkpoint C"
-  without replaying from genesis. Straight reuse of `Board`/`Verifier`, unchanged.
+- **Verification = always-on defense-in-depth, NOT periodic (revised 2026-07-16).** Determinism gives per-transfer
+  validity for free — any node re-folds the public quorum-ordered sequence from genesis at any time, so verification
+  is a *continuous* defense-in-depth, never gated to a checkpoint. K6/Board stays available on-demand (a claim, a
+  wallet read, a dispute triggers a re-fold + k-signed verdict). **Checkpointing is dropped from the core** — it was
+  only a replay-cost accelerator and must never be the trust boundary (you can always re-verify from genesis);
+  revisit it as an optional optimisation only if replay length ever becomes a real cost.
 - **Reserved-namespace enforcement is structural:** `owner_authentic` stops anyone ordering a write into an account
   they don't hold; the deterministic transition (re-run by verifiers + any reader) rejects any fold that isn't
   `fold_account(canonical_ledger_cid, sequence)`. Same "verification re-runs the canonical cid" property K6 provides.
 
-## 5. Phase 4c — mint-from-receipts
+## 4a-bis. Program-to-program invoke — new primitive (`invoke_program`)
 
-`ChequeService` (unchanged) accumulates `ServingCheque`s; at epoch close the provider authors `MintOp{epoch, cheques,
-claimed_reward}` on its own account. **Reward valuation is INLINED in the ledger program for v1** (not a separate
-anchor — there is no program-to-program invoke host fn yet; decomposing is a deferrable pure refactor, still fully
-governed via the same `SetProgram` swap). The mint amount = `reward_from_cheques(cheques)` (§10 #1: metered, capped at
-paid usage, linear) computed inside the deterministic fold → self-verifying; K6 checkpointing as in 4b.
-**Single-use** = a monotonic "already-rewarded-up-to" watermark per consumer in `LedgerBalanceState` (reuses
-`ServingCheque`'s monotonic-cumulative invariant), so replayed cheques mint zero.
+Build a host fn `invoke_program(anchor_name | cid, func, input) -> output` in `crates/com/src/transition.rs`
+(+ a `Capability::InvokeProgram` grant in `capability.rs`), reusing `InvokeService`/`AnchorDispatcher` underneath.
+**Hard constraint: the callee must be DETERMINISTIC** (the deterministic-capability subset — deny wall-clock/random),
+or verification's re-execution of the *caller* diverges. This unblocks the reward-valuation program (§5) as a
+*separate* governed program the ledger calls, rather than inlined — the proper §5-of-the-design decomposition. Its own
+phase, sequenced after 4a (it depends on the anchor dispatcher) and before 4c (which needs it).
+
+## 5. Phase 4c — reward = bounded pool-average (a separate program)
+
+Reward is a **bounded pool-average distribution** (§10.1), computed by a **separate governed reward-valuation
+program** the ledger calls via `invoke_program` (§4a-bis) — *not* inlined. Flow: `ChequeService` (unchanged)
+accumulates `ServingCheque`s; each epoch the reward program takes `{payment pool, all providers' rewardable-served
+bytes}` and returns per-provider shares at the uniform rate `pool ÷ Σ min(used, paid-quota)`. `allocate_quota` still
+runs per-consumer to *identify* rewardable (paid, first-come) bytes; the pool then sets **one uniform rate** across
+them — so a provider earns the *average*, not the per-consumer rate (fair, because producer-randomization assigns
+consumers). Mostly **redistribution** (consumers' escrowed tokens → providers); bootstrap issuance tops up the pool
+(tapering, identity-gated). **Guardrail:** per-GB price uniform / floor-bounded (else an extract-the-average farm).
+Deterministic → verification re-runs it (always-on, §4b). **Single-use** = a monotonic per-consumer
+`minted_watermark` in `LedgerBalanceState` (reuses `ServingCheque`'s monotonic-cumulative invariant), so replayed
+cheques reward zero.
 
 ## 6. Phase 4d — settlement + tiers
 
@@ -172,18 +189,23 @@ owner-signed genesis. Heaviest sub-phase; its own commit + gate.
 ## 8. Build sequence (strict sequential; one phase resolved + committed before the next)
 
 - [ ] **4a — K1 anchor dispatcher.** `anchor.rs`; un-dead-code `resolve` + `resolve_interface_version`; `--anchor` on
-  `Invoke` + `AnchorResolve`; sentinel anchor-owner in `rpc_invoke`. **Exit:** build/test green; `gov-propose
-  --set-program` + `--set-config anchor:foo:iface=1` + `invoke --anchor foo` round-trips on one node; no `--name`/
-  `--wasm` regression. *(Design-check the anchor-authority routing first — gap #1.)*
+  `Invoke` + `AnchorResolve`; sentinel anchor-owner in `rpc_invoke` routed to the committee quorum source. **Exit:**
+  build/test green; `gov-propose --set-program` + `--set-config anchor:foo:iface=1` + `invoke --anchor foo`
+  round-trips on one node; no `--name`/`--wasm` regression.
 - [ ] **4e — rotating epoch committee.** `quorum_source.rs` (trait + AttestStore impl) + `epoch_committee.rs`;
   generalize `SequenceStore`. **Exit:** identical-committee-across-nodes test; hand-off property test (write started
   under E, gathered after rotation to E+1, still commits); existing Sequence/Attest tests green. *Built before
   4b/4c/4d because they depend on it for real ordering.*
-- [ ] **4b — ledger core.** `crates/ledger` + `apps/ledger-wasm`; `TransferOp`/`ClaimOp`/`fold_account`; checkpoint
-  `verify()`. **Exit:** wasm-vs-native fold-equivalence test; transfer→claim→balance integration; duplicate-claim
-  rejection.
-- [ ] **4c — mint-from-receipts.** `MintOp` + `reward_from_cheques`; wire `total_earned`. **Exit:** mint increases
-  balance by the deterministic formula; replayed cheques mint zero (monotonic dedup).
+- [ ] **4a-bis — `invoke_program` primitive.** New host fn + `Capability::InvokeProgram`; deterministic-callee only.
+  **Exit:** a program invokes another anchored program and gets its output; a non-deterministic callee is rejected;
+  verification re-runs the caller identically. *(After 4a; before 4c needs it.)*
+- [ ] **4b — ledger core.** `crates/ledger` + `apps/ledger-wasm`; `TransferOp`/`ClaimOp`/`fold_account`; always-on
+  re-fold validity (no checkpoint). **Exit:** wasm-vs-native fold-equivalence test; transfer→claim→balance
+  integration; duplicate-claim rejection.
+- [ ] **4c — reward = pool-average (separate program).** The reward-valuation program + `invoke_program` wiring; wire
+  `total_earned`; two-pass `allocate_quota` to identify rewardable bytes; uniform-rate distribution. **Exit:** reward
+  matches the deterministic pool-average formula; replayed cheques reward zero (monotonic `minted_watermark`); a
+  uniform-pricing self-deal nets ~zero in a test.
 - [ ] **4d — settlement + tiers.** `EscrowOp`/`SettleClaim`; admission + pin gates. **Exit:** two-pass
   `allocate_quota` unit-tested (extend `quota_allocation_caps_paid_at_quota_by_timestamp` with a reciprocity case);
   free-tier deficit trips the admission gate; pin-without-balance downgrades.
@@ -193,13 +215,16 @@ integration-check → commit) and updates `.claude/feature-progress.md`.
 
 ## 9. Remaining design gaps (need a call before/at their phase)
 
-1. **Anchor authority routing** — sentinel owner + `EpochCommitteeSource` instead of `AttestedChain`'s owner-sig root.
-   First time `program_owner` ≠ a real keyholder → **design-check before 4a**.
+1. **Anchor authority routing — RESOLVED (2026-07-16):** anchored programs use a sentinel owner +
+   `EpochCommitteeSource` (= the #5 rotating committee), *not* `AttestedChain`'s owner-sig root. 4a just confirms the
+   plumbing.
 2. **Escrow lifecycle** (top-up/close/reclaim/disputes) — deferred in §7/§10.9, but 4d needs *a* minimal answer.
    Recommend: reclaim after N epochs of no matching `SettleClaim` (governed N).
 3. **Cold-start grant + identity gate** (§8/§10 #6/#7) — the admission gate needs a Sybil bound. Recommend v1: gate
    the initial grant on registry-registered account age (first `HeadEntry` timestamp); defer stake/invite/PoP.
-4. **Checkpoint cadence** — every-account-every-epoch is O(accounts). Recommend lazy: trigger on first claim/read
-   referencing an account older than N nonces since its last checkpoint.
-5. **Reward-valuation decomposition** — scoped out (inlined v1); revisit if/when a program-to-program invoke host fn
-   exists.
+4. **Checkpoint acceleration — DROPPED from core (2026-07-16):** verification is always-on re-execution (§4b);
+   checkpointing is only a future replay-cost optimisation, never the trust boundary.
+5. **Reward-valuation decomposition — RESOLVED (2026-07-16):** it IS a separate governed program via `invoke_program`
+   (§4a-bis / §5), not inlined.
+6. **Uniform-pricing floor** — the pool-average reward is farm-safe only under uniform / floor-bounded per-GB pricing
+   (§10.1). The pricing mechanism (protocol-set rate vs. market floor) needs pinning at 4c.

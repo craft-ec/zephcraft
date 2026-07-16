@@ -125,10 +125,13 @@ North-star-consistent: **no global-lockstep chain, no BFT-committee-per-block.**
   cadence, not per transfer.
 - **Ordering / uniqueness = attestation sequencer [K7]** (§4) — the one thing
   verification cannot provide.
-- **Mint = measurement-justified issuance.** A provider submits its signed receipts /
-  measurement evidence → a deterministic reward function (the distribution policy §10.1,
-  run by the accounting pipeline §6) → verification [K6] re-runs it to confirm the mint
-  amount → tokens minted. Receipts / evidence are single-use (can't be re-minted).
+- **Reward = bounded pool-average distribution (§10.1).** A provider submits its signed cheques /
+  measurement evidence → the **reward-valuation program** (a *separate* governed program the ledger
+  calls via program-to-program invoke) distributes the epoch's payment pool at a uniform per-byte
+  rate → verification [K6] re-runs the deterministic distribution to confirm each provider's share →
+  tokens move. Mostly **redistribution** of consumers' payments (aggregate-bounded by paid-in); fresh
+  issuance only tops up the pool during bootstrap. Cheques are single-use (monotonic-cumulative →
+  can't be re-rewarded).
 - **Issuance & genesis = a governed policy program (§10.3), default fair-launch.** No premine
   in the default: tokens are earned by contribution from genesis, a bootstrap-issuance curve
   tapers as paid demand grows, and steady state is fee-recycled. The schedule, supply-cap-vs-
@@ -194,7 +197,8 @@ mechanism. Same split already used for governance, the registry, and attestation
 |---|---|---|
 | **Token ledger** — balances, transfer, mint/reward math, supply schedule, fee/burn, staking | **Program** (WASM financial-chain app) | Pure policy; validity by verification [K6]. Governance-upgradeable without a binary roll. |
 | **Discretionary attestation policy** — "should this tx be attested at all" | **Program** (the deferred K7 auto-sign) | Swappable policy. |
-| **Reward valuation** — measurement → token amount; quorum **sizing** `(n,k)` | **Program** | Economic knobs, governed (default n=4/k=3, §10.4). |
+| **Reward valuation** — pool-average distribution (§10.1); quorum **sizing** `(n,k)` | **Program** (a *separate* reward program the ledger invokes) | Economic knobs, governed (default n=4/k=3, §10.4). |
+| **Program-to-program invoke** (`invoke_program` host fn) | **Binary** (extends the runtime) | Lets the ledger call the reward-valuation program behind its anchor; **deterministic-callee only** (deterministic-capability subset — no wall-clock/random — so verification's re-execution reproduces it). |
 | **Sequencer quorum membership** — which live nodes form the epoch committee | **Binary** (rotating epoch committee, §10.5) | Deterministic per-epoch selection from membership (node's view + rendezvous rank) — agreement machinery, not a program knob. |
 | **Attestation rounds + auto-sign host hook** | **Binary** (extends K7) | Agreement machinery. |
 | **Non-equivocation invariant** — never sign two conflicting statements at one `(account, nonce)` | **Binary, structural** | SAFETY, not policy (like the namespace gate). A buggy/malicious policy can only *decline* to sign — never cause a double-spend. |
@@ -727,14 +731,24 @@ binary roll). Committing to a *shape* rather than a magic constant is itself the
 #3/#4.
 
 **Economics / policy — DECIDED:**
-1. **Distribution policy — DECIDED: reward ∝ paid demand.** Metered-reward with subsidized
-   overflow. Reward is direct **revenue** (not a contribution-pool split) and **linear in
-   revenue** (no volume/reputation superlinearity → self-inflation-proof); **metered /
-   quota-bounded**, never flat-unlimited (a flat-unlimited marginal self-fetch is free →
-   farmable). Reward is capped per-consumer at paid usage; overflow is cost-reimbursed +
-   pool-bounded (the free tier is this with a zero paid-quota). Cold storage = **owner-pays-pin**;
-   consensus work = **fee-funded**; bootstrap = **subsidized**. The market prices real demand
-   directly and is auto-farm-resistant (§8). *This is the spine.*
+1. **Distribution policy — DECIDED: reward ∝ paid demand, as a BOUNDED POOL-AVERAGE (revised
+   2026-07-16).** Payments pool per epoch; each consumer's rewardable basis is capped at their paid
+   quota (`min(used, paid-quota)`); the pool is distributed to providers at a **uniform per-byte
+   rate** (`pool ÷ total rewardable-served`), so a provider earns the *average* rate for bytes
+   served **regardless of which consumer it was assigned**. This is the fair compensation given the
+   protocol (not the consumer) picks the producer — a provider can't choose its consumer, so it
+   shouldn't bear that consumer's rate. *This supersedes the earlier "direct-revenue-per-consumer,
+   linear" form.* It stays farm-safe because it is (a) **aggregate-bounded by payments**
+   (redistribution, not fresh issuance — can't extract more than was paid in), (b) distributed by
+   **non-inflatable attested serving** (counterparty-signed cheques + producer-randomization → can't
+   fake or monopolize your share), and (c) **Sybil-neutral** (proportional split). **Guardrail: the
+   per-GB price must be uniform / floor-bounded** — else a self-dealer pays a trivially-low rate for
+   a large quota and extracts the pool *average* (a farm); under uniform pricing, self-dealing nets
+   zero. It is mostly **redistribution** (consumers' tokens → providers at the average rate); fresh
+   issuance only tops up the pool during **bootstrap** (tapering, identity-gated). Free/reciprocal
+   serving earns reciprocity credit (§8), *not* pool share. Cold storage = **owner-pays-pin**;
+   consensus work = **fee-funded**. The rate self-balances (more providers → lower unit rate →
+   market-clearing). *This is the spine.*
 2. **Participation-metric formula — DECIDED: dissolved.** Paid demand *is* the metric; no
    rich multi-signal contribution oracle (with sybil-normalization + organic-demand weighting)
    is built. Organic-demand weighting is retained only as **optional defense-in-depth** (§8-A),
