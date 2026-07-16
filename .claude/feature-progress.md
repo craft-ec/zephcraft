@@ -2409,3 +2409,35 @@ Long investigation into the Mac (phone hotspot, relay, ~600ms rtt) misbehaving. 
 
 ### ROOT CAUSE of Mac "no active connection" regression — fill_active (fixed c3f99c9)
 Found by DIFFING old-vs-new functions (user correctly rejected my live tests: full-pre-membership was window-confounded; old-Mac-vs-new-Hetzner is mixed-version = invalid). add_active/mark_dead UNCHANGED. The regression is my fill_active self-heal (2a99780): f0554a8 loops ALL passive candidates and DROPS a failed promotion (self-cleans passive of unreachable/stale addrs -> promotions keep finding reachable peers). Mine CAPPED at active_size attempts + RE-QUEUED failures -> on a passive polluted with dead addrs (accumulated via shuffle), a random few attempts hit only dead entries -> active view never fills -> ZERO active connections, can't refill, and re-queue prevents self-cleaning. Reverted to draining; recover_isolated's seed dial covers the full-isolation case that motivated the self-heal. This is the REAL regression; the member-sync fold (b5cc1f4) + empty-bootstrap (1288873) were also real but secondary.
+
+# ECONOMY PROGRAMS — token / economy-* split + CPI (§ docs/ECONOMY_PROGRAMS_DESIGN.md) — PLANNED 2026-07-16
+
+User directive: split the monolithic token-ledger into a minimal **token** program + a family of
+**economy-\*** policy programs (first **economy-egress**, future **economy-storage** …), rename the
+"reward" anchor → "economy-egress", and implement **cross-program invocation (CPI)**. Full design +
+rationale in docs/ECONOMY_PROGRAMS_DESIGN.md (architecture map done via Explore; the hard seam is the
+shared `LedgerBalanceState.balance` written by both token ops and Pay/RewardClaim).
+
+Phases (each: build + test + gate + commit; roll together where consensus-affecting):
+- [ ] **P1 — anchor-name constants** (centralize the re-typed "token-ledger"/"reward" literals into shared
+      `const`s so the split can't drift). Pure refactor, no behavior change.
+- [ ] **P2 — CPI primitive:** `Capability::InvokeProgram` + `invoke_program(anchor|cid, func, input)` host fn
+      + `InvokeProgramBackend` in `TransitionCtx`; callee runs under `CapabilityGrant::deterministic()` (no
+      wall-clock/random/verify/attest/sequence → caller re-execution reproduces the call tree). General
+      composition primitive; NOT wedged onto the verified settlement fold (value-move stays node-orchestrated
+      — the "in-wasm CPI value-move fights verification" hazard the tracker already flagged). Tests: program A
+      invokes B, re-run reproduces; determinism wall (non-det callee rejected).
+- [ ] **P3 — split `zeph_ledger` → `zeph_token`** (Transfer/Claim, `{balance, processed_claims}`) **+
+      `zeph_economy_egress`** (Pay/RewardClaim + `zeph_reward::compute`, `{claimed_epochs}`). Native fold kept;
+      `EconomyEgressService` holds `Arc<TokenService>`.
+- [ ] **P4 — rehome settlement** (SettlementStore/Service, record_chain) under economy-egress; pool = token
+      pool account; `reward_claim` two-step (token credit → economy claim-mark) across the new boundary.
+- [ ] **P5 — genesis + dashboard:** publish `token.wasm` + `economy-egress.wasm`, pin both anchors (rename
+      "reward"→"economy-egress", "token-ledger"→"token"); dashboard anchor list + labels.
+- [ ] **P6 — subscriptions in economy-egress:** governed `bytes_per_token`, subscription = locked
+      `egress_bytes`, 30-day windowed per-consumer quota (on top of the per-consumer FCFS already shipped),
+      use-it-or-lose-it (no escrow — tokens already priced into the pool-average).
+- [ ] **P7 — deploy** (wire+consensus → simultaneous fleet roll).
+
+Open decision (docs §7): CPI value-move = node-orchestrated (recommended, matches native fold + avoids the
+verification hazard) vs in-wasm CPI value-move (not recommended). Awaiting user confirm before P2+.
