@@ -1,0 +1,21 @@
+[package]
+name = "zeph-reward-wasm"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# The reward-valuation program — a thin wrapper over the shared zeph-reward crate, so a verifier
+# re-running it reproduces the node's native computation by construction.
+zeph-reward = { path = "../../crates/reward" }
+dlmalloc = { version = "0.2", features = ["global"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"
+strip = true
+
+[workspace]

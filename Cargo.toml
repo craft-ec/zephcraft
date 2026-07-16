@@ -9,7 +9,7 @@ members = [
     "apps/*",
     "tests",
 ]
-exclude = ["apps/registry-wasm", "apps/guestbook-wasm", "apps/ledger-wasm"]
+exclude = ["apps/registry-wasm", "apps/guestbook-wasm", "apps/ledger-wasm", "apps/reward-wasm"]
 
 [workspace.package]
 version = "0.1.0"
