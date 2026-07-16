@@ -69,8 +69,13 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       `claimed_epochs`); `apply` refactored to a `Resolved{debit, reward_share}` context; state gained `escrowed` +
       `claimed_epochs`; +1 test (escrow lock/overdraft/zero, reward-claim once/replay/zero-share). LedgerService
       `escrow`/`reward_claim` authoring + RPC/CLI (`ledger-escrow`, `ledger-reward-claim`, balance shows escrowed);
-      ledger.wasm refreshed. NEXT (4d-2/3): the node epoch-close LOOP (gather→offset→reward program→verify→publish
-      RECORD), resolve RewardClaim shares from the record, obj admission + pin gates. Original spine (EscrowOp→pool;
+      ledger.wasm refreshed. **4d-2 DONE:** obj `admission_gate` + `pin_gate` OnceLock hooks + `set_admission_gate`/
+      `set_pin_gate` + `admit_fetch`/`pin_allowed` helpers (mirror shed_gate); admission checked at the network-fetch
+      boundary in `get()` (locally-decodable reads never gated), pin DOWNGRADED to non-pinned in `publish_impl` when the
+      gate declines (owner-pays-pin). Unwired = permissive; wiring to the reciprocity/escrow position (needs a sync
+      cache) is 4d-3. Gates green (obj 6 tests). NEXT (4d-3): the node epoch-close LOOP (gather→offset→reward program→
+      verify→publish RECORD), resolve RewardClaim shares from the record, wire the gates to the ledger position.
+      Original spine (EscrowOp→pool;
       `LedgerOp::RewardClaim{epoch}` credits the recorded
       share once; node epoch-close loop gather→offset→reward→verify→publish; two-pass allocate_quota; admission + pin
       gates in obj mirroring shed_gate).

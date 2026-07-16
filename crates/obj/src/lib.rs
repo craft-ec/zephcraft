@@ -393,6 +393,14 @@ pub struct ObjEngine {
     /// piece this node FETCHES from a provider, so the serving-cheque service can issue cumulative
     /// cheques. Unwired (tests/library), fetch metering is a no-op.
     byte_meter: std::sync::OnceLock<Arc<dyn ByteMeter>>,
+    /// Set by the node (§11 step 4): a real-time ADMISSION gate for a network FETCH —
+    /// `Fn(estimated_bytes) -> admit`. Wired to the ledger's reciprocity/escrow position, so a
+    /// free-tier deficit is throttled here before hitting the network. Unwired, every fetch is admitted.
+    admission_gate: std::sync::OnceLock<Arc<dyn Fn(u64) -> bool + Send + Sync>>,
+    /// Set by the node (§11 step 4): a PIN/publish gate — `Fn(bytes) -> allow durable pin`. Wired to
+    /// owner-pays-pin; on rejection a pin DOWNGRADES to a non-pinned (consume-only) publish. Unwired,
+    /// pin is allowed.
+    pin_gate: std::sync::OnceLock<Arc<dyn Fn(u64) -> bool + Send + Sync>>,
     /// Liveness source (set by the node = membership; a test source in tests). The health scan
     /// filters provider records by this so a DIED holder — whose record lingers until TTL — stops
     /// inflating a cid's effective count, and repair fires. None → no filtering (legacy).
@@ -448,6 +456,8 @@ impl ObjEngine {
             shed_gate: std::sync::OnceLock::new(),
             grant_gate: std::sync::OnceLock::new(),
             byte_meter: std::sync::OnceLock::new(),
+            admission_gate: std::sync::OnceLock::new(),
+            pin_gate: std::sync::OnceLock::new(),
             liveness: Mutex::new(None),
             alive_cache: Mutex::new(None),
             node_liveness: Mutex::new(HashMap::new()),
@@ -698,6 +708,9 @@ impl ObjEngine {
         k: usize,
     ) -> anyhow::Result<PublishReport> {
         anyhow::ensure!(!data.is_empty(), "refusing to publish empty content");
+        // Pin/publish gate (§11 step 4): owner-pays-pin — if the gate declines, DOWNGRADE a pin to a
+        // non-pinned (consume-only) publish rather than failing the call.
+        let pin = pin && self.pin_allowed(data.len() as u64);
         let cid = Cid::of(data);
         let piece_len = data.len().div_ceil(k).max(1);
         let sources = self.split_sources(data, piece_len, k);
@@ -1060,6 +1073,13 @@ impl ObjEngine {
         } else {
             self.routing.resolve(cid).await.unwrap_or_default()
         };
+        // Admission gate (§11 step 4): a network fetch is egress consumption — a throttled free-tier
+        // deficit is declined here. Locally-decodable reads (no fetch needed) are never gated.
+        if !done(&decoder) && !self.admit_fetch(total_len) {
+            anyhow::bail!(
+                "egress admission gate declined this fetch (insufficient reciprocity/escrow)"
+            );
+        }
         anyhow::ensure!(
             !providers.is_empty() || done(&decoder),
             "no providers for {cid} and local pieces insufficient to reconstruct"
@@ -2499,6 +2519,26 @@ impl ObjEngine {
         if let Some(m) = self.byte_meter.get() {
             m.on_bytes_received(provider, bytes);
         }
+    }
+
+    /// Wire the fetch ADMISSION gate (§11 step 4) — `Fn(estimated_bytes) -> admit`. Set once.
+    pub fn set_admission_gate(&self, gate: Arc<dyn Fn(u64) -> bool + Send + Sync>) {
+        let _ = self.admission_gate.set(gate);
+    }
+
+    /// Wire the PIN/publish gate (§11 step 4) — `Fn(bytes) -> allow durable pin`. Set once.
+    pub fn set_pin_gate(&self, gate: Arc<dyn Fn(u64) -> bool + Send + Sync>) {
+        let _ = self.pin_gate.set(gate);
+    }
+
+    /// Whether to admit a network fetch of ~`bytes` (permissive if unwired).
+    fn admit_fetch(&self, bytes: u64) -> bool {
+        self.admission_gate.get().map(|g| g(bytes)).unwrap_or(true)
+    }
+
+    /// Whether a durable pin of `bytes` is allowed (permissive if unwired).
+    fn pin_allowed(&self, bytes: u64) -> bool {
+        self.pin_gate.get().map(|g| g(bytes)).unwrap_or(true)
     }
 
     /// Wire the graded admission gate for offer/grant (TRANSFER_PLANE_V2 §3):
