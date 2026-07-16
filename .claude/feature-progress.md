@@ -2436,9 +2436,19 @@ Phases (each: build + test + gate + commit; roll together where consensus-affect
       NODED-side real `InvokeProgramBackend` impl — resolve anchor name→cid (AnchorDispatcher), run the callee
       under the deterministic grant in its OWN reserved namespace (app_ns switch + Sql read) — lands when economy
       actually calls `token.share_of`/`balance_of`.
-- [ ] **P3 — split `zeph_ledger` → `zeph_token`** (Transfer/Claim, `{balance, processed_claims}`) **+
-      `zeph_economy_egress`** (Pay/RewardClaim + `zeph_reward::compute`, `{claimed_epochs}`). Native fold kept;
-      `EconomyEgressService` holds `Arc<TokenService>`.
+- [x] **P3 — token/economy crate split DONE (2026-07-17, behavior-preserving).** New `crates/token` (`zeph-token`):
+      owns the account-chain op vocab (`LedgerOp`/`TransferOp`/`ClaimOp`/`Resolved`/`LedgerInput`) + `TokenState
+      {balance, processed_claims}` + `apply_token` (the VALUE effect of every op). New `crates/economy-egress`
+      (`zeph-economy-egress`, depends on zeph-token): `EconomyState{claimed_epochs}` + `apply_economy` (the POLICY
+      effect — RewardClaim single-use dedup; identity for token ops). `zeph-ledger` rewritten as the thin COMBINER:
+      keeps `LedgerBalanceState` FLAT (byte-identical serde) + re-exports the token vocab so noded/wasm call sites
+      are unchanged; `apply` co-folds (economy dedup FIRST → token value effect; commits only if both accept, so a
+      partial mark is discarded). **Behavior-preserving:** committed state bytes identical, `ledger.wasm` untouched,
+      cid unchanged → NO consensus change, NO fleet roll. Verified: token 2 / economy 4 / ledger 3 crate tests +
+      all 48 noded tests green; fmt/clippy clean. (Deployed program split into separate token.wasm/economy.wasm +
+      anchors is P5; the `LedgerService` → `TokenService`/`EconomyEgressService` service split is P4.) NOTE: `LedgerOp`
+      still shared (token owns it, applies Pay/RewardClaim value effect) — the op-vocab decoupling (generic
+      Debit/Credit-with-memo so economy adds ops without touching token) lands with P6 subscriptions if needed.
 - [ ] **P4 — rehome settlement** (SettlementStore/Service, record_chain) under economy-egress; pool = token
       pool account; `reward_claim` two-step (token credit → economy claim-mark) across the new boundary.
 - [ ] **P5 — genesis + dashboard:** publish `token.wasm` + `economy-egress.wasm`, pin both anchors (rename

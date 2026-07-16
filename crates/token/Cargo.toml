@@ -1,14 +1,12 @@
 [package]
-name = "zeph-ledger"
+name = "zeph-token"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
-# `#![no_std]` + alloc so the SAME crate compiles for the `apps/ledger-wasm` protocol program
+# `#![no_std]` + alloc so the SAME crate compiles for the `apps/token-wasm` protocol program
 # (wasm32) and for native noded/CLI/tests. Deps are no_std-only (no default features).
 [dependencies]
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 postcard = { version = "1", default-features = false, features = ["alloc"] }
-zeph-token = { workspace = true }
-zeph-economy-egress = { workspace = true }

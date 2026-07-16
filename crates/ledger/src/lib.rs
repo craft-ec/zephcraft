@@ -1,22 +1,15 @@
-//! `zeph-ledger` — the token ledger's pure, deterministic transition logic + wire schemas
-//! (TOKEN_LEDGER_BUILD.md §4; the canonical token PROTOCOL PROGRAM, not a user app). `#![no_std]` so
-//! the identical crate compiles for the `apps/ledger-wasm` governed-WASM program (which the node runs
-//! behind the K1 `token-ledger` anchor) and for native noded/CLI/tests.
+//! `zeph-ledger` — the COMBINER over the split token/economy protocol programs
+//! (`ECONOMY_PROGRAMS_DESIGN.md §5b`). The value authority is [`zeph_token`] ([`TokenState`] +
+//! [`apply_token`]); the egress policy authority is [`zeph_economy_egress`] ([`EconomyState`] +
+//! [`apply_economy`]). This crate co-folds them over ONE account write into the flat
+//! [`LedgerBalanceState`] the node/wasm still commit — a behaviour-preserving seam: the committed state
+//! bytes are byte-identical to the pre-split monolith, so the split is invisible on the wire until the
+//! deployed program split (P5). `#![no_std]` so the identical crate compiles for wasm and native.
 //!
-//! **Model.** A balance is the fold of an account's OWN sequence: each ordered write is one
-//! [`apply`] step (like the registry program — `(prev_state, op) → new_state`). Every node, and a
-//! verifier re-run, computes the identical state from the same public, quorum-ordered sequence —
-//! *validity by re-execution*, no committee for the fold itself.
-//!
-//! **Recipient credit = CLAIM** (not a global scan). A transfer DEBITS the sender's own chain; the
-//! recipient later CLAIMS it onto *its* own chain, referencing the sender's debit. So every account's
-//! state stays a pure fold of only its own chain (§6: O(1)/account, no "who-owes-me" index), and
-//! "no double-credit" is an ordinary same-chain dedup ([`LedgerBalanceState::processed_claims`]).
-//!
-//! **Reserved namespace.** Balances are self-custodial account-chains, not PDAs (§3): the owner signs
-//! the write (the sequencer's `owner_authentic` gate), but the transition here CONSTRAINS it to a
-//! valid step — a modified client can submit garbage, but re-execution of the canonical cid rejects
-//! any state that isn't `apply(...)`, so nobody can forge a balance.
+//! **Co-fold order (`RewardClaim`).** Economy folds first (single-use-per-epoch dedup; reject if already
+//! claimed) → token credits the resolved share. Both are the effect of one self-authored write on the
+//! provider's own chain (single-writer → atomic); the combiner only commits if BOTH slices accept, so a
+//! partial mark is discarded on any rejection.
 
 #![no_std]
 
@@ -25,47 +18,21 @@ extern crate alloc;
 use alloc::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
+use zeph_economy_egress::{apply_economy, EconomyState};
+use zeph_token::{apply_token, TokenState};
 
-/// A transfer: DEBIT the sender (this account) by `amount`, in favour of `to` (who later CLAIMs it).
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct TransferOp {
-    pub to: [u8; 32],
-    pub amount: u64,
-    /// Opaque application memo (e.g. an invoice id); not interpreted by the ledger.
-    pub memo: [u8; 32],
-}
+// Re-export the shared vocabulary + context so existing `zeph_ledger::{LedgerOp, ...}` call sites
+// (noded LedgerService, apps/ledger-wasm, CLI) keep working unchanged.
+pub use zeph_token::{ClaimOp, LedgerInput, LedgerOp, Resolved, ResolvedDebit, TransferOp};
 
-/// A claim: CREDIT the recipient (this account) with the transfer the sender debited at
-/// `(debit_account, debit_nonce)`. Validated against the node-resolved debit (`to == me`, amount) +
-/// single-use dedup.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct ClaimOp {
-    pub debit_account: [u8; 32],
-    pub debit_nonce: u64,
-}
-
-/// One ledger write on an account's sequence.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub enum LedgerOp {
-    Transfer(TransferOp),
-    Claim(ClaimOp),
-    /// PAY `amount` of egress cost into the epoch pool — a self-authored debit (§10.1 pay-into-pool):
-    /// the amount funds the reward pool the node sums at epoch close. No escrow lock, no cross-account
-    /// draw; the provider's `RewardClaim` is the matching self-authored credit.
-    Pay(u64),
-    /// A PROVIDER claims its reward share for `epoch` from the verified epoch reward RECORD (§10.1) —
-    /// single-use per epoch; the node resolves the share from the record.
-    RewardClaim(u64),
-}
-
-/// An account's ledger state — the fold of its own sequence.
+/// An account's ledger state — the COMBINED fold (token value slice + economy policy slice), kept in a
+/// FLAT layout byte-identical to the pre-split monolith so committed state is unchanged.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct LedgerBalanceState {
     pub balance: u64,
-    /// `(debit_account, debit_nonce)` already claimed — single-use, self-contained (§4b): a duplicate
-    /// claim is caught the same way a duplicate nonce is, with no global spent-set.
+    /// `(debit_account, debit_nonce)` already claimed (token slice — single-use claim dedup).
     pub processed_claims: BTreeSet<([u8; 32], u64)>,
-    /// Reward epochs already claimed — a `RewardClaim` is single-use per epoch.
+    /// Reward epochs already claimed (economy slice — single-use-per-epoch reward dedup).
     pub claimed_epochs: BTreeSet<u64>,
 }
 
@@ -78,42 +45,23 @@ impl LedgerBalanceState {
             postcard::from_bytes(prev).ok()
         }
     }
-}
 
-/// The resolved debit a claim references: the node supplies the sender's ORDERED `TransferOp`
-/// (validated as a committed entry of `debit_account`'s sequence) so this pure transition can check
-/// `to == me` + the amount.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct ResolvedDebit {
-    pub transfer: TransferOp,
-}
-
-/// The node-supplied context a transition needs beyond its own state: the resolved debit (for a
-/// `Claim`) and the resolved reward share (for a `RewardClaim`, from the verified epoch reward
-/// record). Both are node-resolved and re-checked by re-execution; a missing one for the op that
-/// needs it rejects the write.
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
-pub struct Resolved {
-    #[serde(default)]
-    pub debit: Option<ResolvedDebit>,
-    #[serde(default)]
-    pub reward_share: Option<u64>,
-}
-
-/// The full input the node hands the ledger program for one write: the account being advanced (its
-/// identity is authenticated by the sequencer's `owner_authentic` gate — the owner signed for it — so
-/// the program trusts it), the op (the write's payload), and the resolved context it needs.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct LedgerInput {
-    pub account: [u8; 32],
-    pub op: LedgerOp,
-    #[serde(default)]
-    pub resolved: Resolved,
+    fn split(&self) -> (TokenState, EconomyState) {
+        (
+            TokenState {
+                balance: self.balance,
+                processed_claims: self.processed_claims.clone(),
+            },
+            EconomyState {
+                claimed_epochs: self.claimed_epochs.clone(),
+            },
+        )
+    }
 }
 
 /// Convenience: decode the prior state + a [`LedgerInput`], apply, and return the new state blob to
-/// commit (`None` = reject → commit nothing). This is the whole program body — the `apps/ledger-wasm`
-/// wrapper and the native node both call it, so their results are identical by construction.
+/// commit (`None` = reject → commit nothing). The whole program body — the wasm wrapper and native node
+/// both call it, so their results are identical by construction.
 pub fn run_transition(prev_state: &[u8], input: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     let state = LedgerBalanceState::decode(prev_state)?;
     let inp: LedgerInput = postcard::from_bytes(input).ok()?;
@@ -121,63 +69,24 @@ pub fn run_transition(prev_state: &[u8], input: &[u8]) -> Option<alloc::vec::Vec
     postcard::to_allocvec(&next).ok()
 }
 
-/// Apply one ledger op to `caller`'s state — pure + deterministic, so every node and every verifier
-/// re-run computes the identical next state. Returns `None` on ANY rejection (commits nothing).
-///
-/// - **Transfer**: debit `caller` by `amount` iff the balance suffices (`amount > 0`).
-/// - **Claim**: credit `caller` by the resolved debit iff `debit.transfer.to == caller` and the
-///   `(debit_account, debit_nonce)` was not already claimed.
-/// - **Pay**: debit `amount` of `caller`'s balance into the epoch pool (iff sufficient, `amount > 0`);
-///   the node sums `Pay` writes into the pool at epoch close.
-/// - **RewardClaim**: credit `caller` by its resolved epoch share iff that epoch was not already
-///   claimed and the share is non-zero.
+/// Apply one ledger op by CO-FOLDING the two slices — pure + deterministic, byte-identical to the
+/// pre-split fold. Economy's policy effect first (so a `RewardClaim` dedup rejects the whole write
+/// before token credits), then token's value effect. Returns `None` on ANY rejection (nothing commits,
+/// so a partial economy mark is discarded).
 pub fn apply(
-    mut state: LedgerBalanceState,
+    state: LedgerBalanceState,
     op: &LedgerOp,
     caller: &[u8; 32],
     resolved: &Resolved,
 ) -> Option<LedgerBalanceState> {
-    match op {
-        LedgerOp::Transfer(t) => {
-            if t.amount == 0 {
-                return None; // a zero transfer is a no-op; reject rather than churn a nonce
-            }
-            state.balance = state.balance.checked_sub(t.amount)?; // insufficient funds → reject
-            Some(state)
-        }
-        LedgerOp::Claim(c) => {
-            let d = resolved.debit.as_ref()?; // the node must resolve + validate the ordered debit
-            if &d.transfer.to != caller {
-                return None; // the debit does not credit me
-            }
-            let key = (c.debit_account, c.debit_nonce);
-            if !state.processed_claims.insert(key) {
-                return None; // already claimed (single-use)
-            }
-            state.balance = state.balance.checked_add(d.transfer.amount)?;
-            Some(state)
-        }
-        LedgerOp::Pay(amount) => {
-            if *amount == 0 {
-                return None;
-            }
-            // Pay into the epoch pool: a self-authored debit (the pool total is summed by the node
-            // from Pay writes; §10.1). No escrow, no cross-account draw.
-            state.balance = state.balance.checked_sub(*amount)?; // insufficient balance → reject
-            Some(state)
-        }
-        LedgerOp::RewardClaim(epoch) => {
-            let share = resolved.reward_share?; // node-resolved from the verified epoch record
-            if share == 0 {
-                return None; // nothing to claim
-            }
-            if !state.claimed_epochs.insert(*epoch) {
-                return None; // this epoch's reward already claimed (single-use)
-            }
-            state.balance = state.balance.checked_add(share)?;
-            Some(state)
-        }
-    }
+    let (token, economy) = state.split();
+    let economy = apply_economy(economy, op)?; // policy (dedup) — rejects before any credit
+    let token = apply_token(token, op, caller, resolved)?; // value effect
+    Some(LedgerBalanceState {
+        balance: token.balance,
+        processed_claims: token.processed_claims,
+        claimed_epochs: economy.claimed_epochs,
+    })
 }
 
 #[cfg(test)]
@@ -188,7 +97,6 @@ mod tests {
     fn acct(n: u8) -> [u8; 32] {
         [n; 32]
     }
-
     fn transfer(to: [u8; 32], amount: u64) -> LedgerOp {
         LedgerOp::Transfer(TransferOp {
             to,
@@ -197,151 +105,61 @@ mod tests {
         })
     }
 
-    /// A resolved context carrying just a debit (for `Claim` tests).
-    fn dctx(d: &ResolvedDebit) -> Resolved {
-        Resolved {
-            debit: Some(d.clone()),
-            reward_share: None,
-        }
-    }
-
     #[test]
-    fn transfer_debits_and_rejects_overdraft_and_zero() {
-        let alice = acct(1);
-        let bob = acct(2);
+    fn combined_fold_matches_the_pre_split_behaviour() {
+        let (alice, bob) = (acct(1), acct(2));
         let st = LedgerBalanceState {
             balance: 100,
             ..Default::default()
         };
-        // Debit 30 → 70.
+        // Transfer debits.
         let st = apply(st, &transfer(bob, 30), &alice, &Resolved::default()).unwrap();
         assert_eq!(st.balance, 70);
-        // Overdraft rejected (state unchanged — caller keeps the prior).
-        assert!(apply(st.clone(), &transfer(bob, 71), &alice, &Resolved::default()).is_none());
-        // Zero rejected.
-        assert!(apply(st, &transfer(bob, 0), &alice, &Resolved::default()).is_none());
-    }
-
-    #[test]
-    fn claim_credits_once_and_rejects_wrong_recipient_missing_and_replay() {
-        let alice = acct(1);
-        let bob = acct(2);
-        let carol = acct(3);
-        // Alice debited a 40-transfer to Bob at her nonce 7 (resolved by the node).
-        let debit = ResolvedDebit {
-            transfer: TransferOp {
-                to: bob,
-                amount: 40,
-                memo: [0u8; 32],
-            },
-        };
-        let claim = LedgerOp::Claim(ClaimOp {
-            debit_account: alice,
-            debit_nonce: 7,
-        });
-
-        // Missing/unresolved debit → reject.
-        assert!(apply(
-            LedgerBalanceState::default(),
-            &claim,
-            &bob,
-            &Resolved::default()
-        )
-        .is_none());
-        // Wrong recipient (Carol claims Bob's credit) → reject.
-        assert!(apply(LedgerBalanceState::default(), &claim, &carol, &dctx(&debit)).is_none());
-
-        // Bob claims → +40.
-        let bob_st = apply(LedgerBalanceState::default(), &claim, &bob, &dctx(&debit)).unwrap();
-        assert_eq!(bob_st.balance, 40);
-        assert!(bob_st.processed_claims.contains(&(alice, 7)));
-        // Replay of the same debit → reject (single-use), balance unchanged.
-        assert!(apply(bob_st, &claim, &bob, &dctx(&debit)).is_none());
-    }
-
-    #[test]
-    fn transfer_then_claim_conserves_supply() {
-        let alice = acct(1);
-        let bob = acct(2);
-        let alice_st = LedgerBalanceState {
-            balance: 100,
-            ..Default::default()
-        };
-        // Alice debits 25 to Bob at nonce 0.
-        let alice_st = apply(alice_st, &transfer(bob, 25), &alice, &Resolved::default()).unwrap();
-        let debit = ResolvedDebit {
-            transfer: TransferOp {
-                to: bob,
-                amount: 25,
-                memo: [0u8; 32],
-            },
-        };
-        let bob_st = apply(
-            LedgerBalanceState::default(),
-            &LedgerOp::Claim(ClaimOp {
-                debit_account: alice,
-                debit_nonce: 0,
-            }),
-            &bob,
-            &dctx(&debit),
-        )
-        .unwrap();
-        // Conservation: Alice 75 + Bob 25 = 100.
-        assert_eq!(alice_st.balance + bob_st.balance, 100);
-        assert_eq!(alice_st.balance, 75);
-        assert_eq!(bob_st.balance, 25);
-    }
-
-    #[test]
-    fn pay_debits_balance_and_reward_claim_credits_once() {
-        let p = acct(5);
-        let st = LedgerBalanceState {
-            balance: 100,
-            ..Default::default()
-        };
-        // Pay 40 into the pool → balance 60 (the amount funds the pool, summed by the node).
-        let st = apply(st, &LedgerOp::Pay(40), &p, &Resolved::default()).unwrap();
-        assert_eq!(st.balance, 60);
-        // Over-pay (more than the balance) and zero are rejected.
-        assert!(apply(st.clone(), &LedgerOp::Pay(61), &p, &Resolved::default()).is_none());
-        assert!(apply(st.clone(), &LedgerOp::Pay(0), &p, &Resolved::default()).is_none());
-
-        // RewardClaim epoch 7 with a node-resolved share of 15 → +15, epoch marked.
+        // Pay debits.
+        let st = apply(st, &LedgerOp::Pay(20), &alice, &Resolved::default()).unwrap();
+        assert_eq!(st.balance, 50);
+        // RewardClaim: economy dedups + token credits the resolved share.
         let rctx = Resolved {
             debit: None,
             reward_share: Some(15),
         };
-        let st = apply(st, &LedgerOp::RewardClaim(7), &p, &rctx).unwrap();
-        assert_eq!(st.balance, 75);
+        let st = apply(st, &LedgerOp::RewardClaim(7), &alice, &rctx).unwrap();
+        assert_eq!(st.balance, 65);
         assert!(st.claimed_epochs.contains(&7));
-        // Replaying the same epoch is rejected (single-use).
-        assert!(apply(st.clone(), &LedgerOp::RewardClaim(7), &p, &rctx).is_none());
-        // A missing or zero resolved share is rejected (nothing to claim).
+        // Replay of the epoch is rejected by the economy slice → whole write rejected, no double credit.
+        assert!(apply(st.clone(), &LedgerOp::RewardClaim(7), &alice, &rctx).is_none());
+    }
+
+    #[test]
+    fn a_rejected_write_discards_partial_state() {
+        // RewardClaim with a fresh epoch but NO resolved share: economy would mark the epoch, but token
+        // rejects (no share) → the combiner returns None, so the epoch mark is discarded (not committed).
+        let p = acct(5);
+        let st = LedgerBalanceState {
+            balance: 10,
+            ..Default::default()
+        };
         assert!(apply(
             st.clone(),
-            &LedgerOp::RewardClaim(8),
+            &LedgerOp::RewardClaim(9),
             &p,
             &Resolved::default()
         )
         .is_none());
-        let zero = Resolved {
-            debit: None,
-            reward_share: Some(0),
-        };
-        assert!(apply(st, &LedgerOp::RewardClaim(8), &p, &zero).is_none());
+        // The epoch was NOT marked (state unchanged, since the write was rejected wholesale).
+        assert!(!st.claimed_epochs.contains(&9));
     }
 
     #[test]
-    fn state_roundtrips_through_postcard() {
+    fn state_roundtrips_and_layout_is_flat() {
         let mut st = LedgerBalanceState {
             balance: 4242,
             ..Default::default()
         };
         st.processed_claims.insert((acct(9), 3));
+        st.claimed_epochs.insert(7);
         let bytes = postcard::to_allocvec(&st).unwrap();
-        let back = LedgerBalanceState::decode(&bytes).unwrap();
-        assert_eq!(st, back);
-        // Empty prior → fresh zero account.
+        assert_eq!(LedgerBalanceState::decode(&bytes).unwrap(), st);
         assert_eq!(
             LedgerBalanceState::decode(&[]).unwrap(),
             LedgerBalanceState::default()
@@ -350,9 +168,7 @@ mod tests {
 
     #[test]
     fn run_transition_is_the_whole_program_body() {
-        // The exact path `apps/ledger-wasm` runs: decode prev + LedgerInput → apply → encode.
-        let alice = acct(1);
-        let bob = acct(2);
+        let (alice, bob) = (acct(1), acct(2));
         let prev = postcard::to_allocvec(&LedgerBalanceState {
             balance: 50,
             ..Default::default()
@@ -367,7 +183,6 @@ mod tests {
         let out = run_transition(&prev, &input).expect("valid transfer commits");
         let next: LedgerBalanceState = postcard::from_bytes(&out).unwrap();
         assert_eq!(next.balance, 30);
-        // An overdraft input rejects → no commit.
         let bad = postcard::to_allocvec(&LedgerInput {
             account: alice,
             op: transfer(bob, 999),
