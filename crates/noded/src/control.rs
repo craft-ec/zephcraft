@@ -295,9 +295,19 @@ impl State {
                     });
                 }
             }
+            // ONE token fold serves both the balance and the claimed-set that `owed_from_records` needs
+            // (token owns the dedup; economy owns the valuation — the dashboard is the only place that
+            // legitimately holds both handles, so it joins them here rather than coupling the services).
+            let token_state = self.ledger.balance(me).await;
+            let now_epoch = self.settlement.epoch();
             Economy {
-                balance: self.ledger.balance(me).await.balance,
-                reward_owed: self.economy.reward_owed(me).await,
+                balance: token_state.balance,
+                // From the CANONICAL records, not local settle state: since settling is committee-gated,
+                // most nodes have no local record and would otherwise report 0 of their own money.
+                reward_owed: self
+                    .economy
+                    .owed_from_records(me, &token_state.claimed_epochs, now_epoch)
+                    .await,
                 reward_settled: self.economy.rewardable_served(me).await,
                 pool: self.economy.pool_unallocated().await,
                 subscription_bytes: self.economy.entitlement(me, self.settlement.epoch()).await,
@@ -1569,7 +1579,7 @@ async fn rpc_config(state: &State, id: serde_json::Value) -> serde_json::Value {
 /// the computed k-of-n quorum that orders its writes this epoch.
 async fn rpc_committee(state: &State, id: serde_json::Value) -> serde_json::Value {
     let program = crate::ledger::token_program_cid();
-    let epoch = state.clock.now().millis() / 30_000; // EPOCH_MILLIS
+    let epoch = crate::epoch::epoch_at(state.clock.now().millis());
     let quorum = state
         .epoch_committee
         .committee_for_epoch(&program, epoch)

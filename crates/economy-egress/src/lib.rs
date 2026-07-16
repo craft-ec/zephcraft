@@ -25,8 +25,8 @@ pub mod subscription;
 // The valuation vocabulary + math, re-exported so `zeph_economy_egress::{RewardRecord, compute, …}` is
 // the single import for the economy program's callers (node settlement, the wasm wrapper, tests).
 pub use subscription::{
-    Grant, SubscriptionLedger, BYTES_PER_TOKEN_CONFIG_KEY, DEFAULT_BYTES_PER_TOKEN,
-    DEFAULT_WINDOW_EPOCHS, WINDOW_EPOCHS_CONFIG_KEY,
+    Grant, SubscriptionLedger, BYTES_PER_TOKEN_CONFIG_KEY, DEFAULT_BYTES_PER_TOKEN, DEFAULT_WINDOW,
+    WINDOW_SECS_CONFIG_KEY,
 };
 pub use zeph_reward::{compute, Contribution, RewardInput, RewardRecord, Share};
 

@@ -21,8 +21,9 @@ use zeph_membership::Membership;
 
 use crate::quorum_source::QuorumSource;
 
-/// Committee epoch length (ms) — matches `headreg`'s writer-election epoch so the two rotate in step.
-const EPOCH_MILLIS: u64 = 30_000;
+// Committee epoch length comes from THE shared definition (`crate::epoch`) — it must rotate in step
+// with `headreg`'s writer election and the settlement close, which is why it is no longer re-declared.
+use crate::epoch::EPOCH_MILLIS;
 /// Default committee size / threshold (§10.4; a governed config value later). `2k>n` holds (6 > 4).
 const N_DEFAULT: usize = 4;
 const K_DEFAULT: usize = 3;

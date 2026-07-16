@@ -41,6 +41,7 @@ mod board;
 mod cheque;
 mod control;
 mod economy_egress;
+mod epoch;
 mod epoch_committee;
 mod genesis;
 mod governance;
@@ -2159,11 +2160,12 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                     }
                 }
                 if let Some(v) = gov
-                    .resolve_config(zeph_economy_egress::WINDOW_EPOCHS_CONFIG_KEY)
+                    .resolve_config(zeph_economy_egress::WINDOW_SECS_CONFIG_KEY)
                     .await
                 {
                     if v > 0 {
-                        eco.set_window_epochs(v as u64).await;
+                        eco.set_window(std::time::Duration::from_secs(v as u64))
+                            .await;
                     }
                 }
                 // Paid-tier terms: this node's pool payment (admission) + each peer's (serve), read from

@@ -81,8 +81,9 @@ fn textlit(s: &str) -> String {
 const MAX_FRAME: usize = 256 * 1024;
 
 /// Length of a registry writer-election epoch, in milliseconds. Short cycle (fast rotation),
-/// tunable. `epoch = clock.now().millis() / EPOCH_MILLIS`.
-const EPOCH_MILLIS: u64 = 30_000;
+/// tunable. `epoch = clock.now().millis() / EPOCH_MILLIS` — from THE shared definition
+/// (`crate::epoch`), so the writer election rotates in step with the committee + settlement close.
+use crate::epoch::EPOCH_MILLIS;
 
 /// Default shard-count exponent: the keyspace starts as `2^DEFAULT_SHARD_BITS` shards. Applied
 /// when the governed `shard_bits` config value is unset (or before governance is wired), so a

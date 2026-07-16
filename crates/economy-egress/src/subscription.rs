@@ -18,6 +18,8 @@
 //! same order, so every node's ledger — and therefore the reward record — is bit-identical. FIFO
 //! (oldest grant first) is what makes "use it before it expires" both natural and deterministic.
 
+use core::time::Duration;
+
 use alloc::collections::{BTreeMap, VecDeque};
 
 /// DEFAULT egress price: bytes of rewardable serving that ONE token buys. Governed (see
@@ -27,12 +29,17 @@ pub const DEFAULT_BYTES_PER_TOKEN: u64 = 1 << 20; // 1 MiB per token
 /// Governed config key for the egress price (`SetConfig` → every node reads the identical value).
 pub const BYTES_PER_TOKEN_CONFIG_KEY: &str = "economy:bytes_per_token";
 
-/// DEFAULT subscription window in EPOCHS ≈ 30 days at a 30s epoch (30×24×3600÷30). Governed via
-/// [`WINDOW_EPOCHS_CONFIG_KEY`].
-pub const DEFAULT_WINDOW_EPOCHS: u64 = 86_400;
+/// DEFAULT subscription window, as a DURATION — 30 days.
+///
+/// Deliberately NOT an epoch count. A window is a promise to the payer ("30 days of egress"), so it must
+/// survive a change to the epoch period: this was originally `DEFAULT_WINDOW_EPOCHS = 86_400`, derived as
+/// 30 days *at a 30s epoch*, which would have silently become 300 days the moment the epoch was retuned
+/// to 5 minutes. The node converts to epochs via `epoch::epochs_in` at its own layer, where the period is
+/// known. Governed via [`WINDOW_SECS_CONFIG_KEY`] — also in TIME, for the same reason.
+pub const DEFAULT_WINDOW: Duration = Duration::from_secs(30 * 24 * 3600);
 
-/// Governed config key for the subscription window (in epochs).
-pub const WINDOW_EPOCHS_CONFIG_KEY: &str = "economy:subscription_window_epochs";
+/// Governed config key for the subscription window, in SECONDS (a duration, not an epoch count).
+pub const WINDOW_SECS_CONFIG_KEY: &str = "economy:subscription_window_secs";
 
 /// One purchased entitlement: `remaining` egress bytes, unusable once `expires_at` is reached.
 #[derive(Clone, Debug, PartialEq, Eq)]

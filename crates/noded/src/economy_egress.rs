@@ -12,6 +12,7 @@
 //! [`settle_from_board`](Self::settle_from_board), and governance tunes the egress price + subscription
 //! window. First of the `economy-*` family (economy-storage, … reuse the same token program).
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use zeph_reward::{Contribution, RewardRecord};
@@ -54,12 +55,11 @@ impl EconomyEgressService {
             .set_bytes_per_token(bytes_per_token);
     }
 
-    /// Apply the GOVERNED subscription window in epochs (`economy:subscription_window_epochs`, ≈30 days).
-    pub async fn set_window_epochs(&self, window_epochs: u64) {
-        self.settlement
-            .write()
-            .await
-            .set_window_epochs(window_epochs);
+    /// Apply the GOVERNED subscription window as a DURATION (`economy:subscription_window_secs`, default
+    /// 30 days). Time, not an epoch count, so retuning the epoch period cannot rescale the promise made
+    /// to payers.
+    pub async fn set_window(&self, window: std::time::Duration) {
+        self.settlement.write().await.set_window(window);
     }
 
     /// `consumer`'s remaining unexpired egress entitlement at `epoch` — the dashboard's "subscription
@@ -87,10 +87,31 @@ impl EconomyEgressService {
         self.settlement.write().await.claim(epoch, node);
     }
 
-    /// Total reward `account` is owed but hasn't yet claimed, across all in-window settlement records —
-    /// the dashboard "reward earned by serving, awaiting claim" figure (the claimed part is in `balance`).
-    pub async fn reward_owed(&self, account: [u8; 32]) -> u64 {
-        self.settlement.read().await.owed_to(&account)
+    /// What `account` is owed across in-window epochs, read from the CANONICAL committee-attested records
+    /// instead of local settle state — so a node that does NOT settle (the common case once settling is
+    /// committee-gated) still sees its own money instead of a misleading 0.
+    ///
+    /// `claimed` is the account's own on-chain dedup set: TOKEN is the authority on what it has already
+    /// taken, and economy must not call token (the one-directional boundary), so the caller — which holds
+    /// both handles — passes it in. Cost is bounded: the records chains are keyed per COMMITTEE MEMBER,
+    /// not per epoch, so the whole window costs a handful of (debounced) syncs plus local reads.
+    pub async fn owed_from_records(
+        &self,
+        account: [u8; 32],
+        claimed: &BTreeSet<u64>,
+        now_epoch: u64,
+    ) -> u64 {
+        let Some(records) = self.record_chain.read().await.clone() else {
+            return 0;
+        };
+        let start = now_epoch.saturating_sub(crate::settlement::CLAIM_WINDOW_EPOCHS);
+        let mut window = Vec::new();
+        for e in start..=now_epoch {
+            if let Some(rec) = records.canonical_record(e).await {
+                window.push(rec);
+            }
+        }
+        sum_unclaimed_shares(&account, &window, claimed)
     }
 
     /// Cross-node epoch close (§10.1, node-orchestrated by the settlement loop). `paid` = each node's
@@ -139,6 +160,66 @@ impl EconomyEgressService {
     /// compares it against the canonical committee-attested record.
     pub async fn local_record(&self, epoch: u64) -> Option<RewardRecord> {
         self.settlement.read().await.record(epoch)
+    }
+}
+
+/// The pure core of [`EconomyEgressService::owed_from_records`]: sum `account`'s shares across `window`,
+/// skipping epochs it has already claimed (token's `claimed_epochs` is the authority on what was taken —
+/// a claimed share is in `balance`, not owed). Split out so the sum/dedup logic stays unit-testable
+/// without standing up a RecordChain.
+fn sum_unclaimed_shares(
+    account: &[u8; 32],
+    window: &[RewardRecord],
+    claimed: &BTreeSet<u64>,
+) -> u64 {
+    window
+        .iter()
+        .filter(|r| !claimed.contains(&r.epoch))
+        .map(|r| r.share_of(account))
+        .fold(0u64, |a, b| a.saturating_add(b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeph_reward::Share;
+
+    fn prov(n: u8) -> [u8; 32] {
+        [n; 32]
+    }
+    fn rec(epoch: u64, shares: &[([u8; 32], u64)]) -> RewardRecord {
+        RewardRecord {
+            epoch,
+            shares: shares
+                .iter()
+                .map(|(provider, amount)| Share {
+                    provider: *provider,
+                    amount: *amount,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn owed_sums_unclaimed_shares_across_records() {
+        // Moved from SettlementStore::owed_to, which the canonical-records path replaced: the dashboard
+        // must show a node its own money even when it never settles (settling is committee-gated).
+        let window = vec![
+            rec(1, &[(prov(1), 60), (prov(2), 40)]),
+            rec(2, &[(prov(1), 50)]),
+        ];
+        let none = BTreeSet::new();
+        assert_eq!(sum_unclaimed_shares(&prov(1), &window, &none), 110);
+        assert_eq!(sum_unclaimed_shares(&prov(2), &window, &none), 40);
+        // Claiming an epoch drops it out of `owed` — it is in `balance` now, so counting it twice would
+        // overstate what the node can still take.
+        let claimed_1: BTreeSet<u64> = [1u64].into_iter().collect();
+        assert_eq!(sum_unclaimed_shares(&prov(1), &window, &claimed_1), 50);
+        // A provider absent from every record is owed nothing.
+        assert_eq!(sum_unclaimed_shares(&prov(9), &window, &none), 0);
+        // All claimed → nothing owed.
+        let both: BTreeSet<u64> = [1u64, 2].into_iter().collect();
+        assert_eq!(sum_unclaimed_shares(&prov(1), &window, &both), 0);
     }
 }
 

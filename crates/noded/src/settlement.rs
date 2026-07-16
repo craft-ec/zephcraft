@@ -23,7 +23,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use zeph_economy_egress::subscription::{
-    SubscriptionLedger, DEFAULT_BYTES_PER_TOKEN, DEFAULT_WINDOW_EPOCHS,
+    SubscriptionLedger, DEFAULT_BYTES_PER_TOKEN, DEFAULT_WINDOW,
 };
 use zeph_reward::{compute, Contribution, RewardInput, RewardRecord};
 
@@ -55,7 +55,9 @@ pub struct SettlementStore {
     subs: SubscriptionLedger,
     /// GOVERNED egress price: bytes of rewardable serving one token buys (`economy:bytes_per_token`).
     bytes_per_token: u64,
-    /// GOVERNED subscription window in epochs (`economy:subscription_window_epochs`, ≈30 days).
+    /// Subscription window in EPOCHS, DERIVED from a duration (governed `economy:subscription_window_secs`,
+    /// default 30 days) via `epoch::epochs_in` — so retuning the epoch period re-derives the window rather
+    /// than silently rescaling it.
     window_epochs: u64,
     /// Per-provider CUMULATIVE rewardable served (Σ allocated to it across consumers) — the observable
     /// "settled" numerator of the dashboard settled/served meter.
@@ -72,7 +74,7 @@ impl Default for SettlementStore {
             served_pair_wm: BTreeMap::new(),
             subs: SubscriptionLedger::new(),
             bytes_per_token: DEFAULT_BYTES_PER_TOKEN,
-            window_epochs: DEFAULT_WINDOW_EPOCHS,
+            window_epochs: crate::epoch::epochs_in(DEFAULT_WINDOW),
             rewardable: BTreeMap::new(),
         }
     }
@@ -89,9 +91,10 @@ impl SettlementStore {
         self.bytes_per_token = bytes_per_token;
     }
 
-    /// Apply the GOVERNED subscription window (epochs). Future purchases only, same reasoning.
-    pub fn set_window_epochs(&mut self, window_epochs: u64) {
-        self.window_epochs = window_epochs;
+    /// Apply the GOVERNED subscription window, given as a DURATION and converted to epochs here (the
+    /// layer that knows the period). Future purchases only, same reasoning as the price.
+    pub fn set_window(&mut self, window: std::time::Duration) {
+        self.window_epochs = crate::epoch::epochs_in(window);
     }
 
     /// `consumer`'s remaining unexpired egress entitlement at `epoch` — the dashboard's
@@ -231,16 +234,6 @@ impl SettlementStore {
         self.records.get(&epoch).cloned()
     }
 
-    /// Total unclaimed reward this `provider` is owed across ALL in-window records (Σ `share_of`) — the
-    /// dashboard "reward earned but not yet claimed" figure. Claimed shares already read 0, so they're
-    /// excluded automatically.
-    pub fn owed_to(&self, provider: &[u8; 32]) -> u64 {
-        self.records
-            .keys()
-            .map(|e| self.share_of(*e, provider))
-            .sum()
-    }
-
     /// The unclaimed share owed to `provider` for `epoch` (0 if absent, already claimed, or expired) —
     /// what a `RewardClaim` resolves + credits.
     pub fn share_of(&self, epoch: u64, provider: &[u8; 32]) -> u64 {
@@ -358,21 +351,6 @@ mod tests {
         let again = s.settle_epoch_with_pool(1, 100, vec![contrib(1, 60), contrib(2, 40)]);
         assert_eq!(again.share_of(&prov(1)), 60);
         assert_eq!(s.unallocated(), 0, "no double pay-in on re-settle");
-    }
-
-    #[test]
-    fn owed_to_sums_unclaimed_shares_across_records() {
-        let mut s = SettlementStore::new();
-        s.pay_in(100);
-        s.settle_epoch(1, vec![contrib(1, 60), contrib(2, 40)]); // 1→60, 2→40
-        s.pay_in(50);
-        s.settle_epoch(2, vec![contrib(1, 1)]); // 1→50
-                                                // Provider 1 is owed 60 (epoch 1) + 50 (epoch 2) across records; provider 2 owed 40.
-        assert_eq!(s.owed_to(&prov(1)), 110);
-        assert_eq!(s.owed_to(&prov(2)), 40);
-        // Claiming epoch 1 drops it out of `owed`.
-        s.claim(1, prov(1));
-        assert_eq!(s.owed_to(&prov(1)), 50);
     }
 
     #[test]
@@ -495,7 +473,9 @@ mod tests {
         // pool-average, so an unspent subscription is LOST at the window edge, not refunded.
         let mut s = SettlementStore::new();
         s.set_bytes_per_token(10);
-        s.set_window_epochs(5);
+        s.set_window(std::time::Duration::from_millis(
+            crate::epoch::EPOCH_MILLIS * 5,
+        )); // 5 epochs
         let c = prov(9);
         s.settle_epoch_from_cheques(1, vec![(c, 0)], vec![]); // first sight
         s.settle_epoch_from_cheques(2, vec![(c, 10)], vec![]); // buys 100 B at epoch 2, expires at 7
