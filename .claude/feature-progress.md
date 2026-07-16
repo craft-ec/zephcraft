@@ -249,6 +249,20 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       `ledger-verification`→{verified:0, mismatched:0} (0 verified expected — no economic traffic yet; mismatched:0 = no
       divergence); full 5-node fleet peers=4, 0 restarts, 0 panics. **STEP 4 (token ledger) COMPLETE + LIVE ON THE FLEET.**
       Organic economic traffic (pay/serve → records → verified>0) is now usage, not deploy.
+- [x] **4d-21 — DASHBOARD CAUGHT UP TO THE NEW FEATURES + DEPLOYED (2026-07-16).** The web UI was blind to everything
+      this session added. Two new tabs, fed by new snapshot blocks + `/api` routes:
+      **economy** (`Economy` in the status snapshot) — token-ledger balance + settlement pool, the settlement re-execution
+      verification tally (verified/mismatched), reciprocity standing (served/consumed/fetch-headroom/paid/pinned + the
+      governed fetch/peer/storage grants via new `ChequeService::reciprocity_snapshot`), and the pinned canonical anchors;
+      plus a one-line economy summary on the overview.
+      **consensus** — the quorum family: governance quorum (governor set), the rotating COMPUTED epoch committee (automated
+      attestation, new `/api/committee` via `EpochCommitteeSource::committee_for_epoch` + `State.epoch_committee`),
+      user-declared attestation quorums (new `/api/attest_list` via `AttestStore::list`), and governed config (new
+      `/api/config` via `GovernanceChainStore::list_config`). All local-logic (dashboard + control snapshot, no p2p wire).
+      Rolled to the whole 5-node fleet (rsync crates/+webui/ → release build → staggered restart, all active/0-restarts/
+      4-peers/0-panics; Mac node rebuilt + restarted). **Verified LIVE on the fleet dashboard:** both tabs served, the
+      consensus tab shows the real **3-of-4 epoch committee**, economy shows the 2 pinned anchors. Commits 1c25776 (economy),
+      fb9ac86 (overview line), 499d704 (consensus). **The UI is now on par with the deployed features.**
       **Remaining follow-ons:** dedicated storage-provided measure + persist `pinned`; reciprocity policy as a full governed
       PROGRAM (only if the formula must be swappable); 4e-2 committee snapshots. (Verify-board→durable deferred by user.)
 Open gaps needing a call at their phase: (1) anchor-authority routing RESOLVED (= committee), (2) escrow reclaim lifecycle [4d],
