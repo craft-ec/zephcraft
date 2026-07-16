@@ -1633,13 +1633,20 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let (cheque_service, cheque_push_rx) =
         cheque::ChequeService::new(identity.clone(), transport.clock(), transport.clone());
     engine.set_byte_meter(cheque_service.clone());
-    // Free-tier ENFORCEMENT (§8): gate a network fetch on this node's reciprocity headroom — it fetches
-    // freely while `consumed ≤ earned + cold-start grant`, then must contribute (serve others) or pay.
-    // Native MVP policy in the cheque service; a governed program can supersede it later.
+    // Free-tier ENFORCEMENT (§8): gate a network FETCH on this node's reciprocity headroom — it fetches
+    // freely while `consumed ≤ earned + grant`, then must contribute (serve others) or pay. And gate the
+    // SERVE side per-peer (the AUTHENTICATED requester) — refuse a freeloader we've served far more than
+    // it served back. Governed grants (below); native mechanism.
     {
         let cs = cheque_service.clone();
         engine.set_admission_gate(std::sync::Arc::new(move |bytes| {
             cs.reciprocity_admits(bytes)
+        }));
+    }
+    {
+        let cs = cheque_service.clone();
+        engine.set_serve_gate(std::sync::Arc::new(move |peer, bytes| {
+            cs.should_serve(peer, bytes)
         }));
     }
 
@@ -1960,6 +1967,28 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // Run the epoch-close loop: author this node's settlement report + settle past-grace epochs by
     // reading the durable, committee-ordered settlement chains (no gossip handler needed).
     tokio::spawn(settlement_service.clone().run());
+    // Refresh the reciprocity grant from GOVERNED config (`reciprocity:grant`) into the sync-cached value
+    // the admission gate reads — so the free-tier policy is governance-tunable without a binary change.
+    {
+        let cs = cheque_service.clone();
+        let gov = governance_store.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                tick.tick().await;
+                if let Some(v) = gov.resolve_config(cheque::GRANT_CONFIG_KEY).await {
+                    if v >= 0 {
+                        cs.set_grant(v as u64);
+                    }
+                }
+                if let Some(v) = gov.resolve_config(cheque::PEER_GRANT_CONFIG_KEY).await {
+                    if v >= 0 {
+                        cs.set_peer_grant(v as u64);
+                    }
+                }
+            }
+        });
+    }
     // "Pending distribution" completion (per-incomplete-cid DHT resolve + deficit pushes)
     // — network fan-out, so it runs THROUGH the coordinator (Distribution priority,
     // deduped: a slow pass coalesces with the next tick instead of stacking). This loop

@@ -312,6 +312,8 @@ pub trait ByteMeter: Send + Sync {
 
 /// Elected-scan per-cid snapshot: (last_scan_ms, capable holder ids).
 type ScanSnapshot = (u64, Vec<NodeId>);
+/// Provider-side per-peer serve gate — `(requester, bytes) -> serve` (§8 reciprocity).
+type ServeGate = Arc<dyn Fn([u8; 32], u64) -> bool + Send + Sync>;
 
 /// Per-cid diagnostic snapshot from the last health scan (for the dashboard). The verdict is
 /// derived separately from the at-risk / fading sets; this carries the raw numbers.
@@ -401,6 +403,12 @@ pub struct ObjEngine {
     /// owner-pays-pin; on rejection a pin DOWNGRADES to a non-pinned (consume-only) publish. Unwired,
     /// pin is allowed.
     pin_gate: std::sync::OnceLock<Arc<dyn Fn(u64) -> bool + Send + Sync>>,
+    /// Set by the node (§8): a PROVIDER-side per-peer SERVE gate — `Fn(requester, bytes) -> serve`. Wired
+    /// to the requester's reciprocity from THIS node's view (bytes it served the peer vs the peer served
+    /// it), so a freeloader is refused at the serve boundary — robust against a peer that disables its own
+    /// (consumer-side) admission gate, because the requester here is the AUTHENTICATED connection peer.
+    /// Unwired, every request is served.
+    serve_gate: std::sync::OnceLock<ServeGate>,
     /// Liveness source (set by the node = membership; a test source in tests). The health scan
     /// filters provider records by this so a DIED holder — whose record lingers until TTL — stops
     /// inflating a cid's effective count, and repair fires. None → no filtering (legacy).
@@ -458,6 +466,7 @@ impl ObjEngine {
             byte_meter: std::sync::OnceLock::new(),
             admission_gate: std::sync::OnceLock::new(),
             pin_gate: std::sync::OnceLock::new(),
+            serve_gate: std::sync::OnceLock::new(),
             liveness: Mutex::new(None),
             alive_cache: Mutex::new(None),
             node_liveness: Mutex::new(HashMap::new()),
@@ -2541,6 +2550,19 @@ impl ObjEngine {
         self.pin_gate.get().map(|g| g(bytes)).unwrap_or(true)
     }
 
+    /// Wire the per-peer SERVE gate (§8) — `Fn(requester, bytes) -> serve`. Set once.
+    pub fn set_serve_gate(&self, gate: ServeGate) {
+        let _ = self.serve_gate.set(gate);
+    }
+
+    /// Whether to serve `requester` ~`bytes` of pieces (permissive if unwired).
+    fn serve_allowed(&self, requester: [u8; 32], bytes: u64) -> bool {
+        self.serve_gate
+            .get()
+            .map(|g| g(requester, bytes))
+            .unwrap_or(true)
+    }
+
     /// Wire the graded admission gate for offer/grant (TRANSFER_PLANE_V2 §3):
     /// `(class, items) -> accept`. Typically closes over the node's
     /// `ResourceGauge` — critical → 0, high → 1 for the critical class else 0,
@@ -2892,7 +2914,9 @@ impl ObjEngine {
         // saturated the recv loop blocks, backpressuring the transport demux.
         let permits = Arc::new(tokio::sync::Semaphore::new(PIPELINE_STREAMS));
         while let Some(TaggedStream {
-            mut send, mut recv, ..
+            remote,
+            mut send,
+            mut recv,
         }) = streams.recv().await
         {
             let Ok(permit) = permits.clone().acquire_owned().await else {
@@ -2907,7 +2931,7 @@ impl ObjEngine {
                 let Ok(frame) = wire::decode(&bytes) else {
                     return;
                 };
-                let reply = engine.handle(frame.message).await;
+                let reply = engine.handle(remote.0, frame.message).await;
                 let _ = send
                     .write_all(&wire::encode(&reply, engine.transport.clock().now().0))
                     .await;
@@ -2916,7 +2940,7 @@ impl ObjEngine {
         }
     }
 
-    async fn handle(&self, msg: wire::Message) -> wire::Message {
+    async fn handle(&self, requester: [u8; 32], msg: wire::Message) -> wire::Message {
         match msg {
             wire::Message::PiecePush(push) => wire::Message::PiecePushAck(self.ingest(push).await),
             wire::Message::Offer(offer) => wire::Message::Grant(self.grant(&offer)),
@@ -2937,6 +2961,19 @@ impl ObjEngine {
                     .store
                     .serve_pieces(&cid, &exclude, req.max_pieces as usize)
                     .unwrap_or_default();
+                // PROVIDER-side reciprocity (§8): refuse to serve a freeloader. The requester is the
+                // AUTHENTICATED connection peer, so this can't be evaded by a peer disabling its own gate.
+                let serve_bytes: u64 = pieces.iter().map(|p| p.data.len() as u64).sum();
+                if !pieces.is_empty() && !self.serve_allowed(requester, serve_bytes) {
+                    return wire::Message::PieceResponse(wire::PieceResponse {
+                        found: false,
+                        k: 0,
+                        piece_len: 0,
+                        total_len: 0,
+                        vtags: Vec::new(),
+                        pieces: Vec::new(),
+                    });
+                }
                 // Record a real fetch: demand (drives Scaling) + last-served
                 // recency (drives Fade — serve-only, not lifecycle writes).
                 if !pieces.is_empty() {

@@ -185,11 +185,20 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       admission gate (`set_admission_gate`), so a network fetch in `get()` is now DECLINED once a node exhausts its
       reciprocity headroom — it must contribute (serve others → earn) or pay. Sync (atomics + book lock), so it runs inline
       on the fetch path. 1 new test (grant → exhaust → earn reopens). 37 noded tests, fmt, clippy green. **This is a native
-      MVP policy (minimal-kernel: mechanism = the gate; policy = the closure) + CONSUMER-side self-limit** (honest nodes
-      respect their budget). Follow-ons: move the policy into a GOVERNED program (grant/throttle-vs-refuse/paid-override
-      swappable); PROVIDER-side per-peer enforcement (refuse to SERVE a freeloader — robust vs an adversary that disables
-      its own gate); wire the pin_gate to a storage-standing policy (owner-pays-pin, a separate resource from egress).
-      **Remaining follow-ons:** governed reciprocity policy + provider-side enforcement (above); pin_gate→storage policy;
+      MVP policy (minimal-kernel: mechanism = the gate; policy = the closure) + CONSUMER-side self-limit.
+- [x] **4d-15 — RECIPROCITY: GOVERNED POLICY + PROVIDER-SIDE ENFORCEMENT DONE (2026-07-16).** Two hardenings of 4d-14:
+      (1) **Governed policy** — the grant is no longer a hardcoded const. `ChequeService` caches a `grant`/`peer_grant`
+      (`AtomicU64`), refreshed every 30s from the GOVERNED config keys `reciprocity:grant` / `reciprocity:peer_grant`
+      (`GovernanceChainStore::resolve_config`, deterministic), so governance retunes the free tier with NO binary change.
+      (Design note: the gate is a sync hot-path closure, so a WASM-program-per-fetch is wrong; governance controls the
+      PARAMETERS the native gate applies — the correct minimal-kernel shape for a hot path.) (2) **Provider-side per-peer
+      enforcement** — new obj `serve_gate: Fn(requester, bytes)->bool` checked in the `PieceRequest` handler; the requester
+      is `TaggedStream.remote` = the AUTHENTICATED connection peer, so it can't be evaded by a peer disabling its own
+      consumer gate. `ChequeService::should_serve(peer, bytes)` = `served_to_peer (its acked cheque) + bytes ≤
+      peer_served_me (owed_to) + peer_grant` → a freeloader is refused before the bytes go out (empty PieceResponse). 2 new
+      tests. 38 noded + 27 obj tests, fmt, clippy green.
+      **Remaining follow-ons:** move the reciprocity policy into a full governed PROGRAM (vs governed params — only if the
+      formula itself needs to be swappable); wire pin_gate→storage-standing policy (owner-pays-pin, separate resource);
       genesis anchor-pin + wasm-publish; an active verification loop; 4e-2 committee snapshots. (Verify-board→durable deferred by user.)
 Open gaps needing a call at their phase: (1) anchor-authority routing RESOLVED (= committee), (2) escrow reclaim lifecycle [4d],
 (3) cold-start grant + identity gate [4d], (4) uniform-pricing floor for the pool-average reward [4c]. (Checkpoint

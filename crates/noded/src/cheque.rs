@@ -29,10 +29,18 @@ use zeph_transport::{tag, TaggedStream, Transport};
 const CREDIT_BAND: u64 = 4 * 1024 * 1024;
 /// Max cheque frame (a `ServingCheque` is small — a few fixed fields + a 64-byte sig).
 const MAX_CHEQUE_FRAME: usize = 4096;
-/// Cold-start reciprocity grant (§8): a node with zero contribution may still fetch this much for free
-/// before the admission gate requires reciprocity (having served others) or payment. A governed policy
-/// value later — native default for the MVP.
-const COLD_START_GRANT: u64 = 1 << 30; // 1 GiB
+/// DEFAULT cold-start reciprocity grant (§8): a node with zero contribution may still fetch this much for
+/// free before the admission gate requires reciprocity (having served others) or payment. This is only
+/// the default — the LIVE grant is a GOVERNED config value (`reciprocity:grant`) cached in `grant`, so
+/// governance can retune the free tier without a binary change (the gate stays the mechanism).
+const DEFAULT_COLD_START_GRANT: u64 = 1 << 30; // 1 GiB
+/// The governance config key carrying the reciprocity grant (bytes), refreshed into `grant`.
+pub const GRANT_CONFIG_KEY: &str = "reciprocity:grant";
+/// DEFAULT per-peer serve grant (§8): how much this node will SERVE a peer before requiring the peer to
+/// have reciprocated (served it back) or paid. Governed via `reciprocity:peer_grant`.
+const DEFAULT_PEER_GRANT: u64 = 256 * 1024 * 1024; // 256 MiB
+/// The governance config key carrying the per-peer serve grant (bytes), refreshed into `peer_grant`.
+pub const PEER_GRANT_CONFIG_KEY: &str = "reciprocity:peer_grant";
 
 pub struct ChequeService {
     identity: Arc<NodeIdentity>,
@@ -48,6 +56,12 @@ pub struct ChequeService {
     /// Total bytes this node has fetched from providers (the CONSUMED side of reciprocity). Reciprocity
     /// headroom = `total_earned − consumed`; the admission gate reads it synchronously.
     consumed: AtomicU64,
+    /// The LIVE cold-start grant (bytes), refreshed from the governed `reciprocity:grant` config so the
+    /// free-tier policy is governance-tunable. Read synchronously by the gate.
+    grant: AtomicU64,
+    /// The LIVE per-peer serve grant (bytes), from the governed `reciprocity:peer_grant` config. Read
+    /// synchronously by the provider-side serve gate.
+    peer_grant: AtomicU64,
     /// Cheques to push (drained by [`run_pusher`](ChequeService::run_pusher)); `on_bytes_received` must
     /// not block, so it enqueues here rather than doing the network push inline.
     push_tx: mpsc::Sender<ServingCheque>,
@@ -71,18 +85,53 @@ impl ChequeService {
             book: Mutex::new(ChequeBook::new(me)),
             pending: Mutex::new(HashMap::new()),
             consumed: AtomicU64::new(0),
+            grant: AtomicU64::new(DEFAULT_COLD_START_GRANT),
+            peer_grant: AtomicU64::new(DEFAULT_PEER_GRANT),
             push_tx,
         });
         (svc, push_rx)
     }
 
+    /// Set the cold-start grant (bytes) from the governed `reciprocity:grant` config — governance retunes
+    /// the free tier here without a binary change.
+    pub fn set_grant(&self, grant: u64) {
+        self.grant.store(grant, Ordering::Relaxed);
+    }
+
+    /// Set the per-peer serve grant (bytes) from the governed `reciprocity:peer_grant` config.
+    pub fn set_peer_grant(&self, grant: u64) {
+        self.peer_grant.store(grant, Ordering::Relaxed);
+    }
+
+    /// PROVIDER-side reciprocity (§8): should this node serve `peer` ~`bytes` right now? Yes while what it
+    /// has served the peer (the peer's acknowledged cumulative cheque) stays within what the peer has
+    /// served IT (the cumulative it acknowledged to the peer) plus the per-peer grant. A freeloader — one
+    /// this node has served far more than it served back, without paying — is refused. Synchronous.
+    pub fn should_serve(&self, peer: [u8; 32], bytes: u64) -> bool {
+        let served_to_peer = self
+            .book
+            .lock()
+            .expect("cheque book lock")
+            .latest_from(&peer)
+            .map(|c| c.cumulative_bytes)
+            .unwrap_or(0);
+        let peer_served_me = self
+            .issuer
+            .lock()
+            .expect("cheque issuer lock")
+            .owed_to(&peer);
+        let grant = self.peer_grant.load(Ordering::Relaxed);
+        served_to_peer.saturating_add(bytes) <= peer_served_me.saturating_add(grant)
+    }
+
     /// The free-tier admission decision (§8 tit-for-tat): may this node fetch `bytes` right now? Yes while
     /// its CONSUMED total stays within what it has EARNED (cheque-proven bytes served to others) plus the
-    /// cold-start grant. Beyond that a fetch must be paid for (a cheque) or wait until the node contributes
-    /// more. Synchronous (atomics + the book lock), so the obj admission gate can call it inline.
+    /// current (governed) grant. Beyond that a fetch must be paid for (a cheque) or wait until the node
+    /// contributes more. Synchronous (atomics + the book lock), so the obj admission gate can call it inline.
     pub fn reciprocity_admits(&self, bytes: u64) -> bool {
         let consumed = self.consumed.load(Ordering::Relaxed);
-        let budget = self.total_earned().saturating_add(COLD_START_GRANT);
+        let grant = self.grant.load(Ordering::Relaxed);
+        let budget = self.total_earned().saturating_add(grant);
         consumed.saturating_add(bytes) <= budget
     }
 
@@ -271,5 +320,35 @@ mod tests {
             .record(ServingCheque::sign(&consumer, me, 5000, 1));
         assert!(svc.reciprocity_admits(5000));
         assert!(!svc.reciprocity_admits(5001));
+    }
+
+    #[tokio::test]
+    async fn provider_side_refuses_a_freeloader_beyond_the_peer_grant() {
+        let (svc, _rx) = service().await;
+        let peer = NodeIdentity::generate();
+        let pid = peer.node_id().0;
+        let me = svc.identity.node_id().0;
+        let grant = 256u64 * 1024 * 1024; // DEFAULT_PEER_GRANT
+
+        // A fresh peer that has served us nothing → covered only up to the per-peer grant.
+        assert!(svc.should_serve(pid, grant));
+        assert!(
+            !svc.should_serve(pid, grant + 1),
+            "no reciprocity beyond the grant → refuse"
+        );
+
+        // The peer serves US (we consume a band from it) → owed_to(peer) grows → we'll serve it more.
+        svc.on_bytes_received(NodeId(pid), CREDIT_BAND);
+        assert!(svc.should_serve(pid, grant + CREDIT_BAND));
+
+        // Once we've actually served it that much back (its acknowledged cheque), headroom closes again.
+        svc.book
+            .lock()
+            .unwrap()
+            .record(ServingCheque::sign(&peer, me, grant + CREDIT_BAND, 1));
+        assert!(
+            !svc.should_serve(pid, 1),
+            "served == what the peer served us + grant → refuse more"
+        );
     }
 }
