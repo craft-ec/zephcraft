@@ -1739,6 +1739,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         cheque_service.clone(),
         ledger_service.clone(),
         record_chain.clone(),
+        engine.clone(),
     );
     let state = Arc::new(control::State {
         clock: transport.clock(),

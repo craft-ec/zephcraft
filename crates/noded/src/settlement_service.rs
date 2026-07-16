@@ -20,11 +20,10 @@
 //!    everywhere, and a verifier re-reads the chains to re-run it.
 //!
 //! **MVP scope (honest):** the participant SET is the converged census, so a momentary census difference
-//! can differ the record until it converges (the full-finality version has the committee COMMIT the
-//! canonical record as its own write — a follow-on); the proof is carried INLINE (fits the 64 KiB write
-//! frame for small networks; large ones want an obj-cid + fetch, or proof compaction); a settle re-scans
-//! each chain (a scan-cache is a follow-on); and watermarks are in-memory (persisting them avoids losing
-//! one epoch's baseline per restart).
+//! can differ the record until it converges — resolved at finalization by the committee-attested record
+//! ([`crate::record_chain`]); a settle re-scans each chain (a scan-cache is a follow-on); and watermarks
+//! are in-memory (persisting them avoids losing one epoch's baseline per restart). The cheque proof scales
+//! to any network size: it rides INLINE when small, else as a durable obj object referenced by cid.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +36,7 @@ use zeph_core::hlc::Clock;
 use zeph_core::Cid;
 use zeph_crypto::NodeIdentity;
 use zeph_membership::Membership;
+use zeph_obj::{ConsumeMode, ObjEngine};
 
 use crate::anchor::AnchorDispatcher;
 use crate::cheque::ChequeService;
@@ -54,6 +54,19 @@ const TICK: Duration = Duration::from_secs(5);
 /// The synthetic program id of the settlement chain. Its anchor-sentinel owner routes writes to the epoch
 /// committee (a network-owned chain, no owner key — same pattern as the ledger).
 const SETTLE_PROGRAM_TAG: &[u8] = b"craftec/settlement-chain/1";
+/// A serialized cheque proof larger than this is published to obj and referenced by cid instead of
+/// carried inline — so the settlement write stays well under the 64 KiB sequencer frame regardless of how
+/// many consumers a node serves. Small proofs stay inline (no fetch). ~100 cheques.
+const INLINE_PROOF_MAX: usize = 16 * 1024;
+
+/// The cheque proof backing a report's `served_cumulative`: carried INLINE when small, or REFERENCED by an
+/// obj cid when large (the proof bytes are published as a durable content-addressed object; a verifier
+/// fetches by cid — content-addressing binds the exact bytes to the cid the signed report commits to).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ServedProof {
+    Inline(Vec<ServingCheque>),
+    Ref([u8; 32]),
+}
 
 /// A node's per-epoch settlement report — authored as a committee-ordered write on its settlement chain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,8 +76,9 @@ pub struct SettleReport {
     pub paid_cumulative: u64,
     /// This node's cumulative cheque-proven bytes served — must equal `Σ proof` (delta-folded as weight).
     pub served_cumulative: u64,
-    /// The counterparty-signed cheques (latest per consumer) that PROVE `served_cumulative`.
-    pub proof: Vec<ServingCheque>,
+    /// The counterparty-signed cheques (latest per consumer) that PROVE `served_cumulative` — inline or
+    /// an obj cid (see [`ServedProof`]).
+    pub proof: ServedProof,
 }
 
 /// The cheque-proven cumulative bytes `node` has served: each cheque must be consumer-signed AND name
@@ -84,17 +98,6 @@ fn proven_cumulative(node: &[u8; 32], proof: &[ServingCheque]) -> Option<u64> {
     Some(per_consumer.values().sum())
 }
 
-impl SettleReport {
-    /// The proof-verified served cumulative for `node`: `Some(served)` iff the cheque proof is valid and
-    /// sums to exactly the claimed `served_cumulative` (anti-farming); `None` otherwise.
-    fn verified_served(&self, node: &[u8; 32]) -> Option<u64> {
-        match proven_cumulative(node, &self.proof) {
-            Some(c) if c == self.served_cumulative => Some(c),
-            _ => None,
-        }
-    }
-}
-
 pub struct SettlementService {
     identity: Arc<NodeIdentity>,
     clock: Arc<Clock>,
@@ -108,6 +111,9 @@ pub struct SettlementService {
     /// Committee-attested record finality — this node attests each epoch's record here if it's on the
     /// committee, and claims resolve against the canonical (quorum-signed) record.
     records: Arc<RecordChain>,
+    /// Content-addressed store — publishes a LARGE cheque proof as a durable object and fetches a
+    /// participant's proof by cid at settle time (small proofs stay inline in the report).
+    obj: Arc<ObjEngine>,
     /// The settlement chain's program cid + its anchor-sentinel owner (routes ordering to the committee).
     settle_cid: [u8; 32],
     settle_owner: [u8; 32],
@@ -121,6 +127,7 @@ impl SettlementService {
         cheques: Arc<ChequeService>,
         ledger: Arc<LedgerService>,
         records: Arc<RecordChain>,
+        obj: Arc<ObjEngine>,
     ) -> Arc<Self> {
         let settle_cid = Cid::of(SETTLE_PROGRAM_TAG).0;
         let settle_owner = AnchorDispatcher::anchor_owner(&settle_cid);
@@ -132,6 +139,7 @@ impl SettlementService {
             cheques,
             ledger,
             records,
+            obj,
             settle_cid,
             settle_owner,
         })
@@ -151,9 +159,20 @@ impl SettlementService {
     async fn report(&self, epoch: u64) -> bool {
         let account = self.identity.node_id().0;
         let paid_cumulative = self.ledger.total_paid();
-        let proof = self.cheques.serving_proof();
+        let cheques = self.cheques.serving_proof();
         // Our own cheques are always valid → the proof justifies our served total by construction.
-        let served_cumulative = proven_cumulative(&account, &proof).unwrap_or(0);
+        let served_cumulative = proven_cumulative(&account, &cheques).unwrap_or(0);
+        // Carry the proof inline if small; otherwise publish it as a durable content-addressed object and
+        // reference it by cid — so a node serving many consumers doesn't overflow the sequencer frame.
+        let proof = match postcard::to_allocvec(&cheques) {
+            Ok(bytes) if bytes.len() > INLINE_PROOF_MAX => {
+                match self.obj.publish_system(&bytes).await {
+                    Ok(cid) => ServedProof::Ref(cid.0),
+                    Err(_) => ServedProof::Inline(cheques), // publish failed → try inline (may reject if huge)
+                }
+            }
+            _ => ServedProof::Inline(cheques),
+        };
         let report = SettleReport {
             epoch,
             paid_cumulative,
@@ -196,10 +215,22 @@ impl SettlementService {
             }
         }
         let report = best?;
-        let served = report.verified_served(&account)?; // proof must back the served claim
-                                                        // PAID proof: cap the reported paid at the node's ACTUAL committee-ordered `Pay` total (durable
-                                                        // on its ledger chain), so it can't inflate the pool beyond what it really paid. Under-reporting
-                                                        // stays possible (it only shrinks the node's own pool contribution — griefing, not theft).
+        // Resolve the proof (inline directly, or FETCH the referenced object by cid) and verify it backs
+        // the claimed served — an unfetchable or unbacked proof means this participant contributes nothing.
+        let cheques = match &report.proof {
+            ServedProof::Inline(c) => c.clone(),
+            ServedProof::Ref(cid) => match self.obj.get(Cid(*cid), ConsumeMode::Drop).await {
+                Ok(bytes) => postcard::from_bytes::<Vec<ServingCheque>>(&bytes).ok()?,
+                Err(_) => return None, // proof not fetchable → can't verify → skip
+            },
+        };
+        let served = match proven_cumulative(&account, &cheques) {
+            Some(c) if c == report.served_cumulative => c,
+            _ => return None, // proof doesn't back the claimed served (anti-farming)
+        };
+        // PAID proof: cap the reported paid at the node's ACTUAL committee-ordered `Pay` total (durable
+        // on its ledger chain), so it can't inflate the pool beyond what it really paid. Under-reporting
+        // stays possible (it only shrinks the node's own pool contribution — griefing, not theft).
         let paid = report
             .paid_cumulative
             .min(self.ledger.paid_total(account).await);
@@ -317,27 +348,30 @@ mod tests {
     }
 
     #[test]
-    fn report_verified_served_backs_the_claim_and_rejects_farming() {
+    fn proof_must_back_the_claimed_served_regardless_of_inline_or_ref() {
+        // `cumulatives_of` accepts a report's served ONLY if the resolved cheques prove exactly it; this
+        // is that check (the proof source — inline vs a fetched obj-ref — resolves to the same cheque set).
         let node = NodeIdentity::generate();
         let n = node.node_id().0;
         let alice = NodeIdentity::generate();
-        let proof = vec![cheque(&alice, n, 900)];
-        // Honest report: served matches the proof sum.
-        let honest = SettleReport {
-            epoch: 5,
-            paid_cumulative: 42,
-            served_cumulative: 900,
-            proof: proof.clone(),
-        };
-        assert_eq!(honest.verified_served(&n), Some(900));
-        // THE ANTI-FARM CASE: a report claiming more served than its cheques prove is rejected — even
-        // though the write itself is validly authored, the proof (sums to 900) doesn't back 999_999.
-        let farmed = SettleReport {
-            epoch: 5,
-            paid_cumulative: 42,
-            served_cumulative: 999_999,
-            proof,
-        };
-        assert_eq!(farmed.verified_served(&n), None);
+        let cheques = vec![cheque(&alice, n, 900)];
+        // Honest: the proof sums to exactly the claimed served.
+        assert_eq!(proven_cumulative(&n, &cheques), Some(900));
+        // THE ANTI-FARM CASE: claiming 999_999 with a proof that sums to 900 fails the `== served` check.
+        let claimed = 999_999u64;
+        assert_ne!(proven_cumulative(&n, &cheques), Some(claimed));
+        // A large proof round-trips through the Ref variant's serialization the same as inline.
+        let inline = ServedProof::Inline(cheques.clone());
+        let bytes = postcard::to_allocvec(&inline).unwrap();
+        assert!(matches!(
+            postcard::from_bytes::<ServedProof>(&bytes).unwrap(),
+            ServedProof::Inline(_)
+        ));
+        let refv = ServedProof::Ref([7u8; 32]);
+        let rb = postcard::to_allocvec(&refv).unwrap();
+        assert!(matches!(
+            postcard::from_bytes::<ServedProof>(&rb).unwrap(),
+            ServedProof::Ref(c) if c == [7u8; 32]
+        ));
     }
 }

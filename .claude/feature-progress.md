@@ -131,8 +131,15 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       `RewardClaim` from the canonical record if finalized (durable + restart-safe + census-divergence-proof), else the
       local record (`apply` still enforces single-use). `EpochCommitteeSource::committee_for_epoch` added for a past epoch.
       2 new primitive tests. 36 noded tests, fmt, clippy green.
-      **Remaining follow-ons (all non-urgent / scale / perf):** proof via obj-cid + fetch (the 64 KiB write frame limits the
-      inline cheque proof past ~430 consumers/node) or proof COMPACTION; a scan-cache for `cumulatives_of`/`paid_total`/
+- [x] **4d-9 — OBJ-CID PROOF (scales to any network size) DONE (2026-07-16).** The cheque proof no longer has to fit the
+      64 KiB sequencer write frame. `ServedProof::{Inline(cheques), Ref(cid)}`: `report()` carries the proof inline when its
+      serialized size ≤ 16 KiB, else publishes it via `obj.publish_system` (a durable SYSTEM object — `mark_system`, the
+      same lifecycle CraftSQL pages use, excluded from GC + replicated) and references it by cid. `cumulatives_of` resolves
+      the proof — inline directly, or FETCHES `obj.get(cid)` — then verifies `proven_cumulative == served_cumulative`;
+      content-addressing means the fetched bytes are bound to the cid the signed report commits to (no tamper), and an
+      unfetchable/unbacked proof simply skips that participant. 1 test updated (inline/ref round-trip + anti-farm check).
+      36 noded tests, fmt, clippy green.
+      **Remaining follow-ons (all non-urgent / scale / perf):** a scan-cache for `cumulatives_of`/`paid_total`/
       `canonical_record` (re-scan each chain per settle); wire the obj gates to a sync-cached reciprocity position; genesis
       anchor-pin + wasm-publish; an active verification loop; 4e-2 committee snapshots. (Verify-board→durable deferred by user.)
 Open gaps needing a call at their phase: (1) anchor-authority routing RESOLVED (= committee), (2) escrow reclaim lifecycle [4d],
