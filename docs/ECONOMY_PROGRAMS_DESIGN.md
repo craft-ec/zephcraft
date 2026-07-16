@@ -140,6 +140,16 @@ is the general external-read primitive from P2):
 So P3 is: split the state + `apply` into a token slice and an economy slice, co-folded by `LedgerService`
 (native). The service split into `TokenService` / `EconomyEgressService` + rehoming settlement is P4.
 
+**Why native protocol programs never need CPI internally (2026-07-16).** In this substrate **reads are
+transparent** — all committed data is public and re-derivable if you know the DB shape; the `app_ns` gate is
+single-writer *write* confinement + a *sandbox* scoping for untrusted WASM, NOT data secrecy. So there are two
+read paths: **native protocol programs** (`token`, `economy-egress` — part of the node) **direct-read** any
+namespace in Rust (no host-fn, no gate — "we are the protocol"), while **sandboxed WASM** (user apps, any WASM
+economy-\* program) must cross the host-fn boundary via **CPI**. Both re-derive from the op-log (re-execution-
+authoritative), so no trust difference — just native-direct vs. host-fn-mediated. The token↔economy internal
+flow is native, so it direct-reads + passes `share` fold-to-fold; **CPI's real audience is the WASM sandbox.**
+Do not conflate the two in later phases.
+
 ## 6. Phase plan (each phase: build + test + gate + commit; roll together where consensus-affecting)
 
 1. **P1 — anchor-name constants + rename `reward` → `economy-egress`** (mechanical; re-pin anchor at genesis).
