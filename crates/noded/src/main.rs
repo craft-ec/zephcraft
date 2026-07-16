@@ -40,9 +40,11 @@ mod attest;
 mod board;
 mod cheque;
 mod control;
+mod epoch_committee;
 mod governance;
 mod headreg;
 mod peers;
+mod quorum_source;
 mod registry_heads;
 mod registry_net;
 mod sequence;
@@ -1467,15 +1469,27 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // each chain is published + pulled cross-node (obj + routing), so attest() works on any node.
     let attest_store =
         attest::AttestStore::open(identity.clone(), data_dir, engine.clone(), routing.clone());
+    // The rotating epoch committee (§10.5) — the sequencer's quorum SOURCE for anchored (network-owned)
+    // programs, which have no owner key to declare an attestation quorum. Computes a deterministic k-of-n
+    // committee from the converged census + HLC epoch (membership injected once it's built, below).
+    let epoch_committee = std::sync::Arc::new(epoch_committee::EpochCommitteeSource::new(
+        identity.node_id().0,
+        transport.clock(),
+    ));
+    // Route each (owner, program) to its quorum provenance: the declared attestation quorum for user
+    // programs, the epoch committee for anchored ones (matched by the deterministic sentinel owner).
+    let quorum_source: std::sync::Arc<dyn quorum_source::QuorumSource> = std::sync::Arc::new(
+        quorum_source::AnchorAwareQuorumSource::new(attest_store.clone(), epoch_committee.clone()),
+    );
     // sequence() = the ordering sequencer (uniqueness): quorum-serialized per-account writes, the
-    // mechanism the token ledger rides on. Reuses the program's attestation quorum (one program, one
-    // quorum) + the same cross-node anti-entropy attestation uses.
+    // mechanism the token ledger rides on. User programs order under their declared quorum; anchored
+    // programs order under the epoch committee (via the quorum source above).
     let sequence_store = sequence::SequenceStore::open(
         identity.clone(),
         data_dir,
         engine.clone(),
         routing.clone(),
-        attest_store.clone(),
+        quorum_source,
         transport.clone(),
     );
     let com_service = Arc::new(zeph_com::InvokeService::new(
@@ -1902,6 +1916,8 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         });
     }
     governance_store.set_membership(membership.clone()).await;
+    // The epoch committee elects over the converged census — give it the membership handle.
+    epoch_committee.set_membership(membership.clone()).await;
     head_registry.set_membership(membership.clone()).await;
     board_service.set_membership(membership.clone()).await;
     attest_store.set_membership(membership.clone()).await;

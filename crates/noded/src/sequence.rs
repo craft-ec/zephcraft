@@ -38,7 +38,11 @@ use zeph_obj::{ConsumeMode, ObjEngine};
 use zeph_routing::ContentRouting;
 use zeph_transport::{tag, TaggedStream, Transport};
 
+// Referenced by this module's intra-doc links and constructed by the tests (via `super::*`); the
+// live quorum type is now the `QuorumSource` trait (an `AttestStore` is one of its impls).
+#[allow(unused_imports)]
 use crate::attest::AttestStore;
+use crate::quorum_source::QuorumSource;
 
 /// How long a collector waits for one member's sign-solicitation reply before moving on.
 const SOLICIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -80,8 +84,9 @@ pub struct SequenceStore {
     obj: Arc<ObjEngine>,
     routing: Arc<dyn ContentRouting>,
     membership: RwLock<Option<Arc<Membership>>>,
-    /// The shared quorum source — a program declares one quorum (via attestation), reused here.
-    quorums: Arc<AttestStore>,
+    /// The shared quorum SOURCE (`quorum_for`): a user program's declared attestation quorum, or an
+    /// anchored program's computed epoch committee — routed by `AnchorAwareQuorumSource` (§10.5).
+    quorums: Arc<dyn QuorumSource>,
     /// For soliciting ORDERING signatures from remote quorum members (the collector path).
     transport: Arc<Transport>,
     /// This member's PERSISTENT signed-set — `(owner, program, account, nonce) → hash(write)` it has
@@ -96,7 +101,7 @@ impl SequenceStore {
         data_dir: &Path,
         obj: Arc<ObjEngine>,
         routing: Arc<dyn ContentRouting>,
-        quorums: Arc<AttestStore>,
+        quorums: Arc<dyn QuorumSource>,
         transport: Arc<Transport>,
     ) -> Arc<Self> {
         let dir = data_dir.join("sequence");
@@ -174,7 +179,7 @@ impl SequenceStore {
         program_cid: [u8; 32],
         commit: SequencedCommit,
     ) -> bool {
-        let Some(quorum) = self.quorums.current_quorum(&owner, &program_cid).await else {
+        let Some(quorum) = self.quorums.quorum_for(&owner, &program_cid).await else {
             return false; // no declared quorum for this program
         };
         let account = commit.write.account;
@@ -258,7 +263,7 @@ impl SequenceStore {
     /// under an intersection-sized quorum with honest non-equivocation, but we still refuse a divergent
     /// sequence (safety over liveness). No-op when membership is unset (tests → local-only).
     async fn sync(&self, key: &SeqKey) {
-        let Some(quorum) = self.quorums.current_quorum(&key.0, &key.1).await else {
+        let Some(quorum) = self.quorums.quorum_for(&key.0, &key.1).await else {
             return;
         };
         if !quorum.is_intersection_sized() {
@@ -315,7 +320,7 @@ impl SequenceStore {
         program_cid: [u8; 32],
         write: &SequencedWrite,
     ) -> Option<MemberSignature> {
-        let quorum = self.quorums.current_quorum(&owner, &program_cid).await?;
+        let quorum = self.quorums.quorum_for(&owner, &program_cid).await?;
         if !quorum.is_member(&self.me())
             || !quorum.is_intersection_sized()
             || !write.owner_authentic()
@@ -485,7 +490,7 @@ impl SequenceBackend for SequenceStore {
         program_cid: [u8; 32],
         write: SequencedWrite,
     ) -> bool {
-        let Some(quorum) = self.quorums.current_quorum(&owner, &program_cid).await else {
+        let Some(quorum) = self.quorums.quorum_for(&owner, &program_cid).await else {
             return false;
         };
         if !quorum.is_intersection_sized() || !write.owner_authentic() {

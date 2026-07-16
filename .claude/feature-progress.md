@@ -22,8 +22,17 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       `control::State`; RPC `anchor_resolve` + `--anchor` branch in `rpc_invoke`; CLI `AnchorResolve` + `invoke
       --anchor`. 1 unit test (sentinel deterministic + cid-bound). Gates: build/test/fmt/clippy green. (Sentinel→
       committee quorum routing is 4e; for now a stateless anchor invoke works, stateful awaits the committee.)
-- [ ] **4e — rotating epoch committee** (`quorum_source.rs` trait + `epoch_committee.rs`; generalize SequenceStore to
-      `Arc<dyn QuorumSource>`; per-epoch snapshots for historical re-verify).
+- [x] **4e — rotating epoch committee CORE DONE 2026-07-16 (staged).** `crates/noded/src/quorum_source.rs`
+      (`QuorumSource` trait `quorum_for`; `impl` for `AttestStore` = declared quorum; `AnchorAwareQuorumSource`
+      routes by the sentinel owner → committee for anchored, declared otherwise) + `crates/noded/src/epoch_committee.rs`
+      (`EpochCommitteeSource`: deterministic k-of-n `Quorum` via BLAKE3 rendezvous over `(program_cid, epoch, node_id)`
+      + self-included converged census, reusing headreg's election pattern; default n=4/k=3, clamped to a valid `2k>n`
+      for small nets). Generalized `SequenceStore.quorums` → `Arc<dyn QuorumSource>` (call sites `current_quorum`→
+      `quorum_for`); wired in main.rs (construct committee + router, pass to SequenceStore, `set_membership`). 3 tests
+      (sentinel routing via anchor test; committee determinism+rotation; small-net clamp). Gates green.
+      **FOLLOW-ON (4e-2, deferred):** per-epoch committee SNAPSHOTS + robust cross-epoch hand-off — until then a commit
+      verifies against the CURRENT committee, so a past-epoch commit across a membership change may not re-verify (the
+      ledger should gate writes on a converged census, headreg-style). Enough to unblock 4b.
 - [ ] **4a-bis — `invoke_program` primitive** (com host fn + `Capability::InvokeProgram`; deterministic-callee only).
 - [ ] **4b — ledger core** (`crates/ledger` + `apps/ledger-wasm`; TransferOp/ClaimOp/fold_account; always-on re-fold
       validity, no checkpoint).
