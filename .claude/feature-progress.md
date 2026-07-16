@@ -2419,8 +2419,11 @@ rationale in docs/ECONOMY_PROGRAMS_DESIGN.md (architecture map done via Explore;
 shared `LedgerBalanceState.balance` written by both token ops and Pay/RewardClaim).
 
 Phases (each: build + test + gate + commit; roll together where consensus-affecting):
-- [ ] **P1 — anchor-name constants** (centralize the re-typed "token-ledger"/"reward" literals into shared
-      `const`s so the split can't drift). Pure refactor, no behavior change.
+- [x] **P1 — anchor-name constants DONE (2026-07-16).** Centralized `LEDGER_ANCHOR="token-ledger"` /
+      `REWARD_ANCHOR="reward"` as pub consts in `anchor.rs` (values unchanged — rename to "token"/"economy-egress"
+      is P5); replaced the re-typed literals in genesis.rs (`activate`) + control.rs (dashboard anchor list +
+      rpc_committee program name). Pure refactor — build/fmt/clippy/genesis-test green, no behavior/wire/consensus
+      change, no fleet roll needed.
 - [ ] **P2 — CPI primitive:** `Capability::InvokeProgram` + `invoke_program(anchor|cid, func, input)` host fn
       + `InvokeProgramBackend` in `TransitionCtx`; callee runs under `CapabilityGrant::deterministic()` (no
       wall-clock/random/verify/attest/sequence → caller re-execution reproduces the call tree). General

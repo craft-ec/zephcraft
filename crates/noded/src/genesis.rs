@@ -28,9 +28,7 @@ pub fn reward_program_cid() -> [u8; 32] {
     Cid::of(REWARD_WASM).0
 }
 
-/// Canonical anchor names for the two network-owned programs.
-const LEDGER_ANCHOR: &str = "token-ledger";
-const REWARD_ANCHOR: &str = "reward";
+use crate::anchor::{LEDGER_ANCHOR, REWARD_ANCHOR};
 
 /// Publish the embedded protocol-program wasm to obj and pin their governance anchors. See the module
 /// docs — idempotent, safe every startup.

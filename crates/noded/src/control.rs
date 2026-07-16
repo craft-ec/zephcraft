@@ -278,7 +278,7 @@ impl State {
                 .unwrap_or([0u8; 32]);
             let (verified, mismatched) = self.settlement.verification_stats();
             let mut anchors = Vec::new();
-            for name in ["token-ledger", "reward"] {
+            for name in [crate::anchor::LEDGER_ANCHOR, crate::anchor::REWARD_ANCHOR] {
                 if let Some(res) = self.anchor.resolve(name).await {
                     anchors.push(AnchorRow {
                         name: name.to_string(),
@@ -1574,7 +1574,7 @@ async fn rpc_committee(state: &State, id: serde_json::Value) -> serde_json::Valu
         })
         .unwrap_or_default();
     serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
-        "epoch": epoch, "program": "token-ledger", "members": members, "threshold": threshold,
+        "epoch": epoch, "program": crate::anchor::LEDGER_ANCHOR, "members": members, "threshold": threshold,
     }})
 }
 
