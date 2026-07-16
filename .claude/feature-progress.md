@@ -301,15 +301,21 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       **Follow-on 1 (real reward meters):** `SettlementStore::owed_to` (Σ a provider's unclaimed shares across
       in-window records; +test) → `LedgerService::reward_owed` → `Economy.reward_owed` on the snapshot. Reward card
       now shows real **balance / claimable / served**; the usage paid tier shows **paid_consumed**. **Deliberately NOT
-      shown:** the literal per-consumer `settled/served` byte ratio — it's neither locally computable (the FCFS
-      position needs a global per-consumer serving view) nor cross-node verifiable (`served_cumulative` is proven by
-      cheques alone, and a verifier can't recompute another node's consumers' quotas). The honest, wired economics —
-      served bytes → pool-average reward — is what the meters show. All LOCAL-LOGIC (admission decisions + read-only
-      accessors + UI; no wire/consensus/cheque-format change → mixed-version-safe). Gate `--quick` PASSED (after a
-      fmt-only re-roll); rolled to full 5-node fleet (all peers=4). Live-verified: `reward_owed`/`paid_consumed` serve
-      on Mac + Hetzner main. **STILL OPEN (noted, not silently dropped):** overflow-throttle for unlimited paid serving
-      (a paid peer fetching far past what it funded gets subsidised serving — §8 says throttle/pool-bound it); moot at
-      zero paid traffic.
+      shown YET:** the literal per-consumer `settled/served` byte ratio — the meters show the currently-wired economics
+      (served bytes → pool-average reward). All LOCAL-LOGIC (admission decisions + read-only accessors + UI; no
+      wire/consensus/cheque-format change → mixed-version-safe). Gate `--quick` PASSED (after a fmt-only re-roll);
+      rolled to full 5-node fleet (all peers=4). Live-verified: `reward_owed`/`paid_consumed` serve on Mac + Hetzner main.
+      **CORRECTION (2026-07-16):** two claims made mid-build were WRONG and are retracted. (a) There is NO overflow-throttle
+      for paid consumers, and there shouldn't be — paid = unlimited; overflow serving is pool-unrewarded but still earns
+      the provider HEADROOM (serving always does), and the pool only ever pays what was funded, so nothing drains → no
+      throttle needed. (b) The per-consumer FCFS cap is NOT impossible — that analysis wrongly used a single provider's
+      local view. It belongs at SETTLEMENT, which has the whole board (every node's cheque proofs = per-consumer served
+      bytes + signed timestamps, + every consumer's on-chain paid total) = a full global view → `allocate_quota` per
+      consumer is deterministic + verifiable there. It's simply UNWIRED: `settle_epoch_cumulative` flattens each node to
+      one aggregate `served_cumulative` and discards the per-consumer proof structure. **REAL OPEN ITEM:** wire per-consumer
+      FCFS `allocate_quota` into settlement (derive each provider's rewardable-served from the board's grouped-by-consumer
+      cheques + paid totals, replacing the raw served delta) → makes reward truly per-consumer-capped AND the settled/served
+      meter real. Consensus-semantic change (roll together), but no new wire fields (proofs already carried).
       **Remaining follow-ons:** dedicated storage-provided measure + persist `pinned`; reciprocity policy as a full governed
       PROGRAM (only if the formula must be swappable); 4e-2 committee snapshots. (Verify-board→durable deferred by user.)
 Open gaps needing a call at their phase: (1) anchor-authority routing RESOLVED (= committee), (2) escrow reclaim lifecycle [4d],
