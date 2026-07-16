@@ -26,6 +26,21 @@
 //!    reports + cheques and prices with the SAME governed params ⇒ bit-identical record ⇒ a `RewardClaim`
 //!    resolves the same share everywhere, and a verifier re-reads the chains to re-run it.
 //!
+//! **Committee-settles [2026-07-17].** Settling is O(participants × census) chain reads; every node used
+//! to pay that EVERY epoch, which is why an IDLE fleet burned the most CPU (an epoch where nothing
+//! happened costs the same as a busy one). Now only the epoch's COMMITTEE settles — it must, since it
+//! attests the canonical record — plus a deterministic 1-in-[`VERIFY_SAMPLE`] elected sample of everyone
+//! else, because re-execution is the ONLY check on a lying committee and a committee verifying its own
+//! record proves nothing. Claims are unaffected: `reward_share` resolves from the canonical attested
+//! record, which any node reads cheaply.
+//!
+//! **KNOWN CONSEQUENCE (observability, not correctness):** a node that neither sits on the committee nor
+//! is elected for an epoch never builds local settlement state, so its dashboard reads 0 for `reward_owed`
+//! / `reward_settled` / `pool` / `subscription_bytes`. Harmless at the current fleet size (committee 4 of
+//! 5) but wrong at scale (~12 of 20 nodes). `reward_owed` is derivable from the canonical records; the
+//! running `pool` and a consumer's remaining `subscription_bytes` are NOT (they are settle-derived), so
+//! surfacing those on a non-settling node needs the record to carry them. Follow-on, tracked.
+//!
 //! **MVP scope (honest):** the participant SET is the converged census, so a momentary census difference
 //! can differ the record until it converges — resolved at finalization by the committee-attested record
 //! ([`crate::record_chain`]); and watermarks are in-memory (persisting them avoids losing one epoch's
@@ -57,11 +72,21 @@ use crate::record_chain::RecordChain;
 use crate::sequence::SequenceStore;
 use crate::settlement::CLAIM_WINDOW_EPOCHS;
 
-/// Epoch length (ms) — MUST match `epoch_committee::EPOCH_MILLIS` so settlement epochs align with the
-/// committee that orders the reports.
-const EPOCH_MILLIS: u64 = 30_000;
+// Settlement epochs come from THE shared definition (`crate::epoch`), so they cannot drift from the
+// committee that orders + attests the reports — previously this was a copy of the constant kept in sync
+// only by a comment.
+use crate::epoch::EPOCH_MILLIS;
 /// How many epochs to wait past an epoch's close before settling it, letting reports commit + propagate.
 const SETTLE_GRACE_EPOCHS: u64 = 1;
+/// Verification SAMPLING: a NON-committee node re-executes 1-in-this-many epochs [2026-07-17].
+///
+/// Settling is O(participants × census) chain reads, and EVERY node used to pay it EVERY epoch — the bulk
+/// of an idle fleet's CPU, since an epoch in which nothing happened costs the same as a busy one. The
+/// committee must settle (it attests the canonical record); everyone else settles only to CHECK it.
+/// That check must stay INDEPENDENT — a committee verifying its own record proves nothing — but it does
+/// not have to be every node every epoch: sampling keeps a lying committee caught with high probability
+/// (each epoch still draws several independent re-executions across the fleet) at a fraction of the cost.
+const VERIFY_SAMPLE: u64 = 4;
 /// Loop cadence — sub-epoch so boundary crossings are caught promptly (idempotent within an epoch).
 const TICK: Duration = Duration::from_secs(5);
 /// The synthetic program id of the settlement chain. Its anchor-sentinel owner routes writes to the epoch
@@ -109,6 +134,21 @@ fn proven_cumulative(node: &[u8; 32], proof: &[ServingCheque]) -> Option<u64> {
         *e = (*e).max(c.cumulative_bytes); // latest (highest) per consumer
     }
     Some(per_consumer.values().sum())
+}
+
+/// Is `node` ELECTED to independently re-execute `epoch` (1-in-[`VERIFY_SAMPLE`])? Deterministic per
+/// (node, epoch) and unpredictable-but-stable — no coordination needed, and it spreads which nodes check
+/// which epoch, so every epoch draws several independent verifiers while no node checks them all.
+///
+/// This gates a SAFETY property (re-execution is the only check on a lying committee), so it is a free
+/// function purely to keep it unit-testable: an election that silently never fires would disable
+/// verification fleet-wide without failing anything.
+fn elected_to_verify(node: &[u8; 32], epoch: u64) -> bool {
+    let mut buf = [0u8; 40];
+    buf[..32].copy_from_slice(node);
+    buf[32..].copy_from_slice(&epoch.to_le_bytes());
+    let h = Cid::of(&buf).0;
+    u64::from_le_bytes(h[..8].try_into().unwrap()) % VERIFY_SAMPLE == 0
 }
 
 /// Scan cache for one account's settlement chain: the last nonce scanned + the PROOF-VERIFIED reports
@@ -220,6 +260,18 @@ impl SettlementService {
 
     pub async fn set_membership(&self, m: Arc<Membership>) {
         *self.membership.write().await = Some(m);
+    }
+
+    /// Is this node ELECTED to independently re-execute `epoch`? See [`elected_to_verify`].
+    fn elected_to_verify(&self, epoch: u64) -> bool {
+        elected_to_verify(&self.identity.node_id().0, epoch)
+    }
+
+    /// Should this node settle `epoch` at all? The committee MUST (it attests the canonical record);
+    /// everyone else settles only the epochs they are elected to verify — that is the only reason a
+    /// non-committee node needs the record, and it is what makes the check independent.
+    async fn should_settle(&self, epoch: u64) -> bool {
+        self.records.is_committee_for(epoch).await || self.elected_to_verify(epoch)
     }
 
     /// The current epoch index = `now / EPOCH_MILLIS` (identical derivation to the epoch committee).
@@ -494,18 +546,25 @@ impl SettlementService {
                 last_reported = Some(closed);
             }
 
-            // SETTLE every epoch through its grace window, in order (catch up if we fell behind).
+            // SETTLE every epoch through its grace window, in order (catch up if we fell behind) — but
+            // only the epochs THIS node has a reason to compute: it is on the committee (must attest), or
+            // it is elected to independently verify. Before this gate every node re-derived every epoch,
+            // which is what made an IDLE fleet expensive (see `should_settle` / `VERIFY_SAMPLE`).
             if now > SETTLE_GRACE_EPOCHS + 1 {
                 let target = now - 1 - SETTLE_GRACE_EPOCHS;
                 let start = last_settled.map_or(target, |e| e + 1);
                 for s in start..=target {
-                    self.settle(s).await;
+                    if self.should_settle(s).await {
+                        self.settle(s).await;
+                    }
                 }
                 last_settled = Some(target);
             }
 
             // VERIFY: one epoch behind the settle target (giving the committee time to finalize the
-            // canonical record), re-execution-check our own record against the canonical one.
+            // canonical record), re-execution-check our own record against the canonical one. A no-op
+            // unless we actually settled that epoch above (`verify_epoch` needs a local record), so this
+            // naturally runs on exactly the elected sample.
             if now > SETTLE_GRACE_EPOCHS + 2 {
                 let vtarget = now - 2 - SETTLE_GRACE_EPOCHS;
                 let start = last_verified.map_or(vtarget, |e| e + 1);
@@ -521,6 +580,53 @@ impl SettlementService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verify_election_is_deterministic_and_samples_at_the_expected_rate() {
+        let node = [7u8; 32];
+        // Deterministic: the same (node, epoch) always elects the same way — a verifier can't flip-flop.
+        for e in 0..50u64 {
+            assert_eq!(elected_to_verify(&node, e), elected_to_verify(&node, e));
+        }
+        // It FIRES: an election that never fires would silently disable verification fleet-wide.
+        let hits = (0..4000u64)
+            .filter(|e| elected_to_verify(&node, *e))
+            .count();
+        assert!(hits > 0, "election never fires → nothing would ever verify");
+        // ~1-in-VERIFY_SAMPLE (generous bounds — this is a hash, not a counter).
+        let expected = 4000 / VERIFY_SAMPLE as usize;
+        assert!(
+            hits > expected / 2 && hits < expected * 2,
+            "sampling rate off: {hits} hits vs ~{expected} expected"
+        );
+    }
+
+    #[test]
+    fn every_epoch_draws_verifiers_and_no_node_verifies_them_all() {
+        // Across a fleet, each epoch must draw independent re-executions (else a lying committee goes
+        // unchecked), while no single node carries the whole cost.
+        let fleet: Vec<[u8; 32]> = (0..20u8).map(|i| [i; 32]).collect();
+        let mut unverified = 0;
+        for epoch in 0..200u64 {
+            let verifiers = fleet.iter().filter(|n| elected_to_verify(n, epoch)).count();
+            if verifiers == 0 {
+                unverified += 1;
+            }
+        }
+        // With 20 nodes at 1-in-4, an epoch drawing ZERO verifiers should be vanishingly rare.
+        assert!(
+            unverified < 5,
+            "{unverified}/200 epochs had no verifier — the committee would be unchecked"
+        );
+        // And no node is elected for everything (the cost is spread).
+        for n in &fleet {
+            let mine = (0..200u64).filter(|e| elected_to_verify(n, *e)).count();
+            assert!(
+                mine < 200,
+                "a node elected for every epoch defeats the sampling"
+            );
+        }
+    }
 
     /// A cheque from `consumer` acknowledging that `server` served it `cumulative` bytes.
     fn cheque(consumer: &NodeIdentity, server: [u8; 32], cumulative: u64) -> ServingCheque {

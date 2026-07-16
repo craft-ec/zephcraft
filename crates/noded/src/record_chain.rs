@@ -58,6 +58,22 @@ impl RecordChain {
         })
     }
 
+    /// Is THIS node on the committee that settles + attests `epoch`? Callers use it to skip work a
+    /// non-committee node has no reason to do: the settle itself is O(participants × census) chain reads,
+    /// and before this gate EVERY node paid that cost every epoch only for [`attest`] to then discard the
+    /// result on all but the k committee members. Same derivation `attest` uses, so the two can't disagree.
+    pub async fn is_committee_for(&self, epoch: u64) -> bool {
+        let me = self.identity.node_id().0;
+        match self
+            .committee
+            .committee_for_epoch(&self.records_cid, epoch)
+            .await
+        {
+            Some(c) => c.is_member(&me),
+            None => false,
+        }
+    }
+
     /// If this node is on the committee for `epoch`, sign `record` and author it to this node's records
     /// chain (committee-ordered). A no-op for non-committee nodes or an empty record. Returns whether a
     /// share was written.
