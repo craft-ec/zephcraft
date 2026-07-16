@@ -34,8 +34,14 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       verifies against the CURRENT committee, so a past-epoch commit across a membership change may not re-verify (the
       ledger should gate writes on a converged census, headreg-style). Enough to unblock 4b.
 - [ ] **4a-bis — `invoke_program` primitive** (com host fn + `Capability::InvokeProgram`; deterministic-callee only).
-- [ ] **4b — ledger core** (`crates/ledger` + `apps/ledger-wasm`; TransferOp/ClaimOp/fold_account; always-on re-fold
-      validity, no checkpoint).
+- [~] **4b — ledger core (IN PROGRESS).** 4b-1 DONE: `crates/ledger` (`#![no_std]` shared crate) — `LedgerOp`
+      {Transfer, Claim}, `LedgerBalanceState{balance, processed_claims}`, pure `apply(state, op, caller, debit)`:
+      Transfer debits self (checked, reject overdraft/zero); Claim credits self from a node-resolved sender debit
+      (to==me + single-use dedup) — recipient credit = CLAIM (each account a fold of its own chain). 4 tests
+      (debit/overdraft/zero, claim once/wrong-recipient/missing/replay, transfer→claim conserves, postcard roundtrip).
+      NEXT: 4b-2 `apps/ledger-wasm` (thin wasm wrapper, state/input/commit) + blob → cid; 4b-3 `noded::ledger`
+      (LedgerService: author SequencedWrite via the sequencer under the committee; resolve a claim's debit; balance
+      RPC) + wiring. Validity = always-on re-execution (no checkpoint).
 - [ ] **4c — reward = pool-average (separate program)** (reward-valuation program via invoke_program; two-pass
       allocate_quota identifies rewardable bytes; uniform-rate distribution; monotonic `minted_watermark` single-use).
 - [ ] **4d — settlement + tiers** (two-pass allocate_quota reciprocity-offset; EscrowOp/SettleClaim; admission + pin
