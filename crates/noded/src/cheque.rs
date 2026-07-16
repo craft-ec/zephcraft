@@ -73,6 +73,12 @@ pub struct ChequeService {
     pinned: AtomicU64,
     /// The LIVE storage-standing grant (bytes), from the governed `reciprocity:storage_grant` config.
     storage_grant: AtomicU64,
+    /// THIS node's cumulative Pay into the pool (from the durable ledger chain, refreshed periodically) —
+    /// the PAID-tier term: paying lifts the admission budget beyond reciprocity, so a paid user isn't gated.
+    my_paid: AtomicU64,
+    /// Per-peer cumulative Pay into the pool (each peer's `paid_total`, refreshed periodically) — the
+    /// PAID-tier term for the serve gate, so a paid REQUESTER isn't gated by our per-peer reciprocity.
+    peer_paid: Mutex<HashMap<[u8; 32], u64>>,
     /// Cheques to push (drained by [`run_pusher`](ChequeService::run_pusher)); `on_bytes_received` must
     /// not block, so it enqueues here rather than doing the network push inline.
     push_tx: mpsc::Sender<ServingCheque>,
@@ -100,9 +106,26 @@ impl ChequeService {
             peer_grant: AtomicU64::new(DEFAULT_PEER_GRANT),
             pinned: AtomicU64::new(0),
             storage_grant: AtomicU64::new(DEFAULT_STORAGE_GRANT),
+            my_paid: AtomicU64::new(0),
+            peer_paid: Mutex::new(HashMap::new()),
             push_tx,
         });
         (svc, push_rx)
+    }
+
+    /// Refresh THIS node's cumulative pool payment (from the durable ledger `paid_total`) — the paid-tier
+    /// term for the admission gate.
+    pub fn set_my_paid(&self, paid: u64) {
+        self.my_paid.store(paid, Ordering::Relaxed);
+    }
+
+    /// Refresh a peer's cumulative pool payment (its ledger `paid_total`) — the paid-tier term for the
+    /// serve gate, so a paid requester bypasses our per-peer reciprocity limit.
+    pub fn set_peer_paid(&self, peer: [u8; 32], paid: u64) {
+        self.peer_paid
+            .lock()
+            .expect("peer_paid lock")
+            .insert(peer, paid);
     }
 
     /// Set the cold-start grant (bytes) from the governed `reciprocity:grant` config — governance retunes
@@ -140,9 +163,9 @@ impl ChequeService {
     }
 
     /// PROVIDER-side reciprocity (§8): should this node serve `peer` ~`bytes` right now? Yes while what it
-    /// has served the peer (the peer's acknowledged cumulative cheque) stays within what the peer has
-    /// served IT (the cumulative it acknowledged to the peer) plus the per-peer grant. A freeloader — one
-    /// this node has served far more than it served back, without paying — is refused. Synchronous.
+    /// has served the peer stays within what the peer served IT (reciprocity) + the per-peer grant + what
+    /// the peer has PAID into the pool (the paid tier — a paid requester isn't bound by reciprocity). A
+    /// freeloader — served far more than it served back, and not paying — is refused. Synchronous.
     pub fn should_serve(&self, peer: [u8; 32], bytes: u64) -> bool {
         let served_to_peer = self
             .book
@@ -157,17 +180,31 @@ impl ChequeService {
             .expect("cheque issuer lock")
             .owed_to(&peer);
         let grant = self.peer_grant.load(Ordering::Relaxed);
-        served_to_peer.saturating_add(bytes) <= peer_served_me.saturating_add(grant)
+        let peer_paid = self
+            .peer_paid
+            .lock()
+            .expect("peer_paid lock")
+            .get(&peer)
+            .copied()
+            .unwrap_or(0);
+        served_to_peer.saturating_add(bytes)
+            <= peer_served_me
+                .saturating_add(grant)
+                .saturating_add(peer_paid)
     }
 
-    /// The free-tier admission decision (§8 tit-for-tat): may this node fetch `bytes` right now? Yes while
-    /// its CONSUMED total stays within what it has EARNED (cheque-proven bytes served to others) plus the
-    /// current (governed) grant. Beyond that a fetch must be paid for (a cheque) or wait until the node
-    /// contributes more. Synchronous (atomics + the book lock), so the obj admission gate can call it inline.
+    /// The admission decision (§8): may this node fetch `bytes` right now? Yes while its CONSUMED total
+    /// stays within reciprocity (what it EARNED by serving) + the grant + what it has PAID into the pool.
+    /// Reciprocity nets first for everyone; PAYING lifts the budget so a paid user isn't gated — a free
+    /// user (`my_paid = 0`) is capped at earned + grant. Synchronous, so the obj admission gate calls it inline.
     pub fn reciprocity_admits(&self, bytes: u64) -> bool {
         let consumed = self.consumed.load(Ordering::Relaxed);
         let grant = self.grant.load(Ordering::Relaxed);
-        let budget = self.total_earned().saturating_add(grant);
+        let paid = self.my_paid.load(Ordering::Relaxed);
+        let budget = self
+            .total_earned()
+            .saturating_add(grant)
+            .saturating_add(paid);
         consumed.saturating_add(bytes) <= budget
     }
 
@@ -407,5 +444,27 @@ mod tests {
             .record(ServingCheque::sign(&consumer, me, 10_000, 1));
         assert!(svc.pin_admits(10_000));
         assert!(!svc.pin_admits(1), "standing consumed → declined again");
+    }
+
+    #[tokio::test]
+    async fn paying_lifts_both_gate_budgets_past_reciprocity() {
+        let (svc, _rx) = service().await;
+        let gb = 1u64 << 30;
+        // A free node that spent its grant is gated on fetch...
+        svc.on_bytes_received(NodeId([1u8; 32]), gb);
+        assert!(!svc.reciprocity_admits(1), "free: grant spent → gated");
+        // ...until it PAYS → its admission budget lifts by exactly what it paid.
+        svc.set_my_paid(500);
+        assert!(svc.reciprocity_admits(500));
+        assert!(!svc.reciprocity_admits(501));
+
+        // Serve: a peer over its per-peer grant with no reciprocity is refused...
+        let peer = [7u8; 32];
+        let pg = 256u64 * 1024 * 1024;
+        assert!(!svc.should_serve(peer, pg + 1));
+        // ...until the peer has PAID into the pool → served beyond its per-peer grant.
+        svc.set_peer_paid(peer, 1000);
+        assert!(svc.should_serve(peer, pg + 1000));
+        assert!(!svc.should_serve(peer, pg + 1001));
     }
 }

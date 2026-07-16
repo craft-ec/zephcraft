@@ -1973,33 +1973,6 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // Run the epoch-close loop: author this node's settlement report + settle past-grace epochs by
     // reading the durable, committee-ordered settlement chains (no gossip handler needed).
     tokio::spawn(settlement_service.clone().run());
-    // Refresh the reciprocity grant from GOVERNED config (`reciprocity:grant`) into the sync-cached value
-    // the admission gate reads — so the free-tier policy is governance-tunable without a binary change.
-    {
-        let cs = cheque_service.clone();
-        let gov = governance_store.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
-            loop {
-                tick.tick().await;
-                if let Some(v) = gov.resolve_config(cheque::GRANT_CONFIG_KEY).await {
-                    if v >= 0 {
-                        cs.set_grant(v as u64);
-                    }
-                }
-                if let Some(v) = gov.resolve_config(cheque::PEER_GRANT_CONFIG_KEY).await {
-                    if v >= 0 {
-                        cs.set_peer_grant(v as u64);
-                    }
-                }
-                if let Some(v) = gov.resolve_config(cheque::STORAGE_GRANT_CONFIG_KEY).await {
-                    if v >= 0 {
-                        cs.set_storage_grant(v as u64);
-                    }
-                }
-            }
-        });
-    }
     // "Pending distribution" completion (per-incomplete-cid DHT resolve + deficit pushes)
     // — network fan-out, so it runs THROUGH the coordinator (Distribution priority,
     // deduped: a slow pass coalesces with the next tick instead of stacking). This loop
@@ -2115,6 +2088,44 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // The cheque pusher resolves a provider's address through membership before pushing a cheque.
     cheque_service.set_membership(membership.clone()).await;
     settlement_service.set_membership(membership.clone()).await;
+    // Refresh the reciprocity policy from GOVERNED config (grants) + the PAID-tier terms (this node's and
+    // each peer's cumulative pool payment from the durable ledger) into the sync-cached values the gates
+    // read — so the free-tier policy is governance-tunable and a paid user isn't gated, without any async
+    // work on the hot path.
+    {
+        let cs = cheque_service.clone();
+        let gov = governance_store.clone();
+        let led = ledger_service.clone();
+        let mem = membership.clone();
+        let me = identity.node_id().0;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                tick.tick().await;
+                if let Some(v) = gov.resolve_config(cheque::GRANT_CONFIG_KEY).await {
+                    if v >= 0 {
+                        cs.set_grant(v as u64);
+                    }
+                }
+                if let Some(v) = gov.resolve_config(cheque::PEER_GRANT_CONFIG_KEY).await {
+                    if v >= 0 {
+                        cs.set_peer_grant(v as u64);
+                    }
+                }
+                if let Some(v) = gov.resolve_config(cheque::STORAGE_GRANT_CONFIG_KEY).await {
+                    if v >= 0 {
+                        cs.set_storage_grant(v as u64);
+                    }
+                }
+                // Paid-tier terms: this node's pool payment (admission) + each peer's (serve), read from
+                // the durable ledger `Pay` chains (cached), so paying lifts the gate budget.
+                cs.set_my_paid(led.paid_total(me).await);
+                for (n, _addr) in mem.census().await {
+                    cs.set_peer_paid(n.0, led.paid_total(n.0).await);
+                }
+            }
+        });
+    }
     state.set_boot_stage("census-settling").await;
     {
         let (st, reg) = (state.clone(), head_registry.clone());

@@ -208,6 +208,14 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       tracks storage-provided-to-others, which the store doesn't expose today; and `pinned` resets on restart (a freeloader
       could re-pin the grant per session — bounded + re-pinning same content adds no real storage; re-deriving `pinned`
       from the store on startup is a follow-on).
+- [x] **4d-17 — PAID-TIER BYPASS on both gates DONE (2026-07-16).** The gates enforced FREE-tier reciprocity for everyone;
+      a paid user should hit no gate (§8: reciprocity nets first for all, paid/free = how the DEFICIT settles). Added the
+      paid term to both budgets: admission = `consumed ≤ earned + grant + my_paid`; serve = `served_to_peer ≤
+      peer_served_me + peer_grant + peer_paid`. So a free user (`paid = 0`) is capped at reciprocity + grant, while paying
+      into the pool lifts the budget 1:1 — a paid user isn't gated. The paid terms come from the DURABLE ledger `Pay`
+      chains: `ChequeService` caches `my_paid` + a per-peer `peer_paid` map, refreshed every 30s from
+      `LedgerService::paid_total(self)` and `paid_total(peer)` over the census (so the hot-path gate stays sync). 1 new test
+      (paying lifts both budgets past reciprocity). 40 noded + 27 obj tests, fmt, clippy green.
       **Remaining follow-ons:** dedicated storage-provided measure + persist `pinned`; reciprocity policy as a full governed
       PROGRAM (only if the formula must be swappable, not just the params); genesis anchor-pin + wasm-publish; an active
       verification loop; 4e-2 committee snapshots. (Verify-board→durable deferred by user.)
