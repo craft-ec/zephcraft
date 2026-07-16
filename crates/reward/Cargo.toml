@@ -6,7 +6,7 @@ authors.workspace = true
 license.workspace = true
 
 # The reward-valuation policy is a SEPARATE governed program (its own anchor, swappable). `#![no_std]`
-# + alloc so the same crate compiles for `apps/reward-wasm` (wasm32) and native node/tests.
+# + alloc so the same crate compiles into the `economy-egress` program (wasm32) and native node/tests.
 [dependencies]
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 postcard = { version = "1", default-features = false, features = ["alloc"] }

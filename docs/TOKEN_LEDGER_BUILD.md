@@ -33,10 +33,10 @@ The only genuinely new mechanism is the §10.5 **rotating epoch committee** (a n
 ## 1. File / crate manifest
 
 **New crates**
-- `crates/ledger` (`zeph-ledger`) — shared `#![no_std]` + `alloc` crate: Layer-0/Layer-1 postcard message schemas +
+- `crates/token` (`zeph-token`) [P5: was `crates/ledger`/`zeph-ledger`] — shared `#![no_std]` + `alloc` crate: Layer-0/Layer-1 postcard message schemas +
   deterministic fold functions. Consumed by *both* the wasm program and native noded/CLI/tests.
-- `apps/ledger-wasm` (`zeph-ledger-wasm`) — the protocol program compiled to `wasm32-unknown-unknown`; thin `run()`
-  over the `craftcom` host ABI (mirrors `apps/registry-wasm`), calling into `zeph-ledger`. Own `[workspace]`,
+- `apps/token-wasm` (`zeph-token-wasm`) [P5: was `apps/ledger-wasm`] — the protocol program compiled to `wasm32-unknown-unknown`; thin `run()`
+  over the `craftcom` host ABI (mirrors `apps/registry-wasm`), calling into `zeph-token`. Own `[workspace]`,
   `dlmalloc`; add to root `Cargo.toml` `exclude`.
 
 **New noded modules**
@@ -51,7 +51,7 @@ The only genuinely new mechanism is the §10.5 **rotating epoch committee** (a n
   admission-gate + pin-gate closures, the settlement loop.
 
 **Modified**
-- root `Cargo.toml` — add `zeph-ledger` to workspace.deps; add `apps/ledger-wasm` to `exclude`.
+- root `Cargo.toml` — add `zeph-token` to workspace.deps; add `apps/token-wasm` to `exclude`.
 - `crates/obj/src/lib.rs` — add `admission_gate` + `pin_gate` OnceLock fields + setters (mirror `set_shed_gate`),
   call sites at top of `get()` (~1017) and in `publish_impl()` before the pin branch (~720).
 - `crates/noded/src/sequence.rs` — generalize `quorums: Arc<AttestStore>` → `Arc<dyn QuorumSource>` (existing call
@@ -71,7 +71,7 @@ ABI, capabilities, and governance/attestation wire types are complete for this b
 `apps/registry-wasm` hand-mirrors `crates/com/src/registry.rs` (kept in sync manually, cross-checked by a test) —
 tolerable there for historical reasons. The ledger has no native-twin requirement (§5: the token logic *is* a
 governed-WASM program) and a materially larger ABI consumed by native code too. So factor schemas + pure fold logic
-into `crates/ledger` (compiles for wasm + host) and make `apps/ledger-wasm` a thin shim. This is the one deliberate
+into `crates/token` (compiles for wasm + host) and make `apps/token-wasm` a thin shim. This is the one deliberate
 departure from the app-crate pattern; the registry precedent was an accident, not a rule.
 
 ## 3. Phase 4a — K1 anchor-dispatcher
@@ -97,13 +97,13 @@ plumbing routes `(sentinel, ledger_cid)` to the committee quorum source.
 
 ## 4. Phase 4b — ledger core (Layer-0 ABI + account-chain model)
 
-Schemas (`crates/ledger`): `TransferOp{to,amount,memo}`, `ClaimOp{debit:SequencedCommitRef,amount}`,
+Schemas (`crates/token`): `TransferOp{to,amount,memo}`, `ClaimOp{debit:SequencedCommitRef,amount}`,
 `LedgerBalanceState{balance, processed_claims:BTreeSet<(sender,nonce)>, minted_watermark:BTreeMap<consumer,u64>}`. `SequencedCommitRef`
 carries the full `SequencedCommit` (write + k-of-n sigs) inline → a claim re-runs without a live network round-trip.
 
 - **Balance = fold of the owner's own `AccountSequence`.** A transfer is `SequencedWrite::author(sender, next_nonce,
   postcard(TransferOp))` → the `sequence` host fn → `SequenceStore::sequence` (unchanged), ordered under the sender's
-  epoch committee. `fold_account` in `zeph-ledger` replays `payload_at(0..n)` deterministically — every node computes
+  epoch committee. `fold_account` in `zeph-token` replays `payload_at(0..n)` deterministically — every node computes
   the identical balance, no gossip, no committee for the fold itself (like governance/attestation folding). Durability
   rides `SequenceStore`'s existing publish/pull.
 - **Recipient credit = CLAIM (not fold) — decisive.** Fold would need a global "who-owes-me" index (violates §6's
@@ -215,7 +215,7 @@ owner-signed genesis. Heaviest sub-phase; its own commit + gate.
   its verified output into the ledger), so a program-to-program host fn is NOT required for step 4 — and an in-wasm
   invoke of a callee fights verification (every re-run would nest-execute the callee). Keep as a *general* future
   capability if programs ever need to compose on the hot path; not on the step-4 path.
-- [x] **4b — ledger core. DONE** (4b-1 `crates/ledger` pure `apply(Transfer/Claim)`; 4b-2 `apps/ledger-wasm` +
+- [x] **4b — ledger core. DONE** (4b-1 `crates/token` pure `apply(Transfer/Claim)`; 4b-2 `apps/token-wasm` +
   `run_transition`; 4b-3 `noded::ledger::LedgerService` — committee-ordered transfers/claims + native balance fold +
   RPC/CLI). Validity = always-on re-fold (no checkpoint). Follow-ons: genesis anchor-pin/publish, active verify loop.
 - [ ] **4c — reward = contribution-ratio (separate program, NODE-orchestrated).** A pure reward-valuation program

@@ -2461,8 +2461,27 @@ Phases (each: build + test + gate + commit; roll together where consensus-affect
       stays on ledger), `control.rs` (State gains `economy`; reward_owed/rewardable_served/pool/dev_settle → economy;
       balance stays on ledger). Behavior-preserving (pure service reorg — no consensus/wire change) → NO fleet roll.
       48 noded tests green; fmt/clippy clean.
-- [ ] **P5 — genesis + dashboard:** publish `token.wasm` + `economy-egress.wasm`, pin both anchors (rename
-      "reward"→"economy-egress", "token-ledger"→"token"); dashboard anchor list + labels.
+- [x] **P5 — TRUE DEPLOYED SPLIT DONE (2026-07-17, user chose "true split"; CONSENSUS-AFFECTING, rolls in P7).**
+      The COMBINER IS GONE. Key insight that made it clean: the reward dedup (`claimed_epochs`) is VALUE SAFETY
+      (it protects the balance, exactly like `processed_claims` does for `Claim`), so it belongs to TOKEN, not
+      economy → moved into `TokenState`. With it there, dedup+credit are one fold of one write on the provider's
+      own single-writer chain ⇒ ATOMIC by construction, no co-fold, no combiner, no cross-program transaction
+      (this DISCHARGES the §3 atomicity worry rather than breaking it).
+      - `zeph-token` = the ACCOUNT CHAIN's program: `TokenState{balance, processed_claims, claimed_epochs}` +
+        `apply_token` (all 4 ops) + `run_transition` (the whole program body). Its cid IS the chain identity.
+      - `zeph-economy-egress` = the STATELESS valuation/record program: wraps `zeph_reward` (`run_program` =
+        contribution-ratio compute). No account state, never folds a balance. P6 subscriptions land here.
+      - `apps/token-wasm` → `crates/noded/token.wasm` (NEW cid, replaces ledger.wasm);
+        `apps/economy-egress-wasm` → `crates/noded/economy-egress.wasm` — **byte-identical to the retired
+        reward.wasm** (same valuation bytes) ⇒ that anchor rename is a pure NAME change, same cid.
+      - DELETED: `crates/ledger`, `apps/ledger-wasm`, `apps/reward-wasm`, `ledger.wasm`, `reward.wasm`.
+      - Anchors: `TOKEN_ANCHOR="token"` + `ECONOMY_EGRESS_ANCHOR="economy-egress"` (were "token-ledger"/"reward");
+        genesis publishes+pins both; control dashboard anchor list + committee label follow.
+      - **CONSENSUS: token's cid CHANGED ⇒ every account chain restarts EMPTY (all dev-testnet balances reset).**
+        User accepted; no migration written. Rolls with P7 (simultaneous — old/new nodes disagree on the chain).
+      - Verified: token 5 / economy 3 / reward + 48 noded tests green, full workspace test green, fmt/clippy clean.
+      - Docs reconciled IN PLACE: design §5b rewritten (co-fold marked superseded, the built model documented),
+        phase plan P3/P4/P5 marked done, TOKEN_LEDGER_BUILD.md structural refs repointed.
 - [ ] **P6 — subscriptions in economy-egress:** governed `bytes_per_token`, subscription = locked
       `egress_bytes`, 30-day windowed per-consumer quota (on top of the per-consumer FCFS already shipped),
       use-it-or-lose-it (no escrow — tokens already priced into the pool-average).

@@ -1,0 +1,21 @@
+[package]
+name = "zeph-economy-egress-wasm"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# The economy-egress policy/record program — a thin wrapper over the shared zeph-economy-egress crate,
+# so a verifier re-running it reproduces the node's native valuation by construction.
+zeph-economy-egress = { path = "../../crates/economy-egress" }
+dlmalloc = { version = "0.2", features = ["global"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"
+strip = true
+
+[workspace]

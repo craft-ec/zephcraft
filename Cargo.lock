@@ -5856,8 +5856,7 @@ name = "zeph-economy-egress"
 version = "0.1.0"
 dependencies = [
  "postcard",
- "serde",
- "zeph-token",
+ "zeph-reward",
 ]
 
 [[package]]
@@ -5877,16 +5876,6 @@ version = "0.1.0"
 dependencies = [
  "tokio",
  "zeph-core",
-]
-
-[[package]]
-name = "zeph-ledger"
-version = "0.1.0"
-dependencies = [
- "postcard",
- "serde",
- "zeph-economy-egress",
- "zeph-token",
 ]
 
 [[package]]
@@ -5933,9 +5922,9 @@ dependencies = [
  "zeph-core",
  "zeph-crypto",
  "zeph-dht",
+ "zeph-economy-egress",
  "zeph-erasure",
  "zeph-events",
- "zeph-ledger",
  "zeph-membership",
  "zeph-obj",
  "zeph-reward",
@@ -5943,6 +5932,7 @@ dependencies = [
  "zeph-sched",
  "zeph-sql",
  "zeph-store",
+ "zeph-token",
  "zeph-transport",
  "zeph-wire",
 ]

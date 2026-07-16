@@ -280,7 +280,10 @@ impl State {
                 .unwrap_or([0u8; 32]);
             let (verified, mismatched) = self.settlement.verification_stats();
             let mut anchors = Vec::new();
-            for name in [crate::anchor::LEDGER_ANCHOR, crate::anchor::REWARD_ANCHOR] {
+            for name in [
+                crate::anchor::TOKEN_ANCHOR,
+                crate::anchor::ECONOMY_EGRESS_ANCHOR,
+            ] {
                 if let Some(res) = self.anchor.resolve(name).await {
                     anchors.push(AnchorRow {
                         name: name.to_string(),
@@ -1558,10 +1561,10 @@ async fn rpc_config(state: &State, id: serde_json::Value) -> serde_json::Value {
     serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"config": rows}})
 }
 
-/// The current rotating EPOCH COMMITTEE (automated attestation) for the anchored token-ledger program —
+/// The current rotating EPOCH COMMITTEE (automated attestation) for the anchored token program —
 /// the computed k-of-n quorum that orders its writes this epoch.
 async fn rpc_committee(state: &State, id: serde_json::Value) -> serde_json::Value {
-    let program = crate::ledger::ledger_program_cid();
+    let program = crate::ledger::token_program_cid();
     let epoch = state.clock.now().millis() / 30_000; // EPOCH_MILLIS
     let quorum = state
         .epoch_committee
@@ -1576,7 +1579,7 @@ async fn rpc_committee(state: &State, id: serde_json::Value) -> serde_json::Valu
         })
         .unwrap_or_default();
     serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
-        "epoch": epoch, "program": crate::anchor::LEDGER_ANCHOR, "members": members, "threshold": threshold,
+        "epoch": epoch, "program": crate::anchor::TOKEN_ANCHOR, "members": members, "threshold": threshold,
     }})
 }
 

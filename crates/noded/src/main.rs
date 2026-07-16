@@ -1751,8 +1751,8 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // token ledger. Built first so the token ledger can hold it (token → economy, one-directional) to
     // resolve a RewardClaim's share + mark it claimed.
     let economy_service = std::sync::Arc::new(economy_egress::EconomyEgressService::new());
-    // The token-ledger service (§11 step 4): authors owner-signed ledger writes ordered by the epoch
-    // committee, and folds an account's sequence into its balance via the shared zeph-ledger crate.
+    // The TOKEN service (the `token` anchor): authors owner-signed account writes ordered by the epoch
+    // committee, and folds an account's sequence into its balance via the shared zeph-token crate.
     let ledger_service = std::sync::Arc::new(ledger::LedgerService::new(
         identity.clone(),
         sequence_store.clone(),

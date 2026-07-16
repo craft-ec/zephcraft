@@ -9,7 +9,7 @@ members = [
     "apps/*",
     "tests",
 ]
-exclude = ["apps/registry-wasm", "apps/guestbook-wasm", "apps/ledger-wasm", "apps/reward-wasm"]
+exclude = ["apps/registry-wasm", "apps/guestbook-wasm", "apps/token-wasm", "apps/economy-egress-wasm"]
 
 [workspace.package]
 version = "0.1.0"
@@ -38,7 +38,6 @@ zeph-com = { path = "crates/com" }
 zeph-cheque = { path = "crates/cheque" }
 zeph-token = { path = "crates/token" }
 zeph-economy-egress = { path = "crates/economy-egress" }
-zeph-ledger = { path = "crates/ledger" }
 zeph-reward = { path = "crates/reward" }
 zeph-testkit = { path = "crates/testkit" }
 

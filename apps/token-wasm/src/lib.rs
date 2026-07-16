@@ -1,9 +1,11 @@
-//! The token ledger as a governance-upgradeable WASM PROTOCOL PROGRAM — the canonical program pinned
-//! behind the K1 `token-ledger` anchor (ECONOMIC_LAYER_DESIGN.md §5; TOKEN_LEDGER_BUILD.md §4). A
-//! thin wrapper over `zeph_ledger` (the SAME crate the node folds natively): read the account's prior
-//! `LedgerBalanceState` via `state`, the node-built `LedgerInput` via `input`, run the pure
-//! transition, and `commit` the new state. An empty commit = a rejected write. Because the wasm and
-//! the node share `zeph_ledger`, a verifier re-running this program reproduces the node's fold exactly.
+//! The TOKEN program as a governance-upgradeable WASM PROTOCOL PROGRAM — the canonical program pinned
+//! behind the K1 `token` anchor, and the program of every account chain
+//! (`ECONOMY_PROGRAMS_DESIGN.md §5`; replaces the pre-split `token-ledger`/ledger.wasm).
+//!
+//! A thin wrapper over `zeph_token` (the SAME crate the node folds natively): read the account's prior
+//! `TokenState` via `state`, the node-built `LedgerInput` via `input`, run the pure transition, and
+//! `commit` the new state. An empty commit = a rejected write. Because the wasm and the node share
+//! `zeph_token`, a verifier re-running this program reproduces the node's fold exactly.
 
 #![no_std]
 
@@ -41,7 +43,7 @@ fn read_host(f: unsafe extern "C" fn(*mut u8, i32) -> i32) -> Vec<u8> {
 pub extern "C" fn run() {
     let prev = read_host(state);
     let req = read_host(input);
-    if let Some(out) = zeph_ledger::run_transition(&prev, &req) {
+    if let Some(out) = zeph_token::run_transition(&prev, &req) {
         unsafe {
             commit(out.as_ptr(), out.len() as i32);
         }

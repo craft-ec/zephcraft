@@ -17,25 +17,30 @@ use zeph_core::Cid;
 use zeph_obj::ObjEngine;
 
 use crate::governance::GovernanceChainStore;
-use crate::ledger::{ledger_program_cid, LedgerService};
+use crate::ledger::{token_program_cid, LedgerService};
 
-/// The canonical reward-valuation program (built from `apps/reward-wasm`) — the referent a verifier
-/// re-runs to check an epoch record.
-const REWARD_WASM: &[u8] = include_bytes!("../reward.wasm");
+/// The canonical economy-egress program (built from `apps/economy-egress-wasm`) — the referent a
+/// verifier re-runs to check an epoch record. It is the egress VALUATION (formerly the standalone
+/// `reward` program, whose bytes it is); balances live in the separate `token` program.
+const ECONOMY_EGRESS_WASM: &[u8] = include_bytes!("../economy-egress.wasm");
 
-/// The reward program's canonical cid = the content hash of its embedded wasm.
-pub fn reward_program_cid() -> [u8; 32] {
-    Cid::of(REWARD_WASM).0
+/// The economy-egress program's canonical cid = the content hash of its embedded wasm.
+pub fn economy_egress_program_cid() -> [u8; 32] {
+    Cid::of(ECONOMY_EGRESS_WASM).0
 }
 
-use crate::anchor::{LEDGER_ANCHOR, REWARD_ANCHOR};
+use crate::anchor::{ECONOMY_EGRESS_ANCHOR, TOKEN_ANCHOR};
 
 /// Publish the embedded protocol-program wasm to obj and pin their governance anchors. See the module
 /// docs — idempotent, safe every startup.
 pub async fn activate(engine: &Arc<ObjEngine>, governance: &Arc<GovernanceChainStore>) {
     let programs: [(&str, &[u8], [u8; 32]); 2] = [
-        (LEDGER_ANCHOR, LedgerService::wasm(), ledger_program_cid()),
-        (REWARD_ANCHOR, REWARD_WASM, reward_program_cid()),
+        (TOKEN_ANCHOR, LedgerService::wasm(), token_program_cid()),
+        (
+            ECONOMY_EGRESS_ANCHOR,
+            ECONOMY_EGRESS_WASM,
+            economy_egress_program_cid(),
+        ),
     ];
 
     // 1. Publish the wasm so verifiers can fetch the canonical program by cid (durable system objects).
@@ -82,10 +87,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reward_program_cid_is_stable_and_distinct_from_the_ledger() {
+    fn economy_egress_program_cid_is_stable_and_distinct_from_token() {
         // Content-addressed → a publish lands at exactly this cid, which the anchor pins.
-        assert_eq!(reward_program_cid(), reward_program_cid());
-        assert_ne!(reward_program_cid(), [0u8; 32]);
-        assert_ne!(reward_program_cid(), ledger_program_cid());
+        assert_eq!(economy_egress_program_cid(), economy_egress_program_cid());
+        assert_ne!(economy_egress_program_cid(), [0u8; 32]);
+        assert_ne!(economy_egress_program_cid(), token_program_cid());
     }
 }

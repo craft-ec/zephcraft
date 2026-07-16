@@ -135,25 +135,31 @@ row, each in its own reserved namespace, single-writer per account); CPI reads t
 - Crates: `zeph_ledger` → `zeph_token` (slimmed); new `zeph_economy_egress` (absorbs `Pay`/`RewardClaim` +
   `zeph_reward::compute`). Wasm artifacts renamed + rebuilt; genesis publishes + pins both anchors.
 
-## 5b. P3 split — the co-fold seam (refined 2026-07-16)
+## 5b. The split seam — token folds the chain, economy values the bytes (settled 2026-07-17, P5)
 
-`apply()` today mutates ONE `LedgerBalanceState` for all four ops. The split partitions the *state*, and one
-account write is **co-folded** by both program slices in-process (no CPI needed for the internal flow — CPI
-is the general external-read primitive from P2):
-- **`zeph_token` — the balance authority.** `TokenState { balance, processed_claims }`. Handles the *value
-  effect* of every op: `Transfer` (debit), `Claim` (credit), and the debit/credit that `Pay`/`RewardClaim`
-  carry. Knows money, not egress.
-- **`zeph_economy_egress` — the policy authority.** `EconomyState { claimed_epochs }` + the derived pool +
-  record. Handles the *policy effect*: `Pay` contributes to the derived egress pool (node sums Pay writes),
-  `RewardClaim` marks `claimed_epochs` (single-use dedup) and yields the reward **share** from the record.
-- **Co-fold order for `RewardClaim`:** economy folds first (dedup `claimed_epochs`; reject if already claimed;
-  produce `share` from the committee-attested record) → token credits `balance` by that `share`. Both are the
-  effect of ONE write on the provider's own chain (single-writer → atomic, §3). The `share` passes fold→fold
-  **in-process**, so no CPI is required for the token↔economy internal path; CPI (P2) is the general primitive
-  for *external* programs reading token/economy (and future economy-\* reading token).
+**Superseded design note.** P3 shipped an interim *co-fold*: `claimed_epochs` sat in a `zeph_economy_egress`
+slice and a `zeph-ledger` COMBINER folded both slices into one flat state. P5 removed that combiner. The
+co-fold only existed because the reward dedup had been assigned to economy; putting it where it belongs
+dissolved the problem. What follows is the built design.
 
-So P3 is: split the state + `apply` into a token slice and an economy slice, co-folded by `LedgerService`
-(native). The service split into `TokenService` / `EconomyEgressService` + rehoming settlement is P4.
+**The cut: value vs. valuation.**
+- **`zeph_token` — the account chain's program (the value authority).** `TokenState { balance,
+  processed_claims, claimed_epochs }`, advanced by `apply_token` for ALL four ops. Its cid IS the chain's
+  identity (`program_cid`), so a verifier re-running `token.wasm` over a chain reproduces the balance.
+- **`zeph_economy_egress` — the policy/record program (the valuation authority).** STATELESS: a pure
+  function of a node-built `RewardInput` → `RewardRecord` (it is the former `reward` program's bytes,
+  absorbed per §5). It never folds a balance and holds no account state. P6 adds subscriptions here.
+
+**Why both dedup sets are token's.** Deduping a credit is *value safety* — it protects the balance, exactly
+what `processed_claims` already does for `Claim`. So `claimed_epochs` lives in `TokenState`, folded WITH the
+credit in one write on the provider's own single-writer chain ⇒ the dedup and the credit are atomic by
+construction (both or neither), with no cross-program transaction and no combiner. Economy says what is
+*owed*; token says what is *paid*, exactly once. This is §3's atomicity claim, discharged.
+
+**The share crosses as data, not a call.** A `RewardClaim`'s share is resolved by the node from the
+committee-attested record (economy's authority) and handed to token as `Resolved.reward_share` — the same
+node-resolved pattern `Claim` already uses for its debit, and re-checked by re-execution (a verifier
+re-derives the record from committed inputs). No CPI on this path.
 
 **Why native protocol programs never need CPI internally (2026-07-16).** In this substrate **reads are
 transparent** — all committed data is public and re-derivable if you know the DB shape; the `app_ns` gate is
@@ -162,8 +168,8 @@ read paths: **native protocol programs** (`token`, `economy-egress` — part of 
 namespace in Rust (no host-fn, no gate — "we are the protocol"), while **sandboxed WASM** (user apps, any WASM
 economy-\* program) must cross the host-fn boundary via **CPI**. Both re-derive from the op-log (re-execution-
 authoritative), so no trust difference — just native-direct vs. host-fn-mediated. The token↔economy internal
-flow is native, so it direct-reads + passes `share` fold-to-fold; **CPI's real audience is the WASM sandbox.**
-Do not conflate the two in later phases.
+flow is native, so it direct-reads + passes `share` as resolved data; **CPI's real audience is the WASM
+sandbox.** Do not conflate the two in later phases.
 
 ## 6. Phase plan (each phase: build + test + gate + commit; roll together where consensus-affecting)
 
@@ -171,12 +177,17 @@ Do not conflate the two in later phases.
 2. **P2 — CPI primitive:** `Capability::InvokeProgram` + `invoke_program` host fn + `InvokeProgramBackend`,
    deterministic-callee grant; tests (a program invokes another, re-execution reproduces). No behavior change
    to existing programs.
-3. **P3 — split `zeph_ledger` → `zeph_token` (Transfer/Claim) + `zeph_economy_egress` (Pay/RewardClaim +
-   reward compute).** Keep native fold; `EconomyEgressService` holds `Arc<TokenService>`.
-4. **P4 — rehome settlement** (SettlementStore/Service, record_chain) under economy-egress; wire pool as a
-   token pool account; `reward_claim` two-step (token credit → economy claim mark) across the new boundary.
-5. **P5 — genesis + dashboard:** publish `token.wasm` + `economy-egress.wasm`, pin both anchors; dashboard
-   anchor list + labels.
+3. **P3 — DONE 2026-07-17.** Split the crates (`zeph-token` + `zeph-economy-egress`), interim combiner —
+   superseded by P5 (see §5b).
+4. **P4 — DONE 2026-07-17.** Rehomed settlement (SettlementStore + record_chain) under
+   `EconomyEgressService`; `LedgerService` holds `Arc<EconomyEgressService>` one-directionally (token →
+   economy) for `reward_share`. NOTE: inverted vs. the original sketch — economy is self-contained policy
+   with no account-chain access, which is what avoids a service-level cycle.
+5. **P5 — DONE 2026-07-17.** Combiner removed; `token.wasm` (from `apps/token-wasm`) is the account chain's
+   program and `economy-egress.wasm` (from `apps/economy-egress-wasm`, byte-identical to the retired
+   `reward.wasm`) is the valuation program. Anchors re-pinned `token` / `economy-egress`; `zeph-ledger`,
+   `apps/ledger-wasm`, `apps/reward-wasm` deleted. **Consensus:** token's cid changed ⇒ account chains
+   restart from empty (accepted: dev-testnet balances, no migration written).
 6. **P6 — subscriptions in economy-egress:** governed `bytes_per_token`, subscription = locked `egress_bytes`,
    30-day windowed per-consumer quota (build on the per-consumer FCFS already shipped). Use-it-or-lose-it.
 7. **P7 — deploy** (wire+consensus → simultaneous fleet roll).

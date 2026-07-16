@@ -6,8 +6,9 @@ authors.workspace = true
 license.workspace = true
 
 # `#![no_std]` + alloc so the SAME crate compiles for the `apps/economy-egress-wasm` protocol program
-# (wasm32) and native. Depends on `zeph-token` for the shared account-chain op vocabulary.
+# (wasm32) and native. Wraps `zeph-reward` (the egress valuation math): this crate IS the economy-egress
+# program behind the anchor, so it owns the reward record. `zeph-token` is a SEPARATE program (value) —
+# economy deliberately does not depend on it (no account-chain state here).
 [dependencies]
-serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 postcard = { version = "1", default-features = false, features = ["alloc"] }
-zeph-token = { workspace = true }
+zeph-reward = { workspace = true }

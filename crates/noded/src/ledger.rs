@@ -1,12 +1,12 @@
-//! `LedgerService` — the node-side integration of the token-ledger protocol program
-//! (TOKEN_LEDGER_BUILD.md §4; step 4 phase 4b-3). It:
+//! `LedgerService` — the node-side integration of the TOKEN protocol program (the `token` anchor;
+//! ECONOMY_PROGRAMS_DESIGN.md §5, P5 split). It:
 //! - **authors** owner-signed ledger writes into the sequencer, ordered by the **epoch committee**
 //!   (the write's owner is the anchor sentinel, so `AnchorAwareQuorumSource` routes to the committee);
-//! - **folds** an account's committed sequence into its balance via the shared [`zeph_ledger`] crate —
+//! - **folds** an account's committed sequence into its balance via the shared [`zeph_token`] crate —
 //!   NATIVELY, identical to a verifier re-running the wasm program by construction (same crate).
 //!
-//! The ledger *program* is the embedded [`LEDGER_WASM`] (the canonical cid pinned behind the K1
-//! `token-ledger` anchor, for verification/governance-swap); the node's own balance computation folds
+//! The token *program* is the embedded [`TOKEN_WASM`] (the canonical cid pinned behind the K1
+//! `token` anchor, for verification/governance-swap); the node's own balance computation folds
 //! natively. Validity is by re-execution (the fold), not a committee for the fold itself; an invalid
 //! write (e.g. an overdraft) folds to a no-op, so it can occupy a nonce but never corrupts the balance.
 
@@ -16,34 +16,35 @@ use std::sync::{Arc, Mutex};
 use zeph_com::{SequenceBackend, SequencedWrite};
 use zeph_core::Cid;
 use zeph_crypto::NodeIdentity;
-use zeph_ledger::{
-    apply, ClaimOp, LedgerBalanceState, LedgerOp, Resolved, ResolvedDebit, TransferOp,
-};
+use zeph_token::{apply_token, ClaimOp, LedgerOp, Resolved, ResolvedDebit, TokenState, TransferOp};
 
 use crate::anchor::AnchorDispatcher;
 use crate::economy_egress::EconomyEgressService;
 use crate::sequence::SequenceStore;
 
-/// The embedded ledger WASM program — the canonical `token-ledger` cid. Built from `apps/ledger-wasm`
-/// (a thin wrapper over `zeph-ledger`), so re-running it reproduces the node's native fold.
-const LEDGER_WASM: &[u8] = include_bytes!("../ledger.wasm");
+/// The embedded TOKEN WASM program — the canonical `token` cid, and the program of every account chain.
+/// Built from `apps/token-wasm` (a thin wrapper over `zeph-token`), so re-running it reproduces the
+/// node's native fold.
+const TOKEN_WASM: &[u8] = include_bytes!("../token.wasm");
 
-/// The canonical token-ledger program cid = the content hash of the embedded wasm.
-pub fn ledger_program_cid() -> [u8; 32] {
-    Cid::of(LEDGER_WASM).0
+/// The canonical token program cid = the content hash of the embedded wasm. This is the account chain's
+/// `program_cid`, so it IS the chain's identity: changing the program's bytes starts a fresh chain.
+pub fn token_program_cid() -> [u8; 32] {
+    Cid::of(TOKEN_WASM).0
 }
 
 pub struct LedgerService {
     identity: Arc<NodeIdentity>,
     sequence: Arc<SequenceStore>,
-    /// The canonical ledger program cid (the sequencer's `program_cid` for every ledger account).
+    /// The canonical TOKEN program cid (the sequencer's `program_cid` for every account chain).
     cid: [u8; 32],
-    /// The deterministic sentinel owner of the anchored ledger — routes ordering to the epoch committee
+    /// The deterministic sentinel owner of the anchored token program — routes ordering to the committee
     /// (a network-owned program has no owner key). One owner, one committee, many accounts.
     owner: [u8; 32],
-    /// The ECONOMY-EGRESS policy service (settlement pool + committee-attested records), P4 split. Token
-    /// is the value authority; when it co-folds a `RewardClaim` it asks economy for the reward SHARE and
-    /// marks the epoch claimed on commit. One-directional: token → economy, no cycle.
+    /// The ECONOMY-EGRESS policy service (settlement pool + committee-attested records). Token is the
+    /// value authority and owns the claim DEDUP; economy answers only "what SHARE is this provider owed
+    /// for this epoch" ([`EconomyEgressService::reward_share`]), which token folds as `Resolved`.
+    /// One-directional: token → economy, no cycle, no cross-program transaction.
     economy: Arc<EconomyEgressService>,
     /// Scan cache for [`paid_total`](Self::paid_total): `account → (next_nonce, running Pay total)`. The
     /// ledger chain is append-only, so a re-read only sums NEW `Pay` writes instead of the whole chain.
@@ -56,7 +57,7 @@ impl LedgerService {
         sequence: Arc<SequenceStore>,
         economy: Arc<EconomyEgressService>,
     ) -> Self {
-        let cid = ledger_program_cid();
+        let cid = token_program_cid();
         let owner = AnchorDispatcher::anchor_owner(&cid);
         Self {
             identity,
@@ -68,11 +69,11 @@ impl LedgerService {
         }
     }
 
-    /// The embedded ledger wasm bytes + its cid — consumed by the genesis step (publish the wasm to
-    /// obj so verifiers can fetch it, and pin the `token-ledger` anchor), which is the next follow-on.
+    /// The embedded token wasm bytes — consumed by the genesis step (publish the wasm to obj so
+    /// verifiers can fetch it, and pin the `token` anchor).
     #[allow(dead_code)]
     pub fn wasm() -> &'static [u8] {
-        LEDGER_WASM
+        TOKEN_WASM
     }
 
     #[allow(dead_code)]
@@ -133,15 +134,15 @@ impl LedgerService {
 
     /// Fold `account`'s committed sequence into its balance state (native — identical to a wasm
     /// re-run). An invalid write (`apply → None`) is a no-op, leaving the prior state.
-    pub async fn balance(&self, account: [u8; 32]) -> LedgerBalanceState {
+    pub async fn balance(&self, account: [u8; 32]) -> TokenState {
         let Some(seq) = self
             .sequence
             .sequence_of(self.owner, self.cid, account)
             .await
         else {
-            return LedgerBalanceState::default();
+            return TokenState::default();
         };
-        let mut state = LedgerBalanceState::default();
+        let mut state = TokenState::default();
         for nonce in 0..seq.next_nonce() {
             let Some(payload) = seq.payload_at(nonce) else {
                 break;
@@ -155,15 +156,16 @@ impl LedgerService {
                     reward_share: None,
                 },
                 // A RewardClaim's share resolves from the CANONICAL committee-attested record if one is
-                // finalized (durable + restart-safe), else the local in-memory record. `apply` enforces
-                // single-use, so double-claims are rejected regardless of the source.
+                // finalized (durable + restart-safe), else the local in-memory record. `apply_token`
+                // enforces single-use (its own `claimed_epochs`), so a replay credits nothing regardless
+                // of the source — the dedup is token's, not economy's.
                 LedgerOp::RewardClaim(epoch) => Resolved {
                     debit: None,
                     reward_share: Some(self.economy.reward_share(*epoch, &account).await),
                 },
                 _ => Resolved::default(),
             };
-            if let Some(next) = apply(state.clone(), &op, &account, &resolved) {
+            if let Some(next) = apply_token(state.clone(), &op, &account, &resolved) {
                 state = next;
             }
             // else: rejected write → no-op (the nonce is spent, the balance is unchanged)
@@ -222,7 +224,8 @@ impl LedgerService {
     pub async fn reward_claim(&self, epoch: u64) -> bool {
         let ok = self.submit_own(LedgerOp::RewardClaim(epoch)).await;
         if ok {
-            // Co-fold's economy effect on commit: mark the epoch claimed in the settlement pool.
+            // The authoritative dedup is token's own `claimed_epochs` (folded with the credit). This only
+            // moves the epoch out of the pool's `owed` accounting — observability, not a safety gate.
             self.economy
                 .mark_claimed(epoch, self.identity.node_id().0)
                 .await;
@@ -236,12 +239,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ledger_cid_is_stable_and_nonzero() {
+    fn token_cid_is_stable_and_nonzero() {
         // The embedded program has a stable content cid (the anchor referent).
-        assert_eq!(ledger_program_cid(), ledger_program_cid());
-        assert_ne!(ledger_program_cid(), [0u8; 32]);
+        assert_eq!(token_program_cid(), token_program_cid());
+        assert_ne!(token_program_cid(), [0u8; 32]);
         // Sentinel owner is derived from it (routes to the committee) and isn't the cid itself.
-        let owner = AnchorDispatcher::anchor_owner(&ledger_program_cid());
-        assert_ne!(owner, ledger_program_cid());
+        let owner = AnchorDispatcher::anchor_owner(&token_program_cid());
+        assert_ne!(owner, token_program_cid());
     }
 }

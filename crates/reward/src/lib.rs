@@ -3,7 +3,7 @@
 //! program** (its own K1 anchor, swappable): the node runs it once per epoch at settlement close, its
 //! output is independently verified (k nodes re-run this pure `compute`), and it becomes the **epoch
 //! reward RECORD** that providers claim against. `#![no_std]` so the identical crate compiles for
-//! `apps/reward-wasm` and for native node/tests.
+//! the `economy-egress` program (`apps/economy-egress-wasm`) and for native node/tests.
 //!
 //! **Model — contribution ratio, no overflow.** Each provider's share is its ratio of the payment
 //! pool: `pool × bytes_i / Σ bytes` (a uniform per-byte rate, so a provider earns the same regardless
@@ -92,7 +92,7 @@ pub fn compute(input: &RewardInput) -> RewardRecord {
 }
 
 /// The whole program body: decode a [`RewardInput`], compute, and return the encoded [`RewardRecord`]
-/// to commit. `apps/reward-wasm` and the native node both call this, so their results are identical.
+/// to commit. `zeph-economy-egress` (the program) and the native node both call this, so results match.
 pub fn run_reward(input: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     let inp: RewardInput = postcard::from_bytes(input).ok()?;
     postcard::to_allocvec(&compute(&inp)).ok()

@@ -20,10 +20,13 @@ use crate::governance::GovernanceChainStore;
 
 /// Canonical protocol-program anchor names (governance-pinned name → program cid). Centralized here so the
 /// token / economy-\* split (docs/ECONOMY_PROGRAMS_DESIGN.md) can't drift across genesis/control/dashboard.
-/// NOTE: the string values stay "token-ledger"/"reward" until P5 re-pins them at genesis as "token" /
-/// "economy-egress".
-pub const LEDGER_ANCHOR: &str = "token-ledger";
-pub const REWARD_ANCHOR: &str = "reward";
+///
+/// P5 re-pinned both (was "token-ledger" / "reward"): `token` is the VALUE program — the program of every
+/// account chain, so its cid is the chain's identity — and `economy-egress` is the POLICY/record program
+/// (the egress valuation, formerly the standalone `reward` program, whose bytes it is). Future siblings:
+/// `economy-storage`, … — each a separate anchor reusing the one `token`.
+pub const TOKEN_ANCHOR: &str = "token";
+pub const ECONOMY_EGRESS_ANCHOR: &str = "economy-egress";
 
 /// A resolved anchor: the program cid governance currently pins to a name, plus its interface version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
