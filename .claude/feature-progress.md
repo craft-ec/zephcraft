@@ -56,8 +56,12 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       + verifier fetch); wire an ACTIVE verification loop re-running the ledger fold (validity is currently native-fold
       correct, trust-by-re-execution not yet an active cross-node loop for the ledger); trustless claim-ordering needs
       4e-2 committee snapshots. End-to-end transfer→claim→balance is fleet-validatable.
-- [ ] **4c — reward = CONTRIBUTION-RATIO (separate program, node-orchestrated)** (pure `{pool, contributions}→shares`
-      program invoked BY THE NODE at epoch close, verified → epoch reward RECORD; NO overflow subsidy; two-pass
+- [~] **4c — reward = CONTRIBUTION-RATIO (separate program, node-orchestrated). 4c-1 DONE:** `crates/reward` (pure
+      no_std) — `compute(RewardInput{epoch,pool,contributions}) → RewardRecord{shares}`: each share = `pool×bytes/Σbytes`
+      (uniform rate, aggregated+sorted canonical, `Σ shares ≤ pool`, dust unallocated); `run_reward` body; `share_of`.
+      6 tests (ratio, uniform-fairness, zero-pool, aggregation-canonical, dust-bounded, roundtrip). NEXT: 4c-2
+      `apps/reward-wasm` (canonical cid for verify/swap). Then invoked BY THE NODE at epoch close → epoch reward RECORD.
+      Original spine: two-pass
       allocate_quota identifies rewardable bytes; uniform-rate distribution; monotonic `minted_watermark` single-use).
 - [ ] **4d — settlement (CLAIM-based) + gates** (EscrowOp→pool; `LedgerOp::RewardClaim{epoch}` credits the recorded
       share once; node epoch-close loop gather→offset→reward→verify→publish; two-pass allocate_quota; admission + pin
