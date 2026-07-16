@@ -1649,6 +1649,12 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
             cs.should_serve(peer, bytes)
         }));
     }
+    // Owner-pays-pin (§8): gate a durable PIN on this node's storage standing — pin freely up to
+    // `total_earned + storage grant`, beyond which a new pin downgrades to a non-pinned publish.
+    {
+        let cs = cheque_service.clone();
+        engine.set_pin_gate(std::sync::Arc::new(move |bytes| cs.pin_admits(bytes)));
+    }
 
     tracing::info!(
         node_id = %identity.node_id().to_hex(),
@@ -1984,6 +1990,11 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                 if let Some(v) = gov.resolve_config(cheque::PEER_GRANT_CONFIG_KEY).await {
                     if v >= 0 {
                         cs.set_peer_grant(v as u64);
+                    }
+                }
+                if let Some(v) = gov.resolve_config(cheque::STORAGE_GRANT_CONFIG_KEY).await {
+                    if v >= 0 {
+                        cs.set_storage_grant(v as u64);
                     }
                 }
             }

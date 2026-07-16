@@ -41,6 +41,12 @@ pub const GRANT_CONFIG_KEY: &str = "reciprocity:grant";
 const DEFAULT_PEER_GRANT: u64 = 256 * 1024 * 1024; // 256 MiB
 /// The governance config key carrying the per-peer serve grant (bytes), refreshed into `peer_grant`.
 pub const PEER_GRANT_CONFIG_KEY: &str = "reciprocity:peer_grant";
+/// DEFAULT storage-standing grant (§8, owner-pays-pin): how much durable content a node may PIN before
+/// its network contribution must cover it. Pinning consumes durable network storage (replicated × n), so
+/// a freeloader can't hoard it. Governed via `reciprocity:storage_grant`.
+const DEFAULT_STORAGE_GRANT: u64 = 256 * 1024 * 1024; // 256 MiB
+/// The governance config key carrying the storage-standing grant (bytes), refreshed into `storage_grant`.
+pub const STORAGE_GRANT_CONFIG_KEY: &str = "reciprocity:storage_grant";
 
 pub struct ChequeService {
     identity: Arc<NodeIdentity>,
@@ -62,6 +68,11 @@ pub struct ChequeService {
     /// The LIVE per-peer serve grant (bytes), from the governed `reciprocity:peer_grant` config. Read
     /// synchronously by the provider-side serve gate.
     peer_grant: AtomicU64,
+    /// Total bytes this node has PINNED (durable-storage footprint it asks the network to hold). Gated
+    /// against its storage standing (`total_earned + storage_grant`) so a freeloader can't hoard storage.
+    pinned: AtomicU64,
+    /// The LIVE storage-standing grant (bytes), from the governed `reciprocity:storage_grant` config.
+    storage_grant: AtomicU64,
     /// Cheques to push (drained by [`run_pusher`](ChequeService::run_pusher)); `on_bytes_received` must
     /// not block, so it enqueues here rather than doing the network push inline.
     push_tx: mpsc::Sender<ServingCheque>,
@@ -87,6 +98,8 @@ impl ChequeService {
             consumed: AtomicU64::new(0),
             grant: AtomicU64::new(DEFAULT_COLD_START_GRANT),
             peer_grant: AtomicU64::new(DEFAULT_PEER_GRANT),
+            pinned: AtomicU64::new(0),
+            storage_grant: AtomicU64::new(DEFAULT_STORAGE_GRANT),
             push_tx,
         });
         (svc, push_rx)
@@ -101,6 +114,29 @@ impl ChequeService {
     /// Set the per-peer serve grant (bytes) from the governed `reciprocity:peer_grant` config.
     pub fn set_peer_grant(&self, grant: u64) {
         self.peer_grant.store(grant, Ordering::Relaxed);
+    }
+
+    /// Set the storage-standing grant (bytes) from the governed `reciprocity:storage_grant` config.
+    pub fn set_storage_grant(&self, grant: u64) {
+        self.storage_grant.store(grant, Ordering::Relaxed);
+    }
+
+    /// STORAGE-standing gate (§8, owner-pays-pin): may this node PIN `bytes` of durable content right now?
+    /// Yes while its pinned footprint stays within its network contribution (`total_earned`) plus the
+    /// storage grant; on admit the footprint is accounted. Beyond that a new pin DOWNGRADES to non-pinned.
+    /// (`total_earned` is the standing proxy — a node that serves the network earns the right to consume
+    /// durable storage; a dedicated storage-provided measure is a follow-on.) Synchronous.
+    pub fn pin_admits(&self, bytes: u64) -> bool {
+        let pinned = self.pinned.load(Ordering::Relaxed);
+        let budget = self
+            .total_earned()
+            .saturating_add(self.storage_grant.load(Ordering::Relaxed));
+        if pinned.saturating_add(bytes) <= budget {
+            self.pinned.fetch_add(bytes, Ordering::Relaxed); // account the pin
+            true
+        } else {
+            false
+        }
     }
 
     /// PROVIDER-side reciprocity (§8): should this node serve `peer` ~`bytes` right now? Yes while what it
@@ -350,5 +386,26 @@ mod tests {
             !svc.should_serve(pid, 1),
             "served == what the peer served us + grant → refuse more"
         );
+    }
+
+    #[tokio::test]
+    async fn owner_pays_pin_grants_then_requires_storage_standing() {
+        let (svc, _rx) = service().await;
+        let grant = 256u64 * 1024 * 1024; // DEFAULT_STORAGE_GRANT
+                                          // A fresh node may pin up to the storage grant (this accounts the pin).
+        assert!(svc.pin_admits(grant));
+        assert!(
+            !svc.pin_admits(1),
+            "grant spent → must earn standing to pin more"
+        );
+        // Contributing to the network (serving) earns pin standing.
+        let me = svc.identity.node_id().0;
+        let consumer = NodeIdentity::generate();
+        svc.book
+            .lock()
+            .unwrap()
+            .record(ServingCheque::sign(&consumer, me, 10_000, 1));
+        assert!(svc.pin_admits(10_000));
+        assert!(!svc.pin_admits(1), "standing consumed → declined again");
     }
 }

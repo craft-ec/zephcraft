@@ -197,9 +197,20 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       consumer gate. `ChequeService::should_serve(peer, bytes)` = `served_to_peer (its acked cheque) + bytes ≤
       peer_served_me (owed_to) + peer_grant` → a freeloader is refused before the bytes go out (empty PieceResponse). 2 new
       tests. 38 noded + 27 obj tests, fmt, clippy green.
-      **Remaining follow-ons:** move the reciprocity policy into a full governed PROGRAM (vs governed params — only if the
-      formula itself needs to be swappable); wire pin_gate→storage-standing policy (owner-pays-pin, separate resource);
-      genesis anchor-pin + wasm-publish; an active verification loop; 4e-2 committee snapshots. (Verify-board→durable deferred by user.)
+- [x] **4d-16 — PIN GATE → STORAGE-STANDING POLICY (owner-pays-pin) DONE (2026-07-16).** The obj `pin_gate` (unwired
+      since 4d-2 — a permissive no-op that downgrades pin→non-pinned when it declines) is now wired to storage standing.
+      `ChequeService` tracks `pinned` (an `AtomicU64` durable-storage footprint) + a governed `storage_grant`
+      (`reciprocity:storage_grant`, refreshed in the same loop); `pin_admits(bytes)` = `pinned + bytes ≤ total_earned +
+      storage_grant` and accounts the pin on admit. `main.rs` installs it via `set_pin_gate`, so a node pins freely up to
+      its standing then a new pin DOWNGRADES to non-pinned. So all THREE obj gates are now enforced (admission=fetch,
+      serve=per-peer, pin=storage). 1 new test. 39 noded + 27 obj tests, fmt, clippy green.
+      **Honest caveats (noted in code):** `total_earned` (bandwidth-served) is the storage-standing PROXY — a proper model
+      tracks storage-provided-to-others, which the store doesn't expose today; and `pinned` resets on restart (a freeloader
+      could re-pin the grant per session — bounded + re-pinning same content adds no real storage; re-deriving `pinned`
+      from the store on startup is a follow-on).
+      **Remaining follow-ons:** dedicated storage-provided measure + persist `pinned`; reciprocity policy as a full governed
+      PROGRAM (only if the formula must be swappable, not just the params); genesis anchor-pin + wasm-publish; an active
+      verification loop; 4e-2 committee snapshots. (Verify-board→durable deferred by user.)
 Open gaps needing a call at their phase: (1) anchor-authority routing RESOLVED (= committee), (2) escrow reclaim lifecycle [4d],
 (3) cold-start grant + identity gate [4d], (4) uniform-pricing floor for the pool-average reward [4c]. (Checkpoint
 acceleration + reward-valuation decomposition RESOLVED; see TOKEN_LEDGER_BUILD.md §9.)
