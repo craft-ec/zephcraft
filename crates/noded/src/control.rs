@@ -174,6 +174,9 @@ pub struct Economy {
     pub reward_settled: u64,
     /// The distributable settlement pool (`unallocated`).
     pub pool: u64,
+    /// P6 SUBSCRIPTION: this node's remaining unexpired egress entitlement in bytes — what its payments
+    /// still entitle it to have served (use-it-or-lose-it: unspent bytes expire at the window edge).
+    pub subscription_bytes: u64,
     /// Settlement re-execution verification tally — epochs whose canonical record matched this node's own.
     pub verified: u64,
     /// Epochs whose canonical record DIVERGED from this node's re-execution (should stay 0).
@@ -297,6 +300,7 @@ impl State {
                 reward_owed: self.economy.reward_owed(me).await,
                 reward_settled: self.economy.rewardable_served(me).await,
                 pool: self.economy.pool_unallocated().await,
+                subscription_bytes: self.economy.entitlement(me, self.settlement.epoch()).await,
                 verified,
                 mismatched,
                 reciprocity: Some(self.cheque.reciprocity_snapshot()),

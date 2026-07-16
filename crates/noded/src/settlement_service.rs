@@ -14,14 +14,17 @@
 //!    reported `paid_cumulative` is likewise CAPPED at the node's actual committee-ordered `Pay` total on
 //!    its ledger chain, so neither side of the settlement can be inflated.
 //! 3. **Settle** — feed each participant's `(paid_cumulative)` AND its verified per-consumer cheques to
-//!    [`LedgerService::settle_from_board`], which applies the PER-CONSUMER FCFS cap (§10.1): a consumer's
-//!    paid quota — its `paid_cumulative` delta past a first-sight baseline — is allocated first-come across
-//!    the providers that served it (by cheque timestamp), so `Σ rewarded-for-a-consumer ≤ what it paid`
-//!    (self-dealing nets ≤ its own payment); serving past a consumer's quota is unrewarded subsidy. The
-//!    pool (Σ paid deltas) is then distributed pool-average over the resulting rewardable bytes. Per-(pair)
-//!    served watermarks make replaying cheques earn nothing. Every node reads the SAME committed reports +
-//!    cheques ⇒ bit-identical record ⇒ a `RewardClaim` resolves the same share everywhere, and a verifier
-//!    re-reads the chains to re-run it.
+//!    [`EconomyEgressService::settle_from_board`], which applies the PER-CONSUMER SUBSCRIPTION cap
+//!    (§10.1 with P6): each epoch a node's `paid_cumulative` delta both funds the pool AND buys it
+//!    `delta × bytes_per_token` bytes of egress ENTITLEMENT expiring one governed window (≈30 days) later.
+//!    Serving is allocated first-come (by cheque timestamp) against the consumer's unexpired entitlement,
+//!    oldest grant first, so `Σ rewarded-for-a-consumer ≤ what its payments entitle` (self-dealing nets ≤
+//!    its own payment — the price cancels in pool-average); serving past it is unrewarded subsidy, and
+//!    unspent entitlement expires (use-it-or-lose-it, never refunded — those tokens already funded reward).
+//!    The pool (Σ paid deltas) is then distributed pool-average over the resulting rewardable bytes.
+//!    Per-(pair) served watermarks make replaying cheques earn nothing. Every node reads the SAME committed
+//!    reports + cheques and prices with the SAME governed params ⇒ bit-identical record ⇒ a `RewardClaim`
+//!    resolves the same share everywhere, and a verifier re-reads the chains to re-run it.
 //!
 //! **MVP scope (honest):** the participant SET is the converged census, so a momentary census difference
 //! can differ the record until it converges — resolved at finalization by the committee-attested record
@@ -220,7 +223,7 @@ impl SettlementService {
     }
 
     /// The current epoch index = `now / EPOCH_MILLIS` (identical derivation to the epoch committee).
-    fn epoch(&self) -> u64 {
+    pub fn epoch(&self) -> u64 {
         self.clock.now().millis() / EPOCH_MILLIS
     }
 

@@ -2126,6 +2126,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         let cs = cheque_service.clone();
         let gov = governance_store.clone();
         let led = ledger_service.clone();
+        let eco = economy_service.clone();
         let mem = membership.clone();
         let me = identity.node_id().0;
         tokio::spawn(async move {
@@ -2145,6 +2146,24 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                 if let Some(v) = gov.resolve_config(cheque::STORAGE_GRANT_CONFIG_KEY).await {
                     if v >= 0 {
                         cs.set_storage_grant(v as u64);
+                    }
+                }
+                // P6 subscription terms: the egress PRICE (bytes one token buys) + the entitlement
+                // window. Governed so every node prices identically → deterministic reward records.
+                if let Some(v) = gov
+                    .resolve_config(zeph_economy_egress::BYTES_PER_TOKEN_CONFIG_KEY)
+                    .await
+                {
+                    if v > 0 {
+                        eco.set_bytes_per_token(v as u64).await;
+                    }
+                }
+                if let Some(v) = gov
+                    .resolve_config(zeph_economy_egress::WINDOW_EPOCHS_CONFIG_KEY)
+                    .await
+                {
+                    if v > 0 {
+                        eco.set_window_epochs(v as u64).await;
                     }
                 }
                 // Paid-tier terms: this node's pool payment (admission) + each peer's (serve), read from

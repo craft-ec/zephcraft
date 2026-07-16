@@ -1,5 +1,6 @@
 //! `SettlementStore` — the epoch-close settlement pool (ECONOMIC_LAYER_DESIGN.md §10.1; step 4 phase
-//! 4d-3). It holds the **running pool** and drives the pay-into-pool / claim-out model:
+//! 4d-3) + the P6 per-consumer SUBSCRIPTION entitlements. It holds the **running pool** and drives the
+//! pay-into-pool / claim-out model:
 //!
 //! - **`unallocated`** — payments not yet assigned to any provider (new `Pay` pay-ins + integer dust +
 //!   expired forfeits). The *only* thing a reward record distributes.
@@ -9,6 +10,11 @@
 //! Each epoch, [`settle_epoch`](SettlementStore::settle_epoch) distributes the current `unallocated`
 //! to that epoch's contributions by ratio (via the pure [`zeph_reward::compute`], so verifiers
 //! reproduce it), moving `unallocated → owed`; dust stays `unallocated` and folds into the next epoch.
+//! One paid delta has TWO effects (P6): it funds the pool AND buys the payer a windowed egress
+//! entitlement (`delta × bytes_per_token` bytes, expiring after the governed window) — serving a consumer
+//! earns reward only within its unexpired entitlement, and unspent bytes are lost at the edge rather than
+//! refunded, because those same tokens already funded providers' reward through the pool.
+//!
 //! A provider [`claim`](SettlementStore::claim)s its share (`owed → paid`). Records older than the
 //! **[`CLAIM_WINDOW_EPOCHS`]** window expire — their UNCLAIMED shares forfeit back to `unallocated` —
 //! which bounds storage to the last N records. Conservation is total: every paid token is `claimed`,
@@ -16,6 +22,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use zeph_economy_egress::subscription::{
+    SubscriptionLedger, DEFAULT_BYTES_PER_TOKEN, DEFAULT_WINDOW_EPOCHS,
+};
 use zeph_reward::{compute, Contribution, RewardInput, RewardRecord};
 
 /// Governed claim window (§10.1): an unclaimed reward share forfeits back to the pool after this many
@@ -23,7 +32,6 @@ use zeph_reward::{compute, Contribution, RewardInput, RewardRecord};
 /// reconstruction depth (replay this many epochs of durable reports to rebuild state).
 pub const CLAIM_WINDOW_EPOCHS: u64 = 8;
 
-#[derive(Default)]
 pub struct SettlementStore {
     /// Distributable pool (running): new pay-ins + rolled dust + expired forfeits.
     unallocated: u64,
@@ -34,26 +42,62 @@ pub struct SettlementStore {
     /// Per-node CUMULATIVE `Pay` total already folded into the pool. An epoch folds only each node's
     /// `paid_cumulative − watermark` delta, advancing the watermark — so a pay is counted exactly once.
     paid_watermark: BTreeMap<[u8; 32], u64>,
-    /// Per-node FIRST-SIGHT `Pay` baseline (§10.1 per-consumer path). A consumer's reward QUOTA is what it
-    /// has folded into the pool = `paid_cumulative − paid_baseline` (deltas since first sight), so the
-    /// quota can never exceed pool-funded value even for a node that joins with a historical `Pay` total.
-    paid_baseline: BTreeMap<[u8; 32], u64>,
     /// Per-`(provider, consumer)` CUMULATIVE served bytes already processed for rewardable allocation
     /// (per-consumer path). Deltas past it are rewardable-eligible; monotonic (cheques are cumulative), so
-    /// re-announcing the same cheque earns nothing twice. Safety is the quota cap, not a first-sight baseline.
+    /// re-announcing the same cheque earns nothing twice. Safety is the entitlement cap below.
     served_pair_wm: BTreeMap<([u8; 32], [u8; 32]), u64>,
-    /// Per-consumer CUMULATIVE rewardable already allocated — the per-consumer CAP: once a consumer's
-    /// allocated reaches its quota, further serving to it is subsidy (unrewarded). Guarantees
-    /// `Σ rewarded-for-a-consumer ≤ what that consumer paid` → self-dealing nets ≤ its own payment (zero-sum).
-    consumer_allocated: BTreeMap<[u8; 32], u64>,
+    /// Per-consumer WINDOWED egress entitlement (P6 subscriptions, `zeph_economy_egress`): each epoch's
+    /// paid delta buys `delta × bytes_per_token` bytes expiring `window` epochs later, and serving is
+    /// rewardable only within it. This IS the per-consumer cap — it guarantees
+    /// `Σ rewarded-for-a-consumer ≤ what that consumer's payments entitle` → self-dealing nets ≤ its own
+    /// payment. Unused bytes expire (use-it-or-lose-it); the first-sight watermark keeps a joining node's
+    /// historical `Pay` total from buying anything (delta from first sight = 0).
+    subs: SubscriptionLedger,
+    /// GOVERNED egress price: bytes of rewardable serving one token buys (`economy:bytes_per_token`).
+    bytes_per_token: u64,
+    /// GOVERNED subscription window in epochs (`economy:subscription_window_epochs`, ≈30 days).
+    window_epochs: u64,
     /// Per-provider CUMULATIVE rewardable served (Σ allocated to it across consumers) — the observable
     /// "settled" numerator of the dashboard settled/served meter.
     rewardable: BTreeMap<[u8; 32], u64>,
 }
 
+impl Default for SettlementStore {
+    fn default() -> Self {
+        Self {
+            unallocated: 0,
+            records: BTreeMap::new(),
+            claimed: BTreeSet::new(),
+            paid_watermark: BTreeMap::new(),
+            served_pair_wm: BTreeMap::new(),
+            subs: SubscriptionLedger::new(),
+            bytes_per_token: DEFAULT_BYTES_PER_TOKEN,
+            window_epochs: DEFAULT_WINDOW_EPOCHS,
+            rewardable: BTreeMap::new(),
+        }
+    }
+}
+
 impl SettlementStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Apply the GOVERNED egress price (bytes one token buys). Takes effect for FUTURE purchases only —
+    /// entitlements already bought keep the price they were bought at (no retroactive repricing).
+    pub fn set_bytes_per_token(&mut self, bytes_per_token: u64) {
+        self.bytes_per_token = bytes_per_token;
+    }
+
+    /// Apply the GOVERNED subscription window (epochs). Future purchases only, same reasoning.
+    pub fn set_window_epochs(&mut self, window_epochs: u64) {
+        self.window_epochs = window_epochs;
+    }
+
+    /// `consumer`'s remaining unexpired egress entitlement at `epoch` — the dashboard's
+    /// "subscription bytes left".
+    pub fn entitlement(&self, consumer: &[u8; 32], epoch: u64) -> u64 {
+        self.subs.available(consumer, epoch)
     }
 
     /// A consumer paid `amount` into the pool (from a committed `Pay` write) → `unallocated`.
@@ -108,25 +152,33 @@ impl SettlementStore {
         if let Some(existing) = self.records.get(&epoch) {
             return existing.clone(); // already settled → don't re-advance watermarks
         }
-        // Pool + per-consumer quota. Pool grows by each node's paid delta past its watermark; a node's quota
-        // (as a consumer) is what it has folded into the pool = paid_cumulative − first-sight baseline.
+        // Pool + subscriptions. ONE paid delta has both effects (P6): it funds the pool AND buys the
+        // payer's windowed egress entitlement — the same tokens, priced into the pool-average, which is
+        // exactly why an unused entitlement is never refunded (the reward it funded is already paid out).
+        // First sight sets the watermark only: a node joining with a historical `Pay` total buys nothing.
         let mut pool_add = 0u64;
-        let mut quota: BTreeMap<[u8; 32], u64> = BTreeMap::new();
         for (node, paid_cum) in &paid {
-            let baseline = *self.paid_baseline.entry(*node).or_insert(*paid_cum);
-            quota.insert(*node, paid_cum.saturating_sub(baseline));
             match self.paid_watermark.get(node).copied() {
                 None => {
-                    self.paid_watermark.insert(*node, *paid_cum); // baseline on first sight
+                    self.paid_watermark.insert(*node, *paid_cum); // first sight → delta 0
                 }
                 Some(w) => {
-                    pool_add = pool_add.saturating_add(paid_cum.saturating_sub(w));
+                    let delta = paid_cum.saturating_sub(w);
+                    pool_add = pool_add.saturating_add(delta);
+                    self.subs.purchase(
+                        *node,
+                        delta,
+                        self.bytes_per_token,
+                        epoch,
+                        self.window_epochs,
+                    );
                     self.paid_watermark.insert(*node, (*paid_cum).max(w));
                 }
             }
         }
-        // Allocate rewardable per provider: walk cheque DELTAS in a deterministic FCFS order and cap each
-        // consumer's cumulative rewardable at its quota (over-quota serving = subsidy, unrewarded).
+        // Allocate rewardable per provider: walk cheque DELTAS in a deterministic FCFS order, drawing each
+        // consumer's serving from its unexpired entitlement, oldest grant first (serving past what the
+        // consumer's subscription entitles = subsidy, unrewarded).
         cheques.sort_by(|a, b| (a.3, a.0, a.1).cmp(&(b.3, b.0, b.1)));
         let mut contrib: BTreeMap<[u8; 32], u64> = BTreeMap::new();
         for (provider, consumer, cum, _ts) in cheques {
@@ -137,14 +189,11 @@ impl SettlementStore {
             if delta == 0 {
                 continue;
             }
-            let q = quota.get(&consumer).copied().unwrap_or(0);
-            let used = self.consumer_allocated.get(&consumer).copied().unwrap_or(0);
-            let rewardable = delta.min(q.saturating_sub(used));
+            let rewardable = self.subs.allocate(&consumer, delta, epoch);
             if rewardable == 0 {
                 continue;
             }
             *contrib.entry(provider).or_default() += rewardable;
-            *self.consumer_allocated.entry(consumer).or_default() += rewardable;
             *self.rewardable.entry(provider).or_default() += rewardable;
         }
         self.pay_in(pool_add);
@@ -329,6 +378,7 @@ mod tests {
     #[test]
     fn per_consumer_fcfs_caps_rewardable_at_what_the_consumer_paid() {
         let mut s = SettlementStore::new();
+        s.set_bytes_per_token(1); // unit price: 1 token = 1 byte, so the arithmetic below is the mechanics
         let c = prov(9);
         // Epoch 1: consumer first seen at paid 0 → baselines (quota 0, pool 0), no serving yet.
         s.settle_epoch_from_cheques(1, vec![(c, 0)], vec![]);
@@ -356,6 +406,7 @@ mod tests {
     #[test]
     fn self_dealing_nets_at_most_what_was_paid() {
         let mut s = SettlementStore::new();
+        s.set_bytes_per_token(1); // unit price (the price cancels in pool-average — see the price test)
         let attacker = prov(5);
         s.settle_epoch_from_cheques(1, vec![(attacker, 0)], vec![]); // baseline
                                                                      // Attacker pays 100 and serves ITSELF 1000 bytes (sock-puppet consumer = itself).
@@ -376,6 +427,7 @@ mod tests {
     #[test]
     fn replayed_cheques_earn_nothing_twice_per_consumer() {
         let mut s = SettlementStore::new();
+        s.set_bytes_per_token(1); // unit price
         let c = prov(9);
         s.settle_epoch_from_cheques(1, vec![(c, 0)], vec![]);
         s.settle_epoch_from_cheques(2, vec![(c, 100)], vec![(prov(1), c, 60, 1)]);
@@ -392,12 +444,70 @@ mod tests {
     #[test]
     fn serving_beyond_a_consumers_quota_is_unrewarded_subsidy() {
         let mut s = SettlementStore::new();
+        s.set_bytes_per_token(1); // unit price
         let c = prov(9);
         s.settle_epoch_from_cheques(1, vec![(c, 0)], vec![]);
         // C paid 40 but was served 100 by one provider → only 40 rewardable, 60 subsidy.
         let rec = s.settle_epoch_from_cheques(2, vec![(c, 40)], vec![(prov(1), c, 100, 1)]);
         assert_eq!(rec.share_of(&prov(1)), 40);
         assert_eq!(s.rewardable_served(&prov(1)), 40, "capped at the 40 paid");
+    }
+
+    #[test]
+    fn a_token_buys_bytes_per_token_bytes_of_rewardable_serving() {
+        // P6: the governed price converts paid TOKENS into an egress BYTE budget. Before P6 the cap
+        // compared bytes against tokens directly (an implicit 1 token = 1 byte).
+        let mut s = SettlementStore::new();
+        s.set_bytes_per_token(1000);
+        let c = prov(9);
+        s.settle_epoch_from_cheques(1, vec![(c, 0)], vec![]); // first sight
+                                                              // C pays 2 tokens → 2 × 1000 = 2000 bytes of entitlement.
+        assert_eq!(
+            s.entitlement(&c, 2),
+            0,
+            "not bought until the delta settles"
+        );
+        let rec = s.settle_epoch_from_cheques(2, vec![(c, 2)], vec![(prov(1), c, 1500, 1)]);
+        assert_eq!(
+            rec.share_of(&prov(1)),
+            2,
+            "the whole pool (2 paid) to the sole provider"
+        );
+        assert_eq!(
+            s.rewardable_served(&prov(1)),
+            1500,
+            "1500 served is inside the 2000-byte entitlement → all rewardable"
+        );
+        assert_eq!(s.entitlement(&c, 2), 500, "500 bytes of subscription left");
+        // Serving past the entitlement is subsidy: 900 more, only 500 rewardable.
+        s.settle_epoch_from_cheques(3, vec![(c, 2)], vec![(prov(1), c, 2400, 2)]);
+        assert_eq!(
+            s.rewardable_served(&prov(1)),
+            2000,
+            "capped at the 2000 bought"
+        );
+        assert_eq!(s.entitlement(&c, 3), 0);
+    }
+
+    #[test]
+    fn an_unused_entitlement_expires_and_is_never_refunded() {
+        // P6 use-it-or-lose-it: the tokens were folded into the pool and already priced into everyone's
+        // pool-average, so an unspent subscription is LOST at the window edge, not refunded.
+        let mut s = SettlementStore::new();
+        s.set_bytes_per_token(10);
+        s.set_window_epochs(5);
+        let c = prov(9);
+        s.settle_epoch_from_cheques(1, vec![(c, 0)], vec![]); // first sight
+        s.settle_epoch_from_cheques(2, vec![(c, 10)], vec![]); // buys 100 B at epoch 2, expires at 7
+        assert_eq!(s.entitlement(&c, 6), 100, "alive inside the window");
+        assert_eq!(s.entitlement(&c, 7), 0, "dead at the window edge");
+        // Serving after expiry earns nothing — the entitlement is gone, not refunded or carried.
+        let rec = s.settle_epoch_from_cheques(8, vec![(c, 10)], vec![(prov(1), c, 50, 1)]);
+        assert!(
+            rec.shares.is_empty(),
+            "expired entitlement → no rewardable serving"
+        );
+        assert_eq!(s.rewardable_served(&prov(1)), 0);
     }
 
     #[test]

@@ -2482,9 +2482,28 @@ Phases (each: build + test + gate + commit; roll together where consensus-affect
       - Verified: token 5 / economy 3 / reward + 48 noded tests green, full workspace test green, fmt/clippy clean.
       - Docs reconciled IN PLACE: design §5b rewritten (co-fold marked superseded, the built model documented),
         phase plan P3/P4/P5 marked done, TOKEN_LEDGER_BUILD.md structural refs repointed.
-- [ ] **P6 — subscriptions in economy-egress:** governed `bytes_per_token`, subscription = locked
-      `egress_bytes`, 30-day windowed per-consumer quota (on top of the per-consumer FCFS already shipped),
-      use-it-or-lose-it (no escrow — tokens already priced into the pool-average).
+- [x] **P6 — SUBSCRIPTIONS DONE (2026-07-17, CONSENSUS-AFFECTING, rolls in P7).** New
+      `crates/economy-egress/src/subscription.rs`: `SubscriptionLedger` = per-consumer FIFO of `Grant{expires_at,
+      remaining}`. `purchase(consumer, tokens, bytes_per_token, epoch, window)` → `tokens × bytes_per_token`
+      egress bytes expiring `epoch+window`; `allocate(consumer, bytes, epoch)` draws OLDEST-FIRST from unexpired
+      grants (so they're used before expiring) returning the rewardable amount; `available()` = the dashboard's
+      remaining entitlement. Governed: `economy:bytes_per_token` (DEFAULT 1 MiB/token) +
+      `economy:subscription_window_epochs` (DEFAULT 86_400 ≈ 30 days @30s epochs), read in main.rs's 30s
+      governance tick → `EconomyEgressService::set_*` → SettlementStore (future purchases only, no retroactive
+      repricing).
+      - **FIXED A REAL UNIT BUG:** pre-P6, `rewardable = delta.min(quota - used)` compared served BYTES against
+        paid TOKENS — an implicit 1 token = 1 byte. Now tokens are priced into a byte budget.
+      - **The price is DISTRIBUTION-NEUTRAL:** in pool-average `pool × (t·p)/Σ(tᵢ·p)` the price cancels, so it
+        only sets the byte budget, not who earns what — self-dealing stays bounded exactly as before (verified:
+        the invariant tests still pass at unit price).
+      - SettlementStore: `paid_baseline` + `consumer_allocated` DELETED (the ledger subsumes both — the
+        first-sight watermark already stops a joining node's historical Pay total from buying anything); ONE paid
+        delta now both funds the pool AND buys the entitlement (which is exactly why unspent bytes are never
+        refunded — those tokens already funded providers' reward).
+      - Dashboard: `Economy.subscription_bytes` (this node's unexpired entitlement); `SettlementService::epoch()`
+        made pub for it.
+      - Verified: 8 economy (5 new subscription) + 16 settlement (2 new: price multiplies, entitlement expires) +
+        50 noded tests green; fmt/clippy clean. Old quota tests kept as invariants, pinned to unit price.
 - [ ] **P7 — deploy** (wire+consensus → simultaneous fleet roll).
 
 ATOMICITY (resolved 2026-07-16, docs §3): a value move is NEVER a two-op cross-account transaction (half-commit

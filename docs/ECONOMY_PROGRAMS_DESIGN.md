@@ -188,8 +188,14 @@ sandbox.** Do not conflate the two in later phases.
    `reward.wasm`) is the valuation program. Anchors re-pinned `token` / `economy-egress`; `zeph-ledger`,
    `apps/ledger-wasm`, `apps/reward-wasm` deleted. **Consensus:** token's cid changed ⇒ account chains
    restart from empty (accepted: dev-testnet balances, no migration written).
-6. **P6 — subscriptions in economy-egress:** governed `bytes_per_token`, subscription = locked `egress_bytes`,
-   30-day windowed per-consumer quota (build on the per-consumer FCFS already shipped). Use-it-or-lose-it.
+6. **P6 — DONE 2026-07-17.** Subscriptions in `zeph_economy_egress::subscription`: a paid delta buys
+   `delta × bytes_per_token` egress bytes expiring after a governed window (`economy:bytes_per_token`
+   default 1 MiB/token, `economy:subscription_window_epochs` default 86 400 ≈ 30 days at a 30s epoch).
+   Serving is drawn FCFS from a consumer's unexpired grants (oldest first); past it = unrewarded subsidy;
+   unspent bytes expire unrefunded. **This fixed a real unit bug:** the pre-P6 cap compared served BYTES
+   against paid TOKENS directly (an implicit 1 token = 1 byte). **The price is distribution-neutral** —
+   in pool-average `pool × (t·p)/Σ(tᵢ·p)` it cancels — so it sets the byte budget, not who earns what;
+   that is why self-dealing stays bounded exactly as before. Dashboard: `subscription_bytes`.
 7. **P7 — deploy** (wire+consensus → simultaneous fleet roll).
 
 ## 7. Open decisions
