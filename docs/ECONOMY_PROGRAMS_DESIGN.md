@@ -6,6 +6,21 @@ invocation (CPI)** as a general composition primitive. Supersedes the "add `egre
 op" approach (which would have mutated the canonical token program) — the whole subscription/pricing/
 expiry model now lives in `economy-egress`, and `token` stays a stable money primitive.
 
+## 0. Root rationale — individual, not global, coordination
+
+Everything below (single-writer, transparent reads, co-fold instead of atomic transactions, CPI as a mere
+read) falls out of ONE choice: ZephCraft coordinates trust **individually**, not globally. Global-state
+chains (Ethereum, Solana, …) require every node to agree on **one global state under one global order** — that
+is what forces atomic global transactions, a consensus/ordering bottleneck, and mediated cross-program access
+so all nodes re-derive the same global sequence. (Native code — precompiles, native programs — does not escape
+this; it still operates on the globally-agreed state.) ZephCraft instead makes each identity **its own trust
+domain**: a writer authors + orders only its own chain (single-writer; the quorum orders that account's writes
+for uniqueness, not a global order), and correctness is established **per-writer by re-execution**. There is no
+global state to atomically mutate → no global atomic transaction to need, no global order to bottleneck on;
+cross-identity effects are self-authored + reconciled. This is the north-star bet — **correctness by
+verification, not global lockstep** — and the economy split is a direct consequence of it. (Prior art for the
+lineage: Holochain's agent source chains + validation-by-re-execution; Nano's per-account block-lattice.)
+
 ## 1. Why
 
 - **Separation of concerns (Solana model):** `token` = SPL-Token-like money primitive (transfer, balance);
