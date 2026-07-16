@@ -496,6 +496,22 @@ reciprocity-first and hits *no* gate even when they run a deficit (escrow backs 
 consumption-time free/paid decision** for them; the deficit resolves at the retroactive timestamp
 settlement of §7/§10.8.
 
+**Dashboard — the two allocations, three meters (2026-07-16).** The single bandwidth ledger (cheques)
+presents as two allocations by tier, and the token ledger is a third, separate thing:
+- **Free headroom** = `total_earned + grant − consumed` — the reciprocity position, real-time gated.
+  A *free* fetch draws it down; **serving anyone credits `total_earned` → always grows headroom**
+  (serving a *paid* consumer still earns you free-tier headroom, on top of the settlement claim).
+- **Paid usage (consumer)** = paid bytes this node fetched. A paid user fetches **unlimited** and
+  **never touches headroom** (per the "no consumption-time gate" rule above); this meter is
+  *informational* — the spend reconciles retroactively at settlement, it is not a live cap.
+- **Paid serving (provider)** = `settled / served` — of the paid bytes you served, how much the pool
+  actually paid you. `served` is cheque-proven; `settled` is what survives the **per-consumer quota
+  cap + FCFS-by-timestamp** (`allocate_quota`) **then** the **uniform pool-average per-byte rate**
+  (§10.1, revised 2026-07-16) — both layers apply. The unsettled remainder is subsidised serving
+  (unrewarded), which is *why* it always still earns headroom.
+- **Token balance** (separate ledger, §11) = tokens reconciled **after a claim** — not a running
+  estimate of the above.
+
 **Subsidy shrinks to cold-start only.** The one case reciprocity can't cover is a brand-new account
 that has served nothing yet — a read-only newcomer needs a small **starting grant** of reciprocity
 headroom to begin. That bootstrap (identity-gated, small, one-time-ish) is the *only* thing the pool
