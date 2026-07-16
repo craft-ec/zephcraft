@@ -48,6 +48,25 @@ const DEFAULT_STORAGE_GRANT: u64 = 256 * 1024 * 1024; // 256 MiB
 /// The governance config key carrying the storage-standing grant (bytes), refreshed into `storage_grant`.
 pub const STORAGE_GRANT_CONFIG_KEY: &str = "reciprocity:storage_grant";
 
+/// A dashboard-facing snapshot of this node's reciprocity/economic standing.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct Reciprocity {
+    /// Cheque-proven bytes SERVED to others (the contribution side).
+    pub earned: u64,
+    /// Bytes FETCHED from providers (the consumption side).
+    pub consumed: u64,
+    /// Cumulative bytes PAID into the pool (lifts the free-tier budget).
+    pub paid: u64,
+    /// Governed free-tier fetch grant.
+    pub grant: u64,
+    /// Governed per-peer serve grant.
+    pub peer_grant: u64,
+    /// Governed storage-standing (pin) grant.
+    pub storage_grant: u64,
+    /// Durable-storage footprint pinned so far.
+    pub pinned: u64,
+}
+
 pub struct ChequeService {
     identity: Arc<NodeIdentity>,
     clock: Arc<Clock>,
@@ -219,6 +238,19 @@ impl ChequeService {
     #[allow(dead_code)]
     pub fn total_earned(&self) -> u64 {
         self.book.lock().expect("cheque book lock").total_earned()
+    }
+
+    /// A snapshot of this node's reciprocity/economic standing for the dashboard.
+    pub fn reciprocity_snapshot(&self) -> Reciprocity {
+        Reciprocity {
+            earned: self.total_earned(),
+            consumed: self.consumed.load(Ordering::Relaxed),
+            paid: self.my_paid.load(Ordering::Relaxed),
+            grant: self.grant.load(Ordering::Relaxed),
+            peer_grant: self.peer_grant.load(Ordering::Relaxed),
+            storage_grant: self.storage_grant.load(Ordering::Relaxed),
+            pinned: self.pinned.load(Ordering::Relaxed),
+        }
     }
 
     /// The PROOF behind this node's serving measurement — the latest counterparty-signed cheque per

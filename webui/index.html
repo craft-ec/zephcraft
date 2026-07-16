@@ -115,6 +115,7 @@
     <button class="tab-btn" data-tab="data" onclick="showTab('data')">data</button>
     <button class="tab-btn" data-tab="registry" onclick="showTab('registry')">registry</button>
     <button class="tab-btn" data-tab="governance" onclick="showTab('governance')">governance</button>
+    <button class="tab-btn" data-tab="economy" onclick="showTab('economy')">economy</button>
     <button class="tab-btn" data-tab="status" onclick="showTab('status')">status</button>
     <button class="tab-btn" data-tab="settings" onclick="showTab('settings')">settings</button>
   </nav>
@@ -241,6 +242,38 @@
     </div>
   </section>
 
+  <section id="tab-economy" class="tab" hidden>
+    <div class="card">
+      <div class="cardhead">token ledger <span class="muted">— your self-custodial account balance + the settlement pool (§11 step 4)</span></div>
+      <dl class="kv">
+        <dt>balance</dt><dd id="eco-balance" class="muted">…</dd>
+        <dt>settlement pool</dt><dd id="eco-pool" class="muted">…</dd>
+      </dl>
+    </div>
+    <div class="card">
+      <div class="cardhead">settlement verification <span class="muted">— correctness by re-execution: epochs where your own re-run of the record matched the committee-attested canonical one (mismatched should stay 0)</span></div>
+      <dl class="kv">
+        <dt>verified epochs</dt><dd id="eco-verified" class="muted">…</dd>
+        <dt>mismatched</dt><dd id="eco-mismatched" class="muted">…</dd>
+      </dl>
+    </div>
+    <div class="card">
+      <div class="cardhead">reciprocity <span class="muted">— §8 tit-for-tat: you fetch/serve freely within earned + grant; paying lifts the budget (free vs paid tier)</span></div>
+      <dl class="kv">
+        <dt>served (earned)</dt><dd id="eco-earned" class="muted">…</dd>
+        <dt>consumed</dt><dd id="eco-consumed" class="muted">…</dd>
+        <dt>fetch headroom</dt><dd id="eco-headroom" class="muted">…</dd>
+        <dt>paid into pool</dt><dd id="eco-paid" class="muted">…</dd>
+        <dt>pinned (storage)</dt><dd id="eco-pinned" class="muted">…</dd>
+        <dt>grants</dt><dd id="eco-grants" class="muted">…</dd>
+      </dl>
+    </div>
+    <div class="card">
+      <div class="cardhead">canonical program anchors <span class="muted">— governance-pinned name → cid; verifiers fetch + re-run these</span></div>
+      <div id="eco-anchors"><div class="muted">loading…</div></div>
+    </div>
+  </section>
+
   <section id="tab-status" class="tab" hidden>
     <div class="card">
       <div class="cardhead">event bus <span class="muted">(foundation §52 — the reactive nervous system)</span></div>
@@ -322,6 +355,27 @@ let REG_SCOPE='global', REG_DATA=null, SELF_ID='';
 const $ = (id) => document.getElementById(id);
 function fmtUptime(s){ const h=Math.floor(s/3600), m=Math.floor(s%3600/60), x=s%60;
   return (h? h+"h ":"") + (m? m+"m ":"") + x + "s"; }
+function fmtBytes(n){ n = n||0; if(n<1024) return n+" B"; if(n<1048576) return (n/1024).toFixed(1)+" KiB";
+  if(n<1073741824) return (n/1048576).toFixed(1)+" MiB"; return (n/1073741824).toFixed(2)+" GiB"; }
+function renderEconomy(e){
+  const r = e.reciprocity || {};
+  $("eco-balance").textContent = (e.balance||0).toLocaleString() + " tokens";
+  $("eco-pool").textContent = (e.pool||0).toLocaleString() + " unallocated";
+  $("eco-verified").textContent = (e.verified||0);
+  const mm = e.mismatched||0, mmEl = $("eco-mismatched");
+  mmEl.textContent = mm; mmEl.style.color = mm>0 ? "var(--warnc,#d29922)" : "";
+  $("eco-earned").textContent = fmtBytes(r.earned);
+  $("eco-consumed").textContent = fmtBytes(r.consumed);
+  const head = (r.earned||0)+(r.grant||0)+(r.paid||0)-(r.consumed||0);
+  $("eco-headroom").textContent = fmtBytes(Math.max(0,head)) + " free";
+  $("eco-paid").textContent = fmtBytes(r.paid);
+  $("eco-pinned").textContent = fmtBytes(r.pinned) + " / " + fmtBytes((r.earned||0)+(r.storage_grant||0)) + " standing";
+  $("eco-grants").textContent = "fetch " + fmtBytes(r.grant) + " · peer " + fmtBytes(r.peer_grant) + " · storage " + fmtBytes(r.storage_grant);
+  const a = e.anchors || [];
+  $("eco-anchors").innerHTML = a.length
+    ? a.map(x => `<div style="padding:3px 0"><b>${x.name}</b> &nbsp;<code class="muted">${(x.cid||"").slice(0,16)}…</code> &nbsp;<span class="muted">iface v${x.interface_version}</span></div>`).join("")
+    : '<div class="muted">no anchors pinned yet</div>';
+}
 function fmtAgo(unix){ if(!unix) return "—";
   const d = Math.max(0, Math.floor(Date.now()/1000) - unix); return d + "s ago"; }
 function render(s){
@@ -343,6 +397,7 @@ function render(s){
   $("uptime").textContent = fmtUptime(s.uptime_secs);
   $("bootstage").textContent = s.boot_stage || "—";
   $("bootstage").textContent = s.boot_stage || "—";
+  renderEconomy(s.economy || {});
   renderContent(s);
   renderStatus(s);
   renderSettings(s);

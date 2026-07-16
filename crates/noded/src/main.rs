@@ -1817,6 +1817,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         anchor: anchor_dispatcher.clone(),
         ledger: ledger_service.clone(),
         settlement: settlement_service.clone(),
+        cheque: cheque_service.clone(),
         accounts: account_store.clone(),
         attest: attest_store.clone(),
         sequence: sequence_store.clone(),

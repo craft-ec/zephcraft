@@ -156,6 +156,34 @@ pub struct Status {
     pub in_flight_jobs: Vec<zeph_sched::InFlightJob>,
     /// Node configuration (read-only Settings view).
     pub settings: NodeSettings,
+    /// Economic layer — ledger balance, pool, settlement verification, reciprocity standing, anchors.
+    #[serde(default)]
+    pub economy: Economy,
+}
+
+/// The economy view (§11 step 4): the token ledger + settlement + reciprocity state for the dashboard.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+pub struct Economy {
+    /// This node's token-ledger balance (folded from its committed account chain).
+    pub balance: u64,
+    /// The distributable settlement pool (`unallocated`).
+    pub pool: u64,
+    /// Settlement re-execution verification tally — epochs whose canonical record matched this node's own.
+    pub verified: u64,
+    /// Epochs whose canonical record DIVERGED from this node's re-execution (should stay 0).
+    pub mismatched: u64,
+    /// Reciprocity standing (earned/consumed/paid + the governed grants).
+    pub reciprocity: Option<crate::cheque::Reciprocity>,
+    /// The pinned canonical-program anchors (`name → cid @ interface_version`).
+    pub anchors: Vec<AnchorRow>,
+}
+
+/// One governance-pinned canonical program anchor.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+pub struct AnchorRow {
+    pub name: String,
+    pub cid: String,
+    pub interface_version: i64,
 }
 
 /// Health counters: scanned, at_risk, repaired, moved, scaled, degraded, fading, offloaded, surplus.
@@ -214,6 +242,8 @@ pub struct State {
     pub ledger: std::sync::Arc<crate::ledger::LedgerService>,
     /// Settlement service — the epoch-close loop + its re-execution verification tally.
     pub settlement: std::sync::Arc<crate::settlement_service::SettlementService>,
+    /// Serving-cheque service — reciprocity standing (earned/consumed/paid + grants) for the dashboard.
+    pub cheque: std::sync::Arc<crate::cheque::ChequeService>,
     /// Generic program accounts — any program's single-writer state (the program is the writer).
     pub accounts: std::sync::Arc<crate::account::ProgramAccountStore>,
     /// Per-program attestation quorum chains (the `attest` host fn's backend).
@@ -230,7 +260,33 @@ impl State {
 
     pub async fn snapshot(&self) -> Status {
         let hlc = self.clock.now();
+        // Economy view: ledger balance/pool, settlement verification tally, reciprocity, pinned anchors.
+        let economy = {
+            let me = parse_node_id(&self.node_id)
+                .map(|n| n.0)
+                .unwrap_or([0u8; 32]);
+            let (verified, mismatched) = self.settlement.verification_stats();
+            let mut anchors = Vec::new();
+            for name in ["token-ledger", "reward"] {
+                if let Some(res) = self.anchor.resolve(name).await {
+                    anchors.push(AnchorRow {
+                        name: name.to_string(),
+                        cid: hex::encode(res.cid),
+                        interface_version: res.interface_version as i64,
+                    });
+                }
+            }
+            Economy {
+                balance: self.ledger.balance(me).await.balance,
+                pool: self.ledger.pool_unallocated().await,
+                verified,
+                mismatched,
+                reciprocity: Some(self.cheque.reciprocity_snapshot()),
+                anchors,
+            }
+        };
         Status {
+            economy,
             hlc_ms: hlc.millis(),
             hlc_logical: hlc.logical(),
             node_id: self.node_id.clone(),
