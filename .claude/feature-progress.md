@@ -43,9 +43,16 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       (decode→apply→encode = the whole program body; account is sequencer-authenticated, so trusted); `apps/ledger-wasm`
       (thin cdylib wrapper over the shared crate, mirrors registry-wasm) builds to wasm32 (18 KB blob → crates/noded/
       ledger.wasm for the node to embed/publish); +1 test (run_transition commit + overdraft-reject). 5 crate tests.
-      NEXT: 4b-3 `noded::ledger` (LedgerService: author a SequencedWrite via the sequencer under the epoch committee;
-      resolve a claim's debit from the sender's sequence; native fold for the balance cache; balance/transfer RPCs) +
-      genesis-publish the wasm + pin the `token-ledger` anchor. Validity = always-on re-execution (no checkpoint).
+      4b-3 DONE: `crates/noded/src/ledger.rs` `LedgerService` — embeds ledger.wasm (`ledger_program_cid`),
+      `balance(account)` folds the account's committee-ordered sequence via `zeph_ledger::apply` (native = verifier
+      wasm re-run), `transfer`/`claim` author owner-signed `SequencedWrite`s submitted via `SequenceBackend::sequence`
+      under the committee (owner = the anchor sentinel → committee route), `resolve_debit` reads a claim's referenced
+      transfer. Wired into `control::State`; RPCs `ledger_balance`/`ledger_transfer`/`ledger_claim` + CLI
+      `ledger-balance`/`ledger-transfer`/`ledger-claim`. Gates green (26 noded tests, incl. cid-stable). **4b COMPLETE.**
+      Follow-ons (noted): genesis-publish the wasm to obj + pin the `token-ledger` governance anchor (for invoke-by-name
+      + verifier fetch); wire an ACTIVE verification loop re-running the ledger fold (validity is currently native-fold
+      correct, trust-by-re-execution not yet an active cross-node loop for the ledger); trustless claim-ordering needs
+      4e-2 committee snapshots. End-to-end transfer→claim→balance is fleet-validatable.
 - [ ] **4c — reward = pool-average (separate program)** (reward-valuation program via invoke_program; two-pass
       allocate_quota identifies rewardable bytes; uniform-rate distribution; monotonic `minted_watermark` single-use).
 - [ ] **4d — settlement + tiers** (two-pass allocate_quota reciprocity-offset; EscrowOp/SettleClaim; admission + pin

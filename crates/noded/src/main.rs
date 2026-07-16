@@ -43,6 +43,7 @@ mod control;
 mod epoch_committee;
 mod governance;
 mod headreg;
+mod ledger;
 mod peers;
 mod quorum_source;
 mod registry_heads;
@@ -168,6 +169,29 @@ enum Command {
         /// The canonical anchor name (e.g. `token-ledger`).
         #[arg(long)]
         name: String,
+    },
+    /// Show a token-ledger balance (defaults to this node's own account).
+    LedgerBalance {
+        /// Account node id (64 hex); omit for this node's own account.
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Transfer tokens from this node's account to `to` (a DEBIT; the recipient later claims it).
+    LedgerTransfer {
+        /// Recipient account node id (64 hex).
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        amount: u64,
+    },
+    /// Claim a transfer credited to this node's account (references the sender's debit).
+    LedgerClaim {
+        /// The sender's account node id (64 hex).
+        #[arg(long)]
+        debit_account: String,
+        /// The sender's write nonce that debited the transfer.
+        #[arg(long)]
+        debit_nonce: u64,
     },
     /// Deploy a CraftCOM app: publish the WASM as a SYSTEM object (durable, managed
     /// like a database — NOT a drive file) and register it by name.
@@ -518,6 +542,16 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Resolve { name }) => cmd_resolve(&data_dir, &name).await,
         Some(Command::AnchorResolve { name }) => cmd_anchor_resolve(&data_dir, &name).await,
+        Some(Command::LedgerBalance { account }) => {
+            cmd_ledger_balance(&data_dir, account.as_deref()).await
+        }
+        Some(Command::LedgerTransfer { to, amount }) => {
+            cmd_ledger_transfer(&data_dir, &to, amount).await
+        }
+        Some(Command::LedgerClaim {
+            debit_account,
+            debit_nonce,
+        }) => cmd_ledger_claim(&data_dir, &debit_account, debit_nonce).await,
         Some(Command::Deploy { file, name }) => cmd_deploy(&data_dir, &file, name.as_deref()).await,
         Some(Command::Apps) => cmd_apps(&data_dir).await,
         Some(Command::PublishProgram { file }) => cmd_publish_program(&data_dir, &file).await,
@@ -750,6 +784,36 @@ async fn cmd_anchor_resolve(data_dir: &Path, name: &str) -> anyhow::Result<()> {
     let params = serde_json::json!({ "name": name });
     let r =
         control::query_unix_params(&data_dir.join("zeph.sock"), "anchor_resolve", params).await?;
+    println!("{}", serde_json::to_string_pretty(&r)?);
+    Ok(())
+}
+
+/// `zeph ledger-balance [--account <hex>]` — fold an account's sequence → its token balance.
+async fn cmd_ledger_balance(data_dir: &Path, account: Option<&str>) -> anyhow::Result<()> {
+    let params = serde_json::json!({ "account": account });
+    let r =
+        control::query_unix_params(&data_dir.join("zeph.sock"), "ledger_balance", params).await?;
+    println!("{}", serde_json::to_string_pretty(&r)?);
+    Ok(())
+}
+
+/// `zeph ledger-transfer --to <hex> --amount <n>` — debit this node's account in favour of `to`.
+async fn cmd_ledger_transfer(data_dir: &Path, to: &str, amount: u64) -> anyhow::Result<()> {
+    let params = serde_json::json!({ "to": to, "amount": amount });
+    let r =
+        control::query_unix_params(&data_dir.join("zeph.sock"), "ledger_transfer", params).await?;
+    println!("{}", serde_json::to_string_pretty(&r)?);
+    Ok(())
+}
+
+/// `zeph ledger-claim --debit-account <hex> --debit-nonce <n>` — credit a transfer to this account.
+async fn cmd_ledger_claim(
+    data_dir: &Path,
+    debit_account: &str,
+    debit_nonce: u64,
+) -> anyhow::Result<()> {
+    let params = serde_json::json!({ "debit_account": debit_account, "debit_nonce": debit_nonce });
+    let r = control::query_unix_params(&data_dir.join("zeph.sock"), "ledger_claim", params).await?;
     println!("{}", serde_json::to_string_pretty(&r)?);
     Ok(())
 }
@@ -1587,6 +1651,12 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         governance_store.clone(),
         com_service.clone(),
     ));
+    // The token-ledger service (§11 step 4): authors owner-signed ledger writes ordered by the epoch
+    // committee, and folds an account's sequence into its balance via the shared zeph-ledger crate.
+    let ledger_service = std::sync::Arc::new(ledger::LedgerService::new(
+        identity.clone(),
+        sequence_store.clone(),
+    ));
     let state = Arc::new(control::State {
         clock: transport.clock(),
         boot_stage: tokio::sync::RwLock::new("booting".to_string()),
@@ -1628,6 +1698,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         registry: head_registry.clone(),
         gov: governance_store.clone(),
         anchor: anchor_dispatcher.clone(),
+        ledger: ledger_service.clone(),
         accounts: account_store.clone(),
         attest: attest_store.clone(),
         sequence: sequence_store.clone(),

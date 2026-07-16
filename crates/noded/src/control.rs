@@ -210,6 +210,8 @@ pub struct State {
     pub gov: std::sync::Arc<crate::governance::GovernanceChainStore>,
     /// K1 anchor dispatcher — resolve a canonical name → its governance-pinned program cid, and dispatch.
     pub anchor: std::sync::Arc<crate::anchor::AnchorDispatcher>,
+    /// Token-ledger service — author ledger writes (committee-ordered) + fold account balances.
+    pub ledger: std::sync::Arc<crate::ledger::LedgerService>,
     /// Generic program accounts — any program's single-writer state (the program is the writer).
     pub accounts: std::sync::Arc<crate::account::ProgramAccountStore>,
     /// Per-program attestation quorum chains (the `attest` host fn's backend).
@@ -466,6 +468,9 @@ async fn handle_rpc(state: &State, line: &str) -> serde_json::Value {
         Some("program_resolve") => rpc_program_resolve(state, &request, id).await,
         Some("resolve_name") => rpc_resolve_name(state, &request, id).await,
         Some("anchor_resolve") => rpc_anchor_resolve(state, &request, id).await,
+        Some("ledger_balance") => rpc_ledger_balance(state, &request, id).await,
+        Some("ledger_transfer") => rpc_ledger_transfer(state, &request, id).await,
+        Some("ledger_claim") => rpc_ledger_claim(state, &request, id).await,
         Some("gov") => rpc_gov(state, id).await,
         Some("gov_propose") => rpc_gov_propose(state, &request, id).await,
         Some("gov_sign") => rpc_gov_sign(state, &request, id).await,
@@ -1222,6 +1227,77 @@ async fn rpc_anchor_resolve(
         }}),
         None => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"cid": null}}),
     }
+}
+
+/// Fold `account` (default: this node's own account) → its token balance.
+async fn rpc_ledger_balance(
+    state: &State,
+    req: &serde_json::Value,
+    id: serde_json::Value,
+) -> serde_json::Value {
+    let account: [u8; 32] = match param(req, "account").and_then(|v| v.as_str()) {
+        Some(hex) => match hex::decode(hex.trim()).ok().and_then(|b| b.try_into().ok()) {
+            Some(a) => a,
+            None => return rpc_err(id, "account must be 64 hex chars".into()),
+        },
+        None => match parse_node_id(&state.node_id) {
+            Some(n) => n.0,
+            None => return rpc_err(id, "self node id unparseable".into()),
+        },
+    };
+    let bal = state.ledger.balance(account).await;
+    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
+        "account": hex::encode(account), "balance": bal.balance,
+    }})
+}
+
+/// Transfer `amount` from this node's account to `to` (a debit; the recipient later claims it).
+async fn rpc_ledger_transfer(
+    state: &State,
+    req: &serde_json::Value,
+    id: serde_json::Value,
+) -> serde_json::Value {
+    let (Some(to_hex), Some(amount)) = (
+        param(req, "to").and_then(|v| v.as_str()),
+        param(req, "amount").and_then(|v| v.as_u64()),
+    ) else {
+        return rpc_err(id, "transfer needs 'to' (64 hex) and 'amount'".into());
+    };
+    let to: [u8; 32] = match hex::decode(to_hex.trim())
+        .ok()
+        .and_then(|b| b.try_into().ok())
+    {
+        Some(t) => t,
+        None => return rpc_err(id, "to must be 64 hex chars".into()),
+    };
+    let ok = state.ledger.transfer(to, amount).await;
+    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"committed": ok}})
+}
+
+/// Claim a transfer `(debit_account, debit_nonce)` credited to this node's account.
+async fn rpc_ledger_claim(
+    state: &State,
+    req: &serde_json::Value,
+    id: serde_json::Value,
+) -> serde_json::Value {
+    let (Some(from_hex), Some(nonce)) = (
+        param(req, "debit_account").and_then(|v| v.as_str()),
+        param(req, "debit_nonce").and_then(|v| v.as_u64()),
+    ) else {
+        return rpc_err(
+            id,
+            "claim needs 'debit_account' (64 hex) and 'debit_nonce'".into(),
+        );
+    };
+    let from: [u8; 32] = match hex::decode(from_hex.trim())
+        .ok()
+        .and_then(|b| b.try_into().ok())
+    {
+        Some(f) => f,
+        None => return rpc_err(id, "debit_account must be 64 hex chars".into()),
+    };
+    let ok = state.ledger.claim(from, nonce).await;
+    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"committed": ok}})
 }
 
 async fn rpc_deploy(
