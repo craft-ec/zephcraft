@@ -139,9 +139,18 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       content-addressing means the fetched bytes are bound to the cid the signed report commits to (no tamper), and an
       unfetchable/unbacked proof simply skips that participant. 1 test updated (inline/ref round-trip + anti-farm check).
       36 noded tests, fmt, clippy green.
-      **Remaining follow-ons (all non-urgent / scale / perf):** a scan-cache for `cumulatives_of`/`paid_total`/
-      `canonical_record` (re-scan each chain per settle); wire the obj gates to a sync-cached reciprocity position; genesis
-      anchor-pin + wasm-publish; an active verification loop; 4e-2 committee snapshots. (Verify-board→durable deferred by user.)
+- [x] **4d-10 — SCAN-CACHE for per-settle chain reads DONE (2026-07-16).** The settle path no longer re-scans each chain
+      from nonce 0 every epoch (which grew unbounded as chains lengthen). The chains are append-only, so the caches resume
+      from the last-scanned nonce: `LedgerService::paid_total` keeps `account → (next_nonce, running Pay total)` and sums
+      only NEW `Pay` writes; `SettlementService`'s `ReportCache` keeps `account → (next_nonce, verified [(epoch, paid_cum,
+      served)])` and fetches+verifies each report's proof exactly ONCE — a transient proof-fetch failure STOPS the scan
+      (that report retries next settle instead of being permanently skipped), and the query returns the latest verified
+      report ≤ E (falling back to an older proven cumulative if the newest isn't yet fetchable; the watermark absorbs the
+      delta). Correctness = a full re-scan (committed nonces are immutable); std `Mutex`, no await held over the lock. 36
+      noded tests, fmt, clippy green.
+      **Remaining follow-ons (all non-urgent / scale / perf):** `canonical_record` scan-cache (per-claim, not per-settle);
+      wire the obj gates to a sync-cached reciprocity position; genesis anchor-pin + wasm-publish; an active verification
+      loop; persist watermarks (lose one epoch's baseline per restart); 4e-2 committee snapshots. (Verify-board→durable deferred by user.)
 Open gaps needing a call at their phase: (1) anchor-authority routing RESOLVED (= committee), (2) escrow reclaim lifecycle [4d],
 (3) cold-start grant + identity gate [4d], (4) uniform-pricing floor for the pool-average reward [4c]. (Checkpoint
 acceleration + reward-valuation decomposition RESOLVED; see TOKEN_LEDGER_BUILD.md §9.)

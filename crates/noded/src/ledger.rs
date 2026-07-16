@@ -10,8 +10,9 @@
 //! natively. Validity is by re-execution (the fold), not a committee for the fold itself; an invalid
 //! write (e.g. an overdraft) folds to a no-op, so it can occupy a nonce but never corrupts the balance.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use zeph_com::{SequenceBackend, SequencedWrite};
 use zeph_core::Cid;
@@ -55,6 +56,9 @@ pub struct LedgerService {
     /// its share from the CANONICAL quorum-signed record (durable, restart-safe), falling back to the local
     /// in-memory record only before finalization.
     record_chain: tokio::sync::RwLock<Option<Arc<RecordChain>>>,
+    /// Scan cache for [`paid_total`](Self::paid_total): `account → (next_nonce, running Pay total)`. The
+    /// ledger chain is append-only, so a re-read only sums NEW `Pay` writes instead of the whole chain.
+    paid_scan: Mutex<HashMap<[u8; 32], (u64, u64)>>,
 }
 
 impl LedgerService {
@@ -69,6 +73,7 @@ impl LedgerService {
             settlement: tokio::sync::RwLock::new(SettlementStore::new()),
             total_paid: AtomicU64::new(0),
             record_chain: tokio::sync::RwLock::new(None),
+            paid_scan: Mutex::new(HashMap::new()),
         }
     }
 
@@ -115,18 +120,30 @@ impl LedgerService {
             .sequence_of(self.owner, self.cid, account)
             .await
         else {
-            return 0;
+            return self
+                .paid_scan
+                .lock()
+                .unwrap()
+                .get(&account)
+                .map(|(_, t)| *t)
+                .unwrap_or(0);
         };
-        let mut total = 0u64;
-        for nonce in 0..seq.next_nonce() {
-            let Some(payload) = seq.payload_at(nonce) else {
+        let end = seq.next_nonce();
+        // Sum only the NEW nonces since the last scan (the chain is append-only, so a committed nonce's
+        // payload never changes → resuming from the cached position is identical to a full re-scan). The
+        // lock is held only for the sync scan — no await inside.
+        let mut cache = self.paid_scan.lock().unwrap();
+        let (next, total) = cache.entry(account).or_insert((0, 0));
+        while *next < end {
+            let Some(payload) = seq.payload_at(*next) else {
                 break;
             };
             if let Ok(LedgerOp::Pay(amount)) = postcard::from_bytes::<LedgerOp>(payload) {
-                total = total.saturating_add(amount);
+                *total = total.saturating_add(amount);
             }
+            *next += 1;
         }
-        total
+        *total
     }
 
     /// The reward share owed to `account` for `epoch`: the CANONICAL committee-attested record's share if

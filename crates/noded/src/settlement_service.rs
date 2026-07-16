@@ -21,11 +21,13 @@
 //!
 //! **MVP scope (honest):** the participant SET is the converged census, so a momentary census difference
 //! can differ the record until it converges — resolved at finalization by the committee-attested record
-//! ([`crate::record_chain`]); a settle re-scans each chain (a scan-cache is a follow-on); and watermarks
-//! are in-memory (persisting them avoids losing one epoch's baseline per restart). The cheque proof scales
-//! to any network size: it rides INLINE when small, else as a durable obj object referenced by cid.
+//! ([`crate::record_chain`]); and watermarks are in-memory (persisting them avoids losing one epoch's
+//! baseline per restart). The cheque proof scales to any network size (INLINE when small, else a durable
+//! obj object by cid), and per-settle chain reads are INCREMENTAL (the append-only scan resumes from the
+//! last nonce, verifying each proof once — see [`ReportCache`] and `LedgerService::paid_total`).
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -98,6 +100,15 @@ fn proven_cumulative(node: &[u8; 32], proof: &[ServingCheque]) -> Option<u64> {
     Some(per_consumer.values().sum())
 }
 
+/// Scan cache for one account's settlement chain: the last nonce scanned + the PROOF-VERIFIED reports
+/// parsed so far (`(report.epoch, paid_cumulative, verified_served)`), so a settle only processes — and
+/// re-fetches/re-verifies the proof of — NEW reports rather than re-scanning the whole chain each epoch.
+#[derive(Default)]
+struct ReportCache {
+    next_nonce: u64,
+    verified: Vec<(u64, u64, u64)>,
+}
+
 pub struct SettlementService {
     identity: Arc<NodeIdentity>,
     clock: Arc<Clock>,
@@ -114,6 +125,9 @@ pub struct SettlementService {
     /// Content-addressed store — publishes a LARGE cheque proof as a durable object and fetches a
     /// participant's proof by cid at settle time (small proofs stay inline in the report).
     obj: Arc<ObjEngine>,
+    /// Per-account scan cache of proof-verified reports (see [`ReportCache`]) — avoids re-fetching and
+    /// re-verifying every participant's whole proof history on every settle.
+    report_scan: Mutex<HashMap<[u8; 32], ReportCache>>,
     /// The settlement chain's program cid + its anchor-sentinel owner (routes ordering to the committee).
     settle_cid: [u8; 32],
     settle_owner: [u8; 32],
@@ -140,6 +154,7 @@ impl SettlementService {
             ledger,
             records,
             obj,
+            report_scan: Mutex::new(HashMap::new()),
             settle_cid,
             settle_owner,
         })
@@ -194,46 +209,82 @@ impl SettlementService {
             .await
     }
 
-    /// Read `account`'s committed cumulatives as of `epoch` — the latest report with `report.epoch ≤
-    /// epoch`, with its cheque proof VERIFIED. `None` if the chain is missing, has no in-range report, or
-    /// the proof doesn't back the claimed served (an unbacked report earns nothing).
+    /// Read `account`'s committed cumulatives as of `epoch` — the latest PROOF-VERIFIED report with
+    /// `report.epoch ≤ epoch`. Uses the scan cache: only reports newer than the last scan are parsed and
+    /// their proofs fetched/verified (each proof exactly once); a transient proof-fetch failure stops the
+    /// scan so that report is retried next settle rather than permanently skipped. `None` if the chain is
+    /// missing or no verified report is at/before `epoch`.
     async fn cumulatives_of(&self, account: [u8; 32], epoch: u64) -> Option<(u64, u64)> {
         let seq = self
             .sequence
             .sequence_of(self.settle_owner, self.settle_cid, account)
             .await?;
-        let mut best: Option<SettleReport> = None;
-        for nonce in 0..seq.next_nonce() {
-            let Some(payload) = seq.payload_at(nonce) else {
+        let end = seq.next_nonce();
+        let start = self
+            .report_scan
+            .lock()
+            .unwrap()
+            .get(&account)
+            .map_or(0, |c| c.next_nonce);
+
+        // Scan the NEW nonces, resolving + verifying each report's proof once (no lock held over the fetch).
+        let mut fresh: Vec<(u64, u64, u64)> = Vec::new();
+        let mut advanced = start;
+        let mut n = start;
+        while n < end {
+            let Some(payload) = seq.payload_at(n) else {
                 break;
             };
-            let Ok(r) = postcard::from_bytes::<SettleReport>(payload) else {
-                continue; // a non-report payload → skip
+            let Ok(report) = postcard::from_bytes::<SettleReport>(payload) else {
+                n += 1;
+                advanced = n; // a non-report payload → skip permanently
+                continue;
             };
-            if r.epoch <= epoch && best.as_ref().is_none_or(|b| r.epoch >= b.epoch) {
-                best = Some(r); // latest report at or before E
+            // Ok(Some) = cheques; Ok(None) = permanently invalid proof; Err = TRANSIENT fetch failure.
+            let resolved: Result<Option<Vec<ServingCheque>>, ()> = match &report.proof {
+                ServedProof::Inline(c) => Ok(Some(c.clone())),
+                ServedProof::Ref(cid) => match self.obj.get(Cid(*cid), ConsumeMode::Drop).await {
+                    Ok(bytes) => Ok(postcard::from_bytes::<Vec<ServingCheque>>(&bytes).ok()),
+                    Err(_) => Err(()),
+                },
+            };
+            match resolved {
+                Err(()) => break, // don't advance past a transient failure — retry it next settle
+                Ok(maybe) => {
+                    if let Some(cheques) = maybe {
+                        if proven_cumulative(&account, &cheques) == Some(report.served_cumulative) {
+                            fresh.push((
+                                report.epoch,
+                                report.paid_cumulative,
+                                report.served_cumulative,
+                            ));
+                        }
+                        // else: proof doesn't back the claim → permanently invalid, don't cache (anti-farming)
+                    }
+                    n += 1;
+                    advanced = n;
+                }
             }
         }
-        let report = best?;
-        // Resolve the proof (inline directly, or FETCH the referenced object by cid) and verify it backs
-        // the claimed served — an unfetchable or unbacked proof means this participant contributes nothing.
-        let cheques = match &report.proof {
-            ServedProof::Inline(c) => c.clone(),
-            ServedProof::Ref(cid) => match self.obj.get(Cid(*cid), ConsumeMode::Drop).await {
-                Ok(bytes) => postcard::from_bytes::<Vec<ServingCheque>>(&bytes).ok()?,
-                Err(_) => return None, // proof not fetchable → can't verify → skip
-            },
+
+        // Merge fresh results into the cache (guard against a concurrent advance; settle is sequential).
+        let (paid_cum, served) = {
+            let mut cache = self.report_scan.lock().unwrap();
+            let entry = cache.entry(account).or_default();
+            if entry.next_nonce == start {
+                entry.verified.extend(fresh);
+                entry.next_nonce = advanced;
+            }
+            entry
+                .verified
+                .iter()
+                .filter(|(ep, _, _)| *ep <= epoch)
+                .max_by_key(|(ep, _, _)| *ep)
+                .map(|(_, p, s)| (*p, *s))?
         };
-        let served = match proven_cumulative(&account, &cheques) {
-            Some(c) if c == report.served_cumulative => c,
-            _ => return None, // proof doesn't back the claimed served (anti-farming)
-        };
-        // PAID proof: cap the reported paid at the node's ACTUAL committee-ordered `Pay` total (durable
-        // on its ledger chain), so it can't inflate the pool beyond what it really paid. Under-reporting
-        // stays possible (it only shrinks the node's own pool contribution — griefing, not theft).
-        let paid = report
-            .paid_cumulative
-            .min(self.ledger.paid_total(account).await);
+        // PAID proof: cap the reported paid at the node's ACTUAL committee-ordered `Pay` total (durable on
+        // its ledger chain), so it can't inflate the pool beyond what it really paid.
+        let paid = paid_cum.min(self.ledger.paid_total(account).await);
         Some((paid, served))
     }
 
