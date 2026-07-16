@@ -50,6 +50,7 @@ mod registry_heads;
 mod registry_net;
 mod sequence;
 mod settlement;
+mod settlement_service;
 mod shard_root;
 
 use std::path::{Path, PathBuf};
@@ -204,10 +205,13 @@ enum Command {
         #[arg(long)]
         epoch: u64,
     },
-    /// Close an epoch: distribute the pool to this node's contribution `bytes` (demo/admin trigger).
+    /// DEV: inject `pool` and settle an epoch with this node's contribution `bytes`, exercising the
+    /// settlement math offline (production settlement is the automatic cross-node loop).
     LedgerSettleEpoch {
         #[arg(long)]
         epoch: u64,
+        #[arg(long)]
+        pool: u64,
         #[arg(long)]
         bytes: u64,
     },
@@ -574,8 +578,8 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::LedgerRewardClaim { epoch }) => {
             cmd_ledger_reward_claim(&data_dir, epoch).await
         }
-        Some(Command::LedgerSettleEpoch { epoch, bytes }) => {
-            cmd_ledger_settle_epoch(&data_dir, epoch, bytes).await
+        Some(Command::LedgerSettleEpoch { epoch, pool, bytes }) => {
+            cmd_ledger_settle_epoch(&data_dir, epoch, pool, bytes).await
         }
         Some(Command::Deploy { file, name }) => cmd_deploy(&data_dir, &file, name.as_deref()).await,
         Some(Command::Apps) => cmd_apps(&data_dir).await,
@@ -860,9 +864,14 @@ async fn cmd_ledger_reward_claim(data_dir: &Path, epoch: u64) -> anyhow::Result<
     Ok(())
 }
 
-/// `zeph ledger-settle-epoch --epoch <n> --bytes <b>` — close an epoch, distributing the pool.
-async fn cmd_ledger_settle_epoch(data_dir: &Path, epoch: u64, bytes: u64) -> anyhow::Result<()> {
-    let params = serde_json::json!({ "epoch": epoch, "bytes": bytes });
+/// `zeph ledger-settle-epoch --epoch <n> --pool <p> --bytes <b>` — DEV: inject `pool` and settle.
+async fn cmd_ledger_settle_epoch(
+    data_dir: &Path,
+    epoch: u64,
+    pool: u64,
+    bytes: u64,
+) -> anyhow::Result<()> {
+    let params = serde_json::json!({ "epoch": epoch, "pool": pool, "bytes": bytes });
     let r = control::query_unix_params(&data_dir.join("zeph.sock"), "ledger_settle_epoch", params)
         .await?;
     println!("{}", serde_json::to_string_pretty(&r)?);
@@ -1708,6 +1717,16 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         identity.clone(),
         sequence_store.clone(),
     ));
+    // The cross-node epoch-close loop (§10.1): each node gossips a signed per-epoch {paid, served}
+    // summary over tag::SETTLE; every node folds the converging board and settles each epoch from the
+    // SAME set, so the reward record is deterministic network-wide (what verification re-runs).
+    let settlement_service = settlement_service::SettlementService::new(
+        identity.clone(),
+        transport.clock(),
+        transport.clone(),
+        cheque_service.clone(),
+        ledger_service.clone(),
+    );
     let state = Arc::new(control::State {
         clock: transport.clock(),
         boot_stage: tokio::sync::RwLock::new("booting".to_string()),
@@ -1899,6 +1918,10 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // Serving-cheque pushes (a consumer sends us a cumulative cheque for bytes we served it).
     let (cheque_stream_tx, cheque_stream_rx) = tokio::sync::mpsc::channel(32);
     stream_handlers.push((zeph_transport::tag::CHEQUE, cheque_stream_tx));
+    // Epoch settlement announcements (each node's signed per-epoch {paid, served}; we fold them into the
+    // converging settlement board). Additive → mixed-version-safe.
+    let (settle_stream_tx, settle_stream_rx) = tokio::sync::mpsc::channel(32);
+    stream_handlers.push((zeph_transport::tag::SETTLE, settle_stream_tx));
     let server = transport.clone();
     tokio::spawn(async move { server.serve(stream_handlers).await });
     tokio::spawn(engine.clone().serve(piece_stream_rx));
@@ -1915,6 +1938,9 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // Record inbound cheques (provider side) + drain the outbound push queue (consumer side).
     tokio::spawn(cheque_service.clone().serve(cheque_stream_rx));
     tokio::spawn(cheque_service.clone().run_pusher(cheque_push_rx));
+    // Collect inbound settlement announcements + run the epoch-close loop (announce → settle).
+    tokio::spawn(settlement_service.clone().serve(settle_stream_rx));
+    tokio::spawn(settlement_service.clone().run());
     // "Pending distribution" completion (per-incomplete-cid DHT resolve + deficit pushes)
     // — network fan-out, so it runs THROUGH the coordinator (Distribution priority,
     // deduped: a slow pass coalesces with the next tick instead of stacking). This loop
@@ -2029,6 +2055,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     membership.start(peers, member_stream_rx);
     // The cheque pusher resolves a provider's address through membership before pushing a cheque.
     cheque_service.set_membership(membership.clone()).await;
+    settlement_service.set_membership(membership.clone()).await;
     state.set_boot_stage("census-settling").await;
     {
         let (st, reg) = (state.clone(), head_registry.clone());

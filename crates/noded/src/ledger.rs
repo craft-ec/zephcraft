@@ -10,6 +10,7 @@
 //! natively. Validity is by re-execution (the fold), not a committee for the fold itself; an invalid
 //! write (e.g. an overdraft) folds to a no-op, so it can occupy a nonce but never corrupts the balance.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use zeph_com::{SequenceBackend, SequencedWrite};
@@ -42,8 +43,13 @@ pub struct LedgerService {
     /// (a network-owned program has no owner key). One owner, one committee, many accounts.
     owner: [u8; 32],
     /// The epoch-close settlement pool (running `unallocated`/`owed`, §10.1). Providers' reward shares
-    /// are resolved from here for a `RewardClaim`.
+    /// are resolved from here for a `RewardClaim`. Fed CROSS-NODE by the settlement loop (Σ every node's
+    /// announced pays), NOT by the local `pay()` — so every node's pool folds the identical aggregate and
+    /// the epoch record is deterministic network-wide.
     settlement: tokio::sync::RwLock<SettlementStore>,
+    /// This node's CUMULATIVE `Pay` total (monotonic; incremented on each committed `pay`). The settlement
+    /// loop reads its per-epoch DELTA to announce this node's pay-in contribution to the shared pool.
+    total_paid: AtomicU64,
 }
 
 impl LedgerService {
@@ -56,6 +62,7 @@ impl LedgerService {
             cid,
             owner,
             settlement: tokio::sync::RwLock::new(SettlementStore::new()),
+            total_paid: AtomicU64::new(0),
         }
     }
 
@@ -164,13 +171,20 @@ impl LedgerService {
     }
 
     /// PAY `amount` of egress cost into the epoch pool — a self-authored debit (§10.1 pay-into-pool).
-    /// On commit, the amount is added to the settlement pool's `unallocated`.
+    /// On commit, we bump this node's cumulative `total_paid`; the settlement loop later announces the
+    /// per-epoch DELTA so EVERY node folds the same Σ pays into the pool (the pool is announcement-driven,
+    /// not fed locally here — a local pay_in would make each node's pool differ and break determinism).
     pub async fn pay(&self, amount: u64) -> bool {
         let ok = self.submit_own(LedgerOp::Pay(amount)).await;
         if ok {
-            self.settlement.write().await.pay_in(amount);
+            self.total_paid.fetch_add(amount, Ordering::Relaxed);
         }
         ok
+    }
+
+    /// This node's cumulative committed `Pay` total — the settlement loop deltas it per epoch.
+    pub fn total_paid(&self) -> u64 {
+        self.total_paid.load(Ordering::Relaxed)
     }
 
     /// Claim this node's reward share for `epoch` (single-use, §10.1). The share is resolved from the
@@ -186,14 +200,36 @@ impl LedgerService {
         ok
     }
 
-    /// Close `epoch`: distribute the pool's `unallocated` to `contributions` by contribution ratio,
-    /// publishing the epoch reward RECORD (§10.1, node-orchestrated). Returns the record. The caller
-    /// gathers `contributions` from the epoch's cheques (paid-serving bytes per provider).
-    pub async fn settle_epoch(&self, epoch: u64, contributions: Vec<Contribution>) -> RewardRecord {
+    /// Cross-node epoch close (§10.1, node-orchestrated by the settlement loop): fold this epoch's
+    /// AGGREGATED pool (`pool_add` = Σ every node's announced pays) into `unallocated`, then distribute to
+    /// `contributions` (Σ every node's announced served bytes) by ratio → the epoch RECORD. Idempotent per
+    /// epoch. Every node calls this with the identical `(pool_add, contributions)` from the same converged
+    /// announcement board, so the record is bit-for-bit identical network-wide.
+    pub async fn settle_from_board(
+        &self,
+        epoch: u64,
+        pool_add: u64,
+        contributions: Vec<Contribution>,
+    ) -> RewardRecord {
         self.settlement
             .write()
             .await
-            .settle_epoch(epoch, contributions)
+            .settle_epoch_with_pool(epoch, pool_add, contributions)
+    }
+
+    /// DEV/manual override (the `ledger-settle-epoch` RPC): inject `pool` + settle `epoch` with the given
+    /// `contributions` directly, bypassing the announcement loop — exercises the settlement math offline.
+    /// The production path is [`settle_from_board`], driven automatically by the settlement loop.
+    pub async fn dev_settle_epoch(
+        &self,
+        epoch: u64,
+        pool: u64,
+        contributions: Vec<Contribution>,
+    ) -> RewardRecord {
+        self.settlement
+            .write()
+            .await
+            .settle_epoch_with_pool(epoch, pool, contributions)
     }
 
     /// The current distributable (`unallocated`) pool balance — observability.

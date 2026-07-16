@@ -1280,19 +1280,21 @@ async fn rpc_ledger_reward_claim(
     serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"committed": ok}})
 }
 
-/// Close an epoch: distribute the pool to THIS node's contribution (`bytes`) and publish the reward
-/// record (a single-node demo trigger; the real loop gathers all providers' cheques). Returns this
-/// node's resolved share + the remaining `unallocated` pool.
+/// DEV override: inject `pool` and settle an epoch with THIS node's contribution (`bytes`), exercising
+/// the settlement math offline. The PRODUCTION path is the automatic `SettlementService` cross-node loop
+/// (announce → converge → deterministic settle); this bypasses it. Returns this node's resolved share +
+/// the remaining `unallocated` pool.
 async fn rpc_ledger_settle_epoch(
     state: &State,
     req: &serde_json::Value,
     id: serde_json::Value,
 ) -> serde_json::Value {
-    let (Some(epoch), Some(bytes)) = (
+    let (Some(epoch), Some(pool_in), Some(bytes)) = (
         param(req, "epoch").and_then(|v| v.as_u64()),
+        param(req, "pool").and_then(|v| v.as_u64()),
         param(req, "bytes").and_then(|v| v.as_u64()),
     ) else {
-        return rpc_err(id, "settle_epoch needs 'epoch' and 'bytes'".into());
+        return rpc_err(id, "settle_epoch needs 'epoch', 'pool', and 'bytes'".into());
     };
     let me = match parse_node_id(&state.node_id) {
         Some(n) => n.0,
@@ -1300,8 +1302,9 @@ async fn rpc_ledger_settle_epoch(
     };
     let rec = state
         .ledger
-        .settle_epoch(
+        .dev_settle_epoch(
             epoch,
+            pool_in,
             vec![zeph_reward::Contribution {
                 provider: me,
                 bytes,

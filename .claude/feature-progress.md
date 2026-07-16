@@ -83,11 +83,21 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       `pay`→`pay_in`, RewardClaim fold→`share_of`, `reward_claim`→`claim`, `settle_epoch` + `pool_unallocated`; RPC/CLI
       `ledger-settle-epoch`. **The full `pay → settle-epoch → reward-claim → balance` loop compiles + is wired.** Gates:
       30 noded tests (incl. 4 settlement), fmt, clippy green. **4d COMPLETE → STEP 4 MECHANISMS COMPLETE.**
-      Production follow-ons (noted, not blocking the mechanism): cross-node pool aggregation (`pay_in` is local — the pool
-      should FOLD from all consumers' Pay writes deterministically), the real epoch-close loop gathering contributions
-      from ChequeService (settle-epoch is a single-node demo trigger), an epoch scheduler, wire the obj gates to a
-      sync-cached reciprocity position, genesis anchor-pin + wasm-publish, an active verification loop re-running the
-      ledger/reward folds, 4e-2 committee snapshots.
+- [x] **4d-4 — REAL CROSS-NODE EPOCH-CLOSE LOOP DONE (2026-07-16).** `crates/noded/src/settlement_service.rs`
+      `SettlementService`: at each epoch boundary every node SIGNS a per-epoch `{epoch, paid, served}` summary of its own
+      deltas (`paid`=committed `Pay` delta from `LedgerService::total_paid`; `served`=cheque-proven delta from
+      `ChequeService::total_earned`) and fire-and-forgets it over the new `tag::SETTLE=11`, self-including it; `serve`
+      VERIFIES each inbound sig + folds it into a CONVERGING per-epoch board (`epoch→node→ann`, like the census/verify
+      board); after a grace window the loop settles each epoch DETERMINISTICALLY from the same collected set — pool=`Σ
+      paid`, contributions=`{(node,served)}` — via `LedgerService::settle_from_board` → the record is bit-identical
+      network-wide (what verification re-runs). Refactor: the pool is now ANNOUNCEMENT-DRIVEN — `pay()` drops local
+      `pay_in`, tracks `total_paid`; `SettlementStore::settle_epoch_with_pool` folds `Σ` announced pays idempotently. The
+      old manual `ledger-settle-epoch` RPC is now a DEV override (`dev_settle_epoch(epoch,pool,bytes)`). 3 new tests
+      (aggregate pool+contribs, sign/verify+tamper-reject, idempotent settle-with-pool). 33 noded tests, fmt, clippy green.
+      **Hardening follow-ons:** attach+verify the counterparty-signed cheque PROOF behind `served` (anti-farming — today
+      it's authenticated but self-reported), anti-entropy PULL of missed-epoch announcements (a node that misses an
+      epoch's gossip can't reproduce its record), wire the obj gates to a sync-cached reciprocity position, genesis
+      anchor-pin + wasm-publish, an active verification loop re-running the ledger/reward folds, 4e-2 committee snapshots.
 Open gaps needing a call at their phase: (1) anchor-authority routing RESOLVED (= committee), (2) escrow reclaim lifecycle [4d],
 (3) cold-start grant + identity gate [4d], (4) uniform-pricing floor for the pool-average reward [4c]. (Checkpoint
 acceleration + reward-valuation decomposition RESOLVED; see TOKEN_LEDGER_BUILD.md §9.)

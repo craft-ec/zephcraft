@@ -68,6 +68,24 @@ impl SettlementStore {
         record
     }
 
+    /// Cross-node epoch close: fold this epoch's AGGREGATED pool (`Σ` all nodes' announced pay-ins) into
+    /// `unallocated`, then settle. Guarded so a re-settle of the same epoch does NOT re-add the pool
+    /// (idempotent) — the settlement loop may re-drive a converged epoch. Every node feeds the identical
+    /// `pool_add` + `contributions` from the same converged announcement board, so the record is bit-for-bit
+    /// identical network-wide (what verification re-runs).
+    pub fn settle_epoch_with_pool(
+        &mut self,
+        epoch: u64,
+        pool_add: u64,
+        contributions: Vec<Contribution>,
+    ) -> RewardRecord {
+        if let Some(existing) = self.records.get(&epoch) {
+            return existing.clone(); // already settled → do NOT re-add the pool
+        }
+        self.pay_in(pool_add);
+        self.settle_epoch(epoch, contributions)
+    }
+
     /// The unclaimed share owed to `provider` for `epoch` (0 if absent, already claimed, or expired) —
     /// what a `RewardClaim` resolves + credits.
     pub fn share_of(&self, epoch: u64, provider: &[u8; 32]) -> u64 {
@@ -172,6 +190,19 @@ mod tests {
             50,
             "unclaimed 50 forfeited back to the pool"
         );
+    }
+
+    #[test]
+    fn settle_with_pool_folds_aggregated_pays_and_is_idempotent() {
+        let mut s = SettlementStore::new();
+        // Cross-node close: feed Σ all nodes' announced pays (say 100) + the epoch's contributions.
+        let rec = s.settle_epoch_with_pool(1, 100, vec![contrib(1, 60), contrib(2, 40)]);
+        assert_eq!(rec.share_of(&prov(1)), 60);
+        assert_eq!(s.unallocated(), 0, "the aggregated 100 was distributed");
+        // Re-driving the same epoch must NOT re-add the pool (idempotent) — returns the same record.
+        let again = s.settle_epoch_with_pool(1, 100, vec![contrib(1, 60), contrib(2, 40)]);
+        assert_eq!(again.share_of(&prov(1)), 60);
+        assert_eq!(s.unallocated(), 0, "no double pay-in on re-settle");
     }
 
     #[test]

@@ -45,6 +45,10 @@ pub mod tag {
     /// Serving-cheque push (a consumer fire-and-forgets a cumulative `ServingCheque` to a provider it
     /// fetched from; the provider records it). Fire-and-forget like `BOARD`. Additive → mixed-version-safe.
     pub const CHEQUE: u8 = 10;
+    /// Epoch settlement announcement (each node fire-and-forgets a signed per-epoch `{paid, served}`
+    /// summary; every node collects them into a converging board and settles the epoch deterministically
+    /// from the same set). Fire-and-forget like `CHEQUE`/`BOARD`. Additive → mixed-version-safe.
+    pub const SETTLE: u8 = 11;
 }
 
 /// An inbound muxed bi-stream, already tag-dispatched: the remote's NodeId
