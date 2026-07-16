@@ -41,6 +41,7 @@ mod board;
 mod cheque;
 mod control;
 mod epoch_committee;
+mod genesis;
 mod governance;
 mod headreg;
 mod ledger;
@@ -1973,6 +1974,13 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // Run the epoch-close loop: author this node's settlement report + settle past-grace epochs by
     // reading the durable, committee-ordered settlement chains (no gossip handler needed).
     tokio::spawn(settlement_service.clone().run());
+    // Genesis activation (idempotent): publish the canonical ledger/reward program wasm to obj so
+    // verifiers can fetch + re-run them, and pin their anchors via governance (if this node governs).
+    {
+        let eng = engine.clone();
+        let gov = governance_store.clone();
+        tokio::spawn(async move { genesis::activate(&eng, &gov).await });
+    }
     // "Pending distribution" completion (per-incomplete-cid DHT resolve + deficit pushes)
     // — network fan-out, so it runs THROUGH the coordinator (Distribution priority,
     // deduped: a slow pass coalesces with the next tick instead of stacking). This loop

@@ -216,9 +216,17 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       chains: `ChequeService` caches `my_paid` + a per-peer `peer_paid` map, refreshed every 30s from
       `LedgerService::paid_total(self)` and `paid_total(peer)` over the census (so the hot-path gate stays sync). 1 new test
       (paying lifts both budgets past reciprocity). 40 noded + 27 obj tests, fmt, clippy green.
+- [x] **4d-18 — GENESIS ACTIVATION (wasm-publish + anchor-pin) DONE (2026-07-16).** The ledger/reward programs are now
+      LIVE on the protocol, not just embedded. `crates/noded/src/genesis.rs` `activate(engine, governance)`: (1) PUBLISHES
+      the embedded `ledger.wasm` + `reward.wasm` (now `include_bytes!`'d, `reward_program_cid`) to obj as durable SYSTEM
+      objects (content-addressed → land at exactly the program cid), so a verifier can fetch + re-run the canonical
+      program; (2) PINS the K1 anchors via governance `SetProgram` (`token-ledger`→ledger_cid, `reward`→reward_cid) IF this
+      node governs and the name isn't already at that cid — so a 1-of-1 genesis self-applies, k-of-n needs cosigns.
+      Idempotent, spawned on startup. 1 new test (reward cid stable + ≠ ledger). 41 noded tests, fmt, clippy green.
+      **NEXT (user: complete #1,#2,#3):** #2 active verification loop (cross-node re-run of the ledger/reward folds), then
+      #3 live fleet validation of the full pay→serve→settle→claim→balance loop.
       **Remaining follow-ons:** dedicated storage-provided measure + persist `pinned`; reciprocity policy as a full governed
-      PROGRAM (only if the formula must be swappable, not just the params); genesis anchor-pin + wasm-publish; an active
-      verification loop; 4e-2 committee snapshots. (Verify-board→durable deferred by user.)
+      PROGRAM (only if the formula must be swappable); 4e-2 committee snapshots. (Verify-board→durable deferred by user.)
 Open gaps needing a call at their phase: (1) anchor-authority routing RESOLVED (= committee), (2) escrow reclaim lifecycle [4d],
 (3) cold-start grant + identity gate [4d], (4) uniform-pricing floor for the pool-average reward [4c]. (Checkpoint
 acceleration + reward-valuation decomposition RESOLVED; see TOKEN_LEDGER_BUILD.md §9.)
