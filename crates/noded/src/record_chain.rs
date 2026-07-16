@@ -6,7 +6,7 @@
 //! history (restart-safe) and without trusting its own possibly-divergent census (the committee pins it).
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use zeph_com::{SequenceBackend, SequencedWrite};
 use zeph_core::Cid;
@@ -17,9 +17,18 @@ use crate::anchor::AnchorDispatcher;
 use crate::epoch_committee::EpochCommitteeSource;
 use crate::record_attest::{sign_share, RecordAttestation, SignedRecord};
 use crate::sequence::SequenceStore;
+use crate::settlement::CLAIM_WINDOW_EPOCHS;
 
 /// The records chain's program id; its anchor-sentinel owner routes ordering to the epoch committee.
 const RECORDS_PROGRAM_TAG: &[u8] = b"craftec/settlement-records/1";
+
+/// Scan cache for one member's records chain: the last nonce scanned + its signed records indexed by
+/// epoch, so `canonical_record` doesn't re-scan each member's whole chain on every claim resolution.
+#[derive(Default)]
+struct MemberRecordCache {
+    next_nonce: u64,
+    by_epoch: HashMap<u64, SignedRecord>,
+}
 
 pub struct RecordChain {
     identity: Arc<NodeIdentity>,
@@ -27,6 +36,8 @@ pub struct RecordChain {
     committee: Arc<EpochCommitteeSource>,
     records_cid: [u8; 32],
     records_owner: [u8; 32],
+    /// Per-member scan cache of signed records (append-only chain → resume from the last nonce).
+    record_scan: Mutex<HashMap<[u8; 32], MemberRecordCache>>,
 }
 
 impl RecordChain {
@@ -43,6 +54,7 @@ impl RecordChain {
             committee,
             records_cid,
             records_owner,
+            record_scan: Mutex::new(HashMap::new()),
         })
     }
 
@@ -84,23 +96,33 @@ impl RecordChain {
     }
 
     /// This member's latest signed record for `epoch` on its records chain (`None` if it hasn't attested).
+    /// Uses the per-member scan cache: only NEW nonces are parsed (append-only chain), indexed by epoch,
+    /// and old epochs beyond the claim window are pruned to bound memory.
     async fn share_of_member(&self, member: [u8; 32], epoch: u64) -> Option<SignedRecord> {
         let seq = self
             .sequence
             .sequence_of(self.records_owner, self.records_cid, member)
             .await?;
-        let mut found = None;
-        for nonce in 0..seq.next_nonce() {
-            let Some(payload) = seq.payload_at(nonce) else {
-                break;
-            };
-            if let Ok(sr) = postcard::from_bytes::<SignedRecord>(payload) {
-                if sr.record.epoch == epoch {
-                    found = Some(sr); // latest attestation for this epoch wins
+        let end = seq.next_nonce();
+        // Sync scan of only the NEW nonces under the lock (no await held; committed nonces are immutable).
+        let mut cache = self.record_scan.lock().unwrap();
+        let entry = cache.entry(member).or_default();
+        while entry.next_nonce < end {
+            if let Some(payload) = seq.payload_at(entry.next_nonce) {
+                if let Ok(sr) = postcard::from_bytes::<SignedRecord>(payload) {
+                    entry.by_epoch.insert(sr.record.epoch, sr); // latest attestation for an epoch wins
                 }
+                entry.next_nonce += 1;
+            } else {
+                break;
             }
         }
-        found
+        // Prune epochs older than the claim window — a claim can't resolve against a forfeited record.
+        if let Some(&max_ep) = entry.by_epoch.keys().max() {
+            let cutoff = max_ep.saturating_sub(CLAIM_WINDOW_EPOCHS + 2);
+            entry.by_epoch.retain(|&e, _| e >= cutoff);
+        }
+        entry.by_epoch.get(&epoch).cloned()
     }
 
     /// The CANONICAL record for `epoch`: gather each committee member's signed share, GROUP by the record

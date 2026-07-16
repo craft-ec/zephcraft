@@ -171,8 +171,14 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       self-heal (consumers re-send cumulative cheques). A never-reported node recovers nothing (had no earnings). 36 noded
       tests, fmt, clippy green. **Settlement now survives TOTAL local data loss** — state, own paid, and earnings all
       rebuild from the durable network chains.
-      **Remaining follow-ons:** `canonical_record` scan-cache (per-claim); wire the obj gates to a sync-cached reciprocity
-      position; genesis anchor-pin + wasm-publish; an active verification loop; 4e-2 committee snapshots. (Verify-board→durable deferred by user.)
+- [x] **4d-13 — CANONICAL_RECORD SCAN-CACHE DONE (2026-07-16).** `canonical_record` (called per `RewardClaim` resolution
+      in the balance fold) re-scanned every committee member's whole records chain from nonce 0. Now `RecordChain` holds a
+      per-member `MemberRecordCache { next_nonce, by_epoch }`: `share_of_member` parses only NEW nonces (append-only chain),
+      indexes each `SignedRecord` by epoch, and PRUNES epochs older than the claim window (a claim can't resolve against a
+      forfeited record) to bound memory. std `Mutex`, no await under the lock, results identical to a full scan. 36 noded
+      tests, fmt, clippy green.
+      **Remaining follow-ons:** wire the obj gates to a sync-cached reciprocity position; genesis anchor-pin + wasm-publish;
+      an active verification loop; 4e-2 committee snapshots. (Verify-board→durable deferred by user.)
 Open gaps needing a call at their phase: (1) anchor-authority routing RESOLVED (= committee), (2) escrow reclaim lifecycle [4d],
 (3) cold-start grant + identity gate [4d], (4) uniform-pricing floor for the pool-average reward [4c]. (Checkpoint
 acceleration + reward-valuation decomposition RESOLVED; see TOKEN_LEDGER_BUILD.md §9.)
