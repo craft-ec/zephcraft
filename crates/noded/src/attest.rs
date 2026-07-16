@@ -226,6 +226,17 @@ impl AttestStore {
             .and_then(|a| a.chain.current())
     }
 
+    /// List all locally-known attestation chains for the dashboard: `(owner, program_cid, current
+    /// quorum, seq)` — the user-declared k-of-n quorums and their activity.
+    pub async fn list(&self) -> Vec<([u8; 32], [u8; 32], Option<Quorum>, u64)> {
+        self.chains
+            .read()
+            .await
+            .iter()
+            .map(|((owner, program), a)| (*owner, *program, a.chain.current(), a.chain.seq()))
+            .collect()
+    }
+
     /// Publish an (owner, program) chain: durable content + a per-(owner,program) DHT head (version =
     /// seq + 1, strictly increasing). Publishes the owner-signed envelope. Mirrors governance's
     /// `publish`.

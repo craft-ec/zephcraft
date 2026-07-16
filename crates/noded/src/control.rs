@@ -248,6 +248,8 @@ pub struct State {
     pub accounts: std::sync::Arc<crate::account::ProgramAccountStore>,
     /// Per-program attestation quorum chains (the `attest` host fn's backend).
     pub attest: std::sync::Arc<crate::attest::AttestStore>,
+    /// Rotating epoch committee — the computed k-of-n quorum for anchored programs (automated attestation).
+    pub epoch_committee: std::sync::Arc<crate::epoch_committee::EpochCommitteeSource>,
     /// Per-(owner,program,account) ordered-write logs (the `sequence` host fn's backend).
     pub sequence: std::sync::Arc<crate::sequence::SequenceStore>,
 }
@@ -544,6 +546,9 @@ async fn handle_rpc(state: &State, line: &str) -> serde_json::Value {
         Some("attest_status") => rpc_attest_status(state, &request, id).await,
         Some("sequence_log") => rpc_sequence_log(state, &request, id).await,
         Some("programs") => rpc_programs(state, id).await,
+        Some("config") => rpc_config(state, id).await,
+        Some("committee") => rpc_committee(state, id).await,
+        Some("attest_list") => rpc_attest_list(state, id).await,
         Some("apps") => {
             serde_json::json!({"jsonrpc": "2.0", "id": id, "result": apps_list(state).await})
         }
@@ -1527,6 +1532,65 @@ async fn rpc_programs(state: &State, id: serde_json::Value) -> serde_json::Value
     serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"programs": rows}})
 }
 
+/// All governed config `(key, value)` pairs (the SetConfig registry — reciprocity grants, anchor ifaces).
+async fn rpc_config(state: &State, id: serde_json::Value) -> serde_json::Value {
+    let rows: Vec<serde_json::Value> = state
+        .gov
+        .list_config()
+        .await
+        .into_iter()
+        .map(|(k, v)| serde_json::json!([k, v]))
+        .collect();
+    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"config": rows}})
+}
+
+/// The current rotating EPOCH COMMITTEE (automated attestation) for the anchored token-ledger program —
+/// the computed k-of-n quorum that orders its writes this epoch.
+async fn rpc_committee(state: &State, id: serde_json::Value) -> serde_json::Value {
+    let program = crate::ledger::ledger_program_cid();
+    let epoch = state.clock.now().millis() / 30_000; // EPOCH_MILLIS
+    let quorum = state
+        .epoch_committee
+        .committee_for_epoch(&program, epoch)
+        .await;
+    let (members, threshold) = quorum
+        .map(|q| {
+            (
+                q.members.iter().map(hex::encode).collect::<Vec<_>>(),
+                q.threshold,
+            )
+        })
+        .unwrap_or_default();
+    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
+        "epoch": epoch, "program": "token-ledger", "members": members, "threshold": threshold,
+    }})
+}
+
+/// All locally-known ATTESTATION quorums (user-declared k-of-n authority) — owner, program, members, seq.
+async fn rpc_attest_list(state: &State, id: serde_json::Value) -> serde_json::Value {
+    let rows: Vec<serde_json::Value> = state
+        .attest
+        .list()
+        .await
+        .into_iter()
+        .map(|(owner, program, quorum, seq)| {
+            let (members, threshold) = quorum
+                .map(|q| {
+                    (
+                        q.members.iter().map(hex::encode).collect::<Vec<_>>(),
+                        q.threshold,
+                    )
+                })
+                .unwrap_or_default();
+            serde_json::json!({
+                "owner": hex::encode(owner), "program": hex::encode(program),
+                "members": members, "threshold": threshold, "seq": seq,
+            })
+        })
+        .collect();
+    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"quorums": rows}})
+}
+
 async fn rpc_gov(state: &State, id: serde_json::Value) -> serde_json::Value {
     let set = state.gov.current().await;
     let ig = state.gov.is_governor().await;
@@ -2434,6 +2498,36 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
             .collect();
         axum::Json(serde_json::json!({ "programs": rows })).into_response()
     }
+    async fn api_committee(
+        AxumState(ctx): AxumState<HttpCtx>,
+        Query(params): Query<TokenParam>,
+    ) -> axum::response::Response {
+        if params.token != *ctx.token {
+            return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
+        }
+        let r = rpc_committee(&ctx.state, serde_json::Value::Null).await;
+        axum::Json(r.get("result").cloned().unwrap_or_default()).into_response()
+    }
+    async fn api_config(
+        AxumState(ctx): AxumState<HttpCtx>,
+        Query(params): Query<TokenParam>,
+    ) -> axum::response::Response {
+        if params.token != *ctx.token {
+            return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
+        }
+        let r = rpc_config(&ctx.state, serde_json::Value::Null).await;
+        axum::Json(r.get("result").cloned().unwrap_or_default()).into_response()
+    }
+    async fn api_attest_list(
+        AxumState(ctx): AxumState<HttpCtx>,
+        Query(params): Query<TokenParam>,
+    ) -> axum::response::Response {
+        if params.token != *ctx.token {
+            return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
+        }
+        let r = rpc_attest_list(&ctx.state, serde_json::Value::Null).await;
+        axum::Json(r.get("result").cloned().unwrap_or_default()).into_response()
+    }
 
     async fn api_governance(
         AxumState(ctx): AxumState<HttpCtx>,
@@ -2531,6 +2625,9 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         .route("/api/registry", get(api_registry))
         .route("/api/registry/entries", get(api_registry_entries))
         .route("/api/programs", get(api_programs))
+        .route("/api/committee", get(api_committee))
+        .route("/api/config", get(api_config))
+        .route("/api/attest_list", get(api_attest_list))
         .route("/api/pending", get(api_pending))
         .route("/api/cids", get(api_cids))
         .with_state(ctx);

@@ -115,6 +115,7 @@
     <button class="tab-btn" data-tab="data" onclick="showTab('data')">data</button>
     <button class="tab-btn" data-tab="registry" onclick="showTab('registry')">registry</button>
     <button class="tab-btn" data-tab="governance" onclick="showTab('governance')">governance</button>
+    <button class="tab-btn" data-tab="consensus" onclick="showTab('consensus')">consensus</button>
     <button class="tab-btn" data-tab="economy" onclick="showTab('economy')">economy</button>
     <button class="tab-btn" data-tab="status" onclick="showTab('status')">status</button>
     <button class="tab-btn" data-tab="settings" onclick="showTab('settings')">settings</button>
@@ -240,6 +241,28 @@
     <div class="card">
       <div class="cardhead">protocol programs <span class="muted">— network-owned · governed anchors · canonical WASM set by governance</span></div>
       <div id="prog-protocol"><div class="muted">loading…</div></div>
+    </div>
+  </section>
+
+  <section id="tab-consensus" class="tab" hidden>
+    <div class="card">
+      <div class="muted" style="font-size:.76rem;line-height:1.55;margin-bottom:1rem">One <b style="color:var(--fg)">k-of-n Quorum</b> primitive underlies all authority on the network, in three provenances: <b style="color:var(--fg)">governance</b> (the genesis instance — a declared, owner-signed governor set), <b style="color:var(--fg)">attestation</b> (user-declared quorums — "set up your own consensus"), and the <b style="color:var(--fg)">epoch committee</b> (a <i>computed</i>, rotating quorum that orders network-owned/anchored programs — automated attestation). Separately, <b style="color:var(--fg)">verification</b> is open re-execution consistency (any node re-runs a pure function; see settlement verification under economy).</div>
+    </div>
+    <div class="card">
+      <div class="cardhead">governance quorum <span class="muted">— the genesis authority: k-of-n governor multisig · approves protocol-program listings &amp; config</span></div>
+      <div id="cons-gov"><div class="muted">…</div></div>
+    </div>
+    <div class="card">
+      <div class="cardhead">epoch committee <span class="muted">— automated attestation: the deterministic, rotating k-of-n committee (rendezvous over program + epoch + census) that orders anchored-program writes this epoch</span></div>
+      <div id="cons-committee"><div class="muted">…</div></div>
+    </div>
+    <div class="card">
+      <div class="cardhead">attestation quorums <span class="muted">— user-declared authority: per-program k-of-n sets that can attest statements ("set up your own consensus")</span></div>
+      <div id="cons-attest"><div class="muted">…</div></div>
+    </div>
+    <div class="card">
+      <div class="cardhead">governed config <span class="muted">— protocol parameters set by governance (SetConfig): reciprocity grants, anchor interface versions, finality (n,k)</span></div>
+      <div id="cons-config"><div class="muted">…</div></div>
     </div>
   </section>
 
@@ -694,6 +717,7 @@ function showTab(name){
   // not on every poll tick. loadRegistry() (also called each tick) only refreshes cheap status.
   if(name==="registry"){ loadRegistry(); loadRegistryEntries(); }
   if(name==="governance") loadGovernance();
+  if(name==="consensus") loadConsensus();
 }
 async function doDeploy(){
   const name=$("dep-name").value.trim(); const f=$("dep-file").files[0]; const out=$("dep-result");
@@ -813,6 +837,40 @@ async function loadGovernance(){
         <div class="note">Network-owned WASM programs whose canonical cid <b>Governance</b> sets, so they upgrade with no binary release (none listed = the network runs no governed WASM program yet). The <b>head registry</b> (see <b>Registry</b>) is <b>not</b> one of these — it validates writes <b>natively</b> (owner signature + name limit) as kernel mechanism, so it does not appear here. Governance still owns the governor set and protocol config (e.g. the shard count).</div>`;
     }catch(e){ host.textContent="error: "+e; }
   }
+}
+// Consensus tab: the quorum family — governance (genesis), epoch committee (automated attestation),
+// user-declared attestation quorums, and the governed config.
+async function loadConsensus(){
+  const gh=$("cons-gov");
+  if(gh){ try{
+    const g=await (await fetch("/api/governance?token="+TOKEN)).json();
+    const govs=(g.governors||[]);
+    gh.innerHTML=`<div class="kv"><span>governor set</span><b>${g.threshold||0}-of-${govs.length} · seq ${g.seq||0}${g.is_governor?' · <span class="chip providing">this node</span>':''}</b></div>`
+      + govs.map(h=>`<div class="kv"><span>governor</span><span class="mono muted cidcell" onclick="copyCid('${h}')">${h.slice(0,20)}…</span></div>`).join("");
+  }catch(e){ gh.textContent="error: "+e; } }
+  const ch=$("cons-committee");
+  if(ch){ try{
+    const c=await (await fetch("/api/committee?token="+TOKEN)).json();
+    const m=(c.members||[]);
+    ch.innerHTML=`<div class="kv"><span>epoch ${c.epoch||0} · ${esc(c.program||"—")}</span><b>${c.threshold||0}-of-${m.length}</b></div>`
+      + (m.length ? m.map(h=>`<div class="kv"><span>member${h===SELF_ID?' <span class="chip providing">this node</span>':''}</span><span class="mono muted cidcell" onclick="copyCid('${h}')">${h.slice(0,20)}…</span></div>`).join("") : '<div class="muted">no committee yet (census converging)</div>');
+  }catch(e){ ch.textContent="error: "+e; } }
+  const ah=$("cons-attest");
+  if(ah){ try{
+    const a=await (await fetch("/api/attest_list?token="+TOKEN)).json();
+    const q=(a.quorums||[]);
+    ah.innerHTML = q.length
+      ? q.map(x=>`<div class="kv"><span class="mono muted" title="owner ${x.owner}">program ${String(x.program).slice(0,16)}…</span><b>${x.threshold||0}-of-${(x.members||[]).length} · seq ${x.seq||0}</b></div>`).join("")
+      : '<div class="muted">no user-declared quorums on this node</div>';
+  }catch(e){ ah.textContent="error: "+e; } }
+  const cf=$("cons-config");
+  if(cf){ try{
+    const cc=await (await fetch("/api/config?token="+TOKEN)).json();
+    const rows=(cc.config||[]);
+    cf.innerHTML = rows.length
+      ? '<table><tbody>'+rows.map(x=>`<tr><td style="padding:.15rem .8rem .15rem 0"><b>${esc(x[0])}</b></td><td class="mono muted" style="padding:.15rem 0">${x[1]}</td></tr>`).join("")+'</tbody></table>'
+      : '<div class="muted">no governed config set — native defaults in effect</div>';
+  }catch(e){ cf.textContent="error: "+e; } }
 }
 async function doInvoke(){
   const app=$("inv-app").value.trim(), wasm=$("inv-wasm").value.trim();

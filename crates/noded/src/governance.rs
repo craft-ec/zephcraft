@@ -155,6 +155,18 @@ impl GovernanceChainStore {
         self.chain.read().await.config_registry().resolve(key)
     }
 
+    /// All governed config `(key, value)` pairs — the SetConfig registry, for the dashboard.
+    pub async fn list_config(&self) -> Vec<(String, i64)> {
+        self.chain
+            .read()
+            .await
+            .config_registry()
+            .entries()
+            .iter()
+            .map(|(k, v, _)| (k.clone(), *v))
+            .collect()
+    }
+
     /// `(name, cid_hex, version)` rows of the derived program registry (dashboard).
     pub async fn rows(&self) -> Vec<(String, String, u64)> {
         self.chain
