@@ -81,6 +81,16 @@ pub enum Capability {
     /// an owner-DB row (existing `sql`), and the *re-encryption transform* is pure WASM — neither
     /// needs a host fn (`ENCRYPTION_DESIGN §9b`); only the key-touching `generate_kfrags` does.
     Pre,
+    /// `invoke_program` — **cross-program invocation (CPI)**: synchronously call another program's
+    /// interface method and read back its committed output (`ECONOMY_PROGRAMS_DESIGN.md §4`). Unlike
+    /// `verify`/`attest`/`sequence` (non-deterministic orchestration), CPI is **DETERMINISTIC** — the
+    /// callee runs under the deterministic subset in its OWN reserved namespace (read-only), so a
+    /// verifier re-execution reproduces the whole call tree. It therefore belongs in the deterministic
+    /// profile: a consensus/economy program (e.g. the token/economy fold) can call `token.balance_of`
+    /// and stay reproducible. It is a CALCULATION primitive (returns a value), never a value move — the
+    /// single-writer model makes cross-program WRITES unnecessary (§3). One level only: a callee's ctx
+    /// carries no invoke backend, so it cannot recurse.
+    InvokeProgram,
 }
 
 /// The set of [`Capability`]s a program is granted. A capability not in the set is **not
@@ -112,6 +122,10 @@ impl CapabilityGrant {
                 Capability::Sql,
                 Capability::Obj,
                 Capability::Clock,
+                // CPI is deterministic (callee forced deterministic) → part of the consensus floor, so
+                // an economy/consensus program can read another program (e.g. token.balance_of) and
+                // still reproduce on a verifier re-run.
+                Capability::InvokeProgram,
             ]
             .into_iter()
             .collect(),
@@ -177,9 +191,15 @@ mod tests {
             Capability::Sql,
             Capability::Obj,
             Capability::Clock,
+            Capability::InvokeProgram,
         ] {
             assert!(g.allows(cap), "{cap:?} is deterministic → granted");
         }
+        // CPI is deterministic (callee forced deterministic) → in the consensus floor.
+        assert!(
+            g.allows(Capability::InvokeProgram),
+            "invoke_program (deterministic CPI) is granted by the deterministic profile"
+        );
         // Clock (the CONSENSUS clock, ctx.now) IS deterministic — reproducible across nodes.
         assert!(
             g.allows(Capability::Clock),

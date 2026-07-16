@@ -2424,12 +2424,18 @@ Phases (each: build + test + gate + commit; roll together where consensus-affect
       is P5); replaced the re-typed literals in genesis.rs (`activate`) + control.rs (dashboard anchor list +
       rpc_committee program name). Pure refactor — build/fmt/clippy/genesis-test green, no behavior/wire/consensus
       change, no fleet roll needed.
-- [ ] **P2 — CPI primitive:** `Capability::InvokeProgram` + `invoke_program(anchor|cid, func, input)` host fn
-      + `InvokeProgramBackend` in `TransitionCtx`; callee runs under `CapabilityGrant::deterministic()` (no
-      wall-clock/random/verify/attest/sequence → caller re-execution reproduces the call tree). General
-      composition primitive; NOT wedged onto the verified settlement fold (value-move stays node-orchestrated
-      — the "in-wasm CPI value-move fights verification" hazard the tracker already flagged). Tests: program A
-      invokes B, re-run reproduces; determinism wall (non-det callee rejected).
+- [x] **P2 — CPI primitive DONE (2026-07-16, com-side).** `Capability::InvokeProgram` (added to the DETERMINISTIC
+      profile — CPI is a deterministic calc, callee forced deterministic → reproduces on a verifier re-run, unlike
+      verify/attest/sequence which are non-det orchestration); `InvokeProgramBackend` trait (`invoke_program(name,
+      func, input) -> Option<Vec<u8>>`) in com/lib.rs; `TransitionCtx.invoke_backend` + `with_invoke_backend`;
+      the `invoke_program(name,func,input,out)` host fn in `bind_granted` — reads args, calls the backend, writes
+      the callee's committed output back; NOT inert on a verifier re-run (deterministic → re-runs + reproduces);
+      no backend → `-1` (also bounds recursion: a callee's ctx has no invoke backend → one level only). 3 tests
+      (output flows back + reproduces; no-backend UNAVAILABLE; capability-gated link-time deny). fmt/clippy/88
+      com tests green. Behavior-neutral (no current program imports it) → NO fleet roll. **FOLLOW-ON (P4):** the
+      NODED-side real `InvokeProgramBackend` impl — resolve anchor name→cid (AnchorDispatcher), run the callee
+      under the deterministic grant in its OWN reserved namespace (app_ns switch + Sql read) — lands when economy
+      actually calls `token.share_of`/`balance_of`.
 - [ ] **P3 — split `zeph_ledger` → `zeph_token`** (Transfer/Claim, `{balance, processed_claims}`) **+
       `zeph_economy_egress`** (Pay/RewardClaim + `zeph_reward::compute`, `{claimed_epochs}`). Native fold kept;
       `EconomyEgressService` holds `Arc<TokenService>`.

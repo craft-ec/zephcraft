@@ -21,8 +21,8 @@ use zeph_core::{Cid, NodeId};
 use zeph_crypto::NodeIdentity;
 
 use crate::{
-    AppBackend, AttestBackend, Capability, CapabilityGrant, SequenceBackend, SequencedWrite,
-    VerifyBackend, VerifyRequest,
+    AppBackend, AttestBackend, Capability, CapabilityGrant, InvokeProgramBackend, SequenceBackend,
+    SequencedWrite, VerifyBackend, VerifyRequest,
 };
 
 /// Import module the restricted deterministic ABI is bound under (shares the `craftcom`
@@ -89,6 +89,11 @@ pub struct TransitionCtx {
     /// The node service the `sequence` host fn drives (submit a write to the account's quorum + await
     /// the commit). `None` → `sequence` reports UNAVAILABLE. Set via [`Self::with_sequence_backend`].
     sequence_backend: Option<Arc<dyn SequenceBackend>>,
+    /// The node service the `invoke_program` host fn drives — cross-program invocation (CPI), a
+    /// deterministic calculation. `None` → `invoke_program` reports UNAVAILABLE, which is also how
+    /// recursion is bounded: a CALLEE's ctx carries no invoke backend, so it cannot nest a CPI. Set via
+    /// [`Self::with_invoke_backend`].
+    invoke_backend: Option<Arc<dyn InvokeProgramBackend>>,
 }
 
 impl TransitionCtx {
@@ -117,6 +122,7 @@ impl TransitionCtx {
             verify_backend: None,
             attest_backend: None,
             sequence_backend: None,
+            invoke_backend: None,
         }
     }
 
@@ -167,6 +173,14 @@ impl TransitionCtx {
     /// Absent → `sequence` reports UNAVAILABLE.
     pub fn with_sequence_backend(mut self, backend: Option<Arc<dyn SequenceBackend>>) -> Self {
         self.sequence_backend = backend;
+        self
+    }
+
+    /// Inject the [`InvokeProgramBackend`] the `invoke_program` host fn drives (CPI — a deterministic
+    /// cross-program read). Absent → `invoke_program` reports UNAVAILABLE (and a callee is given `None`,
+    /// which bounds recursion to one level).
+    pub fn with_invoke_backend(mut self, backend: Option<Arc<dyn InvokeProgramBackend>>) -> Self {
+        self.invoke_backend = backend;
         self
     }
 }
@@ -840,6 +854,43 @@ fn bind_granted(linker: &mut Linker<TransitionCtx>, grant: &CapabilityGrant) -> 
                     {
                         Ok(Some(bytes)) => det_write(&mut caller, &mem, out, cap, &bytes),
                         _ => -1, // Ok(None) (unwired) or Err → UNAVAILABLE
+                    }
+                })
+            },
+        )?;
+    }
+
+    if grant.allows(Capability::InvokeProgram) {
+        // `invoke_program(name_ptr, name_len, func_ptr, func_len, in_ptr, in_len, out_ptr, out_cap) -> i32`
+        // — CROSS-PROGRAM INVOCATION (CPI): resolve `name` (a canonical anchor name) → run `func(input)`
+        // under the deterministic subset in the callee's OWN reserved namespace (read-only) → write its
+        // committed output to `out` (≤ `out_cap`). Returns bytes written, or `-1` (bad args / no backend /
+        // callee rejected / out buffer too small). CPI is DETERMINISTIC (the callee is forced deterministic),
+        // so — unlike verify/attest/sequence — it is NOT inert on a verifier re-run: it re-runs and
+        // reproduces. No backend → `-1` (which also bounds recursion: a callee is given no invoke backend).
+        // Never panics.
+        linker.func_wrap_async(
+            TRANSITION_HOST_MODULE,
+            "invoke_program",
+            |mut caller: Caller<'_, TransitionCtx>,
+             (np, nl, fp, fl, ip, il, out, cap): (i32, i32, i32, i32, i32, i32, i32, i32)| {
+                Box::new(async move {
+                    let Some(mem) = det_memory(&mut caller) else {
+                        return -1i32;
+                    };
+                    let (Some(name), Some(func), Some(input)) = (
+                        det_read_str(&caller, &mem, np, nl),
+                        det_read_str(&caller, &mem, fp, fl),
+                        det_read(&caller, &mem, ip, il),
+                    ) else {
+                        return -1;
+                    };
+                    let Some(backend) = caller.data().invoke_backend.clone() else {
+                        return -1; // no invoke backend wired (a callee has none → one level only)
+                    };
+                    match backend.invoke_program(&name, &func, input).await {
+                        Some(output) => det_write(&mut caller, &mem, out, cap, &output),
+                        None => -1, // resolution/exec failure or a rejected (empty) commit
                     }
                 })
             },
@@ -1687,6 +1738,109 @@ mod tests {
             .await
             .is_err(),
             "deterministic profile must NOT bind random"
+        );
+    }
+
+    // A CPI caller: invoke_program("token","ping", <empty>) into out[64..], commit the returned bytes
+    // (0 if the call errored — `select`-guarded so a negative length never reaches `commit`).
+    const INVOKE_WAT: &[u8] = br#"(module
+      (import "craftcom" "invoke_program" (func $cpi (param i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+      (import "craftcom" "commit" (func $commit (param i32 i32) (result i32)))
+      (memory (export "memory") 1)
+      (data (i32.const 0) "token")
+      (data (i32.const 16) "ping")
+      (func (export "run") (local $n i32)
+        (local.set $n (call $cpi
+          (i32.const 0) (i32.const 5) (i32.const 16) (i32.const 4)
+          (i32.const 32) (i32.const 0) (i32.const 64) (i32.const 64)))
+        (drop (call $commit (i32.const 64)
+          (select (local.get $n) (i32.const 0) (i32.ge_s (local.get $n) (i32.const 0)))))))"#;
+
+    struct MockInvoke(Vec<u8>);
+    #[async_trait::async_trait]
+    impl InvokeProgramBackend for MockInvoke {
+        async fn invoke_program(
+            &self,
+            _name: &str,
+            _func: &str,
+            _input: Vec<u8>,
+        ) -> Option<Vec<u8>> {
+            Some(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn invoke_program_returns_the_callee_output_and_reproduces() {
+        let rt = TransitionRuntime::new().unwrap();
+        // Backend present → the callee's output flows back through the CPI host fn and is committed.
+        let ctx = TransitionCtx::deterministic(vec![], vec![], 0)
+            .with_invoke_backend(Some(Arc::new(MockInvoke(b"pong".to_vec()))));
+        let out = rt
+            .run_program(
+                INVOKE_WAT,
+                "run",
+                ctx,
+                DEFAULT_FUEL,
+                &CapabilityGrant::deterministic(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, b"pong", "CPI output returned to the caller");
+        // CPI is deterministic → a verifier re-run with the same inputs reproduces the same output.
+        let ctx2 = TransitionCtx::deterministic(vec![], vec![], 0)
+            .with_invoke_backend(Some(Arc::new(MockInvoke(b"pong".to_vec()))));
+        let out2 = rt
+            .run_program(
+                INVOKE_WAT,
+                "run",
+                ctx2,
+                DEFAULT_FUEL,
+                &CapabilityGrant::deterministic(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, out2, "CPI is deterministic → reproduces");
+    }
+
+    #[tokio::test]
+    async fn invoke_program_without_backend_is_unavailable() {
+        let rt = TransitionRuntime::new().unwrap();
+        // No invoke backend (also a callee's situation → recursion bounded to one level) → cpi returns
+        // -1, nothing committed.
+        let ctx = TransitionCtx::deterministic(vec![], vec![], 0);
+        let out = rt
+            .run_program(
+                INVOKE_WAT,
+                "run",
+                ctx,
+                DEFAULT_FUEL,
+                &CapabilityGrant::deterministic(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.is_empty(),
+            "no invoke backend → UNAVAILABLE, empty commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_program_denied_without_the_capability() {
+        let rt = TransitionRuntime::new().unwrap();
+        // A grant lacking InvokeProgram must not bind the import → the module fails to instantiate.
+        let ctx = TransitionCtx::deterministic(vec![], vec![], 0)
+            .with_invoke_backend(Some(Arc::new(MockInvoke(b"pong".to_vec()))));
+        assert!(
+            rt.run_program(
+                INVOKE_WAT,
+                "run",
+                ctx,
+                DEFAULT_FUEL,
+                &CapabilityGrant::deterministic().without(Capability::InvokeProgram),
+            )
+            .await
+            .is_err(),
+            "invoke_program is unbound without the capability → unknown import"
         );
     }
 }

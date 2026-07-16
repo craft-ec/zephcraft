@@ -163,3 +163,15 @@ pub trait SequenceBackend: Send + Sync {
     async fn sequence(&self, owner: [u8; 32], program_cid: [u8; 32], write: SequencedWrite)
         -> bool;
 }
+
+/// The node service the `invoke_program` host fn drives — **cross-program invocation (CPI)**, a
+/// DETERMINISTIC calculation (`ECONOMY_PROGRAMS_DESIGN.md §4`). Resolve `name` (a canonical anchor
+/// name) to its program cid, run `func` with `input` under the deterministic capability subset in the
+/// callee's OWN reserved namespace (read-only), and return its committed output. Deterministic + pure
+/// (no value move, no non-deterministic caps), so a verifier re-execution of the CALLER reproduces the
+/// whole call tree. `None` on resolution/exec failure or an empty (rejected) commit. One level only: the
+/// callee runs with NO invoke backend, so it cannot recurse.
+#[async_trait]
+pub trait InvokeProgramBackend: Send + Sync {
+    async fn invoke_program(&self, name: &str, func: &str, input: Vec<u8>) -> Option<Vec<u8>>;
+}
