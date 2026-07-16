@@ -39,12 +39,14 @@ use zeph_core::Cid;
 use zeph_crypto::NodeIdentity;
 use zeph_membership::Membership;
 use zeph_obj::{ConsumeMode, ObjEngine};
+use zeph_reward::RewardRecord;
 
 use crate::anchor::AnchorDispatcher;
 use crate::cheque::ChequeService;
 use crate::ledger::LedgerService;
 use crate::record_chain::RecordChain;
 use crate::sequence::SequenceStore;
+use crate::settlement::CLAIM_WINDOW_EPOCHS;
 
 /// Epoch length (ms) — MUST match `epoch_committee::EPOCH_MILLIS` so settlement epochs align with the
 /// committee that orders the reports.
@@ -117,7 +119,7 @@ pub struct SettlementService {
     sequence: Arc<SequenceStore>,
     /// Serving measurement + its cheque proof (`total_earned` / `serving_proof`).
     cheques: Arc<ChequeService>,
-    /// Pool + settle sink — cumulative `Pay` total (`total_paid`) and the epoch-close settle.
+    /// Pool + settle sink — durable `Pay` total (`paid_total`, from the ledger chain) and the settle.
     ledger: Arc<LedgerService>,
     /// Committee-attested record finality — this node attests each epoch's record here if it's on the
     /// committee, and claims resolve against the canonical (quorum-signed) record.
@@ -173,7 +175,9 @@ impl SettlementService {
     /// chain. Returns whether it committed (a quorum of the committee co-signed the ordering).
     async fn report(&self, epoch: u64) -> bool {
         let account = self.identity.node_id().0;
-        let paid_cumulative = self.ledger.total_paid();
+        // Paid from the DURABLE ledger `Pay` chain (not the in-memory counter), so a reconstructed node
+        // reports its true cumulative rather than 0 after data loss.
+        let paid_cumulative = self.ledger.paid_total(account).await;
         let cheques = self.cheques.serving_proof();
         // Our own cheques are always valid → the proof justifies our served total by construction.
         let served_cumulative = proven_cumulative(&account, &cheques).unwrap_or(0);
@@ -309,14 +313,33 @@ impl SettlementService {
     /// — if this node is on the committee — ATTEST the resulting record to the records chain, so a quorum
     /// of matching signatures finalizes the canonical record other nodes resolve claims against.
     async fn settle(&self, epoch: u64) {
+        let record = self.settle_epoch_state(epoch).await;
+        self.records.attest(epoch, &record).await;
+    }
+
+    /// Fold epoch `E`'s durable reports into the settlement store (the state half of `settle`, WITHOUT
+    /// attesting). Used both by the live loop and by startup RECONSTRUCTION — replaying the durable chains
+    /// to rebuild the in-memory watermarks/pool/records after a restart (even total local data loss),
+    /// since the store is a deterministic function of the committed reports. Returns the epoch record.
+    async fn settle_epoch_state(&self, epoch: u64) -> RewardRecord {
         let mut entries: Vec<([u8; 32], u64, u64)> = Vec::new();
         for account in self.participants().await {
             if let Some((paid_cum, served_cum)) = self.cumulatives_of(account, epoch).await {
                 entries.push((account, paid_cum, served_cum));
             }
         }
-        let record = self.ledger.settle_from_board(epoch, entries).await;
-        self.records.attest(epoch, &record).await;
+        self.ledger.settle_from_board(epoch, entries).await
+    }
+
+    /// Reconstruct the in-memory settlement state on startup by replaying the last `CLAIM_WINDOW_EPOCHS`
+    /// of durable reports up to `through` (inclusive) — folding state only, NOT re-attesting or re-writing
+    /// (the reports + canonical records already exist on the chains). Bounded by the claim window: older
+    /// records have forfeited, so genesis replay is never needed.
+    async fn reconstruct_through(&self, through: u64) {
+        let start = through.saturating_sub(CLAIM_WINDOW_EPOCHS);
+        for e in start..=through {
+            self.settle_epoch_state(e).await;
+        }
     }
 
     /// The epoch-close loop: author this node's report for the just-closed epoch, then settle every epoch
@@ -336,20 +359,28 @@ impl SettlementService {
             if now == 0 {
                 continue;
             }
-            // First tick: baseline the closed/settled epochs so we don't re-report or re-settle the past.
+            // First tick: RECONSTRUCT the in-memory settlement state by replaying the claim-window of
+            // durable reports — so a node that restarted (even one that lost all local data) resumes with
+            // the correct watermarks/pool/records rather than re-baselining from empty. Then baseline the
+            // closed/settled cursors past the replayed window.
             if !initialized {
+                let settled_through = now.saturating_sub(1 + SETTLE_GRACE_EPOCHS);
+                self.reconstruct_through(settled_through).await;
                 last_reported = Some(now.saturating_sub(1));
-                last_settled = Some(now.saturating_sub(1 + SETTLE_GRACE_EPOCHS));
-                sent_paid = self.ledger.total_paid();
+                last_settled = Some(settled_through);
+                // Our own reported cumulatives come from durable sources (the ledger `Pay` chain; served
+                // from the cheque book, made durable separately) so they're correct after data loss.
+                sent_paid = self.ledger.paid_total(self.identity.node_id().0).await;
                 sent_served = self.cheques.total_earned();
                 initialized = true;
                 continue;
             }
 
-            // REPORT this node's cumulatives for the just-closed epoch, once, if a cumulative grew.
+            // REPORT this node's cumulatives for the just-closed epoch, once, if a cumulative grew. Paid is
+            // sourced from the durable ledger chain (survives data loss); served from the cheque book.
             let closed = now - 1;
             if last_reported.is_none_or(|e| e < closed) {
-                let paid_now = self.ledger.total_paid();
+                let paid_now = self.ledger.paid_total(self.identity.node_id().0).await;
                 let served_now = self.cheques.total_earned();
                 if (paid_now > sent_paid || served_now > sent_served) && self.report(closed).await {
                     sent_paid = paid_now;

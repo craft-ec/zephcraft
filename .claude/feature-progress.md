@@ -148,9 +148,22 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       report ≤ E (falling back to an older proven cumulative if the newest isn't yet fetchable; the watermark absorbs the
       delta). Correctness = a full re-scan (committed nonces are immutable); std `Mutex`, no await held over the lock. 36
       noded tests, fmt, clippy green.
-      **Remaining follow-ons (all non-urgent / scale / perf):** `canonical_record` scan-cache (per-claim, not per-settle);
-      wire the obj gates to a sync-cached reciprocity position; genesis anchor-pin + wasm-publish; an active verification
-      loop; persist watermarks (lose one epoch's baseline per restart); 4e-2 committee snapshots. (Verify-board→durable deferred by user.)
+- [x] **4d-11 — SETTLEMENT-STATE RECONSTRUCTION (survives total data loss) DONE (2026-07-16).** User point: local-disk
+      persistence wouldn't survive a node losing its data + restarting fresh — the durable state must reconstruct from the
+      NETWORK. It can, because the in-memory `SettlementStore` is a deterministic function of the durable chains (reports on
+      the settlement chain, canonical records on the records chain, `Pay` on the ledger chain — the same obj substrate SQL
+      rides). On startup, `run()` now calls `reconstruct_through(now−1−GRACE)` = replays the last `CLAIM_WINDOW_EPOCHS` of
+      durable reports via `settle_epoch_state` (folds watermarks/pool/records, WITHOUT re-attesting or re-writing) instead
+      of baselining from empty — bounded by the claim window (older records forfeited, no genesis replay). The node's own
+      `paid_cumulative` now comes from the durable ledger chain (`paid_total`), so the in-memory `total_paid` counter was
+      REMOVED (redundant + didn't survive data loss). Watermark = a node's cumulative-as-of-last-settled = read straight
+      from its durable report; claim double-spend state already lives in the durable ledger (`claimed_epochs`). Caveat: the
+      oldest replayed epoch baselines (contributes 0, it's at the forfeit edge) + pre-window dust isn't reconstructed
+      (safe direction — under-distribute, never inflate). 36 noded tests, fmt, clippy green. NEXT: durable ChequeBook (the
+      provider's raw received cheques — its earnings evidence — is still memory-only).
+      **Remaining follow-ons:** durable ChequeBook (in progress); `canonical_record` scan-cache (per-claim); wire the obj
+      gates to a sync-cached reciprocity position; genesis anchor-pin + wasm-publish; an active verification loop; 4e-2
+      committee snapshots. (Verify-board→durable deferred by user.)
 Open gaps needing a call at their phase: (1) anchor-authority routing RESOLVED (= committee), (2) escrow reclaim lifecycle [4d],
 (3) cold-start grant + identity gate [4d], (4) uniform-pricing floor for the pool-average reward [4c]. (Checkpoint
 acceleration + reward-valuation decomposition RESOLVED; see TOKEN_LEDGER_BUILD.md §9.)

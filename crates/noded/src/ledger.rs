@@ -11,7 +11,6 @@
 //! write (e.g. an overdraft) folds to a no-op, so it can occupy a nonce but never corrupts the balance.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use zeph_com::{SequenceBackend, SequencedWrite};
@@ -49,9 +48,6 @@ pub struct LedgerService {
     /// the identical per-node cumulatives read from the durable settlement chains), NOT by the local
     /// `pay()` — so the epoch record is deterministic network-wide.
     settlement: tokio::sync::RwLock<SettlementStore>,
-    /// This node's CUMULATIVE `Pay` total (monotonic; incremented on each committed `pay`). The settlement
-    /// loop reads it as the node's `paid_cumulative` when authoring its per-epoch settlement report.
-    total_paid: AtomicU64,
     /// Committee-attested record finality (set after construction). When present, a `RewardClaim` resolves
     /// its share from the CANONICAL quorum-signed record (durable, restart-safe), falling back to the local
     /// in-memory record only before finalization.
@@ -71,7 +67,6 @@ impl LedgerService {
             cid,
             owner,
             settlement: tokio::sync::RwLock::new(SettlementStore::new()),
-            total_paid: AtomicU64::new(0),
             record_chain: tokio::sync::RwLock::new(None),
             paid_scan: Mutex::new(HashMap::new()),
         }
@@ -235,21 +230,12 @@ impl LedgerService {
         .await
     }
 
-    /// PAY `amount` of egress cost into the epoch pool — a self-authored debit (§10.1 pay-into-pool).
-    /// On commit, we bump this node's cumulative `total_paid`; the settlement loop later announces the
-    /// per-epoch DELTA so EVERY node folds the same Σ pays into the pool (the pool is announcement-driven,
-    /// not fed locally here — a local pay_in would make each node's pool differ and break determinism).
+    /// PAY `amount` of egress cost into the epoch pool — a self-authored debit (§10.1 pay-into-pool). The
+    /// committed `Pay` write on the durable ledger chain IS the record; the settlement loop reads this
+    /// node's cumulative from it via [`paid_total`](Self::paid_total) (no in-memory counter, so it survives
+    /// data loss). The pool is fed cross-node from the settlement reports, not locally here.
     pub async fn pay(&self, amount: u64) -> bool {
-        let ok = self.submit_own(LedgerOp::Pay(amount)).await;
-        if ok {
-            self.total_paid.fetch_add(amount, Ordering::Relaxed);
-        }
-        ok
-    }
-
-    /// This node's cumulative committed `Pay` total — the settlement loop deltas it per epoch.
-    pub fn total_paid(&self) -> u64 {
-        self.total_paid.load(Ordering::Relaxed)
+        self.submit_own(LedgerOp::Pay(amount)).await
     }
 
     /// Claim this node's reward share for `epoch` (single-use, §10.1). The share is resolved from the

@@ -19,8 +19,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use zeph_reward::{compute, Contribution, RewardInput, RewardRecord};
 
 /// Governed claim window (§10.1): an unclaimed reward share forfeits back to the pool after this many
-/// epochs, bounding record storage. A config value later; a sane default for now.
-const CLAIM_WINDOW_EPOCHS: u64 = 8;
+/// epochs, bounding record storage. A config value later; a sane default for now. Also the startup
+/// reconstruction depth (replay this many epochs of durable reports to rebuild state).
+pub const CLAIM_WINDOW_EPOCHS: u64 = 8;
 
 #[derive(Default)]
 pub struct SettlementStore {
