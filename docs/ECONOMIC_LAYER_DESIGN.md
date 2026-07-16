@@ -630,25 +630,16 @@ not load-bearing** (producer randomization still useful for load-balancing/avail
   costs nothing → farmable. Offer generous quotas / fair-use caps ("soft unlimited"), like
   every real "unlimited" ISP/cloud. Also set free-tier reimbursement *at* cost, not above
   (margin = small residual farm).
-  - **Resolved shape — metered-reward with subsidized overflow (2026-07-15).** *Reward =
-    metered paid-usage revenue, **capped per-consumer at what they paid**. Overflow beyond the
-    paid quota is subsidized: **cost-reimbursed (break-even, unrewarded) and
-    best-effort/throttled/pool-bounded**.* This gives the flat/"unlimited" consumer UX while
-    keeping the farm closed on all sides:
-    - **Metered (paid) band → reward** (profit), capped at the consumer's payment → a
-      self-dealer earns at most what it paid for the quota = **strictly zero-sum**. This is
-      *direct revenue, not a pool-split* (satisfies the condition above automatically).
-    - **Overflow band → cost-reimbursed** (provider made whole so it *will* serve, but no
-      profit) → break-even self-dealing gains nothing = **no farm**.
-    - **Overflow is aggregate-bounded** (throttled + pool-health-limited via the §8
-      self-balancing allowance) → even zero-profit unlimited fetching can't drain the pool
-      unboundedly. "Unlimited" = best-effort continuation, not unbounded full-speed resource.
-    Net: zero-sum-safe reward (self-inflation impossible), bounded subsidy cost, flat consumer
-    UX. Producer randomization is then *not* needed for farm-safety here (it stays useful for
-    load-balancing). The *free* tier is the overflow band with a zero paid-quota — same
-    mechanics, quota-bounded by the identity gate + allowance. See §10.1/§10.2 — this simplifies the metric toward "reward ∝ paid
-demand," with cold storage via owner-pays-pin, consensus work fee-funded, bootstrap
-subsidized (the three gaps paid-egress alone doesn't cover).
+  - **SUPERSEDED (2026-07-16) — see §10.1 (pool-average) + §8 top (tit-for-tat).** The earlier
+    "metered-reward with subsidized overflow" framing is gone: there is **NO cost-reimbursed overflow
+    band**. Reward is the **contribution-ratio** distribution of the payment pool (§10.1: `pool ×
+    (its serving / total serving)`, a uniform rate), and **settlement is claim-based** (each provider
+    claims its verified epoch share). Consumption beyond paid + reciprocal is **throttled** (the
+    admission gate), not subsidized. The consumer-facing tiers are the **reciprocity** model (§8 top):
+    reciprocal = free (netted), a deficit settles in tokens or throttles. The only pool-funded subsidy
+    is the small **cold-start grant** (below) — separate from reward distribution. Farm-safety comes
+    from aggregate-boundedness (pool = payments), non-inflatable attested serving, Sybil-neutral
+    proportionality, and uniform pricing (§10.1) — not from an overflow band.
 
 **Net (fallback framing if reward is *not* restricted to paid demand):** producer
 randomization + protocol-enforced placement prevent *value-minting*; counterparty-signed
@@ -748,7 +739,14 @@ binary roll). Committing to a *shape* rather than a magic constant is itself the
    issuance only tops up the pool during **bootstrap** (tapering, identity-gated). Free/reciprocal
    serving earns reciprocity credit (§8), *not* pool share. Cold storage = **owner-pays-pin**;
    consensus work = **fee-funded**. The rate self-balances (more providers → lower unit rate →
-   market-clearing). *This is the spine.*
+   market-clearing). **NO overflow subsidy (corrected 2026-07-16):** the pool is fully distributed by
+   contribution ratio — there is no cost-reimbursed "overflow band"; consumption beyond paid +
+   reciprocal is **throttled** (the admission gate), not subsidized (the only pool-funded item is the
+   small cold-start grant, §8, which is separate from reward distribution). **Settlement is
+   CLAIM-based:** the verified per-epoch shares form an **epoch reward RECORD**, and each provider
+   **claims** its share onto its own chain (`RewardClaim{epoch}`, single-use — the transfer→claim
+   pattern with the record as the "debit"), so there is no node-side fan-out of writes. *This is the
+   spine.*
 2. **Participation-metric formula — DECIDED: dissolved.** Paid demand *is* the metric; no
    rich multi-signal contribution oracle (with sybil-normalization + organic-demand weighting)
    is built. Organic-demand weighting is retained only as **optional defense-in-depth** (§8-A),

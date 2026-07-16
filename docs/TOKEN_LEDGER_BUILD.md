@@ -147,15 +147,24 @@ cheques reward zero.
 
 ## 6. Phase 4d — settlement + tiers
 
-**Reciprocity-offset before `allocate_quota`** — compose the unchanged pure fn **twice**:
-1. `reciprocity_credit = min(total_earned, gross_consumed_this_epoch)` (from `ChequeService::total_earned`, drop its
-   `#[allow(dead_code)]`).
-2. Pass 1: `allocate_quota(cheques, reciprocity_credit)` → the reciprocal band (nets to zero, no tokens move).
-3. Pass 2: `allocate_quota(remainder, token_quota)` → `(token_paid, subsidy)`.
+**Epoch-close pipeline — CLAIM-based, NO overflow subsidy (corrected 2026-07-16, §10.1).** The node runs this once
+per epoch (not per-transfer; reward + settlement are batch stages, so node-orchestration fits and `invoke_program`
+isn't needed):
+1. **Gather** — each provider's cheques (`ChequeBook`) + consumers' escrow.
+2. **Reciprocity offset** — `reciprocity_credit = min(total_earned, gross_consumed)`; `allocate_quota(cheques,
+   reciprocity_credit)` nets the reciprocal band to zero (no tokens). The remainder is the consumer's PAID egress.
+3. **Pool + contribution** — pool = Σ consumers' paid egress; per-provider contribution = its paid-serving bytes.
+4. **Reward program** (separate, governed) — `{pool, per-provider contribution} → per-provider SHARE` = its
+   contribution ratio (`pool × serving / Σ serving`, uniform rate). Verified (k nodes re-run the pure program) →
+   an **epoch reward RECORD**. **No overflow bucket; consumption beyond paid + reciprocal is throttled by the
+   admission gate, not subsidized.**
+5. **Claim** — each provider authors a `RewardClaim{epoch}` on its OWN ledger chain; the transition credits its
+   recorded share (single-use `minted_watermark`), debiting the consumers' escrow that formed the pool. The
+   transfer→claim pattern, with the epoch record as the "debit" — no node-side fan-out of writes.
 
-`token_paid` → a real movement: an `EscrowOp` (consumer pre-reserves tokens; a `SequencedWrite` on its own account)
-redeemed by providers via a `SettleClaim` (same shape as `ClaimOp`). `subsidy` → a mint from the governance-owned
-subsidy-pool **PDA** (`ProgramAccountStore`/`pda()` — the one PDA-analog §3 calls out), capped by pool health.
+`EscrowOp` (consumer pre-reserves egress tokens; a `SequencedWrite` on its own account) feeds the pool. The only
+pool-funded subsidy is the small **cold-start grant** (§8), separate from reward distribution — there is no
+governance-owned overflow-subsidy PDA in the reward path.
 
 **Admission gate** (new obj OnceLock hook, mirrors `shed_gate`): checked at the top of `get()` (~1017) + range
 variants; unwired default = permissive. Wired by `LedgerService` to a sync closure reading the in-memory reciprocity
@@ -196,19 +205,25 @@ owner-signed genesis. Heaviest sub-phase; its own commit + gate.
   generalize `SequenceStore`. **Exit:** identical-committee-across-nodes test; hand-off property test (write started
   under E, gathered after rotation to E+1, still commits); existing Sequence/Attest tests green. *Built before
   4b/4c/4d because they depend on it for real ordering.*
-- [ ] **4a-bis — `invoke_program` primitive.** New host fn + `Capability::InvokeProgram`; deterministic-callee only.
-  **Exit:** a program invokes another anchored program and gets its output; a non-deterministic callee is rejected;
-  verification re-runs the caller identically. *(After 4a; before 4c needs it.)*
-- [ ] **4b — ledger core.** `crates/ledger` + `apps/ledger-wasm`; `TransferOp`/`ClaimOp`/`fold_account`; always-on
-  re-fold validity (no checkpoint). **Exit:** wasm-vs-native fold-equivalence test; transfer→claim→balance
-  integration; duplicate-claim rejection.
-- [ ] **4c — reward = pool-average (separate program).** The reward-valuation program + `invoke_program` wiring; wire
-  `total_earned`; two-pass `allocate_quota` to identify rewardable bytes; uniform-rate distribution. **Exit:** reward
-  matches the deterministic pool-average formula; replayed cheques reward zero (monotonic `minted_watermark`); a
-  uniform-pricing self-deal nets ~zero in a test.
-- [ ] **4d — settlement + tiers.** `EscrowOp`/`SettleClaim`; admission + pin gates. **Exit:** two-pass
-  `allocate_quota` unit-tested (extend `quota_allocation_caps_paid_at_quota_by_timestamp` with a reciprocity case);
-  free-tier deficit trips the admission gate; pin-without-balance downgrades.
+- [~] **4a-bis — `invoke_program` primitive — DEFERRED (not needed for the ledger).** Decision 2026-07-16: reward +
+  settlement are **epoch-batch, node-orchestrated** (the node invokes the reward program once per epoch and composes
+  its verified output into the ledger), so a program-to-program host fn is NOT required for step 4 — and an in-wasm
+  invoke of a callee fights verification (every re-run would nest-execute the callee). Keep as a *general* future
+  capability if programs ever need to compose on the hot path; not on the step-4 path.
+- [x] **4b — ledger core. DONE** (4b-1 `crates/ledger` pure `apply(Transfer/Claim)`; 4b-2 `apps/ledger-wasm` +
+  `run_transition`; 4b-3 `noded::ledger::LedgerService` — committee-ordered transfers/claims + native balance fold +
+  RPC/CLI). Validity = always-on re-fold (no checkpoint). Follow-ons: genesis anchor-pin/publish, active verify loop.
+- [ ] **4c — reward = contribution-ratio (separate program, NODE-orchestrated).** A pure reward-valuation program
+  `{pool, per-provider contribution} → shares` (its own crate + wasm, testable like `crates/ledger`); the NODE invokes
+  it at epoch close (not via `invoke_program` — reward/settlement are epoch-batch, so the node orchestrates), verifies
+  it, and publishes the **epoch reward RECORD**. **Exit:** shares match the deterministic ratio formula; empty pool →
+  zero; a uniform-pricing self-deal nets ~zero in a test.
+- [ ] **4d — settlement (CLAIM-based) + gates.** `EscrowOp` (consumer locks egress tokens → the pool);
+  `LedgerOp::RewardClaim{epoch}` — a provider claims its recorded share onto its own chain (single-use
+  `minted_watermark`), debiting escrow; the node's epoch-close loop (gather → reciprocity offset → reward program →
+  verify → publish record); admission + pin gates in obj (mirror `shed_gate`). **NO overflow subsidy.** **Exit:**
+  RewardClaim credits the recorded share once (replay rejected); a free-tier deficit trips the admission gate;
+  pin-without-balance downgrades.
 
 Each phase runs the full cycle (context-load → design-check → implement → design-check → code-review →
 integration-check → commit) and updates `.claude/feature-progress.md`.

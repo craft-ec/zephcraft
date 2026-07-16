@@ -33,7 +33,10 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       **FOLLOW-ON (4e-2, deferred):** per-epoch committee SNAPSHOTS + robust cross-epoch hand-off — until then a commit
       verifies against the CURRENT committee, so a past-epoch commit across a membership change may not re-verify (the
       ledger should gate writes on a converged census, headreg-style). Enough to unblock 4b.
-- [ ] **4a-bis — `invoke_program` primitive** (com host fn + `Capability::InvokeProgram`; deterministic-callee only).
+- [~] **4a-bis — `invoke_program` primitive — DEFERRED (not needed).** Reward+settlement are epoch-batch,
+      NODE-orchestrated (node invokes the reward program once/epoch + composes its verified output), so no program-to-
+      program host fn is required for step 4 (and in-wasm invoke would nest-execute during every verifier re-run). Kept
+      as a general future capability only.
 - [~] **4b — ledger core (IN PROGRESS).** 4b-1 DONE: `crates/ledger` (`#![no_std]` shared crate) — `LedgerOp`
       {Transfer, Claim}, `LedgerBalanceState{balance, processed_claims}`, pure `apply(state, op, caller, debit)`:
       Transfer debits self (checked, reject overdraft/zero); Claim credits self from a node-resolved sender debit
@@ -53,9 +56,11 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       + verifier fetch); wire an ACTIVE verification loop re-running the ledger fold (validity is currently native-fold
       correct, trust-by-re-execution not yet an active cross-node loop for the ledger); trustless claim-ordering needs
       4e-2 committee snapshots. End-to-end transfer→claim→balance is fleet-validatable.
-- [ ] **4c — reward = pool-average (separate program)** (reward-valuation program via invoke_program; two-pass
+- [ ] **4c — reward = CONTRIBUTION-RATIO (separate program, node-orchestrated)** (pure `{pool, contributions}→shares`
+      program invoked BY THE NODE at epoch close, verified → epoch reward RECORD; NO overflow subsidy; two-pass
       allocate_quota identifies rewardable bytes; uniform-rate distribution; monotonic `minted_watermark` single-use).
-- [ ] **4d — settlement + tiers** (two-pass allocate_quota reciprocity-offset; EscrowOp/SettleClaim; admission + pin
+- [ ] **4d — settlement (CLAIM-based) + gates** (EscrowOp→pool; `LedgerOp::RewardClaim{epoch}` credits the recorded
+      share once; node epoch-close loop gather→offset→reward→verify→publish; two-pass allocate_quota; admission + pin
       gates in obj mirroring shed_gate).
 Open gaps needing a call at their phase: (1) anchor-authority routing RESOLVED (= committee), (2) escrow reclaim lifecycle [4d],
 (3) cold-start grant + identity gate [4d], (4) uniform-pricing floor for the pool-average reward [4c]. (Checkpoint
