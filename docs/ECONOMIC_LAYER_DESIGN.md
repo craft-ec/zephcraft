@@ -745,8 +745,24 @@ binary roll). Committing to a *shape* rather than a magic constant is itself the
    small cold-start grant, §8, which is separate from reward distribution). **Settlement is
    CLAIM-based:** the verified per-epoch shares form an **epoch reward RECORD**, and each provider
    **claims** its share onto its own chain (`RewardClaim{epoch}`, single-use — the transfer→claim
-   pattern with the record as the "debit"), so there is no node-side fan-out of writes. *This is the
-   spine.*
+   pattern with the record as the "debit"), so there is no node-side fan-out of writes. **Pay-into-pool,
+   not escrow (revised 2026-07-16):** a consumer pays its metered egress into the pool with a
+   *self-authored* `Pay` debit — NOT an escrow lock that settlement later draws from. This removes the
+   cross-account settlement-authority problem entirely (no keyless committee reaching into user escrow):
+   *both* sides are self-authored — consumer `Pay` in, provider `RewardClaim` out. The provider serves
+   before it's paid, but that guarantee is already covered by the SWAP-cheque interleaving (§7) + the
+   admission gate (an unfunded consumer is throttled), so no lock is needed. **Cross-epoch rolling — a
+   running pool with a claim window:** the pool is a *running* balance (`Σ payments − Σ claims`, never
+   reset), split into **`unallocated`** (payments not yet assigned — new pay-ins + dust + expired
+   forfeits, and the *only* thing a record distributes) and **`owed`** (shares a published record
+   assigned but not yet claimed — reserved, so they can't be re-distributed). Each epoch's record moves
+   `unallocated → owed` by contribution ratio; a `RewardClaim` moves `owed → the provider's balance`.
+   Integer **dust** stays `unallocated` (folds into next epoch's record automatically); **unclaimed
+   shares** stay claimable for a governed **N epochs**, after which the record *expires* and its `owed`
+   reverts to `unallocated` (forfeit) — which also bounds record storage to the last N epochs.
+   Conservation is total: every paid token is claimed, `owed` (within window), or `unallocated`
+   (rolling); `unallocated + owed ≥ 0` always. The pool state (two counters + last-N records) lives on
+   the governance-owned epoch chain (§6), touched once per epoch, not per fetch. *This is the spine.*
 2. **Participation-metric formula — DECIDED: dissolved.** Paid demand *is* the metric; no
    rich multi-signal contribution oracle (with sybil-normalization + organic-demand weighting)
    is built. Organic-demand weighting is retained only as **optional defense-in-depth** (§8-A),

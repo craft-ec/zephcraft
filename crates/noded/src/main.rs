@@ -193,8 +193,8 @@ enum Command {
         #[arg(long)]
         debit_nonce: u64,
     },
-    /// Lock tokens from this node's account into egress escrow.
-    LedgerEscrow {
+    /// Pay tokens from this node's account into the epoch egress pool.
+    LedgerPay {
         #[arg(long)]
         amount: u64,
     },
@@ -562,7 +562,7 @@ async fn main() -> anyhow::Result<()> {
             debit_account,
             debit_nonce,
         }) => cmd_ledger_claim(&data_dir, &debit_account, debit_nonce).await,
-        Some(Command::LedgerEscrow { amount }) => cmd_ledger_escrow(&data_dir, amount).await,
+        Some(Command::LedgerPay { amount }) => cmd_ledger_pay(&data_dir, amount).await,
         Some(Command::LedgerRewardClaim { epoch }) => {
             cmd_ledger_reward_claim(&data_dir, epoch).await
         }
@@ -832,11 +832,10 @@ async fn cmd_ledger_claim(
     Ok(())
 }
 
-/// `zeph ledger-escrow --amount <n>` — lock tokens into egress escrow.
-async fn cmd_ledger_escrow(data_dir: &Path, amount: u64) -> anyhow::Result<()> {
+/// `zeph ledger-pay --amount <n>` — pay tokens into the epoch egress pool.
+async fn cmd_ledger_pay(data_dir: &Path, amount: u64) -> anyhow::Result<()> {
     let params = serde_json::json!({ "amount": amount });
-    let r =
-        control::query_unix_params(&data_dir.join("zeph.sock"), "ledger_escrow", params).await?;
+    let r = control::query_unix_params(&data_dir.join("zeph.sock"), "ledger_pay", params).await?;
     println!("{}", serde_json::to_string_pretty(&r)?);
     Ok(())
 }

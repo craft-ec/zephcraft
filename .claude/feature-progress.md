@@ -64,11 +64,13 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       the canonical reward-program cid for verify/governance-swap). **4c COMPLETE.** REMAINING = 4d: the node invokes
       the reward program at epoch close → verified → epoch reward RECORD; providers claim. Original spine: two-pass
       allocate_quota identifies rewardable bytes; uniform-rate distribution; monotonic `minted_watermark` single-use).
-- [~] **4d — settlement (CLAIM-based) + gates. 4d-1 DONE:** `crates/ledger` gained `LedgerOp::Escrow(u64)` (lock
-      balance→`escrowed`) + `LedgerOp::RewardClaim(u64)` (credit the node-resolved epoch share, single-use via
-      `claimed_epochs`); `apply` refactored to a `Resolved{debit, reward_share}` context; state gained `escrowed` +
-      `claimed_epochs`; +1 test (escrow lock/overdraft/zero, reward-claim once/replay/zero-share). LedgerService
-      `escrow`/`reward_claim` authoring + RPC/CLI (`ledger-escrow`, `ledger-reward-claim`, balance shows escrowed);
+- [~] **4d — settlement (CLAIM-based, PAY-INTO-POOL) + gates. 4d-1 DONE (revised — pool-direct, no escrow):**
+      `crates/ledger` gained `LedgerOp::Pay(u64)` (self-authored debit into the epoch pool — NO escrow lock, NO
+      cross-account draw; supersedes the earlier Escrow) + `LedgerOp::RewardClaim(u64)` (credit the node-resolved epoch
+      share, single-use via `claimed_epochs`); `apply` refactored to a `Resolved{debit, reward_share}` context; state
+      gained `claimed_epochs`; +1 test. LedgerService `pay`/`reward_claim` authoring + RPC/CLI (`ledger-pay`,
+      `ledger-reward-claim`). **Cross-epoch pool = running `unallocated`/`owed` with an N-epoch claim window** (§10.1):
+      dust rolls immediately, unclaimed shares forfeit on record-expiry — no cross-account settlement authority needed.
       ledger.wasm refreshed. **4d-2 DONE:** obj `admission_gate` + `pin_gate` OnceLock hooks + `set_admission_gate`/
       `set_pin_gate` + `admit_fetch`/`pin_allowed` helpers (mirror shed_gate); admission checked at the network-fetch
       boundary in `get()` (locally-decodable reads never gated), pin DOWNGRADED to non-pinned in `publish_impl` when the

@@ -49,9 +49,10 @@ pub struct ClaimOp {
 pub enum LedgerOp {
     Transfer(TransferOp),
     Claim(ClaimOp),
-    /// Lock `amount` of liquid balance into egress ESCROW (a consumer pre-authorises settlement to
-    /// draw up to this for its paid egress; §7). Reversible only by settlement consuming it.
-    Escrow(u64),
+    /// PAY `amount` of egress cost into the epoch pool — a self-authored debit (§10.1 pay-into-pool):
+    /// the amount funds the reward pool the node sums at epoch close. No escrow lock, no cross-account
+    /// draw; the provider's `RewardClaim` is the matching self-authored credit.
+    Pay(u64),
     /// A PROVIDER claims its reward share for `epoch` from the verified epoch reward RECORD (§10.1) —
     /// single-use per epoch; the node resolves the share from the record.
     RewardClaim(u64),
@@ -61,9 +62,6 @@ pub enum LedgerOp {
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct LedgerBalanceState {
     pub balance: u64,
-    /// Tokens LOCKED for egress (already removed from `balance`); settlement draws paid egress from
-    /// here, so the escrow lock is the consumer's standing authorisation to be charged (§7/§10.9).
-    pub escrowed: u64,
     /// `(debit_account, debit_nonce)` already claimed — single-use, self-contained (§4b): a duplicate
     /// claim is caught the same way a duplicate nonce is, with no global spent-set.
     pub processed_claims: BTreeSet<([u8; 32], u64)>,
@@ -129,7 +127,8 @@ pub fn run_transition(prev_state: &[u8], input: &[u8]) -> Option<alloc::vec::Vec
 /// - **Transfer**: debit `caller` by `amount` iff the balance suffices (`amount > 0`).
 /// - **Claim**: credit `caller` by the resolved debit iff `debit.transfer.to == caller` and the
 ///   `(debit_account, debit_nonce)` was not already claimed.
-/// - **Escrow**: lock `amount` of `caller`'s balance into `escrowed` (iff sufficient, `amount > 0`).
+/// - **Pay**: debit `amount` of `caller`'s balance into the epoch pool (iff sufficient, `amount > 0`);
+///   the node sums `Pay` writes into the pool at epoch close.
 /// - **RewardClaim**: credit `caller` by its resolved epoch share iff that epoch was not already
 ///   claimed and the share is non-zero.
 pub fn apply(
@@ -158,12 +157,13 @@ pub fn apply(
             state.balance = state.balance.checked_add(d.transfer.amount)?;
             Some(state)
         }
-        LedgerOp::Escrow(amount) => {
+        LedgerOp::Pay(amount) => {
             if *amount == 0 {
                 return None;
             }
+            // Pay into the epoch pool: a self-authored debit (the pool total is summed by the node
+            // from Pay writes; §10.1). No escrow, no cross-account draw.
             state.balance = state.balance.checked_sub(*amount)?; // insufficient balance → reject
-            state.escrowed = state.escrowed.checked_add(*amount)?;
             Some(state)
         }
         LedgerOp::RewardClaim(epoch) => {
@@ -293,19 +293,18 @@ mod tests {
     }
 
     #[test]
-    fn escrow_locks_balance_and_reward_claim_credits_once() {
+    fn pay_debits_balance_and_reward_claim_credits_once() {
         let p = acct(5);
         let st = LedgerBalanceState {
             balance: 100,
             ..Default::default()
         };
-        // Escrow 40 → balance 60, escrowed 40 (tokens leave liquid balance into the lock).
-        let st = apply(st, &LedgerOp::Escrow(40), &p, &Resolved::default()).unwrap();
+        // Pay 40 into the pool → balance 60 (the amount funds the pool, summed by the node).
+        let st = apply(st, &LedgerOp::Pay(40), &p, &Resolved::default()).unwrap();
         assert_eq!(st.balance, 60);
-        assert_eq!(st.escrowed, 40);
-        // Over-escrow (more than the liquid balance) and zero are rejected.
-        assert!(apply(st.clone(), &LedgerOp::Escrow(61), &p, &Resolved::default()).is_none());
-        assert!(apply(st.clone(), &LedgerOp::Escrow(0), &p, &Resolved::default()).is_none());
+        // Over-pay (more than the balance) and zero are rejected.
+        assert!(apply(st.clone(), &LedgerOp::Pay(61), &p, &Resolved::default()).is_none());
+        assert!(apply(st.clone(), &LedgerOp::Pay(0), &p, &Resolved::default()).is_none());
 
         // RewardClaim epoch 7 with a node-resolved share of 15 → +15, epoch marked.
         let rctx = Resolved {

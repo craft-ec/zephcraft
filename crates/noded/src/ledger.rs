@@ -76,7 +76,7 @@ impl LedgerService {
         match postcard::from_bytes::<LedgerOp>(payload).ok()? {
             LedgerOp::Transfer(t) => Some(ResolvedDebit { transfer: t }),
             // The referenced write isn't a transfer → not a claimable debit.
-            LedgerOp::Claim(_) | LedgerOp::Escrow(_) | LedgerOp::RewardClaim(_) => None,
+            LedgerOp::Claim(_) | LedgerOp::Pay(_) | LedgerOp::RewardClaim(_) => None,
         }
     }
 
@@ -153,10 +153,10 @@ impl LedgerService {
         .await
     }
 
-    /// Lock `amount` of this node's liquid balance into egress ESCROW — a consumer's standing
-    /// authorisation for settlement to draw its paid egress (§7).
-    pub async fn escrow(&self, amount: u64) -> bool {
-        self.submit_own(LedgerOp::Escrow(amount)).await
+    /// PAY `amount` of egress cost into the epoch pool — a self-authored debit (§10.1 pay-into-pool);
+    /// the node sums `Pay` writes into the pool at epoch close.
+    pub async fn pay(&self, amount: u64) -> bool {
+        self.submit_own(LedgerOp::Pay(amount)).await
     }
 
     /// Claim this node's reward share for `epoch` (single-use, §10.1). Credits the share recorded in

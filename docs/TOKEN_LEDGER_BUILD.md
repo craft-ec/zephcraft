@@ -150,21 +150,26 @@ cheques reward zero.
 **Epoch-close pipeline — CLAIM-based, NO overflow subsidy (corrected 2026-07-16, §10.1).** The node runs this once
 per epoch (not per-transfer; reward + settlement are batch stages, so node-orchestration fits and `invoke_program`
 isn't needed):
-1. **Gather** — each provider's cheques (`ChequeBook`) + consumers' escrow.
+1. **Gather** — each provider's cheques (`ChequeBook`) + consumers' `Pay` writes (which paid into the pool).
 2. **Reciprocity offset** — `reciprocity_credit = min(total_earned, gross_consumed)`; `allocate_quota(cheques,
    reciprocity_credit)` nets the reciprocal band to zero (no tokens). The remainder is the consumer's PAID egress.
-3. **Pool + contribution** — pool = Σ consumers' paid egress; per-provider contribution = its paid-serving bytes.
-4. **Reward program** (separate, governed) — `{pool, per-provider contribution} → per-provider SHARE` = its
+3. **Pool + contribution** — the pool's `unallocated` balance (running, §10.1) = prior + new `Pay` pay-ins + rolled
+   dust + expired forfeits; per-provider contribution = its paid-serving bytes.
+4. **Reward program** (separate, governed) — `{unallocated, per-provider contribution} → per-provider SHARE` = its
    contribution ratio (`pool × serving / Σ serving`, uniform rate). Verified (k nodes re-run the pure program) →
-   an **epoch reward RECORD**. **No overflow bucket; consumption beyond paid + reciprocal is throttled by the
-   admission gate, not subsidized.**
+   an **epoch reward RECORD** (moves `unallocated → owed`). **No overflow bucket; consumption beyond paid +
+   reciprocal is throttled by the admission gate, not subsidized.**
 5. **Claim** — each provider authors a `RewardClaim{epoch}` on its OWN ledger chain; the transition credits its
-   recorded share (single-use `minted_watermark`), debiting the consumers' escrow that formed the pool. The
-   transfer→claim pattern, with the epoch record as the "debit" — no node-side fan-out of writes.
+   recorded share (single-use `minted_watermark`, `owed → balance`). The transfer→claim pattern, with the epoch
+   record as the "debit" — no node-side fan-out of writes.
 
-`EscrowOp` (consumer pre-reserves egress tokens; a `SequencedWrite` on its own account) feeds the pool. The only
-pool-funded subsidy is the small **cold-start grant** (§8), separate from reward distribution — there is no
-governance-owned overflow-subsidy PDA in the reward path.
+**Pay-into-pool, not escrow (revised 2026-07-16, §10.1).** A consumer pays its egress with a *self-authored* `Pay`
+debit (the pool is `Σ payments − Σ claims`, a running balance split `unallocated`/`owed`); the provider claims with a
+*self-authored* `RewardClaim`. Both self-authored → **no cross-account settlement authority** (no keyless committee
+reaching into user escrow — the hard part is gone). Cross-epoch rolling: dust stays `unallocated` (folds into next
+epoch); unclaimed shares are `owed` for a governed **N epochs**, then the record expires and forfeits back to
+`unallocated` (bounds record storage). The only pool-funded subsidy is the small **cold-start grant** (§8), separate
+from reward distribution — there is no overflow-subsidy PDA in the reward path.
 
 **Admission gate** (new obj OnceLock hook, mirrors `shed_gate`): checked at the top of `get()` (~1017) + range
 variants; unwired default = permissive. Wired by `LedgerService` to a sync closure reading the in-memory reciprocity
@@ -218,7 +223,7 @@ owner-signed genesis. Heaviest sub-phase; its own commit + gate.
   it at epoch close (not via `invoke_program` — reward/settlement are epoch-batch, so the node orchestrates), verifies
   it, and publishes the **epoch reward RECORD**. **Exit:** shares match the deterministic ratio formula; empty pool →
   zero; a uniform-pricing self-deal nets ~zero in a test.
-- [ ] **4d — settlement (CLAIM-based) + gates.** `EscrowOp` (consumer locks egress tokens → the pool);
+- [ ] **4d — settlement (CLAIM-based, pay-into-pool) + gates.** `Pay` (consumer self-authored pay into the pool);
   `LedgerOp::RewardClaim{epoch}` — a provider claims its recorded share onto its own chain (single-use
   `minted_watermark`), debiting escrow; the node's epoch-close loop (gather → reciprocity offset → reward program →
   verify → publish record); admission + pin gates in obj (mirror `shed_gate`). **NO overflow subsidy.** **Exit:**
