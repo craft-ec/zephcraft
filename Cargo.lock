@@ -5852,6 +5852,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeph-economy-egress"
+version = "0.1.0"
+dependencies = [
+ "postcard",
+ "serde",
+ "zeph-token",
+]
+
+[[package]]
 name = "zeph-erasure"
 version = "0.1.0"
 dependencies = [
@@ -5876,6 +5885,8 @@ version = "0.1.0"
 dependencies = [
  "postcard",
  "serde",
+ "zeph-economy-egress",
+ "zeph-token",
 ]
 
 [[package]]
@@ -6071,6 +6082,14 @@ dependencies = [
  "zeph-testkit",
  "zeph-transport",
  "zeph-wire",
+]
+
+[[package]]
+name = "zeph-token"
+version = "0.1.0"
+dependencies = [
+ "postcard",
+ "serde",
 ]
 
 [[package]]
