@@ -2439,5 +2439,10 @@ Phases (each: build + test + gate + commit; roll together where consensus-affect
       use-it-or-lose-it (no escrow — tokens already priced into the pool-average).
 - [ ] **P7 — deploy** (wire+consensus → simultaneous fleet roll).
 
-Open decision (docs §7): CPI value-move = node-orchestrated (recommended, matches native fold + avoids the
-verification hazard) vs in-wasm CPI value-move (not recommended). Awaiting user confirm before P2+.
+ATOMICITY (resolved 2026-07-16, docs §3): a value move is NEVER a two-op cross-account transaction (half-commit
+risk). It's ONE self-authored write on ONE account chain, co-folded by both programs (token debits balance,
+economy records quota — both or neither), and cross-account flow is self-authored + record-mediated (provider
+self-claims against the committee-attested record; Σ claims ≤ pool), never a pool-account transfer. So there's
+NO atomic multi-program transaction primitive to build. CPI = a deterministic cross-program READ (token's
+claim-fold reads economy `share_of`), replacing node-resolved `Resolved.reward_share` — carries no atomicity
+requirement, never mutates a callee. Awaiting user confirm on this framing before executing P1+.

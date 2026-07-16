@@ -28,19 +28,27 @@ expiry model now lives in `economy-egress`, and `token` stays a stable money pri
 | Knows | money only (CTS-1 reference impl) | egress quota, per-consumer FCFS, 30-day expiry, rate |
 | Service | `TokenService` | `EconomyEgressService` (holds `Arc<TokenService>`) |
 
-## 3. How value moves across the boundary
+## 3. How value moves across the boundary — atomicity WITHOUT cross-program transactions
 
-A `Pay`/subscribe = **token `Transfer`(consumer → pool account)** + an **economy-egress record** (credits the
-locked egress quota). A reward payout = economy-egress computes the record → a **token credit** to the
-provider. The token program never learns what a subscription is; economy-egress never touches raw balances
-except *through* token.
+**A value move is never a two-op cross-account transaction** (that could half-commit: pay-no-quota = lost
+funds, quota-no-pay = a farm). Instead, atomicity is inherent to "one quorum-ordered write, one account
+chain, folded by both programs" — the same model the current `Pay`/`RewardClaim` self-ops already use:
 
-**Two integration points, kept consistent (the map's key caveat):**
-1. **Native fold (hot path):** the node folds balances in Rust today (`LedgerService::balance`). Post-split,
-   `EconomyEgressService` calls `TokenService` **directly in Rust** to move value — trivial, no host fn.
-2. **Wasm / verification path:** if a verifier re-runs the economy wasm and it must reflect a token move,
-   it needs `invoke_program(token_cid, …)` under a **deterministic** callee grant, or its committed output
-   won't reproduce.
+1. **A cross-program op is ONE self-authored write on ONE account chain, co-folded.** A subscribe is a single
+   write on the *consumer's* chain; the **token** fold debits `balance`, the **economy-egress** fold records
+   the locked egress quota. One committed write → both effects or neither. The two programs own disjoint
+   *state slices* of the account (token: `balance`, `processed_claims`; economy: `quota`, `claimed_epochs`),
+   routed by op type — but the entry is atomic because it's one chain write.
+2. **Cross-account value flow is self-authored + record-mediated, never a transfer.** The pool is a *derived*
+   aggregate (Σ pay-writes), not an account funds move into. A provider **self-claims** — one write on *its*
+   chain: token fold credits `balance` by the record share, economy fold marks the epoch claimed.
+   Conservation is the committee-attested **record** (`Σ claims ≤ pool`), not a drained pool account. No
+   two-account atomic transfer ever occurs.
+
+So there is **no atomic multi-program transaction primitive to build** — the account-chain model provides
+atomicity per write, and value flows across accounts are self-authored against a shared record. (A true
+Solana-style atomic multi-account transaction would only be needed for a value move spanning two
+uncontrolled accounts in one instruction — which this design deliberately avoids.)
 
 ## 4. CPI (`invoke_program`) — general primitive, but NOT on the verified settlement path
 
@@ -48,12 +56,15 @@ except *through* token.
   callee run under `CapabilityGrant::deterministic()` (no wall-clock/random/verify/attest/sequence) so the
   caller's own re-execution reproduces the whole call tree. Hooks into `bind_granted` (transition.rs) via a
   new `InvokeProgramBackend` injected into `TransitionCtx`, driven by `InvokeService`/`AnchorDispatcher`.
-- **The hazard (why the tracker deferred it):** an in-wasm value-move CPI on a *verified* program means every
-  re-run nests a callee execution — and the actual balance fold is **native**, so an in-wasm CPI wouldn't even
-  be on the hot path. **Resolution:** the economy→token *value move* stays **node-orchestrated** (Pay = a real
-  token `Transfer`; claim = node-authored token credit against the verified record). CPI is built as a
-  **general composition primitive** for programs that want synchronous, deterministic-callee composition
-  (incl. future economy-\* programs calling `token`), NOT wedged onto the verified settlement fold.
+- **CPI's actual role here is a deterministic READ, not a value move (§3).** The token program's claim-fold
+  needs the reward *share* from the economy record: `invoke_program(economy-egress, "share_of", epoch)` —
+  a pure, reproducible cross-program read that replaces today's node-resolved `Resolved.reward_share`. Value
+  moves stay single-write self-ops, so CPI carries **no atomicity requirement** and does not nest a value
+  mutation.
+- **The hazard it avoids:** an in-wasm CPI that *mutated* a callee's state on a verified program would make
+  every re-run nest a state-changing callee execution (and the balance fold is native anyway). By keeping CPI
+  to deterministic reads/pure-compute, re-execution reproduces trivially. General composition primitive for
+  any program (incl. future economy-\* programs reading `token`), never a value-move channel.
 - **Determinism:** callee gets the deterministic capability subset only; `verify_mode` returns inert (no
   nested orchestration); fuel is shared/bounded by the caller's grant.
 
