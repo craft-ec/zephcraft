@@ -5871,6 +5871,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeph-ledger"
+version = "0.1.0"
+dependencies = [
+ "postcard",
+ "serde",
+]
+
+[[package]]
 name = "zeph-membership"
 version = "0.1.0"
 dependencies = [
@@ -5916,8 +5924,10 @@ dependencies = [
  "zeph-dht",
  "zeph-erasure",
  "zeph-events",
+ "zeph-ledger",
  "zeph-membership",
  "zeph-obj",
+ "zeph-reward",
  "zeph-routing",
  "zeph-sched",
  "zeph-sql",
@@ -5950,6 +5960,14 @@ dependencies = [
  "zeph-testkit",
  "zeph-transport",
  "zeph-wire",
+]
+
+[[package]]
+name = "zeph-reward"
+version = "0.1.0"
+dependencies = [
+ "postcard",
+ "serde",
 ]
 
 [[package]]
