@@ -285,6 +285,12 @@ impl LedgerService {
     pub async fn pool_unallocated(&self) -> u64 {
         self.settlement.read().await.unallocated()
     }
+
+    /// This node's OWN computed record for `epoch` (its settle re-execution) — the verification loop
+    /// compares it against the canonical committee-attested record.
+    pub async fn local_record(&self, epoch: u64) -> Option<RewardRecord> {
+        self.settlement.read().await.record(epoch)
+    }
 }
 
 #[cfg(test)]

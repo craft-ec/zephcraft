@@ -212,6 +212,8 @@ pub struct State {
     pub anchor: std::sync::Arc<crate::anchor::AnchorDispatcher>,
     /// Token-ledger service — author ledger writes (committee-ordered) + fold account balances.
     pub ledger: std::sync::Arc<crate::ledger::LedgerService>,
+    /// Settlement service — the epoch-close loop + its re-execution verification tally.
+    pub settlement: std::sync::Arc<crate::settlement_service::SettlementService>,
     /// Generic program accounts — any program's single-writer state (the program is the writer).
     pub accounts: std::sync::Arc<crate::account::ProgramAccountStore>,
     /// Per-program attestation quorum chains (the `attest` host fn's backend).
@@ -474,6 +476,7 @@ async fn handle_rpc(state: &State, line: &str) -> serde_json::Value {
         Some("ledger_pay") => rpc_ledger_pay(state, &request, id).await,
         Some("ledger_reward_claim") => rpc_ledger_reward_claim(state, &request, id).await,
         Some("ledger_settle_epoch") => rpc_ledger_settle_epoch(state, &request, id).await,
+        Some("ledger_verification") => rpc_ledger_verification(state, id).await,
         Some("gov") => rpc_gov(state, id).await,
         Some("gov_propose") => rpc_gov_propose(state, &request, id).await,
         Some("gov_sign") => rpc_gov_sign(state, &request, id).await,
@@ -1314,6 +1317,17 @@ async fn rpc_ledger_settle_epoch(
     let pool = state.ledger.pool_unallocated().await;
     serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
         "epoch": epoch, "share": rec.share_of(&me), "pool_unallocated": pool,
+    }})
+}
+
+/// The settlement re-execution verification tally: epochs whose canonical committee-attested record this
+/// node independently re-computed and confirmed (`verified`) vs found divergent (`mismatched`), plus the
+/// current distributable pool — observability for the correctness-by-re-execution loop.
+async fn rpc_ledger_verification(state: &State, id: serde_json::Value) -> serde_json::Value {
+    let (verified, mismatched) = state.settlement.verification_stats();
+    let pool = state.ledger.pool_unallocated().await;
+    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
+        "verified": verified, "mismatched": mismatched, "pool_unallocated": pool,
     }})
 }
 

@@ -27,6 +27,7 @@
 //! last nonce, verifying each proof once — see [`ReportCache`] and `LedgerService::paid_total`).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -130,6 +131,11 @@ pub struct SettlementService {
     /// Per-account scan cache of proof-verified reports (see [`ReportCache`]) — avoids re-fetching and
     /// re-verifying every participant's whole proof history on every settle.
     report_scan: Mutex<HashMap<[u8; 32], ReportCache>>,
+    /// Verification tally: epochs whose CANONICAL committee-attested record matched this node's own
+    /// independent re-execution (`verified`) vs diverged (`mismatched`) — the correctness-by-re-execution
+    /// audit, observable via [`verification_stats`](Self::verification_stats).
+    verified: AtomicU64,
+    mismatched: AtomicU64,
     /// The settlement chain's program cid + its anchor-sentinel owner (routes ordering to the committee).
     settle_cid: [u8; 32],
     settle_owner: [u8; 32],
@@ -157,9 +163,44 @@ impl SettlementService {
             records,
             obj,
             report_scan: Mutex::new(HashMap::new()),
+            verified: AtomicU64::new(0),
+            mismatched: AtomicU64::new(0),
             settle_cid,
             settle_owner,
         })
+    }
+
+    /// `(verified, mismatched)` epoch counts — the running result of the re-execution verification loop.
+    pub fn verification_stats(&self) -> (u64, u64) {
+        (
+            self.verified.load(Ordering::Relaxed),
+            self.mismatched.load(Ordering::Relaxed),
+        )
+    }
+
+    /// VERIFY epoch `E` by re-execution: compare this node's OWN computed record (its independent settle)
+    /// against the CANONICAL committee-attested record. A match = the finalized record is confirmed by an
+    /// independent re-run (open verification, esp. from non-committee nodes); a mismatch is flagged. No-op
+    /// until the epoch is finalized (canonical available) and this node has computed its own record.
+    async fn verify_epoch(&self, epoch: u64) {
+        let Some(canonical) = self.records.canonical_record(epoch).await else {
+            return; // not finalized yet — nothing to verify against
+        };
+        let Some(local) = self.ledger.local_record(epoch).await else {
+            return; // this node didn't settle E locally (e.g., joined late)
+        };
+        if local == canonical {
+            self.verified.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(epoch, "settlement record verified (matches canonical)");
+        } else {
+            self.mismatched.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                epoch,
+                local_shares = local.shares.len(),
+                canonical_shares = canonical.shares.len(),
+                "settlement record MISMATCH: local re-execution diverges from the canonical record"
+            );
+        }
     }
 
     pub async fn set_membership(&self, m: Arc<Membership>) {
@@ -382,6 +423,7 @@ impl SettlementService {
     pub async fn run(self: Arc<Self>) {
         let mut last_reported: Option<u64> = None;
         let mut last_settled: Option<u64> = None;
+        let mut last_verified: Option<u64> = None;
         // The cumulatives we last reported — skip re-writing an epoch when nothing changed.
         let mut sent_paid = 0u64;
         let mut sent_served = 0u64;
@@ -406,6 +448,7 @@ impl SettlementService {
                 self.reconstruct_through(settled_through).await;
                 last_reported = Some(now.saturating_sub(1));
                 last_settled = Some(settled_through);
+                last_verified = Some(settled_through);
                 // Our own reported cumulatives come from durable sources (the ledger `Pay` chain; served
                 // from the cheque book, made durable separately) so they're correct after data loss.
                 sent_paid = self.ledger.paid_total(self.identity.node_id().0).await;
@@ -435,6 +478,17 @@ impl SettlementService {
                     self.settle(s).await;
                 }
                 last_settled = Some(target);
+            }
+
+            // VERIFY: one epoch behind the settle target (giving the committee time to finalize the
+            // canonical record), re-execution-check our own record against the canonical one.
+            if now > SETTLE_GRACE_EPOCHS + 2 {
+                let vtarget = now - 2 - SETTLE_GRACE_EPOCHS;
+                let start = last_verified.map_or(vtarget, |e| e + 1);
+                for e in start..=vtarget {
+                    self.verify_epoch(e).await;
+                }
+                last_verified = Some(vtarget);
             }
         }
     }

@@ -218,6 +218,8 @@ enum Command {
         #[arg(long)]
         bytes: u64,
     },
+    /// Show the settlement re-execution VERIFICATION tally (verified vs mismatched epochs) + the pool.
+    LedgerVerification,
     /// Deploy a CraftCOM app: publish the WASM as a SYSTEM object (durable, managed
     /// like a database — NOT a drive file) and register it by name.
     Deploy {
@@ -581,6 +583,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::LedgerRewardClaim { epoch }) => {
             cmd_ledger_reward_claim(&data_dir, epoch).await
         }
+        Some(Command::LedgerVerification) => cmd_ledger_verification(&data_dir).await,
         Some(Command::LedgerSettleEpoch { epoch, pool, bytes }) => {
             cmd_ledger_settle_epoch(&data_dir, epoch, pool, bytes).await
         }
@@ -877,6 +880,13 @@ async fn cmd_ledger_settle_epoch(
     let params = serde_json::json!({ "epoch": epoch, "pool": pool, "bytes": bytes });
     let r = control::query_unix_params(&data_dir.join("zeph.sock"), "ledger_settle_epoch", params)
         .await?;
+    println!("{}", serde_json::to_string_pretty(&r)?);
+    Ok(())
+}
+
+/// `zeph ledger-verification` — the settlement re-execution verification tally (verified vs mismatched).
+async fn cmd_ledger_verification(data_dir: &Path) -> anyhow::Result<()> {
+    let r = control::query_unix(&data_dir.join("zeph.sock"), "ledger_verification").await?;
     println!("{}", serde_json::to_string_pretty(&r)?);
     Ok(())
 }
@@ -1806,6 +1816,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         gov: governance_store.clone(),
         anchor: anchor_dispatcher.clone(),
         ledger: ledger_service.clone(),
+        settlement: settlement_service.clone(),
         accounts: account_store.clone(),
         attest: attest_store.clone(),
         sequence: sequence_store.clone(),

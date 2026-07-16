@@ -138,6 +138,12 @@ impl SettlementStore {
         self.settle_epoch(epoch, contributions)
     }
 
+    /// This node's own computed record for `epoch` (from its settle re-execution), for verification
+    /// against the canonical committee-attested record. `None` if it hasn't settled that epoch.
+    pub fn record(&self, epoch: u64) -> Option<RewardRecord> {
+        self.records.get(&epoch).cloned()
+    }
+
     /// The unclaimed share owed to `provider` for `epoch` (0 if absent, already claimed, or expired) —
     /// what a `RewardClaim` resolves + credits.
     pub fn share_of(&self, epoch: u64, provider: &[u8; 32]) -> u64 {

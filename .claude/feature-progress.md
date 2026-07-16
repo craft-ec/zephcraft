@@ -223,8 +223,17 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       program; (2) PINS the K1 anchors via governance `SetProgram` (`token-ledger`→ledger_cid, `reward`→reward_cid) IF this
       node governs and the name isn't already at that cid — so a 1-of-1 genesis self-applies, k-of-n needs cosigns.
       Idempotent, spawned on startup. 1 new test (reward cid stable + ≠ ledger). 41 noded tests, fmt, clippy green.
-      **NEXT (user: complete #1,#2,#3):** #2 active verification loop (cross-node re-run of the ledger/reward folds), then
-      #3 live fleet validation of the full pay→serve→settle→claim→balance loop.
+- [x] **4d-19 — ACTIVE VERIFICATION LOOP DONE (2026-07-16).** The correctness-by-re-execution audit for settlement. Every
+      node already re-executes each epoch's record in its settle loop; the committee attests the canonical one — so
+      verification is each node COMPARING its own independently-computed record against the canonical committee-attested
+      record. `SettlementService::verify_epoch(E)` fetches `canonical_record(E)` + this node's `LedgerService::local_record(E)`
+      (new store `record()` accessor) and tallies `verified`/`mismatched` (`AtomicU64`); a non-committee node doing this IS
+      the open re-run confirming the committee. Wired into `run()` one epoch behind the settle cursor (canonical finalized
+      by then). Surfaced via `ledger_verification` RPC + `zeph ledger-verification` CLI (verified/mismatched/pool) — the
+      hook #3 will check live. Event-driven per epoch (not a periodic defence-in-depth sweep, per the user's guidance).
+      41 noded tests, fmt, clippy green.
+      **NEXT (user: complete #1,#2,#3):** #3 live fleet validation of the full pay→serve→settle→claim→balance loop +
+      `ledger-verification` showing verified>0, mismatched=0 across the cluster.
       **Remaining follow-ons:** dedicated storage-provided measure + persist `pinned`; reciprocity policy as a full governed
       PROGRAM (only if the formula must be swappable); 4e-2 committee snapshots. (Verify-board→durable deferred by user.)
 Open gaps needing a call at their phase: (1) anchor-authority routing RESOLVED (= committee), (2) escrow reclaim lifecycle [4d],
