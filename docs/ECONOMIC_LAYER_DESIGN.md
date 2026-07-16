@@ -739,10 +739,17 @@ binary roll). Committing to a *shape* rather than a magic constant is itself the
 
 **Economics / policy — DECIDED:**
 1. **Distribution policy — DECIDED: reward ∝ paid demand, as a BOUNDED POOL-AVERAGE (revised
-   2026-07-16).** Payments pool per epoch; each consumer's rewardable basis is capped at their paid
-   quota (`min(used, paid-quota)`); the pool is distributed to providers at a **uniform per-byte
+   2026-07-16). WIRED 2026-07-16 (both layers, `settle_epoch_from_cheques`).** Payments pool per
+   epoch; each consumer's rewardable basis is capped at their paid quota (`min(used, paid-quota)`),
+   allocated **FCFS by cheque timestamp** across the providers that served that consumer (so
+   `Σ rewarded-for-a-consumer ≤ what it paid` — self-dealing nets ≤ its own payment, over-quota
+   serving is unrewarded subsidy); the pool is then distributed to providers at a **uniform per-byte
    rate** (`pool ÷ total rewardable-served`), so a provider earns the *average* rate for bytes
-   served **regardless of which consumer it was assigned**. This is the fair compensation given the
+   served **regardless of which consumer it was assigned**. *Implementation note:* the per-consumer
+   cap runs at SETTLEMENT (not per-provider), where the converged board — every node's cheque proofs
+   (per-consumer served + signed timestamps) + on-chain paid totals — is the full global view, so the
+   allocation is deterministic and verifiable; per-`(provider,consumer)` served watermarks + per-node
+   first-sight paid baselines keep it monotonic and replay-free. This is the fair compensation given the
    protocol (not the consumer) picks the producer — a provider can't choose its consumer, so it
    shouldn't bear that consumer's rate. *This supersedes the earlier "direct-revenue-per-consumer,
    linear" form.* It stays farm-safe because it is (a) **aggregate-bounded by payments**

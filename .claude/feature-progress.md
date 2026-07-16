@@ -316,6 +316,22 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       FCFS `allocate_quota` into settlement (derive each provider's rewardable-served from the board's grouped-by-consumer
       cheques + paid totals, replacing the raw served delta) → makes reward truly per-consumer-capped AND the settled/served
       meter real. Consensus-semantic change (roll together), but no new wire fields (proofs already carried).
+- [x] **4d-25 — PER-CONSUMER FCFS SETTLEMENT WIRED + real settled/served meter (2026-07-16, commit 2e7cff5).** The "REAL
+      OPEN ITEM" above is DONE. `SettlementStore::settle_epoch_from_cheques` replaces the aggregate
+      `settle_epoch_cumulative` (removed) on the production path: it groups the board's cheques by consumer and allocates
+      each consumer's paid quota (its `paid_cumulative` delta past a first-sight baseline) **FCFS by cheque timestamp**
+      across the providers that served it → rewardable-served per provider (`Σ rewarded-for-a-consumer ≤ what it paid`),
+      then pool-average on top. New store state: `paid_baseline` (quota = pool-funded value only), `served_pair_wm`
+      (per-(provider,consumer) monotonic, replay-free), `consumer_allocated` (the cap), `rewardable` (the meter). Plumbing:
+      `cumulatives_of` now returns the verified cheques (already in each report's proof — used only to verify before, now
+      drives the settle); `settle_from_board(paid, cheques)`; `ledger.rewardable_served` → `Economy.reward_settled` → reward
+      card shows a REAL `settled / served`. The monotonicity trap (FCFS is non-monotonic per-provider when providers compete
+      for a binding quota) is solved by processing cheque DELTAS in FCFS order against a running per-consumer remaining-quota,
+      never re-attributing. 6 new store tests + reconstruction/verification use the same path (deterministic). NO new wire
+      fields → wire-compatible; reward COMPUTATION changed → rolled all 5 nodes together (gate --quick PASSED; at zero paid
+      traffic old/new records are both empty → seamless). Live: all peers=4, panics=0 (a grep "aborted by peer" during the
+      roll window was a transient conn warning, not a panic), `reward_settled`/settled-served meter serve fleet-wide.
+      Corrects the design doc §10.1 (per-consumer cap now WIRED as layer 1 + pool-average layer 2, both live).
       **Remaining follow-ons:** dedicated storage-provided measure + persist `pinned`; reciprocity policy as a full governed
       PROGRAM (only if the formula must be swappable); 4e-2 committee snapshots. (Verify-board→durable deferred by user.)
 Open gaps needing a call at their phase: (1) anchor-authority routing RESOLVED (= committee), (2) escrow reclaim lifecycle [4d],
