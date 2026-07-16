@@ -39,6 +39,39 @@ const VERIFY_TIMEOUT_SECS: u64 = 30;
 /// How often the producer polls the board for its certificate while waiting.
 const POLL_MS: u64 = 500;
 
+/// A dashboard summary of the verification board — totals + one row per open request. Serialized
+/// into the control status snapshot for the "verification board" dashboard card.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct VerifyView {
+    /// Requests currently on the board (posted, awaiting or having reached their policy).
+    pub requests: u64,
+    /// Total verdicts posted across all requests (agreeing or not).
+    pub verdicts: u64,
+    /// Requests whose valid, agreeing, distinct-verifier count has met their `k`.
+    pub satisfied: u64,
+    /// Per-request rows, open (unsatisfied) first.
+    pub rows: Vec<VerifyRow>,
+}
+
+/// One posted verification request as shown on the dashboard.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct VerifyRow {
+    /// First 8 bytes of the program cid, hex.
+    pub program: String,
+    /// The pure function being re-executed.
+    pub func: String,
+    /// Distinct agreeing verdicts required by the app's policy.
+    pub k: u32,
+    /// Eligible verifier set — "open" or an "N-node set".
+    pub set: String,
+    /// Valid agreeing verdicts collected so far.
+    pub agreements: u32,
+    /// Whether `agreements >= k` (the claim is verified).
+    pub satisfied: bool,
+    /// First 4 bytes of the producer node id, hex.
+    pub producer: String,
+}
+
 /// The node-side verification board: the `com` [`Board`] CRDT + this node's verifier scheduler,
 /// gossiped over `tag::BOARD` and driven by background loops.
 pub struct BoardService {
@@ -90,6 +123,44 @@ impl BoardService {
     #[allow(dead_code)]
     pub async fn snapshot(&self) -> BoardSnapshot {
         self.board.read().await.snapshot()
+    }
+
+    /// A dashboard-ready view of the verification board: one row per posted request with its live
+    /// agreement tally + whether it has met its declared `k`-of-set policy, plus totals. Powers the
+    /// "verification board" card — the open re-execution consistency primitive made visible.
+    pub async fn dashboard(&self) -> VerifyView {
+        let board = self.board.read().await;
+        let snap = board.snapshot();
+        let mut rows = Vec::with_capacity(snap.requests.len());
+        let mut satisfied = 0u64;
+        for posted in &snap.requests {
+            let agreements = board.valid_agreements(posted) as u32;
+            let sat = board.satisfied(posted);
+            if sat {
+                satisfied += 1;
+            }
+            let set = match &posted.policy.set {
+                VerifierSet::Open => "open".to_string(),
+                VerifierSet::Whitelist(w) => format!("{}-node set", w.len()),
+            };
+            rows.push(VerifyRow {
+                program: hex::encode(&posted.req.program_cid[..8]),
+                func: posted.req.func.clone(),
+                k: posted.policy.k,
+                set,
+                agreements,
+                satisfied: sat,
+                producer: hex::encode(&posted.producer[..4]),
+            });
+        }
+        // Open (unsatisfied) requests first — those are what a viewer is watching converge.
+        rows.sort_by_key(|r| r.satisfied);
+        VerifyView {
+            requests: snap.requests.len() as u64,
+            verdicts: snap.verdicts.len() as u64,
+            satisfied,
+            rows,
+        }
     }
 
     /// Serve inbound `tag::BOARD` streams (a peer's gossiped snapshot) and spawn the gossip +

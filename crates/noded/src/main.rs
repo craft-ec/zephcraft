@@ -1822,6 +1822,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         accounts: account_store.clone(),
         attest: attest_store.clone(),
         sequence: sequence_store.clone(),
+        board: board_service.clone(),
         settings: {
             let oc = engine.config();
             control::NodeSettings {

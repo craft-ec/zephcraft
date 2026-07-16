@@ -102,6 +102,13 @@
   .kv b { font-weight:600; }
   .note { color:var(--dim); font-size:.74rem; line-height:1.55; margin-top:.6rem; }
   .note b { color:var(--fg); font-weight:600; }
+  .stats { display:grid; gap:.15rem; }
+  .stat { display:grid; grid-template-columns:1fr auto; align-items:baseline; column-gap:1.25rem; padding:.4rem 0; border-bottom:1px solid var(--line); }
+  .stat:last-child { border-bottom:none; }
+  .stat .lbl { color:var(--dim); font-size:.8rem; }
+  .stat .val { font-weight:600; font-size:.86rem; text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .stat .val.big { color:var(--accent); font-size:1.05rem; }
+  .stat .desc { grid-column:1 / -1; color:var(--dim); font-size:.7rem; line-height:1.45; opacity:.85; margin-top:.15rem; }
   .mech { margin-top:.2rem; }
 </style>
 </head>
@@ -264,34 +271,58 @@
       <div class="cardhead">governed config <span class="muted">— protocol parameters set by governance (SetConfig): reciprocity grants, anchor interface versions, finality (n,k)</span></div>
       <div id="cons-config"><div class="muted">…</div></div>
     </div>
+    <div class="card">
+      <div class="cardhead">verification board <span class="muted">— open re-execution consistency (NOT authority): any node re-runs a pure function; a claim is verified once <i>k</i> distinct verifiers independently agree</span></div>
+      <div class="note" style="margin-top:0">Not a quorum — no fixed set. A producer posts a request; unrelated nodes grab it, re-run the deterministic function, and sign a verdict. It's how the network catches a node claiming a wrong output (e.g. settlement records, app transitions) without trusting anyone.</div>
+      <div id="cons-board" style="margin-top:.6rem"><div class="muted">…</div></div>
+    </div>
   </section>
 
   <section id="tab-economy" class="tab" hidden>
     <div class="card">
-      <div class="cardhead">token ledger <span class="muted">— your self-custodial account balance + the settlement pool (§11 step 4)</span></div>
-      <dl class="kv">
-        <dt>balance</dt><dd id="eco-balance" class="muted">…</dd>
-        <dt>settlement pool</dt><dd id="eco-pool" class="muted">…</dd>
-      </dl>
+      <div class="muted" style="font-size:.76rem;line-height:1.55">Two ways to use the grid. <b style="color:var(--fg)">Reciprocity (free tier)</b> — serve others and you earn the right to fetch, no money needed, as long as you give back roughly what you take. <b style="color:var(--fg)">The token ledger (paid tier)</b> — when you want more than reciprocity allows, you pay into a shared <b style="color:var(--fg)">settlement pool</b>, and providers claim from it in proportion to what they served that epoch. Everything below is <i>this node's</i> position in both. Values sitting at zero mean the fleet is doing storage/repair, not metered paid fetches — they fill in once real egress and payments flow.</div>
     </div>
+
     <div class="card">
-      <div class="cardhead">settlement verification <span class="muted">— correctness by re-execution: epochs where your own re-run of the record matched the committee-attested canonical one (mismatched should stay 0)</span></div>
-      <dl class="kv">
-        <dt>verified epochs</dt><dd id="eco-verified" class="muted">…</dd>
-        <dt>mismatched</dt><dd id="eco-mismatched" class="muted">…</dd>
-      </dl>
+      <div class="cardhead">reciprocity — your standing <span class="muted">— §8 tit-for-tat, the free tier every node has</span></div>
+      <div style="margin:.5rem 0 .2rem"><span id="eco-standing" class="badge net">…</span></div>
+      <div class="stats">
+        <div class="stat"><span class="lbl">fetch headroom</span><span class="val big" id="eco-headroom">…</span>
+          <span class="desc">how much more you can fetch <b>for free</b> right now — earned + grants + paid − consumed. This is your spendable free budget.</span></div>
+        <div class="stat"><span class="lbl">served (earned)</span><span class="val" id="eco-earned">…</span>
+          <span class="desc">bytes you've served to other nodes — contributing this is what buys your free fetches</span></div>
+        <div class="stat"><span class="lbl">consumed</span><span class="val" id="eco-consumed">…</span>
+          <span class="desc">bytes you've fetched from others</span></div>
+        <div class="stat"><span class="lbl">storage standing</span><span class="val" id="eco-pinned">…</span>
+          <span class="desc">bytes you pin for the network vs your storage allowance — governs whether peers will store <i>your</i> data</span></div>
+        <div class="stat"><span class="lbl">cold-start grants</span><span class="val" id="eco-grants">…</span>
+          <span class="desc">governed free allowances (fetch · per-peer · storage) so a brand-new node can start before it has earned anything</span></div>
+      </div>
     </div>
+
     <div class="card">
-      <div class="cardhead">reciprocity <span class="muted">— §8 tit-for-tat: you fetch/serve freely within earned + grant; paying lifts the budget (free vs paid tier)</span></div>
-      <dl class="kv">
-        <dt>served (earned)</dt><dd id="eco-earned" class="muted">…</dd>
-        <dt>consumed</dt><dd id="eco-consumed" class="muted">…</dd>
-        <dt>fetch headroom</dt><dd id="eco-headroom" class="muted">…</dd>
-        <dt>paid into pool</dt><dd id="eco-paid" class="muted">…</dd>
-        <dt>pinned (storage)</dt><dd id="eco-pinned" class="muted">…</dd>
-        <dt>grants</dt><dd id="eco-grants" class="muted">…</dd>
-      </dl>
+      <div class="cardhead">token ledger — paid tier <span class="muted">— self-custodial balance + the shared reward pool (§11 step 4)</span></div>
+      <div class="stats">
+        <div class="stat"><span class="lbl">balance</span><span class="val big" id="eco-balance">…</span>
+          <span class="desc">tokens this node owns — earned by serving as a paid provider, or otherwise held</span></div>
+        <div class="stat"><span class="lbl">settlement pool</span><span class="val" id="eco-pool">…</span>
+          <span class="desc">unallocated tokens in the shared reward pot — consumers pay in, providers claim out in proportion to what they served</span></div>
+        <div class="stat"><span class="lbl">paid into pool (this node)</span><span class="val" id="eco-paid">…</span>
+          <span class="desc">what this node has paid in to lift its own fetch/serve budget above the free tier</span></div>
+      </div>
     </div>
+
+    <div class="card">
+      <div class="cardhead">settlement verification <span class="muted">— trust by re-execution</span></div>
+      <div class="note" style="margin-top:0">Other nodes independently re-run the epoch payout math. A <b>match</b> means your local record agrees with the committee-attested canonical one; <b>mismatched</b> should stay 0.</div>
+      <div class="stats" style="margin-top:.5rem">
+        <div class="stat"><span class="lbl">verified epochs</span><span class="val" id="eco-verified">…</span>
+          <span class="desc">epochs where your re-run matched the canonical record</span></div>
+        <div class="stat"><span class="lbl">mismatched</span><span class="val" id="eco-mismatched">…</span>
+          <span class="desc">epochs where the records disagreed — investigate if &gt; 0</span></div>
+      </div>
+    </div>
+
     <div class="card">
       <div class="cardhead">canonical program anchors <span class="muted">— governance-pinned name → cid; verifiers fetch + re-run these</span></div>
       <div id="eco-anchors"><div class="muted">loading…</div></div>
@@ -384,17 +415,25 @@ function fmtBytes(n){ n = n||0; if(n<1024) return n+" B"; if(n<1048576) return (
 function renderEconomy(e){
   const r = e.reciprocity || {};
   $("eco-balance").textContent = (e.balance||0).toLocaleString() + " tokens";
-  $("eco-pool").textContent = (e.pool||0).toLocaleString() + " unallocated";
+  $("eco-pool").textContent = (e.pool||0).toLocaleString() + " tokens";
   $("eco-verified").textContent = (e.verified||0);
   const mm = e.mismatched||0, mmEl = $("eco-mismatched");
   mmEl.textContent = mm; mmEl.style.color = mm>0 ? "var(--warnc,#d29922)" : "";
-  $("eco-earned").textContent = fmtBytes(r.earned);
-  $("eco-consumed").textContent = fmtBytes(r.consumed);
-  const head = (r.earned||0)+(r.grant||0)+(r.paid||0)-(r.consumed||0);
-  $("eco-headroom").textContent = fmtBytes(Math.max(0,head)) + " free";
+  const earned = r.earned||0, consumed = r.consumed||0;
+  $("eco-earned").textContent = fmtBytes(earned);
+  $("eco-consumed").textContent = fmtBytes(consumed);
+  const head = earned+(r.grant||0)+(r.paid||0)-consumed;
+  $("eco-headroom").textContent = fmtBytes(Math.max(0,head));
   $("eco-paid").textContent = fmtBytes(r.paid);
-  $("eco-pinned").textContent = fmtBytes(r.pinned) + " / " + fmtBytes((r.earned||0)+(r.storage_grant||0)) + " standing";
+  $("eco-pinned").textContent = fmtBytes(r.pinned) + " / " + fmtBytes((r.earned||0)+(r.storage_grant||0));
   $("eco-grants").textContent = "fetch " + fmtBytes(r.grant) + " · peer " + fmtBytes(r.peer_grant) + " · storage " + fmtBytes(r.storage_grant);
+  const st = $("eco-standing");
+  if(st){
+    if(earned===0 && consumed===0){ st.textContent = "idle — no reciprocity traffic yet"; st.className = "badge net"; }
+    else if(earned>=consumed){ st.textContent = "net contributor — riding free"; st.className = "badge ok"; }
+    else if(head>0){ st.textContent = "net consumer — within free budget"; st.className = "badge net"; }
+    else { st.textContent = "over budget — must give back or pay"; st.className = "badge warn"; }
+  }
   const sumEl = $("eco-summary");
   if(sumEl){ sumEl.textContent = "balance " + (e.balance||0) + " · pool " + (e.pool||0) + " · verified " + (e.verified||0) + (mm>0 ? " · MISMATCH " + mm : "") + " · fetch headroom " + fmtBytes(Math.max(0,head));
     sumEl.style.color = mm>0 ? "var(--warnc,#d29922)" : ""; }
@@ -871,6 +910,19 @@ async function loadConsensus(){
       ? '<table><tbody>'+rows.map(x=>`<tr><td style="padding:.15rem .8rem .15rem 0"><b>${esc(x[0])}</b></td><td class="mono muted" style="padding:.15rem 0">${x[1]}</td></tr>`).join("")+'</tbody></table>'
       : '<div class="muted">no governed config set — native defaults in effect</div>';
   }catch(e){ cf.textContent="error: "+e; } }
+  const bh=$("cons-board");
+  if(bh){ try{
+    const b=await (await fetch("/api/board?token="+TOKEN)).json();
+    const rows=(b.rows||[]);
+    const head=`<div class="kv"><span>on the board</span><b>${b.requests||0} request${(b.requests==1?'':'s')} · ${b.satisfied||0} verified · ${b.verdicts||0} verdict${(b.verdicts==1?'':'s')}</b></div>`;
+    bh.innerHTML = head + (rows.length
+      ? rows.map(r=>{
+          const ok = r.satisfied;
+          const badge = ok ? '<span class="badge ok">verified</span>' : '<span class="badge net">'+r.agreements+'/'+r.k+' agree</span>';
+          return `<div class="kv"><span><code class="mono muted">${esc(r.program)}…</code> <b>${esc(r.func)}</b> <span class="muted">· k=${r.k} · ${esc(r.set)}</span></span>${badge}</div>`;
+        }).join("")
+      : '<div class="muted" style="margin-top:.3rem">no verification requests on the board — apps post these when they call <code>verify()</code></div>');
+  }catch(e){ bh.textContent="error: "+e; } }
 }
 async function doInvoke(){
   const app=$("inv-app").value.trim(), wasm=$("inv-wasm").value.trim();

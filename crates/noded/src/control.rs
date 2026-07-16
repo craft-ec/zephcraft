@@ -252,6 +252,9 @@ pub struct State {
     pub epoch_committee: std::sync::Arc<crate::epoch_committee::EpochCommitteeSource>,
     /// Per-(owner,program,account) ordered-write logs (the `sequence` host fn's backend).
     pub sequence: std::sync::Arc<crate::sequence::SequenceStore>,
+    /// Verification board — the open re-execution consistency primitive (§ VERIFICATION_DESIGN),
+    /// surfaced on the consensus dashboard as the "verification board" card.
+    pub board: std::sync::Arc<crate::board::BoardService>,
 }
 
 impl State {
@@ -549,6 +552,7 @@ async fn handle_rpc(state: &State, line: &str) -> serde_json::Value {
         Some("config") => rpc_config(state, id).await,
         Some("committee") => rpc_committee(state, id).await,
         Some("attest_list") => rpc_attest_list(state, id).await,
+        Some("board") => rpc_board(state, id).await,
         Some("apps") => {
             serde_json::json!({"jsonrpc": "2.0", "id": id, "result": apps_list(state).await})
         }
@@ -1591,6 +1595,25 @@ async fn rpc_attest_list(state: &State, id: serde_json::Value) -> serde_json::Va
     serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"quorums": rows}})
 }
 
+/// The verification board (§ VERIFICATION_DESIGN) — open re-execution consistency: totals + one row
+/// per posted request with its live agreeing-verdict tally against the app's declared `k`.
+async fn rpc_board(state: &State, id: serde_json::Value) -> serde_json::Value {
+    let v = state.board.dashboard().await;
+    let rows: Vec<serde_json::Value> = v
+        .rows
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "program": r.program, "func": r.func, "k": r.k, "set": r.set,
+                "agreements": r.agreements, "satisfied": r.satisfied, "producer": r.producer,
+            })
+        })
+        .collect();
+    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
+        "requests": v.requests, "verdicts": v.verdicts, "satisfied": v.satisfied, "rows": rows,
+    }})
+}
+
 async fn rpc_gov(state: &State, id: serde_json::Value) -> serde_json::Value {
     let set = state.gov.current().await;
     let ig = state.gov.is_governor().await;
@@ -2528,6 +2551,16 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         let r = rpc_attest_list(&ctx.state, serde_json::Value::Null).await;
         axum::Json(r.get("result").cloned().unwrap_or_default()).into_response()
     }
+    async fn api_board(
+        AxumState(ctx): AxumState<HttpCtx>,
+        Query(params): Query<TokenParam>,
+    ) -> axum::response::Response {
+        if params.token != *ctx.token {
+            return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
+        }
+        let r = rpc_board(&ctx.state, serde_json::Value::Null).await;
+        axum::Json(r.get("result").cloned().unwrap_or_default()).into_response()
+    }
 
     async fn api_governance(
         AxumState(ctx): AxumState<HttpCtx>,
@@ -2628,6 +2661,7 @@ pub async fn serve_http(state: Arc<State>, token: String, port: u16) -> anyhow::
         .route("/api/committee", get(api_committee))
         .route("/api/config", get(api_config))
         .route("/api/attest_list", get(api_attest_list))
+        .route("/api/board", get(api_board))
         .route("/api/pending", get(api_pending))
         .route("/api/cids", get(api_cids))
         .with_state(ctx);
