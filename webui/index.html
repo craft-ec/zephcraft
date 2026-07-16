@@ -320,8 +320,8 @@
           <span class="desc">reward reconciled into your account <b>after you claim</b> — not a running estimate</span></div>
         <div class="stat"><span class="lbl">claimable</span><span class="val" id="eco-owed">…</span>
           <span class="desc">reward you've <b>earned by serving</b>, owed but not yet claimed (Σ your shares across the in-window settlement records)</span></div>
-        <div class="stat"><span class="lbl">served</span><span class="val" id="eco-served">…</span>
-          <span class="desc">cheque-proven bytes you've served — the reward basis. Each epoch the pool pays per byte served at a uniform average rate, bounded by what paid consumers funded (per-consumer FCFS caps the funding, not this byte count).</span></div>
+        <div class="stat"><span class="lbl">paid serving (settled / served)</span><span class="val" id="eco-served">…</span>
+          <span class="desc">of the bytes you've served, how many fell within a paying consumer's quota — the per-consumer FCFS cap (a consumer's paid quota, allocated first-come across its providers). Settled bytes earn from the pool at its average per-byte rate; the rest is subsidised serving (unrewarded, but still earns free-tier headroom).</span></div>
         <div class="stat"><span class="lbl">settlement pool</span><span class="val" id="eco-pool">…</span>
           <span class="desc">unallocated reward pot — paid consumers fund it, providers claim out per byte served</span></div>
       </div>
@@ -443,7 +443,7 @@ function renderEconomy(e){
   const pc = r.paid_consumed||0;
   const pu = $("eco-paidusage"); if(pu) pu.textContent = pc>0 ? fmtBytes(pc)+" (unlimited)" : "unlimited";
   const ow = $("eco-owed"); if(ow) ow.textContent = (e.reward_owed||0).toLocaleString();
-  const sv = $("eco-served"); if(sv) sv.textContent = fmtBytes(earned);
+  const sv = $("eco-served"); if(sv) sv.textContent = fmtBytes(e.reward_settled||0) + " / " + fmtBytes(earned);
   $("eco-pinned").textContent = fmtBytes(r.pinned) + " / " + fmtBytes(earned+(r.storage_grant||0));
   $("eco-grants").textContent = "fetch " + fmtBytes(r.grant) + " · peer " + fmtBytes(r.peer_grant) + " · storage " + fmtBytes(r.storage_grant);
   const st = $("eco-standing");

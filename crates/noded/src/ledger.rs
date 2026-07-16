@@ -257,19 +257,27 @@ impl LedgerService {
         ok
     }
 
-    /// Cross-node epoch close (§10.1, node-orchestrated by the settlement loop). `entries` = `(node,
-    /// paid_cumulative, served_cumulative)` from the converged, proof-verified announcement board; the
-    /// store folds each node's watermark DELTA (pays → pool, served → reward weight). Idempotent per
-    /// epoch. Every node passes the identical entries, so the record is bit-for-bit identical network-wide.
+    /// Cross-node epoch close (§10.1, node-orchestrated by the settlement loop). `paid` = each node's
+    /// `(node, paid_cumulative)` and `cheques` = every `(provider, consumer, cumulative_bytes, timestamp)`
+    /// from the converged, proof-verified announcement board; the store applies the PER-CONSUMER FCFS cap
+    /// (a consumer's paid quota bounds its rewardable serving) then pool-average. Idempotent per epoch.
+    /// Every node passes the identical inputs, so the record is bit-for-bit identical network-wide.
     pub async fn settle_from_board(
         &self,
         epoch: u64,
-        entries: Vec<([u8; 32], u64, u64)>,
+        paid: Vec<([u8; 32], u64)>,
+        cheques: Vec<([u8; 32], [u8; 32], u64, u64)>,
     ) -> RewardRecord {
         self.settlement
             .write()
             .await
-            .settle_epoch_cumulative(epoch, entries)
+            .settle_epoch_from_cheques(epoch, paid, cheques)
+    }
+
+    /// This provider's cumulative REWARDABLE served bytes (the per-consumer-capped "settled" side of the
+    /// dashboard settled/served meter). Gross served is the cheque `total_earned`.
+    pub async fn rewardable_served(&self, provider: [u8; 32]) -> u64 {
+        self.settlement.read().await.rewardable_served(&provider)
     }
 
     /// DEV/manual override (the `ledger-settle-epoch` RPC): inject `pool` + settle `epoch` with the given

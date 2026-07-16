@@ -13,11 +13,15 @@
 //!    node as server, summing to the claimed `served_cumulative`); an unbacked report is skipped. The
 //!    reported `paid_cumulative` is likewise CAPPED at the node's actual committee-ordered `Pay` total on
 //!    its ledger chain, so neither side of the settlement can be inflated.
-//! 3. **Settle** — feed the per-node cumulatives to [`LedgerService::settle_from_board`], which folds each
-//!    node's WATERMARK DELTA — `paid_cumulative − paid_watermark` into the pool, `served_cumulative −
-//!    served_watermark` as the reward weight — so inflating or replaying cheques earns nothing. Every node
-//!    reads the SAME committed reports ⇒ bit-identical record ⇒ a `RewardClaim` resolves the same share
-//!    everywhere, and a verifier re-reads the chains to re-run it.
+//! 3. **Settle** — feed each participant's `(paid_cumulative)` AND its verified per-consumer cheques to
+//!    [`LedgerService::settle_from_board`], which applies the PER-CONSUMER FCFS cap (§10.1): a consumer's
+//!    paid quota — its `paid_cumulative` delta past a first-sight baseline — is allocated first-come across
+//!    the providers that served it (by cheque timestamp), so `Σ rewarded-for-a-consumer ≤ what it paid`
+//!    (self-dealing nets ≤ its own payment); serving past a consumer's quota is unrewarded subsidy. The
+//!    pool (Σ paid deltas) is then distributed pool-average over the resulting rewardable bytes. Per-(pair)
+//!    served watermarks make replaying cheques earn nothing. Every node reads the SAME committed reports +
+//!    cheques ⇒ bit-identical record ⇒ a `RewardClaim` resolves the same share everywhere, and a verifier
+//!    re-reads the chains to re-run it.
 //!
 //! **MVP scope (honest):** the participant SET is the converged census, so a momentary census difference
 //! can differ the record until it converges — resolved at finalization by the committee-attested record
@@ -104,12 +108,13 @@ fn proven_cumulative(node: &[u8; 32], proof: &[ServingCheque]) -> Option<u64> {
 }
 
 /// Scan cache for one account's settlement chain: the last nonce scanned + the PROOF-VERIFIED reports
-/// parsed so far (`(report.epoch, paid_cumulative, verified_served)`), so a settle only processes — and
-/// re-fetches/re-verifies the proof of — NEW reports rather than re-scanning the whole chain each epoch.
+/// parsed so far (`(report.epoch, paid_cumulative, verified_served, cheques)`), so a settle only processes
+/// — and re-fetches/re-verifies the proof of — NEW reports rather than re-scanning the whole chain each
+/// epoch. The cheques (this account's serving proof, latest per consumer) feed the per-consumer settle.
 #[derive(Default)]
 struct ReportCache {
     next_nonce: u64,
-    verified: Vec<(u64, u64, u64)>,
+    verified: Vec<(u64, u64, u64, Vec<ServingCheque>)>,
 }
 
 pub struct SettlementService {
@@ -259,7 +264,11 @@ impl SettlementService {
     /// their proofs fetched/verified (each proof exactly once); a transient proof-fetch failure stops the
     /// scan so that report is retried next settle rather than permanently skipped. `None` if the chain is
     /// missing or no verified report is at/before `epoch`.
-    async fn cumulatives_of(&self, account: [u8; 32], epoch: u64) -> Option<(u64, u64)> {
+    async fn cumulatives_of(
+        &self,
+        account: [u8; 32],
+        epoch: u64,
+    ) -> Option<(u64, Vec<ServingCheque>)> {
         let seq = self
             .sequence
             .sequence_of(self.settle_owner, self.settle_cid, account)
@@ -273,7 +282,7 @@ impl SettlementService {
             .map_or(0, |c| c.next_nonce);
 
         // Scan the NEW nonces, resolving + verifying each report's proof once (no lock held over the fetch).
-        let mut fresh: Vec<(u64, u64, u64)> = Vec::new();
+        let mut fresh: Vec<(u64, u64, u64, Vec<ServingCheque>)> = Vec::new();
         let mut advanced = start;
         let mut n = start;
         while n < end {
@@ -302,6 +311,7 @@ impl SettlementService {
                                 report.epoch,
                                 report.paid_cumulative,
                                 report.served_cumulative,
+                                cheques,
                             ));
                         }
                         // else: proof doesn't back the claim → permanently invalid, don't cache (anti-farming)
@@ -313,7 +323,7 @@ impl SettlementService {
         }
 
         // Merge fresh results into the cache (guard against a concurrent advance; settle is sequential).
-        let (paid_cum, served) = {
+        let (paid_cum, cheques) = {
             let mut cache = self.report_scan.lock().unwrap();
             let entry = cache.entry(account).or_default();
             if entry.next_nonce == start {
@@ -323,14 +333,14 @@ impl SettlementService {
             entry
                 .verified
                 .iter()
-                .filter(|(ep, _, _)| *ep <= epoch)
-                .max_by_key(|(ep, _, _)| *ep)
-                .map(|(_, p, s)| (*p, *s))?
+                .filter(|(ep, _, _, _)| *ep <= epoch)
+                .max_by_key(|(ep, _, _, _)| *ep)
+                .map(|(_, p, _, ch)| (*p, ch.clone()))?
         };
         // PAID proof: cap the reported paid at the node's ACTUAL committee-ordered `Pay` total (durable on
         // its ledger chain), so it can't inflate the pool beyond what it really paid.
         let paid = paid_cum.min(self.ledger.paid_total(account).await);
-        Some((paid, served))
+        Some((paid, cheques))
     }
 
     /// The deterministic participant set: self + every census member (self-included so a single node
@@ -363,13 +373,17 @@ impl SettlementService {
     /// to rebuild the in-memory watermarks/pool/records after a restart (even total local data loss),
     /// since the store is a deterministic function of the committed reports. Returns the epoch record.
     async fn settle_epoch_state(&self, epoch: u64) -> RewardRecord {
-        let mut entries: Vec<([u8; 32], u64, u64)> = Vec::new();
+        let mut paid: Vec<([u8; 32], u64)> = Vec::new();
+        let mut cheques: Vec<([u8; 32], [u8; 32], u64, u64)> = Vec::new();
         for account in self.participants().await {
-            if let Some((paid_cum, served_cum)) = self.cumulatives_of(account, epoch).await {
-                entries.push((account, paid_cum, served_cum));
+            if let Some((paid_cum, chs)) = self.cumulatives_of(account, epoch).await {
+                paid.push((account, paid_cum));
+                for c in chs {
+                    cheques.push((c.server, c.consumer, c.cumulative_bytes, c.timestamp));
+                }
             }
         }
-        self.ledger.settle_from_board(epoch, entries).await
+        self.ledger.settle_from_board(epoch, paid, cheques).await
     }
 
     /// Reconstruct the in-memory settlement state on startup by replaying the last `CLAIM_WINDOW_EPOCHS`

@@ -34,9 +34,21 @@ pub struct SettlementStore {
     /// Per-node CUMULATIVE `Pay` total already folded into the pool. An epoch folds only each node's
     /// `paid_cumulative − watermark` delta, advancing the watermark — so a pay is counted exactly once.
     paid_watermark: BTreeMap<[u8; 32], u64>,
-    /// Per-node CUMULATIVE cheque-proven served bytes already rewarded. An epoch's reward weight is each
-    /// node's `served_cumulative − watermark` delta — so replaying the same cheques earns nothing twice.
-    served_watermark: BTreeMap<[u8; 32], u64>,
+    /// Per-node FIRST-SIGHT `Pay` baseline (§10.1 per-consumer path). A consumer's reward QUOTA is what it
+    /// has folded into the pool = `paid_cumulative − paid_baseline` (deltas since first sight), so the
+    /// quota can never exceed pool-funded value even for a node that joins with a historical `Pay` total.
+    paid_baseline: BTreeMap<[u8; 32], u64>,
+    /// Per-`(provider, consumer)` CUMULATIVE served bytes already processed for rewardable allocation
+    /// (per-consumer path). Deltas past it are rewardable-eligible; monotonic (cheques are cumulative), so
+    /// re-announcing the same cheque earns nothing twice. Safety is the quota cap, not a first-sight baseline.
+    served_pair_wm: BTreeMap<([u8; 32], [u8; 32]), u64>,
+    /// Per-consumer CUMULATIVE rewardable already allocated — the per-consumer CAP: once a consumer's
+    /// allocated reaches its quota, further serving to it is subsidy (unrewarded). Guarantees
+    /// `Σ rewarded-for-a-consumer ≤ what that consumer paid` → self-dealing nets ≤ its own payment (zero-sum).
+    consumer_allocated: BTreeMap<[u8; 32], u64>,
+    /// Per-provider CUMULATIVE rewardable served (Σ allocated to it across consumers) — the observable
+    /// "settled" numerator of the dashboard settled/served meter.
+    rewardable: BTreeMap<[u8; 32], u64>,
 }
 
 impl SettlementStore {
@@ -75,56 +87,82 @@ impl SettlementStore {
         record
     }
 
-    /// Cross-node epoch close from each node's PROVEN cumulatives (§10.1). `entries` is `(node,
-    /// paid_cumulative, served_cumulative)` from the converged, proof-verified announcement board. Per
-    /// node we fold only the DELTA past its watermark — `paid_cumulative − paid_watermark` into the pool,
-    /// `served_cumulative − served_watermark` as the reward weight — then advance both watermarks. This is
-    /// what makes `served` un-farmable: the weight is a monotonic delta of counterparty-signed cheque
-    /// totals, so replaying cheques or inflating a single epoch buys nothing. A node's FIRST appearance
-    /// only baselines its watermarks (contributes 0), so no cold-start over-count. Idempotent per epoch
-    /// (watermarks advance once). Deterministic: every node folds the identical entries → identical record.
-    pub fn settle_epoch_cumulative(
+    /// Cross-node epoch close with PER-CONSUMER FCFS reward capping (§10.1, the full model — supersedes the
+    /// aggregate [`settle_epoch_cumulative`] on the production path). Instead of rewarding each node's raw
+    /// aggregate served delta, it derives every provider's REWARDABLE-served from the board's cheques grouped
+    /// by consumer: a consumer's paid quota is allocated FCFS (by cheque timestamp, provider/consumer
+    /// tie-break) across the providers that served it, capped so `Σ rewarded-for-a-consumer ≤ what it paid`.
+    /// Then the pool (Σ paid deltas) is distributed pool-average over the resulting rewardable bytes — both
+    /// layers. Deterministic (converged board + stable sort) and verifiable (cheques consumer-signed, paid
+    /// on-chain). Idempotent per epoch (watermarks advance once).
+    ///
+    /// - `paid` = each participant's `(node, paid_cumulative)` — funds the pool AND (as deltas past its
+    ///   first-sight baseline) sets that node's reward quota when it acts as a consumer.
+    /// - `cheques` = every `(provider, consumer, cumulative_bytes, timestamp)` from the board's proofs.
+    pub fn settle_epoch_from_cheques(
         &mut self,
         epoch: u64,
-        entries: Vec<([u8; 32], u64, u64)>,
+        paid: Vec<([u8; 32], u64)>,
+        mut cheques: Vec<([u8; 32], [u8; 32], u64, u64)>,
     ) -> RewardRecord {
         if let Some(existing) = self.records.get(&epoch) {
             return existing.clone(); // already settled → don't re-advance watermarks
         }
+        // Pool + per-consumer quota. Pool grows by each node's paid delta past its watermark; a node's quota
+        // (as a consumer) is what it has folded into the pool = paid_cumulative − first-sight baseline.
         let mut pool_add = 0u64;
-        let mut contributions = Vec::new();
-        for (node, paid_cumulative, served_cumulative) in entries {
-            match self.paid_watermark.get(&node).copied() {
+        let mut quota: BTreeMap<[u8; 32], u64> = BTreeMap::new();
+        for (node, paid_cum) in &paid {
+            let baseline = *self.paid_baseline.entry(*node).or_insert(*paid_cum);
+            quota.insert(*node, paid_cum.saturating_sub(baseline));
+            match self.paid_watermark.get(node).copied() {
                 None => {
-                    self.paid_watermark.insert(node, paid_cumulative); // baseline on first sight
+                    self.paid_watermark.insert(*node, *paid_cum); // baseline on first sight
                 }
                 Some(w) => {
-                    pool_add = pool_add.saturating_add(paid_cumulative.saturating_sub(w));
-                    self.paid_watermark.insert(node, paid_cumulative.max(w));
-                }
-            }
-            match self.served_watermark.get(&node).copied() {
-                None => {
-                    self.served_watermark.insert(node, served_cumulative);
-                }
-                Some(w) => {
-                    let delta = served_cumulative.saturating_sub(w);
-                    if delta > 0 {
-                        contributions.push(Contribution {
-                            provider: node,
-                            bytes: delta,
-                        });
-                    }
-                    self.served_watermark.insert(node, served_cumulative.max(w));
+                    pool_add = pool_add.saturating_add(paid_cum.saturating_sub(w));
+                    self.paid_watermark.insert(*node, (*paid_cum).max(w));
                 }
             }
         }
+        // Allocate rewardable per provider: walk cheque DELTAS in a deterministic FCFS order and cap each
+        // consumer's cumulative rewardable at its quota (over-quota serving = subsidy, unrewarded).
+        cheques.sort_by(|a, b| (a.3, a.0, a.1).cmp(&(b.3, b.0, b.1)));
+        let mut contrib: BTreeMap<[u8; 32], u64> = BTreeMap::new();
+        for (provider, consumer, cum, _ts) in cheques {
+            let key = (provider, consumer);
+            let w = self.served_pair_wm.get(&key).copied().unwrap_or(0);
+            let delta = cum.saturating_sub(w);
+            self.served_pair_wm.insert(key, cum.max(w));
+            if delta == 0 {
+                continue;
+            }
+            let q = quota.get(&consumer).copied().unwrap_or(0);
+            let used = self.consumer_allocated.get(&consumer).copied().unwrap_or(0);
+            let rewardable = delta.min(q.saturating_sub(used));
+            if rewardable == 0 {
+                continue;
+            }
+            *contrib.entry(provider).or_default() += rewardable;
+            *self.consumer_allocated.entry(consumer).or_default() += rewardable;
+            *self.rewardable.entry(provider).or_default() += rewardable;
+        }
         self.pay_in(pool_add);
+        let contributions: Vec<Contribution> = contrib
+            .into_iter()
+            .map(|(provider, bytes)| Contribution { provider, bytes })
+            .collect();
         self.settle_epoch(epoch, contributions)
     }
 
+    /// This provider's CUMULATIVE rewardable served bytes (the "settled" numerator of settled/served) —
+    /// the portion of its serving that fell within consumers' paid quotas and thus earned reward.
+    pub fn rewardable_served(&self, provider: &[u8; 32]) -> u64 {
+        self.rewardable.get(provider).copied().unwrap_or(0)
+    }
+
     /// DEV/manual settle from an explicit pool + contributions (bypasses watermarks). The production path
-    /// is [`settle_epoch_cumulative`]. Idempotent per epoch.
+    /// is [`settle_epoch_from_cheques`]. Idempotent per epoch.
     pub fn settle_epoch_with_pool(
         &mut self,
         epoch: u64,
@@ -274,33 +312,6 @@ mod tests {
     }
 
     #[test]
-    fn cumulative_settle_rewards_deltas_and_baselines_first_sight() {
-        let mut s = SettlementStore::new();
-        // Epoch 1: two nodes first seen → both watermarks baseline, contribute 0 (no reward, no pool).
-        let rec1 = s.settle_epoch_cumulative(1, vec![([1u8; 32], 100, 500), ([2u8; 32], 40, 200)]);
-        assert!(
-            rec1.shares.is_empty(),
-            "first sight only baselines watermarks"
-        );
-        assert_eq!(s.unallocated(), 0);
-        // Epoch 2: node 1 paid 100→150 (Δ50), served 500→800 (Δ300); node 2 unchanged (Δ0).
-        // Pool = Σ paid deltas = 50; only node 1 has a serving delta → it takes the whole 50.
-        let rec2 = s.settle_epoch_cumulative(2, vec![([1u8; 32], 150, 800), ([2u8; 32], 40, 200)]);
-        assert_eq!(
-            rec2.share_of(&[1u8; 32]),
-            50,
-            "node 1's Δserved earns the Δpaid pool"
-        );
-        assert_eq!(rec2.share_of(&[2u8; 32]), 0);
-        // Replaying the SAME cumulatives next epoch buys nothing (deltas are 0) — the anti-farm property.
-        let rec3 = s.settle_epoch_cumulative(3, vec![([1u8; 32], 150, 800)]);
-        assert!(
-            rec3.shares.is_empty(),
-            "replayed cumulatives = zero delta = no reward"
-        );
-    }
-
-    #[test]
     fn owed_to_sums_unclaimed_shares_across_records() {
         let mut s = SettlementStore::new();
         s.pay_in(100);
@@ -313,6 +324,111 @@ mod tests {
         // Claiming epoch 1 drops it out of `owed`.
         s.claim(1, prov(1));
         assert_eq!(s.owed_to(&prov(1)), 50);
+    }
+
+    #[test]
+    fn per_consumer_fcfs_caps_rewardable_at_what_the_consumer_paid() {
+        let mut s = SettlementStore::new();
+        let c = prov(9);
+        // Epoch 1: consumer first seen at paid 0 → baselines (quota 0, pool 0), no serving yet.
+        s.settle_epoch_from_cheques(1, vec![(c, 0)], vec![]);
+        // Epoch 2: C has paid 100 (Δ100 → pool 100, quota 100). A served 60 @ts1, B served 80 @ts2.
+        // FCFS by timestamp: A takes 60, B takes the remaining 40 of the 100 quota; B's other 40 = subsidy.
+        let rec = s.settle_epoch_from_cheques(
+            2,
+            vec![(c, 100)],
+            vec![(prov(1), c, 60, 1), (prov(2), c, 80, 2)],
+        );
+        assert_eq!(rec.share_of(&prov(1)), 60, "A within quota → full 60");
+        assert_eq!(
+            rec.share_of(&prov(2)),
+            40,
+            "B gets the remaining 40 of the quota"
+        );
+        assert_eq!(s.rewardable_served(&prov(1)), 60);
+        assert_eq!(
+            s.rewardable_served(&prov(2)),
+            40,
+            "B's other 40 served is subsidy"
+        );
+    }
+
+    #[test]
+    fn self_dealing_nets_at_most_what_was_paid() {
+        let mut s = SettlementStore::new();
+        let attacker = prov(5);
+        s.settle_epoch_from_cheques(1, vec![(attacker, 0)], vec![]); // baseline
+                                                                     // Attacker pays 100 and serves ITSELF 1000 bytes (sock-puppet consumer = itself).
+        let rec = s.settle_epoch_from_cheques(
+            2,
+            vec![(attacker, 100)],
+            vec![(attacker, attacker, 1000, 1)],
+        );
+        // Rewardable capped at the 100 it paid → it gets back ≤ what it put in (zero-sum, no profit).
+        assert!(rec.share_of(&attacker) <= 100);
+        assert_eq!(
+            s.rewardable_served(&attacker),
+            100,
+            "capped at quota, rest subsidy"
+        );
+    }
+
+    #[test]
+    fn replayed_cheques_earn_nothing_twice_per_consumer() {
+        let mut s = SettlementStore::new();
+        let c = prov(9);
+        s.settle_epoch_from_cheques(1, vec![(c, 0)], vec![]);
+        s.settle_epoch_from_cheques(2, vec![(c, 100)], vec![(prov(1), c, 60, 1)]);
+        assert_eq!(s.rewardable_served(&prov(1)), 60);
+        // Epoch 3: same cheque (cum 60) + no new pay → zero delta, zero pool → nothing.
+        let rec = s.settle_epoch_from_cheques(3, vec![(c, 100)], vec![(prov(1), c, 60, 1)]);
+        assert!(
+            rec.shares.is_empty(),
+            "replayed cheque + no new pay = nothing"
+        );
+        assert_eq!(s.rewardable_served(&prov(1)), 60, "no double count");
+    }
+
+    #[test]
+    fn serving_beyond_a_consumers_quota_is_unrewarded_subsidy() {
+        let mut s = SettlementStore::new();
+        let c = prov(9);
+        s.settle_epoch_from_cheques(1, vec![(c, 0)], vec![]);
+        // C paid 40 but was served 100 by one provider → only 40 rewardable, 60 subsidy.
+        let rec = s.settle_epoch_from_cheques(2, vec![(c, 40)], vec![(prov(1), c, 100, 1)]);
+        assert_eq!(rec.share_of(&prov(1)), 40);
+        assert_eq!(s.rewardable_served(&prov(1)), 40, "capped at the 40 paid");
+    }
+
+    #[test]
+    fn a_free_consumer_that_never_paid_rewards_nobody() {
+        let mut s = SettlementStore::new();
+        let c = prov(9);
+        s.settle_epoch_from_cheques(1, vec![(c, 0)], vec![]);
+        // C never paid (quota 0) but was served 500 → all subsidy, no reward, no pool.
+        let rec = s.settle_epoch_from_cheques(2, vec![(c, 0)], vec![(prov(1), c, 500, 1)]);
+        assert!(rec.shares.is_empty(), "free consumer funds no reward");
+        assert_eq!(s.rewardable_served(&prov(1)), 0);
+    }
+
+    #[test]
+    fn a_joining_nodes_historical_pay_is_baselined_not_dumped() {
+        let mut s = SettlementStore::new();
+        let c = prov(9);
+        // C's FIRST appearance already carries a historical paid total of 1000 → baseline, quota 0, pool 0.
+        let rec1 = s.settle_epoch_from_cheques(1, vec![(c, 1000)], vec![(prov(1), c, 500, 1)]);
+        assert!(
+            rec1.shares.is_empty(),
+            "historical pay is baselined, not dumped into one epoch"
+        );
+        assert_eq!(s.unallocated(), 0);
+        // Only NEW pay past the baseline becomes quota + pool.
+        let rec2 = s.settle_epoch_from_cheques(2, vec![(c, 1200)], vec![(prov(1), c, 700, 2)]);
+        assert_eq!(
+            rec2.share_of(&prov(1)),
+            200,
+            "Δpaid 200 → quota 200 → 200 rewardable"
+        );
     }
 
     #[test]

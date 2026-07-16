@@ -169,6 +169,9 @@ pub struct Economy {
     pub balance: u64,
     /// Reward this node has earned by serving but not yet claimed (Σ owed shares across in-window records).
     pub reward_owed: u64,
+    /// Cumulative REWARDABLE served bytes — the per-consumer-capped "settled" numerator of the settled/served
+    /// meter (gross served is `reciprocity.earned`). What fell within consumers' paid quotas.
+    pub reward_settled: u64,
     /// The distributable settlement pool (`unallocated`).
     pub pool: u64,
     /// Settlement re-execution verification tally — epochs whose canonical record matched this node's own.
@@ -287,6 +290,7 @@ impl State {
             Economy {
                 balance: self.ledger.balance(me).await.balance,
                 reward_owed: self.ledger.reward_owed(me).await,
+                reward_settled: self.ledger.rewardable_served(me).await,
                 pool: self.ledger.pool_unallocated().await,
                 verified,
                 mismatched,
