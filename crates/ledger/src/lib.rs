@@ -49,15 +49,26 @@ pub struct ClaimOp {
 pub enum LedgerOp {
     Transfer(TransferOp),
     Claim(ClaimOp),
+    /// Lock `amount` of liquid balance into egress ESCROW (a consumer pre-authorises settlement to
+    /// draw up to this for its paid egress; §7). Reversible only by settlement consuming it.
+    Escrow(u64),
+    /// A PROVIDER claims its reward share for `epoch` from the verified epoch reward RECORD (§10.1) —
+    /// single-use per epoch; the node resolves the share from the record.
+    RewardClaim(u64),
 }
 
 /// An account's ledger state — the fold of its own sequence.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct LedgerBalanceState {
     pub balance: u64,
+    /// Tokens LOCKED for egress (already removed from `balance`); settlement draws paid egress from
+    /// here, so the escrow lock is the consumer's standing authorisation to be charged (§7/§10.9).
+    pub escrowed: u64,
     /// `(debit_account, debit_nonce)` already claimed — single-use, self-contained (§4b): a duplicate
     /// claim is caught the same way a duplicate nonce is, with no global spent-set.
     pub processed_claims: BTreeSet<([u8; 32], u64)>,
+    /// Reward epochs already claimed — a `RewardClaim` is single-use per epoch.
+    pub claimed_epochs: BTreeSet<u64>,
 }
 
 impl LedgerBalanceState {
@@ -73,21 +84,33 @@ impl LedgerBalanceState {
 
 /// The resolved debit a claim references: the node supplies the sender's ORDERED `TransferOp`
 /// (validated as a committed entry of `debit_account`'s sequence) so this pure transition can check
-/// `to == me` + the amount. `None` at the call site means the node could not resolve/validate it.
+/// `to == me` + the amount.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedDebit {
     pub transfer: TransferOp,
 }
 
+/// The node-supplied context a transition needs beyond its own state: the resolved debit (for a
+/// `Claim`) and the resolved reward share (for a `RewardClaim`, from the verified epoch reward
+/// record). Both are node-resolved and re-checked by re-execution; a missing one for the op that
+/// needs it rejects the write.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Resolved {
+    #[serde(default)]
+    pub debit: Option<ResolvedDebit>,
+    #[serde(default)]
+    pub reward_share: Option<u64>,
+}
+
 /// The full input the node hands the ledger program for one write: the account being advanced (its
 /// identity is authenticated by the sequencer's `owner_authentic` gate — the owner signed for it — so
-/// the program trusts it), the op (the write's payload), and, for a `Claim`, the node-resolved debit.
+/// the program trusts it), the op (the write's payload), and the resolved context it needs.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct LedgerInput {
     pub account: [u8; 32],
     pub op: LedgerOp,
     #[serde(default)]
-    pub debit: Option<ResolvedDebit>,
+    pub resolved: Resolved,
 }
 
 /// Convenience: decode the prior state + a [`LedgerInput`], apply, and return the new state blob to
@@ -96,23 +119,24 @@ pub struct LedgerInput {
 pub fn run_transition(prev_state: &[u8], input: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     let state = LedgerBalanceState::decode(prev_state)?;
     let inp: LedgerInput = postcard::from_bytes(input).ok()?;
-    let next = apply(state, &inp.op, &inp.account, inp.debit.as_ref())?;
+    let next = apply(state, &inp.op, &inp.account, &inp.resolved)?;
     postcard::to_allocvec(&next).ok()
 }
 
 /// Apply one ledger op to `caller`'s state — pure + deterministic, so every node and every verifier
-/// re-run computes the identical next state. Returns `None` on ANY rejection (the program then commits
-/// nothing, which the node treats as a rejected write).
+/// re-run computes the identical next state. Returns `None` on ANY rejection (commits nothing).
 ///
-/// - **Transfer**: debit `caller` by `amount` iff the balance suffices (`amount > 0`). The recipient
-///   is credited later, by its own claim.
-/// - **Claim**: credit `caller` by the resolved debit's amount iff the debit credits `caller`
-///   (`debit.transfer.to == caller`) and `(debit_account, debit_nonce)` was not already claimed.
+/// - **Transfer**: debit `caller` by `amount` iff the balance suffices (`amount > 0`).
+/// - **Claim**: credit `caller` by the resolved debit iff `debit.transfer.to == caller` and the
+///   `(debit_account, debit_nonce)` was not already claimed.
+/// - **Escrow**: lock `amount` of `caller`'s balance into `escrowed` (iff sufficient, `amount > 0`).
+/// - **RewardClaim**: credit `caller` by its resolved epoch share iff that epoch was not already
+///   claimed and the share is non-zero.
 pub fn apply(
     mut state: LedgerBalanceState,
     op: &LedgerOp,
     caller: &[u8; 32],
-    debit: Option<&ResolvedDebit>,
+    resolved: &Resolved,
 ) -> Option<LedgerBalanceState> {
     match op {
         LedgerOp::Transfer(t) => {
@@ -123,7 +147,7 @@ pub fn apply(
             Some(state)
         }
         LedgerOp::Claim(c) => {
-            let d = debit?; // the node must resolve + validate the referenced ordered debit
+            let d = resolved.debit.as_ref()?; // the node must resolve + validate the ordered debit
             if &d.transfer.to != caller {
                 return None; // the debit does not credit me
             }
@@ -132,6 +156,25 @@ pub fn apply(
                 return None; // already claimed (single-use)
             }
             state.balance = state.balance.checked_add(d.transfer.amount)?;
+            Some(state)
+        }
+        LedgerOp::Escrow(amount) => {
+            if *amount == 0 {
+                return None;
+            }
+            state.balance = state.balance.checked_sub(*amount)?; // insufficient balance → reject
+            state.escrowed = state.escrowed.checked_add(*amount)?;
+            Some(state)
+        }
+        LedgerOp::RewardClaim(epoch) => {
+            let share = resolved.reward_share?; // node-resolved from the verified epoch record
+            if share == 0 {
+                return None; // nothing to claim
+            }
+            if !state.claimed_epochs.insert(*epoch) {
+                return None; // this epoch's reward already claimed (single-use)
+            }
+            state.balance = state.balance.checked_add(share)?;
             Some(state)
         }
     }
@@ -154,6 +197,14 @@ mod tests {
         })
     }
 
+    /// A resolved context carrying just a debit (for `Claim` tests).
+    fn dctx(d: &ResolvedDebit) -> Resolved {
+        Resolved {
+            debit: Some(d.clone()),
+            reward_share: None,
+        }
+    }
+
     #[test]
     fn transfer_debits_and_rejects_overdraft_and_zero() {
         let alice = acct(1);
@@ -163,12 +214,12 @@ mod tests {
             ..Default::default()
         };
         // Debit 30 → 70.
-        let st = apply(st, &transfer(bob, 30), &alice, None).unwrap();
+        let st = apply(st, &transfer(bob, 30), &alice, &Resolved::default()).unwrap();
         assert_eq!(st.balance, 70);
         // Overdraft rejected (state unchanged — caller keeps the prior).
-        assert!(apply(st.clone(), &transfer(bob, 71), &alice, None).is_none());
+        assert!(apply(st.clone(), &transfer(bob, 71), &alice, &Resolved::default()).is_none());
         // Zero rejected.
-        assert!(apply(st, &transfer(bob, 0), &alice, None).is_none());
+        assert!(apply(st, &transfer(bob, 0), &alice, &Resolved::default()).is_none());
     }
 
     #[test]
@@ -190,16 +241,22 @@ mod tests {
         });
 
         // Missing/unresolved debit → reject.
-        assert!(apply(LedgerBalanceState::default(), &claim, &bob, None).is_none());
+        assert!(apply(
+            LedgerBalanceState::default(),
+            &claim,
+            &bob,
+            &Resolved::default()
+        )
+        .is_none());
         // Wrong recipient (Carol claims Bob's credit) → reject.
-        assert!(apply(LedgerBalanceState::default(), &claim, &carol, Some(&debit)).is_none());
+        assert!(apply(LedgerBalanceState::default(), &claim, &carol, &dctx(&debit)).is_none());
 
         // Bob claims → +40.
-        let bob_st = apply(LedgerBalanceState::default(), &claim, &bob, Some(&debit)).unwrap();
+        let bob_st = apply(LedgerBalanceState::default(), &claim, &bob, &dctx(&debit)).unwrap();
         assert_eq!(bob_st.balance, 40);
         assert!(bob_st.processed_claims.contains(&(alice, 7)));
         // Replay of the same debit → reject (single-use), balance unchanged.
-        assert!(apply(bob_st, &claim, &bob, Some(&debit)).is_none());
+        assert!(apply(bob_st, &claim, &bob, &dctx(&debit)).is_none());
     }
 
     #[test]
@@ -211,7 +268,7 @@ mod tests {
             ..Default::default()
         };
         // Alice debits 25 to Bob at nonce 0.
-        let alice_st = apply(alice_st, &transfer(bob, 25), &alice, None).unwrap();
+        let alice_st = apply(alice_st, &transfer(bob, 25), &alice, &Resolved::default()).unwrap();
         let debit = ResolvedDebit {
             transfer: TransferOp {
                 to: bob,
@@ -226,13 +283,53 @@ mod tests {
                 debit_nonce: 0,
             }),
             &bob,
-            Some(&debit),
+            &dctx(&debit),
         )
         .unwrap();
         // Conservation: Alice 75 + Bob 25 = 100.
         assert_eq!(alice_st.balance + bob_st.balance, 100);
         assert_eq!(alice_st.balance, 75);
         assert_eq!(bob_st.balance, 25);
+    }
+
+    #[test]
+    fn escrow_locks_balance_and_reward_claim_credits_once() {
+        let p = acct(5);
+        let st = LedgerBalanceState {
+            balance: 100,
+            ..Default::default()
+        };
+        // Escrow 40 → balance 60, escrowed 40 (tokens leave liquid balance into the lock).
+        let st = apply(st, &LedgerOp::Escrow(40), &p, &Resolved::default()).unwrap();
+        assert_eq!(st.balance, 60);
+        assert_eq!(st.escrowed, 40);
+        // Over-escrow (more than the liquid balance) and zero are rejected.
+        assert!(apply(st.clone(), &LedgerOp::Escrow(61), &p, &Resolved::default()).is_none());
+        assert!(apply(st.clone(), &LedgerOp::Escrow(0), &p, &Resolved::default()).is_none());
+
+        // RewardClaim epoch 7 with a node-resolved share of 15 → +15, epoch marked.
+        let rctx = Resolved {
+            debit: None,
+            reward_share: Some(15),
+        };
+        let st = apply(st, &LedgerOp::RewardClaim(7), &p, &rctx).unwrap();
+        assert_eq!(st.balance, 75);
+        assert!(st.claimed_epochs.contains(&7));
+        // Replaying the same epoch is rejected (single-use).
+        assert!(apply(st.clone(), &LedgerOp::RewardClaim(7), &p, &rctx).is_none());
+        // A missing or zero resolved share is rejected (nothing to claim).
+        assert!(apply(
+            st.clone(),
+            &LedgerOp::RewardClaim(8),
+            &p,
+            &Resolved::default()
+        )
+        .is_none());
+        let zero = Resolved {
+            debit: None,
+            reward_share: Some(0),
+        };
+        assert!(apply(st, &LedgerOp::RewardClaim(8), &p, &zero).is_none());
     }
 
     #[test]
@@ -265,7 +362,7 @@ mod tests {
         let input = postcard::to_allocvec(&LedgerInput {
             account: alice,
             op: transfer(bob, 20),
-            debit: None,
+            resolved: Resolved::default(),
         })
         .unwrap();
         let out = run_transition(&prev, &input).expect("valid transfer commits");
@@ -275,7 +372,7 @@ mod tests {
         let bad = postcard::to_allocvec(&LedgerInput {
             account: alice,
             op: transfer(bob, 999),
-            debit: None,
+            resolved: Resolved::default(),
         })
         .unwrap();
         assert!(run_transition(&prev, &bad).is_none());

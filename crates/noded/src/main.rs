@@ -193,6 +193,16 @@ enum Command {
         #[arg(long)]
         debit_nonce: u64,
     },
+    /// Lock tokens from this node's account into egress escrow.
+    LedgerEscrow {
+        #[arg(long)]
+        amount: u64,
+    },
+    /// Claim this node's reward share for an epoch (single-use).
+    LedgerRewardClaim {
+        #[arg(long)]
+        epoch: u64,
+    },
     /// Deploy a CraftCOM app: publish the WASM as a SYSTEM object (durable, managed
     /// like a database — NOT a drive file) and register it by name.
     Deploy {
@@ -552,6 +562,10 @@ async fn main() -> anyhow::Result<()> {
             debit_account,
             debit_nonce,
         }) => cmd_ledger_claim(&data_dir, &debit_account, debit_nonce).await,
+        Some(Command::LedgerEscrow { amount }) => cmd_ledger_escrow(&data_dir, amount).await,
+        Some(Command::LedgerRewardClaim { epoch }) => {
+            cmd_ledger_reward_claim(&data_dir, epoch).await
+        }
         Some(Command::Deploy { file, name }) => cmd_deploy(&data_dir, &file, name.as_deref()).await,
         Some(Command::Apps) => cmd_apps(&data_dir).await,
         Some(Command::PublishProgram { file }) => cmd_publish_program(&data_dir, &file).await,
@@ -814,6 +828,24 @@ async fn cmd_ledger_claim(
 ) -> anyhow::Result<()> {
     let params = serde_json::json!({ "debit_account": debit_account, "debit_nonce": debit_nonce });
     let r = control::query_unix_params(&data_dir.join("zeph.sock"), "ledger_claim", params).await?;
+    println!("{}", serde_json::to_string_pretty(&r)?);
+    Ok(())
+}
+
+/// `zeph ledger-escrow --amount <n>` — lock tokens into egress escrow.
+async fn cmd_ledger_escrow(data_dir: &Path, amount: u64) -> anyhow::Result<()> {
+    let params = serde_json::json!({ "amount": amount });
+    let r =
+        control::query_unix_params(&data_dir.join("zeph.sock"), "ledger_escrow", params).await?;
+    println!("{}", serde_json::to_string_pretty(&r)?);
+    Ok(())
+}
+
+/// `zeph ledger-reward-claim --epoch <n>` — claim this node's reward share for an epoch.
+async fn cmd_ledger_reward_claim(data_dir: &Path, epoch: u64) -> anyhow::Result<()> {
+    let params = serde_json::json!({ "epoch": epoch });
+    let r = control::query_unix_params(&data_dir.join("zeph.sock"), "ledger_reward_claim", params)
+        .await?;
     println!("{}", serde_json::to_string_pretty(&r)?);
     Ok(())
 }

@@ -471,6 +471,8 @@ async fn handle_rpc(state: &State, line: &str) -> serde_json::Value {
         Some("ledger_balance") => rpc_ledger_balance(state, &request, id).await,
         Some("ledger_transfer") => rpc_ledger_transfer(state, &request, id).await,
         Some("ledger_claim") => rpc_ledger_claim(state, &request, id).await,
+        Some("ledger_escrow") => rpc_ledger_escrow(state, &request, id).await,
+        Some("ledger_reward_claim") => rpc_ledger_reward_claim(state, &request, id).await,
         Some("gov") => rpc_gov(state, id).await,
         Some("gov_propose") => rpc_gov_propose(state, &request, id).await,
         Some("gov_sign") => rpc_gov_sign(state, &request, id).await,
@@ -1247,8 +1249,34 @@ async fn rpc_ledger_balance(
     };
     let bal = state.ledger.balance(account).await;
     serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
-        "account": hex::encode(account), "balance": bal.balance,
+        "account": hex::encode(account), "balance": bal.balance, "escrowed": bal.escrowed,
     }})
+}
+
+/// Lock `amount` of this node's balance into egress escrow.
+async fn rpc_ledger_escrow(
+    state: &State,
+    req: &serde_json::Value,
+    id: serde_json::Value,
+) -> serde_json::Value {
+    let Some(amount) = param(req, "amount").and_then(|v| v.as_u64()) else {
+        return rpc_err(id, "escrow needs 'amount'".into());
+    };
+    let ok = state.ledger.escrow(amount).await;
+    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"committed": ok}})
+}
+
+/// Claim this node's reward share for `epoch` (single-use).
+async fn rpc_ledger_reward_claim(
+    state: &State,
+    req: &serde_json::Value,
+    id: serde_json::Value,
+) -> serde_json::Value {
+    let Some(epoch) = param(req, "epoch").and_then(|v| v.as_u64()) else {
+        return rpc_err(id, "reward_claim needs 'epoch'".into());
+    };
+    let ok = state.ledger.reward_claim(epoch).await;
+    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"committed": ok}})
 }
 
 /// Transfer `amount` from this node's account to `to` (a debit; the recipient later claims it).

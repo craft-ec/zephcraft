@@ -15,7 +15,9 @@ use std::sync::Arc;
 use zeph_com::{SequenceBackend, SequencedWrite};
 use zeph_core::Cid;
 use zeph_crypto::NodeIdentity;
-use zeph_ledger::{apply, ClaimOp, LedgerBalanceState, LedgerOp, ResolvedDebit, TransferOp};
+use zeph_ledger::{
+    apply, ClaimOp, LedgerBalanceState, LedgerOp, Resolved, ResolvedDebit, TransferOp,
+};
 
 use crate::anchor::AnchorDispatcher;
 use crate::sequence::SequenceStore;
@@ -73,7 +75,8 @@ impl LedgerService {
         let payload = seq.payload_at(nonce)?;
         match postcard::from_bytes::<LedgerOp>(payload).ok()? {
             LedgerOp::Transfer(t) => Some(ResolvedDebit { transfer: t }),
-            LedgerOp::Claim(_) => None, // the referenced write is not a transfer → not claimable
+            // The referenced write isn't a transfer → not a claimable debit.
+            LedgerOp::Claim(_) | LedgerOp::Escrow(_) | LedgerOp::RewardClaim(_) => None,
         }
     }
 
@@ -95,11 +98,16 @@ impl LedgerService {
             let Ok(op) = postcard::from_bytes::<LedgerOp>(payload) else {
                 continue; // a non-ledger payload at this nonce → skip
             };
-            let debit = match &op {
-                LedgerOp::Claim(c) => self.resolve_debit(c.debit_account, c.debit_nonce).await,
-                LedgerOp::Transfer(_) => None,
+            let resolved = match &op {
+                LedgerOp::Claim(c) => Resolved {
+                    debit: self.resolve_debit(c.debit_account, c.debit_nonce).await,
+                    reward_share: None,
+                },
+                // A RewardClaim's share comes from the verified epoch reward RECORD — wired in the
+                // epoch-close loop (4d-3); until then a RewardClaim folds to a no-op (share None).
+                _ => Resolved::default(),
             };
-            if let Some(next) = apply(state.clone(), &op, &account, debit.as_ref()) {
+            if let Some(next) = apply(state.clone(), &op, &account, &resolved) {
                 state = next;
             }
             // else: rejected write → no-op (the nonce is spent, the balance is unchanged)
@@ -143,6 +151,18 @@ impl LedgerService {
             debit_nonce,
         }))
         .await
+    }
+
+    /// Lock `amount` of this node's liquid balance into egress ESCROW — a consumer's standing
+    /// authorisation for settlement to draw its paid egress (§7).
+    pub async fn escrow(&self, amount: u64) -> bool {
+        self.submit_own(LedgerOp::Escrow(amount)).await
+    }
+
+    /// Claim this node's reward share for `epoch` (single-use, §10.1). Credits the share recorded in
+    /// the verified epoch reward RECORD — a no-op until the epoch-close loop publishes it (4d-3).
+    pub async fn reward_claim(&self, epoch: u64) -> bool {
+        self.submit_own(LedgerOp::RewardClaim(epoch)).await
     }
 }
 

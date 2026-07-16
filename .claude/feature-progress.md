@@ -64,7 +64,14 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       the canonical reward-program cid for verify/governance-swap). **4c COMPLETE.** REMAINING = 4d: the node invokes
       the reward program at epoch close → verified → epoch reward RECORD; providers claim. Original spine: two-pass
       allocate_quota identifies rewardable bytes; uniform-rate distribution; monotonic `minted_watermark` single-use).
-- [ ] **4d — settlement (CLAIM-based) + gates** (EscrowOp→pool; `LedgerOp::RewardClaim{epoch}` credits the recorded
+- [~] **4d — settlement (CLAIM-based) + gates. 4d-1 DONE:** `crates/ledger` gained `LedgerOp::Escrow(u64)` (lock
+      balance→`escrowed`) + `LedgerOp::RewardClaim(u64)` (credit the node-resolved epoch share, single-use via
+      `claimed_epochs`); `apply` refactored to a `Resolved{debit, reward_share}` context; state gained `escrowed` +
+      `claimed_epochs`; +1 test (escrow lock/overdraft/zero, reward-claim once/replay/zero-share). LedgerService
+      `escrow`/`reward_claim` authoring + RPC/CLI (`ledger-escrow`, `ledger-reward-claim`, balance shows escrowed);
+      ledger.wasm refreshed. NEXT (4d-2/3): the node epoch-close LOOP (gather→offset→reward program→verify→publish
+      RECORD), resolve RewardClaim shares from the record, obj admission + pin gates. Original spine (EscrowOp→pool;
+      `LedgerOp::RewardClaim{epoch}` credits the recorded
       share once; node epoch-close loop gather→offset→reward→verify→publish; two-pass allocate_quota; admission + pin
       gates in obj mirroring shed_gate).
 Open gaps needing a call at their phase: (1) anchor-authority routing RESOLVED (= committee), (2) escrow reclaim lifecycle [4d],
