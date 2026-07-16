@@ -25,6 +25,7 @@ zeph-sql.workspace = true
 zeph-com.workspace = true
 zeph-cheque.workspace = true
 zeph-ledger.workspace = true
+zeph-reward.workspace = true
 zeph-events.workspace = true
 zeph-sched.workspace = true
 zeph-cipher.workspace = true

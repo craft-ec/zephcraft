@@ -75,12 +75,19 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       `set_pin_gate` + `admit_fetch`/`pin_allowed` helpers (mirror shed_gate); admission checked at the network-fetch
       boundary in `get()` (locally-decodable reads never gated), pin DOWNGRADED to non-pinned in `publish_impl` when the
       gate declines (owner-pays-pin). Unwired = permissive; wiring to the reciprocity/escrow position (needs a sync
-      cache) is 4d-3. Gates green (obj 6 tests). NEXT (4d-3): the node epoch-close LOOP (gather→offset→reward program→
-      verify→publish RECORD), resolve RewardClaim shares from the record, wire the gates to the ledger position.
-      Original spine (EscrowOp→pool;
-      `LedgerOp::RewardClaim{epoch}` credits the recorded
-      share once; node epoch-close loop gather→offset→reward→verify→publish; two-pass allocate_quota; admission + pin
-      gates in obj mirroring shed_gate).
+      cache) is 4d-3. Gates green (obj 6 tests). **4d-3 DONE (2026-07-16):** `crates/noded/src/settlement.rs`
+      `SettlementStore` — the running pool: `pay_in`→`unallocated`, `settle_epoch` distributes `unallocated` to
+      contributions via `zeph_reward::compute` (→ epoch RECORD, `unallocated→owed`), `share_of` resolves a claim, dust
+      stays `unallocated` (folds forward), records expire after N=8 epochs forfeiting unclaimed shares back (bounds
+      storage). 4 tests (conserve, dust-roll, forfeit-on-expiry, claimed-doesn't-forfeit). Wired into LedgerService:
+      `pay`→`pay_in`, RewardClaim fold→`share_of`, `reward_claim`→`claim`, `settle_epoch` + `pool_unallocated`; RPC/CLI
+      `ledger-settle-epoch`. **The full `pay → settle-epoch → reward-claim → balance` loop compiles + is wired.** Gates:
+      30 noded tests (incl. 4 settlement), fmt, clippy green. **4d COMPLETE → STEP 4 MECHANISMS COMPLETE.**
+      Production follow-ons (noted, not blocking the mechanism): cross-node pool aggregation (`pay_in` is local — the pool
+      should FOLD from all consumers' Pay writes deterministically), the real epoch-close loop gathering contributions
+      from ChequeService (settle-epoch is a single-node demo trigger), an epoch scheduler, wire the obj gates to a
+      sync-cached reciprocity position, genesis anchor-pin + wasm-publish, an active verification loop re-running the
+      ledger/reward folds, 4e-2 committee snapshots.
 Open gaps needing a call at their phase: (1) anchor-authority routing RESOLVED (= committee), (2) escrow reclaim lifecycle [4d],
 (3) cold-start grant + identity gate [4d], (4) uniform-pricing floor for the pool-average reward [4c]. (Checkpoint
 acceleration + reward-valuation decomposition RESOLVED; see TOKEN_LEDGER_BUILD.md §9.)

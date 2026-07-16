@@ -473,6 +473,7 @@ async fn handle_rpc(state: &State, line: &str) -> serde_json::Value {
         Some("ledger_claim") => rpc_ledger_claim(state, &request, id).await,
         Some("ledger_pay") => rpc_ledger_pay(state, &request, id).await,
         Some("ledger_reward_claim") => rpc_ledger_reward_claim(state, &request, id).await,
+        Some("ledger_settle_epoch") => rpc_ledger_settle_epoch(state, &request, id).await,
         Some("gov") => rpc_gov(state, id).await,
         Some("gov_propose") => rpc_gov_propose(state, &request, id).await,
         Some("gov_sign") => rpc_gov_sign(state, &request, id).await,
@@ -1277,6 +1278,40 @@ async fn rpc_ledger_reward_claim(
     };
     let ok = state.ledger.reward_claim(epoch).await;
     serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"committed": ok}})
+}
+
+/// Close an epoch: distribute the pool to THIS node's contribution (`bytes`) and publish the reward
+/// record (a single-node demo trigger; the real loop gathers all providers' cheques). Returns this
+/// node's resolved share + the remaining `unallocated` pool.
+async fn rpc_ledger_settle_epoch(
+    state: &State,
+    req: &serde_json::Value,
+    id: serde_json::Value,
+) -> serde_json::Value {
+    let (Some(epoch), Some(bytes)) = (
+        param(req, "epoch").and_then(|v| v.as_u64()),
+        param(req, "bytes").and_then(|v| v.as_u64()),
+    ) else {
+        return rpc_err(id, "settle_epoch needs 'epoch' and 'bytes'".into());
+    };
+    let me = match parse_node_id(&state.node_id) {
+        Some(n) => n.0,
+        None => return rpc_err(id, "self node id unparseable".into()),
+    };
+    let rec = state
+        .ledger
+        .settle_epoch(
+            epoch,
+            vec![zeph_reward::Contribution {
+                provider: me,
+                bytes,
+            }],
+        )
+        .await;
+    let pool = state.ledger.pool_unallocated().await;
+    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
+        "epoch": epoch, "share": rec.share_of(&me), "pool_unallocated": pool,
+    }})
 }
 
 /// Transfer `amount` from this node's account to `to` (a debit; the recipient later claims it).

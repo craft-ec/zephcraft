@@ -37,6 +37,7 @@ zeph-sql = { path = "crates/sql" }
 zeph-com = { path = "crates/com" }
 zeph-cheque = { path = "crates/cheque" }
 zeph-ledger = { path = "crates/ledger" }
+zeph-reward = { path = "crates/reward" }
 zeph-testkit = { path = "crates/testkit" }
 
 # ── Async ──

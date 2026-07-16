@@ -49,6 +49,7 @@ mod quorum_source;
 mod registry_heads;
 mod registry_net;
 mod sequence;
+mod settlement;
 mod shard_root;
 
 use std::path::{Path, PathBuf};
@@ -202,6 +203,13 @@ enum Command {
     LedgerRewardClaim {
         #[arg(long)]
         epoch: u64,
+    },
+    /// Close an epoch: distribute the pool to this node's contribution `bytes` (demo/admin trigger).
+    LedgerSettleEpoch {
+        #[arg(long)]
+        epoch: u64,
+        #[arg(long)]
+        bytes: u64,
     },
     /// Deploy a CraftCOM app: publish the WASM as a SYSTEM object (durable, managed
     /// like a database — NOT a drive file) and register it by name.
@@ -566,6 +574,9 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::LedgerRewardClaim { epoch }) => {
             cmd_ledger_reward_claim(&data_dir, epoch).await
         }
+        Some(Command::LedgerSettleEpoch { epoch, bytes }) => {
+            cmd_ledger_settle_epoch(&data_dir, epoch, bytes).await
+        }
         Some(Command::Deploy { file, name }) => cmd_deploy(&data_dir, &file, name.as_deref()).await,
         Some(Command::Apps) => cmd_apps(&data_dir).await,
         Some(Command::PublishProgram { file }) => cmd_publish_program(&data_dir, &file).await,
@@ -844,6 +855,15 @@ async fn cmd_ledger_pay(data_dir: &Path, amount: u64) -> anyhow::Result<()> {
 async fn cmd_ledger_reward_claim(data_dir: &Path, epoch: u64) -> anyhow::Result<()> {
     let params = serde_json::json!({ "epoch": epoch });
     let r = control::query_unix_params(&data_dir.join("zeph.sock"), "ledger_reward_claim", params)
+        .await?;
+    println!("{}", serde_json::to_string_pretty(&r)?);
+    Ok(())
+}
+
+/// `zeph ledger-settle-epoch --epoch <n> --bytes <b>` — close an epoch, distributing the pool.
+async fn cmd_ledger_settle_epoch(data_dir: &Path, epoch: u64, bytes: u64) -> anyhow::Result<()> {
+    let params = serde_json::json!({ "epoch": epoch, "bytes": bytes });
+    let r = control::query_unix_params(&data_dir.join("zeph.sock"), "ledger_settle_epoch", params)
         .await?;
     println!("{}", serde_json::to_string_pretty(&r)?);
     Ok(())

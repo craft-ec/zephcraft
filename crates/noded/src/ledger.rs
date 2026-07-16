@@ -18,9 +18,11 @@ use zeph_crypto::NodeIdentity;
 use zeph_ledger::{
     apply, ClaimOp, LedgerBalanceState, LedgerOp, Resolved, ResolvedDebit, TransferOp,
 };
+use zeph_reward::{Contribution, RewardRecord};
 
 use crate::anchor::AnchorDispatcher;
 use crate::sequence::SequenceStore;
+use crate::settlement::SettlementStore;
 
 /// The embedded ledger WASM program — the canonical `token-ledger` cid. Built from `apps/ledger-wasm`
 /// (a thin wrapper over `zeph-ledger`), so re-running it reproduces the node's native fold.
@@ -39,6 +41,9 @@ pub struct LedgerService {
     /// The deterministic sentinel owner of the anchored ledger — routes ordering to the epoch committee
     /// (a network-owned program has no owner key). One owner, one committee, many accounts.
     owner: [u8; 32],
+    /// The epoch-close settlement pool (running `unallocated`/`owed`, §10.1). Providers' reward shares
+    /// are resolved from here for a `RewardClaim`.
+    settlement: tokio::sync::RwLock<SettlementStore>,
 }
 
 impl LedgerService {
@@ -50,6 +55,7 @@ impl LedgerService {
             sequence,
             cid,
             owner,
+            settlement: tokio::sync::RwLock::new(SettlementStore::new()),
         }
     }
 
@@ -103,8 +109,12 @@ impl LedgerService {
                     debit: self.resolve_debit(c.debit_account, c.debit_nonce).await,
                     reward_share: None,
                 },
-                // A RewardClaim's share comes from the verified epoch reward RECORD — wired in the
-                // epoch-close loop (4d-3); until then a RewardClaim folds to a no-op (share None).
+                // A RewardClaim's share is resolved from the settlement pool's epoch record (0 if the
+                // epoch is unsettled/expired or already claimed → `apply` rejects it).
+                LedgerOp::RewardClaim(epoch) => Resolved {
+                    debit: None,
+                    reward_share: Some(self.settlement.read().await.share_of(*epoch, &account)),
+                },
                 _ => Resolved::default(),
             };
             if let Some(next) = apply(state.clone(), &op, &account, &resolved) {
@@ -153,16 +163,42 @@ impl LedgerService {
         .await
     }
 
-    /// PAY `amount` of egress cost into the epoch pool — a self-authored debit (§10.1 pay-into-pool);
-    /// the node sums `Pay` writes into the pool at epoch close.
+    /// PAY `amount` of egress cost into the epoch pool — a self-authored debit (§10.1 pay-into-pool).
+    /// On commit, the amount is added to the settlement pool's `unallocated`.
     pub async fn pay(&self, amount: u64) -> bool {
-        self.submit_own(LedgerOp::Pay(amount)).await
+        let ok = self.submit_own(LedgerOp::Pay(amount)).await;
+        if ok {
+            self.settlement.write().await.pay_in(amount);
+        }
+        ok
     }
 
-    /// Claim this node's reward share for `epoch` (single-use, §10.1). Credits the share recorded in
-    /// the verified epoch reward RECORD — a no-op until the epoch-close loop publishes it (4d-3).
+    /// Claim this node's reward share for `epoch` (single-use, §10.1). The share is resolved from the
+    /// settlement pool's epoch record; on commit, the pool marks it claimed (out of `owed`).
     pub async fn reward_claim(&self, epoch: u64) -> bool {
-        self.submit_own(LedgerOp::RewardClaim(epoch)).await
+        let ok = self.submit_own(LedgerOp::RewardClaim(epoch)).await;
+        if ok {
+            self.settlement
+                .write()
+                .await
+                .claim(epoch, self.identity.node_id().0);
+        }
+        ok
+    }
+
+    /// Close `epoch`: distribute the pool's `unallocated` to `contributions` by contribution ratio,
+    /// publishing the epoch reward RECORD (§10.1, node-orchestrated). Returns the record. The caller
+    /// gathers `contributions` from the epoch's cheques (paid-serving bytes per provider).
+    pub async fn settle_epoch(&self, epoch: u64, contributions: Vec<Contribution>) -> RewardRecord {
+        self.settlement
+            .write()
+            .await
+            .settle_epoch(epoch, contributions)
+    }
+
+    /// The current distributable (`unallocated`) pool balance — observability.
+    pub async fn pool_unallocated(&self) -> u64 {
+        self.settlement.read().await.unallocated()
     }
 }
 
