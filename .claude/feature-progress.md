@@ -2449,8 +2449,18 @@ Phases (each: build + test + gate + commit; roll together where consensus-affect
       anchors is P5; the `LedgerService` → `TokenService`/`EconomyEgressService` service split is P4.) NOTE: `LedgerOp`
       still shared (token owns it, applies Pay/RewardClaim value effect) — the op-vocab decoupling (generic
       Debit/Credit-with-memo so economy adds ops without touching token) lands with P6 subscriptions if needed.
-- [ ] **P4 — rehome settlement** (SettlementStore/Service, record_chain) under economy-egress; pool = token
-      pool account; `reward_claim` two-step (token credit → economy claim-mark) across the new boundary.
+- [x] **P4 — service split + settlement rehome DONE (2026-07-17, behavior-preserving).** New
+      `crates/noded/src/economy_egress.rs` (`EconomyEgressService`) owns the settlement pool (`SettlementStore`) +
+      committee-attested `RecordChain` + the settlement methods (settle_from_board, reward_share, reward_owed,
+      rewardable_served, pool_unallocated, local_record, dev_settle_epoch, mark_claimed, set_record_chain). It is
+      SELF-CONTAINED policy (no token-chain access). `LedgerService` (the token ledger chain) now holds
+      `Arc<EconomyEgressService>` ONE-DIRECTIONALLY (token → economy, no cycle): its `balance` fold asks
+      `economy.reward_share` when co-folding a `RewardClaim`, and `reward_claim` calls `economy.mark_claimed` on
+      commit. Rewired: `main.rs` (mod + construct economy first → pass to LedgerService::new + SettlementService::new
+      + control State), `settlement_service.rs` (holds economy; local_record/settle_from_board → economy; paid_total
+      stays on ledger), `control.rs` (State gains `economy`; reward_owed/rewardable_served/pool/dev_settle → economy;
+      balance stays on ledger). Behavior-preserving (pure service reorg — no consensus/wire change) → NO fleet roll.
+      48 noded tests green; fmt/clippy clean.
 - [ ] **P5 — genesis + dashboard:** publish `token.wasm` + `economy-egress.wasm`, pin both anchors (rename
       "reward"→"economy-egress", "token-ledger"→"token"); dashboard anchor list + labels.
 - [ ] **P6 — subscriptions in economy-egress:** governed `bytes_per_token`, subscription = locked

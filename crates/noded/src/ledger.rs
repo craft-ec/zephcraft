@@ -19,12 +19,10 @@ use zeph_crypto::NodeIdentity;
 use zeph_ledger::{
     apply, ClaimOp, LedgerBalanceState, LedgerOp, Resolved, ResolvedDebit, TransferOp,
 };
-use zeph_reward::{Contribution, RewardRecord};
 
 use crate::anchor::AnchorDispatcher;
-use crate::record_chain::RecordChain;
+use crate::economy_egress::EconomyEgressService;
 use crate::sequence::SequenceStore;
-use crate::settlement::SettlementStore;
 
 /// The embedded ledger WASM program — the canonical `token-ledger` cid. Built from `apps/ledger-wasm`
 /// (a thin wrapper over `zeph-ledger`), so re-running it reproduces the node's native fold.
@@ -43,22 +41,21 @@ pub struct LedgerService {
     /// The deterministic sentinel owner of the anchored ledger — routes ordering to the epoch committee
     /// (a network-owned program has no owner key). One owner, one committee, many accounts.
     owner: [u8; 32],
-    /// The epoch-close settlement pool (running `unallocated`/`owed`, §10.1). Providers' reward shares
-    /// are resolved from here for a `RewardClaim`. Fed CROSS-NODE by `settle_from_board` (every node folds
-    /// the identical per-node cumulatives read from the durable settlement chains), NOT by the local
-    /// `pay()` — so the epoch record is deterministic network-wide.
-    settlement: tokio::sync::RwLock<SettlementStore>,
-    /// Committee-attested record finality (set after construction). When present, a `RewardClaim` resolves
-    /// its share from the CANONICAL quorum-signed record (durable, restart-safe), falling back to the local
-    /// in-memory record only before finalization.
-    record_chain: tokio::sync::RwLock<Option<Arc<RecordChain>>>,
+    /// The ECONOMY-EGRESS policy service (settlement pool + committee-attested records), P4 split. Token
+    /// is the value authority; when it co-folds a `RewardClaim` it asks economy for the reward SHARE and
+    /// marks the epoch claimed on commit. One-directional: token → economy, no cycle.
+    economy: Arc<EconomyEgressService>,
     /// Scan cache for [`paid_total`](Self::paid_total): `account → (next_nonce, running Pay total)`. The
     /// ledger chain is append-only, so a re-read only sums NEW `Pay` writes instead of the whole chain.
     paid_scan: Mutex<HashMap<[u8; 32], (u64, u64)>>,
 }
 
 impl LedgerService {
-    pub fn new(identity: Arc<NodeIdentity>, sequence: Arc<SequenceStore>) -> Self {
+    pub fn new(
+        identity: Arc<NodeIdentity>,
+        sequence: Arc<SequenceStore>,
+        economy: Arc<EconomyEgressService>,
+    ) -> Self {
         let cid = ledger_program_cid();
         let owner = AnchorDispatcher::anchor_owner(&cid);
         Self {
@@ -66,16 +63,9 @@ impl LedgerService {
             sequence,
             cid,
             owner,
-            settlement: tokio::sync::RwLock::new(SettlementStore::new()),
-            record_chain: tokio::sync::RwLock::new(None),
+            economy,
             paid_scan: Mutex::new(HashMap::new()),
         }
-    }
-
-    /// Inject the committee-attested record finality (built after the committee/sequencer). Once set,
-    /// reward claims resolve against the canonical quorum-signed record.
-    pub async fn set_record_chain(&self, records: Arc<RecordChain>) {
-        *self.record_chain.write().await = Some(records);
     }
 
     /// The embedded ledger wasm bytes + its cid — consumed by the genesis step (publish the wasm to
@@ -141,23 +131,6 @@ impl LedgerService {
         *total
     }
 
-    /// The reward share owed to `account` for `epoch`: the CANONICAL committee-attested record's share if
-    /// one is finalized (durable, restart-safe, census-divergence-proof), else the local in-memory record.
-    async fn reward_share(&self, epoch: u64, account: &[u8; 32]) -> u64 {
-        if let Some(records) = self.record_chain.read().await.clone() {
-            if let Some(record) = records.canonical_record(epoch).await {
-                return record.share_of(account);
-            }
-        }
-        self.settlement.read().await.share_of(epoch, account)
-    }
-
-    /// Total reward `account` is owed but hasn't yet claimed, across all in-window settlement records —
-    /// the dashboard "reward earned by serving, awaiting claim" figure (the claimed part is in `balance`).
-    pub async fn reward_owed(&self, account: [u8; 32]) -> u64 {
-        self.settlement.read().await.owed_to(&account)
-    }
-
     /// Fold `account`'s committed sequence into its balance state (native — identical to a wasm
     /// re-run). An invalid write (`apply → None`) is a no-op, leaving the prior state.
     pub async fn balance(&self, account: [u8; 32]) -> LedgerBalanceState {
@@ -186,7 +159,7 @@ impl LedgerService {
                 // single-use, so double-claims are rejected regardless of the source.
                 LedgerOp::RewardClaim(epoch) => Resolved {
                     debit: None,
-                    reward_share: Some(self.reward_share(*epoch, &account).await),
+                    reward_share: Some(self.economy.reward_share(*epoch, &account).await),
                 },
                 _ => Resolved::default(),
             };
@@ -249,61 +222,12 @@ impl LedgerService {
     pub async fn reward_claim(&self, epoch: u64) -> bool {
         let ok = self.submit_own(LedgerOp::RewardClaim(epoch)).await;
         if ok {
-            self.settlement
-                .write()
-                .await
-                .claim(epoch, self.identity.node_id().0);
+            // Co-fold's economy effect on commit: mark the epoch claimed in the settlement pool.
+            self.economy
+                .mark_claimed(epoch, self.identity.node_id().0)
+                .await;
         }
         ok
-    }
-
-    /// Cross-node epoch close (§10.1, node-orchestrated by the settlement loop). `paid` = each node's
-    /// `(node, paid_cumulative)` and `cheques` = every `(provider, consumer, cumulative_bytes, timestamp)`
-    /// from the converged, proof-verified announcement board; the store applies the PER-CONSUMER FCFS cap
-    /// (a consumer's paid quota bounds its rewardable serving) then pool-average. Idempotent per epoch.
-    /// Every node passes the identical inputs, so the record is bit-for-bit identical network-wide.
-    pub async fn settle_from_board(
-        &self,
-        epoch: u64,
-        paid: Vec<([u8; 32], u64)>,
-        cheques: Vec<([u8; 32], [u8; 32], u64, u64)>,
-    ) -> RewardRecord {
-        self.settlement
-            .write()
-            .await
-            .settle_epoch_from_cheques(epoch, paid, cheques)
-    }
-
-    /// This provider's cumulative REWARDABLE served bytes (the per-consumer-capped "settled" side of the
-    /// dashboard settled/served meter). Gross served is the cheque `total_earned`.
-    pub async fn rewardable_served(&self, provider: [u8; 32]) -> u64 {
-        self.settlement.read().await.rewardable_served(&provider)
-    }
-
-    /// DEV/manual override (the `ledger-settle-epoch` RPC): inject `pool` + settle `epoch` with the given
-    /// `contributions` directly, bypassing the announcement loop — exercises the settlement math offline.
-    /// The production path is [`settle_from_board`], driven automatically by the settlement loop.
-    pub async fn dev_settle_epoch(
-        &self,
-        epoch: u64,
-        pool: u64,
-        contributions: Vec<Contribution>,
-    ) -> RewardRecord {
-        self.settlement
-            .write()
-            .await
-            .settle_epoch_with_pool(epoch, pool, contributions)
-    }
-
-    /// The current distributable (`unallocated`) pool balance — observability.
-    pub async fn pool_unallocated(&self) -> u64 {
-        self.settlement.read().await.unallocated()
-    }
-
-    /// This node's OWN computed record for `epoch` (its settle re-execution) — the verification loop
-    /// compares it against the canonical committee-attested record.
-    pub async fn local_record(&self, epoch: u64) -> Option<RewardRecord> {
-        self.settlement.read().await.record(epoch)
     }
 }
 

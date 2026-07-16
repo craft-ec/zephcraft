@@ -246,6 +246,8 @@ pub struct State {
     pub anchor: std::sync::Arc<crate::anchor::AnchorDispatcher>,
     /// Token-ledger service — author ledger writes (committee-ordered) + fold account balances.
     pub ledger: std::sync::Arc<crate::ledger::LedgerService>,
+    /// Economy-egress policy service (settlement pool + records) — P4 split from the token ledger.
+    pub economy: std::sync::Arc<crate::economy_egress::EconomyEgressService>,
     /// Settlement service — the epoch-close loop + its re-execution verification tally.
     pub settlement: std::sync::Arc<crate::settlement_service::SettlementService>,
     /// Serving-cheque service — reciprocity standing (earned/consumed/paid + grants) for the dashboard.
@@ -289,9 +291,9 @@ impl State {
             }
             Economy {
                 balance: self.ledger.balance(me).await.balance,
-                reward_owed: self.ledger.reward_owed(me).await,
-                reward_settled: self.ledger.rewardable_served(me).await,
-                pool: self.ledger.pool_unallocated().await,
+                reward_owed: self.economy.reward_owed(me).await,
+                reward_settled: self.economy.rewardable_served(me).await,
+                pool: self.economy.pool_unallocated().await,
                 verified,
                 mismatched,
                 reciprocity: Some(self.cheque.reciprocity_snapshot()),
@@ -1377,7 +1379,7 @@ async fn rpc_ledger_settle_epoch(
         None => return rpc_err(id, "self node id unparseable".into()),
     };
     let rec = state
-        .ledger
+        .economy
         .dev_settle_epoch(
             epoch,
             pool_in,
@@ -1387,7 +1389,7 @@ async fn rpc_ledger_settle_epoch(
             }],
         )
         .await;
-    let pool = state.ledger.pool_unallocated().await;
+    let pool = state.economy.pool_unallocated().await;
     serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
         "epoch": epoch, "share": rec.share_of(&me), "pool_unallocated": pool,
     }})
@@ -1398,7 +1400,7 @@ async fn rpc_ledger_settle_epoch(
 /// current distributable pool — observability for the correctness-by-re-execution loop.
 async fn rpc_ledger_verification(state: &State, id: serde_json::Value) -> serde_json::Value {
     let (verified, mismatched) = state.settlement.verification_stats();
-    let pool = state.ledger.pool_unallocated().await;
+    let pool = state.economy.pool_unallocated().await;
     serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
         "verified": verified, "mismatched": mismatched, "pool_unallocated": pool,
     }})

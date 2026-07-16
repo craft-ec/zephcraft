@@ -48,6 +48,7 @@ use zeph_reward::RewardRecord;
 
 use crate::anchor::AnchorDispatcher;
 use crate::cheque::ChequeService;
+use crate::economy_egress::EconomyEgressService;
 use crate::ledger::LedgerService;
 use crate::record_chain::RecordChain;
 use crate::sequence::SequenceStore;
@@ -125,8 +126,11 @@ pub struct SettlementService {
     sequence: Arc<SequenceStore>,
     /// Serving measurement + its cheque proof (`total_earned` / `serving_proof`).
     cheques: Arc<ChequeService>,
-    /// Pool + settle sink — durable `Pay` total (`paid_total`, from the ledger chain) and the settle.
+    /// Token ledger — the durable `Pay` total (`paid_total`, read from the ledger chain).
     ledger: Arc<LedgerService>,
+    /// Economy-egress policy — the settle sink (`settle_from_board`) + this node's own `local_record`
+    /// (P4 split: settlement lives under economy, not the token ledger).
+    economy: Arc<EconomyEgressService>,
     /// Committee-attested record finality — this node attests each epoch's record here if it's on the
     /// committee, and claims resolve against the canonical (quorum-signed) record.
     records: Arc<RecordChain>,
@@ -147,12 +151,14 @@ pub struct SettlementService {
 }
 
 impl SettlementService {
+    #[allow(clippy::too_many_arguments)] // a settlement loop with many node-service deps
     pub fn new(
         identity: Arc<NodeIdentity>,
         clock: Arc<Clock>,
         sequence: Arc<SequenceStore>,
         cheques: Arc<ChequeService>,
         ledger: Arc<LedgerService>,
+        economy: Arc<EconomyEgressService>,
         records: Arc<RecordChain>,
         obj: Arc<ObjEngine>,
     ) -> Arc<Self> {
@@ -165,6 +171,7 @@ impl SettlementService {
             sequence,
             cheques,
             ledger,
+            economy,
             records,
             obj,
             report_scan: Mutex::new(HashMap::new()),
@@ -191,7 +198,7 @@ impl SettlementService {
         let Some(canonical) = self.records.canonical_record(epoch).await else {
             return; // not finalized yet — nothing to verify against
         };
-        let Some(local) = self.ledger.local_record(epoch).await else {
+        let Some(local) = self.economy.local_record(epoch).await else {
             return; // this node didn't settle E locally (e.g., joined late)
         };
         if local == canonical {
@@ -383,7 +390,7 @@ impl SettlementService {
                 }
             }
         }
-        self.ledger.settle_from_board(epoch, paid, cheques).await
+        self.economy.settle_from_board(epoch, paid, cheques).await
     }
 
     /// Reconstruct the in-memory settlement state on startup by replaying the last `CLAIM_WINDOW_EPOCHS`

@@ -40,6 +40,7 @@ mod attest;
 mod board;
 mod cheque;
 mod control;
+mod economy_egress;
 mod epoch_committee;
 mod genesis;
 mod governance;
@@ -1746,21 +1747,26 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         governance_store.clone(),
         com_service.clone(),
     ));
+    // The ECONOMY-EGRESS policy service (settlement pool + committee-attested records) — P4 split from the
+    // token ledger. Built first so the token ledger can hold it (token → economy, one-directional) to
+    // resolve a RewardClaim's share + mark it claimed.
+    let economy_service = std::sync::Arc::new(economy_egress::EconomyEgressService::new());
     // The token-ledger service (§11 step 4): authors owner-signed ledger writes ordered by the epoch
     // committee, and folds an account's sequence into its balance via the shared zeph-ledger crate.
     let ledger_service = std::sync::Arc::new(ledger::LedgerService::new(
         identity.clone(),
         sequence_store.clone(),
+        economy_service.clone(),
     ));
     // Committee-attested record finality: committee members write their computed epoch record (signed) to
     // a records chain; a quorum of matching signatures finalizes the CANONICAL record. Claims resolve
-    // against it (durable + restart-safe), so the ledger reads it too.
+    // against it (durable + restart-safe), so economy reads it for reward_share.
     let record_chain = record_chain::RecordChain::new(
         identity.clone(),
         sequence_store.clone(),
         epoch_committee.clone(),
     );
-    ledger_service.set_record_chain(record_chain.clone()).await;
+    economy_service.set_record_chain(record_chain.clone()).await;
     // The cross-node epoch-close loop (§10.1): each node authors a per-epoch {paid, served, proof} report
     // as a COMMITTEE-ORDERED write on its settlement chain (the same durable sequencer the ledger rides);
     // every node settles each epoch by reading the SAME committed reports, so the reward record is
@@ -1771,6 +1777,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         sequence_store.clone(),
         cheque_service.clone(),
         ledger_service.clone(),
+        economy_service.clone(),
         record_chain.clone(),
         engine.clone(),
     );
@@ -1816,6 +1823,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         gov: governance_store.clone(),
         anchor: anchor_dispatcher.clone(),
         ledger: ledger_service.clone(),
+        economy: economy_service.clone(),
         settlement: settlement_service.clone(),
         cheque: cheque_service.clone(),
         epoch_committee: epoch_committee.clone(),
