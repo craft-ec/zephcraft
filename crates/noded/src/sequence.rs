@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, RwLock};
@@ -43,6 +43,21 @@ use zeph_transport::{tag, TaggedStream, Transport};
 #[allow(unused_imports)]
 use crate::attest::AttestStore;
 use crate::quorum_source::QuorumSource;
+
+/// Min interval between cross-node anti-entropy syncs of the SAME sequence [2026-07-17].
+///
+/// `sequence_of` used to call [`SequenceStore::sync`] on EVERY read, and `sync` fans a DHT head lookup
+/// out to EVERY census peer — so ONE read cost O(census) DHT lookups (each verifying signatures). The
+/// economy's read patterns multiplied that badly: `LedgerService::balance` resolves a debit PER `Claim`
+/// op while folding, so a chain with `c` claims cost O(c × census) lookups per balance read, and the
+/// dashboard reads balance on every snapshot. Profiling an IDLE 5-node fleet found ~half a core burned
+/// in Ed25519 verification down this path.
+///
+/// The log is APPEND-ONLY and every caller re-runs on its own timer, so a read at most this stale is
+/// harmless — a commit missed now is picked up on the next window. Kept SHORT deliberately: a `Claim`
+/// needs its debit visible, and this bounds how long a just-committed transfer can stay unseen (that
+/// race already exists via network delay; this must not widen it materially).
+const SYNC_DEBOUNCE: Duration = Duration::from_secs(2);
 
 /// How long a collector waits for one member's sign-solicitation reply before moving on.
 const SOLICIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -92,6 +107,8 @@ pub struct SequenceStore {
     /// This member's PERSISTENT signed-set — `(owner, program, account, nonce) → hash(write)` it has
     /// signed — so it never equivocates (signs two different writes at one nonce), even across restart.
     signed: RwLock<HashMap<SignedKey, [u8; 32]>>,
+    /// Last cross-node anti-entropy sync per sequence — the READ path debounce (see [`SYNC_DEBOUNCE`]).
+    last_sync: RwLock<HashMap<SeqKey, Instant>>,
 }
 
 impl SequenceStore {
@@ -144,6 +161,7 @@ impl SequenceStore {
             quorums,
             transport,
             signed: RwLock::new(signed),
+            last_sync: RwLock::new(HashMap::new()),
         })
     }
 
@@ -204,7 +222,8 @@ impl SequenceStore {
     }
 
     /// The ordered log for `(owner, program, account)` — syncing from peers first, so any node reads
-    /// the same committed order.
+    /// the same committed order. The sync is DEBOUNCED ([`SYNC_DEBOUNCE`]); the commit path calls
+    /// [`sync`](Self::sync) directly because its nonce check must see the live length.
     pub async fn sequence_of(
         &self,
         owner: [u8; 32],
@@ -212,8 +231,24 @@ impl SequenceStore {
         account: [u8; 32],
     ) -> Option<AccountSequence> {
         let key = (owner, program_cid, account);
-        self.sync(&key).await;
+        self.sync_debounced(&key).await;
         self.sequences.read().await.get(&key).cloned()
+    }
+
+    /// Anti-entropy for the READ path: at most one [`sync`](Self::sync) per sequence per
+    /// [`SYNC_DEBOUNCE`]. `sync` fans a DHT head lookup to EVERY census peer, so an undebounced read
+    /// costs O(census) lookups — and the economy's readers call this per participant, per census node,
+    /// and per `Claim` op while folding a balance, which multiplied it into the idle-CPU burn this
+    /// debounce removes. Check-and-set under one write lock so concurrent readers can't stampede.
+    async fn sync_debounced(&self, key: &SeqKey) {
+        {
+            let mut last = self.last_sync.write().await;
+            match last.get(key) {
+                Some(t) if t.elapsed() < SYNC_DEBOUNCE => return, // synced recently → read local
+                _ => last.insert(*key, Instant::now()),
+            };
+        }
+        self.sync(key).await;
     }
 
     /// Publish an account's committed sequence: durable content + a per-(owner,program,account) DHT
