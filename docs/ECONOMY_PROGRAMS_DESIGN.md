@@ -50,7 +50,18 @@ atomicity per write, and value flows across accounts are self-authored against a
 Solana-style atomic multi-account transaction would only be needed for a value move spanning two
 uncontrolled accounts in one instruction — which this design deliberately avoids.)
 
-## 4. CPI (`invoke_program`) — general primitive, but NOT on the verified settlement path
+## 4. CPI (`invoke_program`) — a CALCULATION primitive, not a transaction primitive
+
+**Why CPI here is read-only (the load-bearing rationale):** ZephCraft is **single-writer-per-identity** — every
+write is self-authored on the writer's own account chain. A cross-program *state change* therefore never means
+"program A writes program B's state"; it means **one self-authored write co-folded by both programs** (§3). So
+there is no cross-program *write* to atomize, and CPI is needed only for **calculation** — a deterministic read
+of another program's committed state/logic (token's claim-fold asking economy for `share_of(epoch)`). This is
+the opposite of Solana, whose *multi-writer* model forces CPI to atomically mutate program-owned accounts inside
+a global transaction (privilege delegation, reentrancy, all-or-nothing rollback). ZephCraft CPI returns a value,
+never mutates a callee, runs the callee under the deterministic capability subset — so it can't reenter or
+escalate, and verifier re-execution reproduces it trivially.
+
 
 - **What:** a host fn `invoke_program(anchor_name|cid, func, input) -> output` + `Capability::InvokeProgram`,
   callee run under `CapabilityGrant::deterministic()` (no wall-clock/random/verify/attest/sequence) so the
