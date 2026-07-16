@@ -78,6 +78,23 @@ escalate, and verifier re-execution reproduces it trivially.
 materializes into each program's namespace (a subscribe updates token's `balance` row AND economy's `quota`
 row, each in its own reserved namespace, single-writer per account); CPI reads them read-only.
 
+**SECURITY INVARIANT — reserved namespaces are RE-EXECUTION-authoritative, NOT owner-signature-authoritative
+(2026-07-16).** This is the opposite trust model from a user-app namespace and it MUST NOT be conflated:
+- **User-app namespace:** the owner *is* the authority — single-writer, owner-signed head, no re-execution.
+  Forging your own app data only fools yourself; nobody else depends on it.
+- **Reserved/protocol namespace:** the owner is *NOT* the authority. State is valid ONLY as the canonical
+  program's **re-execution over the owner's quorum-ordered op-log**. A malicious node running a custom binary
+  can write any forged page (`balance = 1e9`, `quota = ∞`) with the correct shape into its own reserved
+  namespace — its own node believes it — but every honest node **re-derives** the state by re-running
+  `token::apply`/`economy::apply` over the ordered ops and DISCARDS any claimed page that isn't the fold
+  result. Same shape, wrong value → rejected. Two walls: ops are quorum-ordered + `apply`-validated (can't
+  author free money); materialized state is a cache, never the authority.
+- **The rule P2–P4 must honor:** a CPI read (`balance_of`, `share_of`) and the token/economy folds ALWAYS
+  re-derive reserved-namespace state from the ordered op-log — they must NEVER trust a target's self-published
+  materialized page. The check fires at every cross-node dependency (Claim, settlement, CPI read, the verify
+  loop); forge-and-never-use is harmless, forge-and-use is caught on first re-execution. No new trust
+  assumption vs. the existing "correctness by re-execution" model.
+
 
 - **What:** a host fn `invoke_program(anchor_name|cid, func, input) -> output` + `Capability::InvokeProgram`,
   callee run under `CapabilityGrant::deterministic()` (no wall-clock/random/verify/attest/sequence) so the
