@@ -103,10 +103,23 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       first-sight only baselines (no cold-start over-count). This also removed the node's boundary-delta bookkeeping (it
       just announces current cumulatives). `MAX_SETTLE_FRAME`→256 KiB for the proof. 4 new tests incl. the anti-farm case
       (signed-but-unbacked rejected) + watermark deltas/baseline. 34 noded tests, fmt, clippy green.
-      **Hardening follow-ons:** anti-entropy PULL of missed-epoch announcements (a node that misses an
-      epoch's gossip can't reproduce its record), proof COMPACTION for very large networks (an accumulator vs the full
-      per-consumer cheque set), PAID proof (cross-check `paid` against the committee-ordered Pay writes), wire the obj gates to a sync-cached reciprocity position, genesis
-      anchor-pin + wasm-publish, an active verification loop re-running the ledger/reward folds, 4e-2 committee snapshots.
+- [x] **4d-6 — SETTLEMENT MOVED OFF GOSSIP ONTO THE DURABLE SEQUENCER (2026-07-16).** User insight: a gossip board is
+      ephemeral, so a record built from it can't be re-derived — which quietly breaks the VERIFICATION story (verification
+      re-runs a record from durable inputs; gossip leaves none). Pivoted `settlement_service.rs` to ride the same
+      committee-ordered account-chain substrate the ledger rides: each node authors a `SettleReport {epoch,
+      paid_cumulative, served_cumulative, proof}` as a COMMITTEE-ORDERED WRITE on its own settlement chain
+      (`settle_cid = Cid::of("craftec/settlement-chain/1")`, owner = anchor sentinel → routed to the epoch committee, exactly
+      like a ledger write; durable via obj). To settle epoch E, `settle()` reads each census participant's chain to its
+      latest report with `epoch ≤ E` (`cumulatives_of`), VERIFIES the cheque proof (`verified_served`), and feeds the
+      cumulatives to `settle_from_board` (unchanged watermark model). **Deterministic AND durable + re-derivable** — no
+      gossip, no anti-entropy, no partition-divergence; a behind node reads the log to catch up and a verifier re-reads it.
+      Removed: `tag::SETTLE` gossip (announce/serve/accept + the board; tag 11 RESERVED). Kept: `proven_cumulative`,
+      watermark settle, cheque proof. 34 noded tests (proof + report-verify incl. the anti-farm case), fmt, clippy green.
+      **Remaining follow-ons:** committee COMMITS the canonical record (full finality / deterministic participant set vs the
+      converged census); proof via obj-cid + fetch (the 64 KiB write frame limits the inline proof on large nets) or proof
+      COMPACTION; a scan-cache for `cumulatives_of` (re-scans each chain per settle); persist watermarks (else lose one
+      epoch's baseline per restart); PAID proof (cross-check `paid` vs the committee-ordered Pay writes); wire the obj gates
+      to a sync-cached reciprocity position; genesis anchor-pin + wasm-publish; an active verification loop; 4e-2 committee snapshots.
 Open gaps needing a call at their phase: (1) anchor-authority routing RESOLVED (= committee), (2) escrow reclaim lifecycle [4d],
 (3) cold-start grant + identity gate [4d], (4) uniform-pricing floor for the pool-average reward [4c]. (Checkpoint
 acceleration + reward-valuation decomposition RESOLVED; see TOKEN_LEDGER_BUILD.md §9.)

@@ -1717,13 +1717,14 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         identity.clone(),
         sequence_store.clone(),
     ));
-    // The cross-node epoch-close loop (§10.1): each node gossips a signed per-epoch {paid, served}
-    // summary over tag::SETTLE; every node folds the converging board and settles each epoch from the
-    // SAME set, so the reward record is deterministic network-wide (what verification re-runs).
+    // The cross-node epoch-close loop (§10.1): each node authors a per-epoch {paid, served, proof} report
+    // as a COMMITTEE-ORDERED write on its settlement chain (the same durable sequencer the ledger rides);
+    // every node settles each epoch by reading the SAME committed reports, so the reward record is
+    // deterministic AND durable — re-derivable by any node and re-runnable by verification (no gossip).
     let settlement_service = settlement_service::SettlementService::new(
         identity.clone(),
         transport.clock(),
-        transport.clone(),
+        sequence_store.clone(),
         cheque_service.clone(),
         ledger_service.clone(),
     );
@@ -1918,10 +1919,6 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // Serving-cheque pushes (a consumer sends us a cumulative cheque for bytes we served it).
     let (cheque_stream_tx, cheque_stream_rx) = tokio::sync::mpsc::channel(32);
     stream_handlers.push((zeph_transport::tag::CHEQUE, cheque_stream_tx));
-    // Epoch settlement announcements (each node's signed per-epoch {paid, served}; we fold them into the
-    // converging settlement board). Additive → mixed-version-safe.
-    let (settle_stream_tx, settle_stream_rx) = tokio::sync::mpsc::channel(32);
-    stream_handlers.push((zeph_transport::tag::SETTLE, settle_stream_tx));
     let server = transport.clone();
     tokio::spawn(async move { server.serve(stream_handlers).await });
     tokio::spawn(engine.clone().serve(piece_stream_rx));
@@ -1938,8 +1935,8 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // Record inbound cheques (provider side) + drain the outbound push queue (consumer side).
     tokio::spawn(cheque_service.clone().serve(cheque_stream_rx));
     tokio::spawn(cheque_service.clone().run_pusher(cheque_push_rx));
-    // Collect inbound settlement announcements + run the epoch-close loop (announce → settle).
-    tokio::spawn(settlement_service.clone().serve(settle_stream_rx));
+    // Run the epoch-close loop: author this node's settlement report + settle past-grace epochs by
+    // reading the durable, committee-ordered settlement chains (no gossip handler needed).
     tokio::spawn(settlement_service.clone().run());
     // "Pending distribution" completion (per-incomplete-cid DHT resolve + deficit pushes)
     // — network fan-out, so it runs THROUGH the coordinator (Distribution priority,
