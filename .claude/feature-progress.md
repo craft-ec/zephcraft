@@ -275,6 +275,22 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       via mv-aside install since the shared /usr/local/bin/zeph was text-file-busy; staggered restart, all active/NRestarts=0/
       peers=4). **Verified live:** `/api/board` returns real data on both Mac and Hetzner main (2 satisfied verify requests,
       func `f`, k=1). UI markers served fleet-wide.
+- [x] **4d-23 — ECONOMY TERMINOLOGY + TWO-ALLOCATION MODEL (2026-07-16, commits 93660d5 + doc).** User-driven model
+      refinement + rename. **Model (now in design-doc §8, in place):** the bandwidth cheque ledger presents as TWO
+      allocations by tier, distinct from the token/reward ledger. Free fetch → **headroom** (`earned + grant − consumed`,
+      real-time gated); **paid fetch → unlimited, never touches headroom** (reconciled retroactively at settlement — matches
+      §8 "no consumption-time gate for paid"). **Serving anyone always grows headroom** (paid consumers too), on top of the
+      settlement claim. Settlement = BOTH layers: per-consumer quota cap + **FCFS-by-cheque-timestamp** (`allocate_quota`,
+      already built in crates/cheque P1) sets the rewardable basis → **uniform pool-average per-byte rate** (§10.1 rev
+      2026-07-16) pays it. **UI rename:** `reciprocity` card → **usage** (free/paid sub-tiers), `token ledger` → **reward**
+      (dropped the overloaded "token"). Removed `+paid` from the headroom calc. Three meters: free headroom · paid usage
+      (unlimited) · reward balance/pool + paid-serving `settled/served`. UI-only + doc; gate --quick PASSED; rolled to full
+      5-node fleet (Mac + 4 Hetzner, all peers=4). **BACKEND FOLLOW-ON (not yet built):** the `settled/served` provider
+      meter + a paid-consumed counter need the settlement service to expose per-node settled + paid-served bytes (sum
+      RewardRecord.shares over the claim window); until then paid-serving shows "no paid serving yet" (honest at zero paid
+      traffic) and paid-fetch shows "unlimited". The precise §8 gate split (route paid fetches to a separate unlimited
+      allocation vs the current folded `consumed ≤ earned+grant+paid` budget) is also deferred — low-risk while the fleet
+      has zero paid traffic.
       **Remaining follow-ons:** dedicated storage-provided measure + persist `pinned`; reciprocity policy as a full governed
       PROGRAM (only if the formula must be swappable); 4e-2 committee snapshots. (Verify-board→durable deferred by user.)
 Open gaps needing a call at their phase: (1) anchor-authority routing RESOLVED (= committee), (2) escrow reclaim lifecycle [4d],
