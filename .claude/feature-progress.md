@@ -39,9 +39,13 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       Transfer debits self (checked, reject overdraft/zero); Claim credits self from a node-resolved sender debit
       (to==me + single-use dedup) — recipient credit = CLAIM (each account a fold of its own chain). 4 tests
       (debit/overdraft/zero, claim once/wrong-recipient/missing/replay, transfer→claim conserves, postcard roundtrip).
-      NEXT: 4b-2 `apps/ledger-wasm` (thin wasm wrapper, state/input/commit) + blob → cid; 4b-3 `noded::ledger`
-      (LedgerService: author SequencedWrite via the sequencer under the committee; resolve a claim's debit; balance
-      RPC) + wiring. Validity = always-on re-execution (no checkpoint).
+      4b-2 DONE: `zeph_ledger` gained `ResolvedDebit` (serde) + `LedgerInput{account, op, debit}` + `run_transition`
+      (decode→apply→encode = the whole program body; account is sequencer-authenticated, so trusted); `apps/ledger-wasm`
+      (thin cdylib wrapper over the shared crate, mirrors registry-wasm) builds to wasm32 (18 KB blob → crates/noded/
+      ledger.wasm for the node to embed/publish); +1 test (run_transition commit + overdraft-reject). 5 crate tests.
+      NEXT: 4b-3 `noded::ledger` (LedgerService: author a SequencedWrite via the sequencer under the epoch committee;
+      resolve a claim's debit from the sender's sequence; native fold for the balance cache; balance/transfer RPCs) +
+      genesis-publish the wasm + pin the `token-ledger` anchor. Validity = always-on re-execution (no checkpoint).
 - [ ] **4c — reward = pool-average (separate program)** (reward-valuation program via invoke_program; two-pass
       allocate_quota identifies rewardable bytes; uniform-rate distribution; monotonic `minted_watermark` single-use).
 - [ ] **4d — settlement + tiers** (two-pass allocate_quota reciprocity-offset; EscrowOp/SettleClaim; admission + pin

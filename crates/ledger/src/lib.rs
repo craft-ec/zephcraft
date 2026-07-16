@@ -74,9 +74,30 @@ impl LedgerBalanceState {
 /// The resolved debit a claim references: the node supplies the sender's ORDERED `TransferOp`
 /// (validated as a committed entry of `debit_account`'s sequence) so this pure transition can check
 /// `to == me` + the amount. `None` at the call site means the node could not resolve/validate it.
-#[derive(Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedDebit {
     pub transfer: TransferOp,
+}
+
+/// The full input the node hands the ledger program for one write: the account being advanced (its
+/// identity is authenticated by the sequencer's `owner_authentic` gate — the owner signed for it — so
+/// the program trusts it), the op (the write's payload), and, for a `Claim`, the node-resolved debit.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct LedgerInput {
+    pub account: [u8; 32],
+    pub op: LedgerOp,
+    #[serde(default)]
+    pub debit: Option<ResolvedDebit>,
+}
+
+/// Convenience: decode the prior state + a [`LedgerInput`], apply, and return the new state blob to
+/// commit (`None` = reject → commit nothing). This is the whole program body — the `apps/ledger-wasm`
+/// wrapper and the native node both call it, so their results are identical by construction.
+pub fn run_transition(prev_state: &[u8], input: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+    let state = LedgerBalanceState::decode(prev_state)?;
+    let inp: LedgerInput = postcard::from_bytes(input).ok()?;
+    let next = apply(state, &inp.op, &inp.account, inp.debit.as_ref())?;
+    postcard::to_allocvec(&next).ok()
 }
 
 /// Apply one ledger op to `caller`'s state — pure + deterministic, so every node and every verifier
@@ -229,5 +250,34 @@ mod tests {
             LedgerBalanceState::decode(&[]).unwrap(),
             LedgerBalanceState::default()
         );
+    }
+
+    #[test]
+    fn run_transition_is_the_whole_program_body() {
+        // The exact path `apps/ledger-wasm` runs: decode prev + LedgerInput → apply → encode.
+        let alice = acct(1);
+        let bob = acct(2);
+        let prev = postcard::to_allocvec(&LedgerBalanceState {
+            balance: 50,
+            ..Default::default()
+        })
+        .unwrap();
+        let input = postcard::to_allocvec(&LedgerInput {
+            account: alice,
+            op: transfer(bob, 20),
+            debit: None,
+        })
+        .unwrap();
+        let out = run_transition(&prev, &input).expect("valid transfer commits");
+        let next: LedgerBalanceState = postcard::from_bytes(&out).unwrap();
+        assert_eq!(next.balance, 30);
+        // An overdraft input rejects → no commit.
+        let bad = postcard::to_allocvec(&LedgerInput {
+            account: alice,
+            op: transfer(bob, 999),
+            debit: None,
+        })
+        .unwrap();
+        assert!(run_transition(&prev, &bad).is_none());
     }
 }

@@ -1,0 +1,21 @@
+[package]
+name = "zeph-ledger-wasm"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# The shared transition crate — the wasm program is a thin ABI wrapper over it, so the node's native
+# fold and a verifier's re-run of this wasm produce identical results by construction.
+zeph-ledger = { path = "../../crates/ledger" }
+dlmalloc = { version = "0.2", features = ["global"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"
+strip = true
+
+[workspace]
