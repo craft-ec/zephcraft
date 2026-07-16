@@ -120,6 +120,26 @@ row, each in its own reserved namespace, single-writer per account); CPI reads t
 - Crates: `zeph_ledger` → `zeph_token` (slimmed); new `zeph_economy_egress` (absorbs `Pay`/`RewardClaim` +
   `zeph_reward::compute`). Wasm artifacts renamed + rebuilt; genesis publishes + pins both anchors.
 
+## 5b. P3 split — the co-fold seam (refined 2026-07-16)
+
+`apply()` today mutates ONE `LedgerBalanceState` for all four ops. The split partitions the *state*, and one
+account write is **co-folded** by both program slices in-process (no CPI needed for the internal flow — CPI
+is the general external-read primitive from P2):
+- **`zeph_token` — the balance authority.** `TokenState { balance, processed_claims }`. Handles the *value
+  effect* of every op: `Transfer` (debit), `Claim` (credit), and the debit/credit that `Pay`/`RewardClaim`
+  carry. Knows money, not egress.
+- **`zeph_economy_egress` — the policy authority.** `EconomyState { claimed_epochs }` + the derived pool +
+  record. Handles the *policy effect*: `Pay` contributes to the derived egress pool (node sums Pay writes),
+  `RewardClaim` marks `claimed_epochs` (single-use dedup) and yields the reward **share** from the record.
+- **Co-fold order for `RewardClaim`:** economy folds first (dedup `claimed_epochs`; reject if already claimed;
+  produce `share` from the committee-attested record) → token credits `balance` by that `share`. Both are the
+  effect of ONE write on the provider's own chain (single-writer → atomic, §3). The `share` passes fold→fold
+  **in-process**, so no CPI is required for the token↔economy internal path; CPI (P2) is the general primitive
+  for *external* programs reading token/economy (and future economy-\* reading token).
+
+So P3 is: split the state + `apply` into a token slice and an economy slice, co-folded by `LedgerService`
+(native). The service split into `TokenService` / `EconomyEgressService` + rehoming settlement is P4.
+
 ## 6. Phase plan (each phase: build + test + gate + commit; roll together where consensus-affecting)
 
 1. **P1 — anchor-name constants + rename `reward` → `economy-egress`** (mechanical; re-pin anchor at genesis).
