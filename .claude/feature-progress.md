@@ -161,9 +161,18 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       oldest replayed epoch baselines (contributes 0, it's at the forfeit edge) + pre-window dust isn't reconstructed
       (safe direction — under-distribute, never inflate). 36 noded tests, fmt, clippy green. NEXT: durable ChequeBook (the
       provider's raw received cheques — its earnings evidence — is still memory-only).
-      **Remaining follow-ons:** durable ChequeBook (in progress); `canonical_record` scan-cache (per-claim); wire the obj
-      gates to a sync-cached reciprocity position; genesis anchor-pin + wasm-publish; an active verification loop; 4e-2
-      committee snapshots. (Verify-board→durable deferred by user.)
+- [x] **4d-12 — DURABLE CHEQUE BOOK (recovers after total data loss) DONE (2026-07-16).** The provider's `ChequeBook`
+      (its received counterparty-signed cheques = earnings evidence) was memory-only. But the node ALREADY publishes that
+      cheque set as its settlement-report PROOF (4d-9: inline or a durable obj SYSTEM object, replicated network-wide), so
+      no new store is needed. On startup `reconstruct_cheque_book` reads the node's OWN latest durable report, resolves the
+      proof (fetches the obj object — recoverable network-wide even after disk loss), and MERGE-loads it via new
+      `ChequeService::load_cheques` (`ChequeBook::record` keeps the highest per consumer → never downgrades a fresh
+      cheque). So `total_earned`/`serving_proof` recover to the last reported value; cheques received since the last report
+      self-heal (consumers re-send cumulative cheques). A never-reported node recovers nothing (had no earnings). 36 noded
+      tests, fmt, clippy green. **Settlement now survives TOTAL local data loss** — state, own paid, and earnings all
+      rebuild from the durable network chains.
+      **Remaining follow-ons:** `canonical_record` scan-cache (per-claim); wire the obj gates to a sync-cached reciprocity
+      position; genesis anchor-pin + wasm-publish; an active verification loop; 4e-2 committee snapshots. (Verify-board→durable deferred by user.)
 Open gaps needing a call at their phase: (1) anchor-authority routing RESOLVED (= committee), (2) escrow reclaim lifecycle [4d],
 (3) cold-start grant + identity gate [4d], (4) uniform-pricing floor for the pool-average reward [4c]. (Checkpoint
 acceleration + reward-valuation decomposition RESOLVED; see TOKEN_LEDGER_BUILD.md §9.)

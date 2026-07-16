@@ -87,6 +87,16 @@ impl ChequeService {
         self.book.lock().expect("cheque book lock").cheques()
     }
 
+    /// MERGE `cheques` into the book (recovery). `record` keeps the highest cumulative per consumer, so
+    /// this never downgrades a fresher cheque — used on startup to rebuild the book from this node's own
+    /// durable settlement-report proof after a restart / total data loss.
+    pub fn load_cheques(&self, cheques: Vec<ServingCheque>) {
+        let mut book = self.book.lock().expect("cheque book lock");
+        for c in cheques {
+            book.record(c);
+        }
+    }
+
     /// Drain the push queue: resolve each cheque's provider address and push it fire-and-forget on
     /// `tag::CHEQUE` (reply ignored, like `tag::BOARD`). No-op targets (unknown addr) are dropped.
     pub async fn run_pusher(self: Arc<Self>, mut rx: mpsc::Receiver<ServingCheque>) {

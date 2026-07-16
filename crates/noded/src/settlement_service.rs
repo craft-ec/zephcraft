@@ -342,6 +342,41 @@ impl SettlementService {
         }
     }
 
+    /// Rebuild this node's cheque book from its OWN latest durable settlement report's proof — the cheque
+    /// set the node published (inline or as a durable obj object) is its serving evidence, so a node that
+    /// lost all local data recovers its earnings from the network instead of from local disk. `record`
+    /// merges (keeps the highest per consumer), so this is safe even if a few fresh cheques already arrived.
+    async fn reconstruct_cheque_book(&self) {
+        let account = self.identity.node_id().0;
+        let Some(seq) = self
+            .sequence
+            .sequence_of(self.settle_owner, self.settle_cid, account)
+            .await
+        else {
+            return;
+        };
+        // The latest report (highest nonce) carries the most-complete cheque set.
+        let mut latest: Option<SettleReport> = None;
+        for nonce in 0..seq.next_nonce() {
+            if let Some(payload) = seq.payload_at(nonce) {
+                if let Ok(r) = postcard::from_bytes::<SettleReport>(payload) {
+                    latest = Some(r);
+                }
+            }
+        }
+        let Some(report) = latest else {
+            return; // never reported → nothing to recover
+        };
+        let cheques = match &report.proof {
+            ServedProof::Inline(c) => c.clone(),
+            ServedProof::Ref(cid) => match self.obj.get(Cid(*cid), ConsumeMode::Drop).await {
+                Ok(bytes) => postcard::from_bytes::<Vec<ServingCheque>>(&bytes).unwrap_or_default(),
+                Err(_) => return, // proof not fetchable → skip (consumers re-send cumulative cheques)
+            },
+        };
+        self.cheques.load_cheques(cheques);
+    }
+
     /// The epoch-close loop: author this node's report for the just-closed epoch, then settle every epoch
     /// that has passed its grace window (in order) by reading the durable settlement chains.
     pub async fn run(self: Arc<Self>) {
@@ -364,6 +399,9 @@ impl SettlementService {
             // the correct watermarks/pool/records rather than re-baselining from empty. Then baseline the
             // closed/settled cursors past the replayed window.
             if !initialized {
+                // Recover this node's cheque book (earnings evidence) from its own durable report, then
+                // rebuild the settlement state — both from the network, so total data loss is survivable.
+                self.reconstruct_cheque_book().await;
                 let settled_through = now.saturating_sub(1 + SETTLE_GRACE_EPOCHS);
                 self.reconstruct_through(settled_through).await;
                 last_reported = Some(now.saturating_sub(1));
