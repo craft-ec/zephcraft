@@ -62,6 +62,22 @@ a global transaction (privilege delegation, reentrancy, all-or-nothing rollback)
 never mutates a callee, runs the callee under the deterministic capability subset — so it can't reenter or
 escalate, and verifier re-execution reproduces it trivially.
 
+**Two mechanics the DB model forces (2026-07-16):**
+- **CPI is shaped to the token's standard interface, not an opaque invoke.** A caller invokes the **CTS-1 token
+  shape** — a defined read surface (`balance_of(account)`, `share_of(epoch, provider)`, …) — so the economy-\*
+  family all compose against the same interface. `invoke_program(anchor|cid, func, input)` where `func` is a
+  named interface method.
+- **The callee runs in ITS OWN reserved DB namespace.** `sql_query`/`sql_execute` are gated to `ctx.app_ns`, so
+  `invoke_program` switches `ctx.app_ns` to the **callee's reserved namespace** and grants **`Sql` read only**
+  (plus the deterministic subset), never write. The callee queries its own state and `commit`s a value; the
+  caller sees only the returned value, never the callee's raw namespace. Value moves remain the self-authored
+  co-folded write (§3) — CPI can *compute over* token state but never *mutate* it.
+
+**Reserved namespaces.** Canonical programs (`token`, `economy-egress`, `economy-storage`, …) get
+**protocol-reserved** DB namespaces a user app cannot claim. Their state lives there; a co-folded write
+materializes into each program's namespace (a subscribe updates token's `balance` row AND economy's `quota`
+row, each in its own reserved namespace, single-writer per account); CPI reads them read-only.
+
 
 - **What:** a host fn `invoke_program(anchor_name|cid, func, input) -> output` + `Capability::InvokeProgram`,
   callee run under `CapabilityGrant::deterministic()` (no wall-clock/random/verify/attest/sequence) so the
