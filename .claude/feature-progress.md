@@ -2504,7 +2504,32 @@ Phases (each: build + test + gate + commit; roll together where consensus-affect
         made pub for it.
       - Verified: 8 economy (5 new subscription) + 16 settlement (2 new: price multiplies, entitlement expires) +
         50 noded tests green; fmt/clippy clean. Old quota tests kept as invariants, pinned to unit price.
-- [ ] **P7 — deploy** (wire+consensus → simultaneous fleet roll).
+- [ ] **P7 — deploy** (wire+consensus → SIMULTANEOUS fleet roll). BLOCKED on (a) a green gate and (b) user
+      go-ahead. NOT rolled — fleet untouched.
+      **GATE RED on scenario B (2026-07-17) — PROVEN NOT P5/P6.** Full gate: 7/8, scenario B census-20 at
+      35.41s vs a 30s bar (one node stuck at census 10 at cutoff; all 20 converge by ~35.4s). Controlled A/B on
+      this Mac:
+      | run | context | census-20 |
+      | baseline P4 (a48526c) | isolated | 8.35s PASS |
+      | HEAD P5+P6 | isolated | 8.76s PASS |
+      | HEAD P5+P6 | full suite | 35.41s FAIL |
+      | HEAD P5+P6 | full suite re-run | 35.43s FAIL |
+      | baseline P4 | full suite | 8/8 PASS (758s) |
+      The baseline-in-suite PASS vs HEAD-in-suite FAIL looks damning, but is a CONFOUNDED comparison —
+      **`cargo tree -p zeph-tests` links NONE of the crates P5/P6 touched** (token/economy-egress/ledger/noded/
+      reward/apps), and `git diff a48526c..HEAD` over the harness's ENTIRE closure (core, crypto, dht,
+      membership, obj, routing, sched, store, transport, wire, sql, testkit, tests/) is EMPTY. Both runs execute
+      the SAME machine code ⇒ the difference is environment/luck, and scenario B's 30s bar is simply FLAKY under
+      suite load (~2/3 fail rate now). Don't re-hunt this as a P5/P6 regression.
+      **Likely environmental cause (untested hypothesis):** the last green gate was 2026-07-13 (A-G 8/8); the Mac
+      node was RESPAWNED 2026-07-16 and now burns ~26% CPU competing with the gate's 20 in-process nodes on the
+      same box. Candidate fixes for the USER to pick: stop the Mac node during gates / re-cut the 30s bar for a
+      box that now hosts a live node / investigate why ONE node lags to ~35s under sustained load (that lag is in
+      UNTOUCHED code — a pre-existing property, present in the baseline binary too, so it is a real but separate
+      question).
+      **METHOD NOTE (lesson):** isolated-vs-isolated was the WRONG comparison for a gate that runs in-suite, and
+      in-suite-vs-in-suite was CONFOUNDED because the harness doesn't link the changed code. The decisive check
+      was the dependency closure — do that FIRST next time a gate reds on a subsystem the diff doesn't name.
 
 ATOMICITY (resolved 2026-07-16, docs §3): a value move is NEVER a two-op cross-account transaction (half-commit
 risk). It's ONE self-authored write on ONE account chain, co-folded by both programs (token debits balance,
