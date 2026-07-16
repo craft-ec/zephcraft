@@ -35,6 +35,7 @@ pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muz
 pub static malloc_conf: &[u8] = b"dirty_decay_ms:1000,muzzy_decay_ms:0\0";
 
 mod account;
+mod anchor;
 mod attest;
 mod board;
 mod cheque;
@@ -149,11 +150,20 @@ enum Command {
         /// Optional input passed to the agent (UTF-8 bytes, via the `input` host fn).
         #[arg(long)]
         input: Option<String>,
+        /// Invoke a K1 ANCHOR (a governance-pinned canonical program name) instead of --name/--wasm.
+        #[arg(long)]
+        anchor: Option<String>,
     },
     /// Resolve a published app NAME to its current cid — WITHOUT fetching content.
     /// Tolerant of a briefly-unreachable writer (tries the shard's replicas in turn).
     Resolve {
         /// `<publisher_hex>/<app>` — the owner's node id (64 hex) and the app name.
+        #[arg(long)]
+        name: String,
+    },
+    /// Resolve a K1 ANCHOR: a canonical name → its governance-pinned program cid + interface version.
+    AnchorResolve {
+        /// The canonical anchor name (e.g. `token-ledger`).
         #[arg(long)]
         name: String,
     },
@@ -491,6 +501,7 @@ async fn main() -> anyhow::Result<()> {
             wasm,
             func,
             input,
+            anchor,
         }) => {
             cmd_invoke(
                 &data_dir,
@@ -499,10 +510,12 @@ async fn main() -> anyhow::Result<()> {
                 wasm.as_deref(),
                 &func,
                 input.as_deref(),
+                anchor.as_deref(),
             )
             .await
         }
         Some(Command::Resolve { name }) => cmd_resolve(&data_dir, &name).await,
+        Some(Command::AnchorResolve { name }) => cmd_anchor_resolve(&data_dir, &name).await,
         Some(Command::Deploy { file, name }) => cmd_deploy(&data_dir, &file, name.as_deref()).await,
         Some(Command::Apps) => cmd_apps(&data_dir).await,
         Some(Command::PublishProgram { file }) => cmd_publish_program(&data_dir, &file).await,
@@ -710,21 +723,32 @@ async fn cmd_invoke(
     wasm: Option<&str>,
     func: &str,
     input: Option<&str>,
+    anchor: Option<&str>,
 ) -> anyhow::Result<()> {
-    if name.is_none() && wasm.is_none() {
-        anyhow::bail!("provide --name <app> or --wasm <cid>");
+    if name.is_none() && wasm.is_none() && anchor.is_none() {
+        anyhow::bail!("provide --name <app>, --wasm <cid>, or --anchor <name>");
     }
     let params = serde_json::json!({
-        "name": name, "app_ns": app, "wasm_cid": wasm, "func": func, "input": input
+        "name": name, "app_ns": app, "wasm_cid": wasm, "func": func, "input": input, "anchor": anchor
     });
     let res = control::query_unix_params(&data_dir.join("zeph.sock"), "invoke", params).await?;
     let output = res.get("output").and_then(|v| v.as_str()).unwrap_or("");
-    let label = name.or(app).unwrap_or("app");
+    let label = anchor.or(name).or(app).unwrap_or("app");
     if output.is_empty() {
         println!("app '{label}' committed (empty)");
     } else {
         println!("app '{label}' committed {output}");
     }
+    Ok(())
+}
+
+/// `zeph anchor-resolve --name <anchor>` — resolve a K1 anchor to its governance-pinned program cid
+/// + interface version + the deterministic sentinel owner.
+async fn cmd_anchor_resolve(data_dir: &Path, name: &str) -> anyhow::Result<()> {
+    let params = serde_json::json!({ "name": name });
+    let r =
+        control::query_unix_params(&data_dir.join("zeph.sock"), "anchor_resolve", params).await?;
+    println!("{}", serde_json::to_string_pretty(&r)?);
     Ok(())
 }
 
@@ -1542,6 +1566,13 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         engine.clone(),
         routing.clone(),
     ));
+    // K1 anchor dispatcher: resolve a canonical NAME → its governance-pinned program cid + interface
+    // version, and dispatch invocations to it (the read/dispatch half of K1). First consumer: the
+    // token-ledger protocol program (step 4).
+    let anchor_dispatcher = std::sync::Arc::new(anchor::AnchorDispatcher::new(
+        governance_store.clone(),
+        com_service.clone(),
+    ));
     let state = Arc::new(control::State {
         clock: transport.clock(),
         boot_stage: tokio::sync::RwLock::new("booting".to_string()),
@@ -1582,6 +1613,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         com: com_service.clone(),
         registry: head_registry.clone(),
         gov: governance_store.clone(),
+        anchor: anchor_dispatcher.clone(),
         accounts: account_store.clone(),
         attest: attest_store.clone(),
         sequence: sequence_store.clone(),

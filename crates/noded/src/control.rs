@@ -208,6 +208,8 @@ pub struct State {
     pub registry: std::sync::Arc<crate::headreg::HeadRegistry>,
     /// Governance: one durable chain deriving both the governor set and program registry.
     pub gov: std::sync::Arc<crate::governance::GovernanceChainStore>,
+    /// K1 anchor dispatcher — resolve a canonical name → its governance-pinned program cid, and dispatch.
+    pub anchor: std::sync::Arc<crate::anchor::AnchorDispatcher>,
     /// Generic program accounts — any program's single-writer state (the program is the writer).
     pub accounts: std::sync::Arc<crate::account::ProgramAccountStore>,
     /// Per-program attestation quorum chains (the `attest` host fn's backend).
@@ -463,6 +465,7 @@ async fn handle_rpc(state: &State, line: &str) -> serde_json::Value {
         Some("program_advance") => rpc_program_advance(state, &request, id).await,
         Some("program_resolve") => rpc_program_resolve(state, &request, id).await,
         Some("resolve_name") => rpc_resolve_name(state, &request, id).await,
+        Some("anchor_resolve") => rpc_anchor_resolve(state, &request, id).await,
         Some("gov") => rpc_gov(state, id).await,
         Some("gov_propose") => rpc_gov_propose(state, &request, id).await,
         Some("gov_sign") => rpc_gov_sign(state, &request, id).await,
@@ -1201,6 +1204,26 @@ async fn rpc_resolve_name(
     serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"cid": cid.map(hex::encode)}})
 }
 
+/// Resolve a K1 anchor: a canonical name → its governance-pinned program cid + interface version +
+/// the deterministic sentinel owner. `cid: null` when nothing is anchored at that name.
+async fn rpc_anchor_resolve(
+    state: &State,
+    req: &serde_json::Value,
+    id: serde_json::Value,
+) -> serde_json::Value {
+    let Some(name) = param(req, "name").and_then(|v| v.as_str()) else {
+        return rpc_err(id, "anchor_resolve needs a 'name'".into());
+    };
+    match state.anchor.resolve(name).await {
+        Some(res) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
+            "cid": hex::encode(res.cid),
+            "interface_version": res.interface_version,
+            "owner": hex::encode(crate::anchor::AnchorDispatcher::anchor_owner(&res.cid)),
+        }}),
+        None => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"cid": null}}),
+    }
+}
+
 async fn rpc_deploy(
     state: &State,
     req: &serde_json::Value,
@@ -1614,6 +1637,33 @@ async fn rpc_invoke(
 ) -> serde_json::Value {
     let p = &req["params"];
     let func = p.get("func").and_then(|v| v.as_str()).unwrap_or("run");
+    // K1 anchor invoke: dispatch to the governance-pinned program behind a canonical anchor name.
+    // The sentinel owner drives the quorum lookup — never a caller-supplied owner.
+    if let Some(anchor_name) = p
+        .get("anchor")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        let caller = match parse_node_id(&state.node_id) {
+            Some(n) => n.0,
+            None => return rpc_err(id, "self node id unparseable".into()),
+        };
+        let input = p
+            .get("input")
+            .and_then(|v| v.as_str())
+            .map(|s| s.as_bytes().to_vec())
+            .unwrap_or_default();
+        return match state
+            .anchor
+            .invoke_anchor(anchor_name, func, input, caller)
+            .await
+        {
+            Ok(out) => {
+                serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"output": hex::encode(out)}})
+            }
+            Err(e) => rpc_err(id, format!("anchor invoke failed: {e}")),
+        };
+    }
     // Resolve the app's WASM cid — by NAME (`<pubhex>/<name>` or `<name>` = own,
     // via the signed KIND_APP head) or by a raw `wasm_cid`.
     // `program_owner` = the registry-authenticated publisher when resolved by name — the identity

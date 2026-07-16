@@ -15,8 +15,13 @@ reward-valuation program** via a new **`invoke_program`** host fn (deterministic
 crate (not a hand-mirrored wasm twin).
 
 Build order (resequenced — 4e before the ledger; invoke_program before 4c):
-- [ ] **4a — K1 anchor-dispatcher** (`anchor.rs`; un-dead-code governance `resolve` + interface-version via config key
-      `anchor:<name>:iface`; `--anchor` invoke path; sentinel anchor-owner → committee quorum source).
+- [x] **4a — K1 anchor-dispatcher DONE 2026-07-16.** `crates/noded/src/anchor.rs` (`AnchorDispatcher`:
+      `resolve(name)→{cid,interface_version}` via governance `resolve` + config key `anchor:<name>:iface`;
+      `anchor_owner(cid)` = deterministic `pda(cid,"craftec/anchor-owner/1")` sentinel; `invoke_anchor` →
+      `InvokeService::invoke` with the sentinel owner). Un-dead-coded `GovernanceChainStore::resolve`. Wired into
+      `control::State`; RPC `anchor_resolve` + `--anchor` branch in `rpc_invoke`; CLI `AnchorResolve` + `invoke
+      --anchor`. 1 unit test (sentinel deterministic + cid-bound). Gates: build/test/fmt/clippy green. (Sentinel→
+      committee quorum routing is 4e; for now a stateless anchor invoke works, stateful awaits the committee.)
 - [ ] **4e — rotating epoch committee** (`quorum_source.rs` trait + `epoch_committee.rs`; generalize SequenceStore to
       `Arc<dyn QuorumSource>`; per-epoch snapshots for historical re-verify).
 - [ ] **4a-bis — `invoke_program` primitive** (com host fn + `Capability::InvokeProgram`; deterministic-callee only).

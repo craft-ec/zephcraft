@@ -135,10 +135,9 @@ impl GovernanceChainStore {
         Ok(set)
     }
 
-    /// Resolve a network-owned program's canonical cid from the derived program registry. Read
-    /// side of the `SetProgram` governance feature; currently unused in-tree (the registry program
-    /// went native — memory `registry-native-validation-not-wasm-hook`), kept as the generic API.
-    #[allow(dead_code)]
+    /// Resolve a network-owned program's canonical cid from the derived program registry — the READ
+    /// side of the `SetProgram` governance feature. Consumed by the K1 [`AnchorDispatcher`](crate::anchor)
+    /// to dispatch a canonical NAME to its currently-pinned program cid.
     pub async fn resolve(&self, name: &str) -> Option<[u8; 32]> {
         self.chain
             .read()
