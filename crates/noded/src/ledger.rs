@@ -22,6 +22,7 @@ use zeph_ledger::{
 use zeph_reward::{Contribution, RewardRecord};
 
 use crate::anchor::AnchorDispatcher;
+use crate::record_chain::RecordChain;
 use crate::sequence::SequenceStore;
 use crate::settlement::SettlementStore;
 
@@ -50,6 +51,10 @@ pub struct LedgerService {
     /// This node's CUMULATIVE `Pay` total (monotonic; incremented on each committed `pay`). The settlement
     /// loop reads it as the node's `paid_cumulative` when authoring its per-epoch settlement report.
     total_paid: AtomicU64,
+    /// Committee-attested record finality (set after construction). When present, a `RewardClaim` resolves
+    /// its share from the CANONICAL quorum-signed record (durable, restart-safe), falling back to the local
+    /// in-memory record only before finalization.
+    record_chain: tokio::sync::RwLock<Option<Arc<RecordChain>>>,
 }
 
 impl LedgerService {
@@ -63,7 +68,14 @@ impl LedgerService {
             owner,
             settlement: tokio::sync::RwLock::new(SettlementStore::new()),
             total_paid: AtomicU64::new(0),
+            record_chain: tokio::sync::RwLock::new(None),
         }
+    }
+
+    /// Inject the committee-attested record finality (built after the committee/sequencer). Once set,
+    /// reward claims resolve against the canonical quorum-signed record.
+    pub async fn set_record_chain(&self, records: Arc<RecordChain>) {
+        *self.record_chain.write().await = Some(records);
     }
 
     /// The embedded ledger wasm bytes + its cid — consumed by the genesis step (publish the wasm to
@@ -117,6 +129,17 @@ impl LedgerService {
         total
     }
 
+    /// The reward share owed to `account` for `epoch`: the CANONICAL committee-attested record's share if
+    /// one is finalized (durable, restart-safe, census-divergence-proof), else the local in-memory record.
+    async fn reward_share(&self, epoch: u64, account: &[u8; 32]) -> u64 {
+        if let Some(records) = self.record_chain.read().await.clone() {
+            if let Some(record) = records.canonical_record(epoch).await {
+                return record.share_of(account);
+            }
+        }
+        self.settlement.read().await.share_of(epoch, account)
+    }
+
     /// Fold `account`'s committed sequence into its balance state (native — identical to a wasm
     /// re-run). An invalid write (`apply → None`) is a no-op, leaving the prior state.
     pub async fn balance(&self, account: [u8; 32]) -> LedgerBalanceState {
@@ -140,11 +163,12 @@ impl LedgerService {
                     debit: self.resolve_debit(c.debit_account, c.debit_nonce).await,
                     reward_share: None,
                 },
-                // A RewardClaim's share is resolved from the settlement pool's epoch record (0 if the
-                // epoch is unsettled/expired or already claimed → `apply` rejects it).
+                // A RewardClaim's share resolves from the CANONICAL committee-attested record if one is
+                // finalized (durable + restart-safe), else the local in-memory record. `apply` enforces
+                // single-use, so double-claims are rejected regardless of the source.
                 LedgerOp::RewardClaim(epoch) => Resolved {
                     debit: None,
-                    reward_share: Some(self.settlement.read().await.share_of(*epoch, &account)),
+                    reward_share: Some(self.reward_share(*epoch, &account).await),
                 },
                 _ => Resolved::default(),
             };

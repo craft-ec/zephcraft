@@ -41,6 +41,7 @@ use zeph_membership::Membership;
 use crate::anchor::AnchorDispatcher;
 use crate::cheque::ChequeService;
 use crate::ledger::LedgerService;
+use crate::record_chain::RecordChain;
 use crate::sequence::SequenceStore;
 
 /// Epoch length (ms) — MUST match `epoch_committee::EPOCH_MILLIS` so settlement epochs align with the
@@ -104,6 +105,9 @@ pub struct SettlementService {
     cheques: Arc<ChequeService>,
     /// Pool + settle sink — cumulative `Pay` total (`total_paid`) and the epoch-close settle.
     ledger: Arc<LedgerService>,
+    /// Committee-attested record finality — this node attests each epoch's record here if it's on the
+    /// committee, and claims resolve against the canonical (quorum-signed) record.
+    records: Arc<RecordChain>,
     /// The settlement chain's program cid + its anchor-sentinel owner (routes ordering to the committee).
     settle_cid: [u8; 32],
     settle_owner: [u8; 32],
@@ -116,6 +120,7 @@ impl SettlementService {
         sequence: Arc<SequenceStore>,
         cheques: Arc<ChequeService>,
         ledger: Arc<LedgerService>,
+        records: Arc<RecordChain>,
     ) -> Arc<Self> {
         let settle_cid = Cid::of(SETTLE_PROGRAM_TAG).0;
         let settle_owner = AnchorDispatcher::anchor_owner(&settle_cid);
@@ -126,6 +131,7 @@ impl SettlementService {
             sequence,
             cheques,
             ledger,
+            records,
             settle_cid,
             settle_owner,
         })
@@ -217,7 +223,9 @@ impl SettlementService {
     }
 
     /// Settle epoch `E` from the durable chains: read each participant's cumulatives as of `E` (proof-
-    /// verified) and feed them to the ledger, which folds each node's watermark delta into the record.
+    /// verified), feed them to the ledger (which folds each node's watermark delta into the record), then
+    /// — if this node is on the committee — ATTEST the resulting record to the records chain, so a quorum
+    /// of matching signatures finalizes the canonical record other nodes resolve claims against.
     async fn settle(&self, epoch: u64) {
         let mut entries: Vec<([u8; 32], u64, u64)> = Vec::new();
         for account in self.participants().await {
@@ -225,7 +233,8 @@ impl SettlementService {
                 entries.push((account, paid_cum, served_cum));
             }
         }
-        self.ledger.settle_from_board(epoch, entries).await;
+        let record = self.ledger.settle_from_board(epoch, entries).await;
+        self.records.attest(epoch, &record).await;
     }
 
     /// The epoch-close loop: author this node's report for the just-closed epoch, then settle every epoch

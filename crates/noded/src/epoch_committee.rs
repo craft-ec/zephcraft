@@ -99,6 +99,15 @@ impl QuorumSource for EpochCommitteeSource {
     }
 }
 
+impl EpochCommitteeSource {
+    /// The committee for a SPECIFIC (program, epoch) over the current converged census — used to attest /
+    /// verify a past epoch's record (the `current` `quorum_for` only serves the live epoch).
+    pub async fn committee_for_epoch(&self, program_cid: &[u8; 32], epoch: u64) -> Option<Quorum> {
+        let eligible = self.eligible().await;
+        Self::committee_for(program_cid, epoch, &eligible)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

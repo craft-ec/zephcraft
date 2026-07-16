@@ -120,11 +120,21 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       reported `paid_cumulative` at that (`min`), so a node can't inflate the pool beyond what it actually paid
       (under-reporting only shrinks its own contribution — griefing, not theft). Both settlement sides are now
       proof-bounded (served via cheques, paid via the ledger chain). 34 noded tests, fmt, clippy green.
-      **Remaining follow-ons:** committee COMMITS the canonical record (full finality / deterministic participant set vs the
-      converged census); proof via obj-cid + fetch (the 64 KiB write frame limits the inline proof on large nets) or proof
-      COMPACTION; a scan-cache for `cumulatives_of`/`paid_total` (re-scans each chain per settle); persist watermarks (else
-      lose one epoch's baseline per restart); wire the obj gates to a sync-cached reciprocity position; genesis anchor-pin +
-      wasm-publish; an active verification loop; 4e-2 committee snapshots. (Verify-board→durable deferred by user 2026-07-16.)
+- [x] **4d-8 — COMMITTEE-ATTESTED RECORD FINALITY DONE (2026-07-16).** The epoch record is now canonical + durable, not
+      per-node in-memory. `record_attest.rs` (pure primitive): a committee member `sign_share`s the record it computed
+      (`domain‖epoch‖hash(record)`); `RecordAttestation::is_canonical` = ≥ threshold DISTINCT committee members signed the
+      SAME record (non-members/dupes/wrong-record rejected) — reuses the `Quorum` primitive over the COMPUTED epoch
+      committee (declared-quorum `AttestStore` can't fit a rotating committee). `record_chain.rs`: `RecordChain` writes each
+      committee member's `SignedRecord` to a second anchored, committee-ordered records chain (`craftec/settlement-records/1`);
+      `canonical_record(E)` groups members' shares BY record and returns the one a quorum agreed (robust to a minority
+      divergence). Wired: `SettlementService::settle` attests after settling; `LedgerService::reward_share` resolves a
+      `RewardClaim` from the canonical record if finalized (durable + restart-safe + census-divergence-proof), else the
+      local record (`apply` still enforces single-use). `EpochCommitteeSource::committee_for_epoch` added for a past epoch.
+      2 new primitive tests. 36 noded tests, fmt, clippy green.
+      **Remaining follow-ons (all non-urgent / scale / perf):** proof via obj-cid + fetch (the 64 KiB write frame limits the
+      inline cheque proof past ~430 consumers/node) or proof COMPACTION; a scan-cache for `cumulatives_of`/`paid_total`/
+      `canonical_record` (re-scan each chain per settle); wire the obj gates to a sync-cached reciprocity position; genesis
+      anchor-pin + wasm-publish; an active verification loop; 4e-2 committee snapshots. (Verify-board→durable deferred by user.)
 Open gaps needing a call at their phase: (1) anchor-authority routing RESOLVED (= committee), (2) escrow reclaim lifecycle [4d],
 (3) cold-start grant + identity gate [4d], (4) uniform-pricing floor for the pool-average reward [4c]. (Checkpoint
 acceleration + reward-valuation decomposition RESOLVED; see TOKEN_LEDGER_BUILD.md §9.)

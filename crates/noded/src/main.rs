@@ -46,6 +46,8 @@ mod headreg;
 mod ledger;
 mod peers;
 mod quorum_source;
+mod record_attest;
+mod record_chain;
 mod registry_heads;
 mod registry_net;
 mod sequence;
@@ -1717,6 +1719,15 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         identity.clone(),
         sequence_store.clone(),
     ));
+    // Committee-attested record finality: committee members write their computed epoch record (signed) to
+    // a records chain; a quorum of matching signatures finalizes the CANONICAL record. Claims resolve
+    // against it (durable + restart-safe), so the ledger reads it too.
+    let record_chain = record_chain::RecordChain::new(
+        identity.clone(),
+        sequence_store.clone(),
+        epoch_committee.clone(),
+    );
+    ledger_service.set_record_chain(record_chain.clone()).await;
     // The cross-node epoch-close loop (§10.1): each node authors a per-epoch {paid, served, proof} report
     // as a COMMITTEE-ORDERED write on its settlement chain (the same durable sequencer the ledger rides);
     // every node settles each epoch by reading the SAME committed reports, so the reward record is
@@ -1727,6 +1738,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         sequence_store.clone(),
         cheque_service.clone(),
         ledger_service.clone(),
+        record_chain.clone(),
     );
     let state = Arc::new(control::State {
         clock: transport.clock(),
