@@ -307,7 +307,7 @@ mod tests {
         s.settle_epoch(1, vec![contrib(1, 60), contrib(2, 40)]); // 1→60, 2→40
         s.pay_in(50);
         s.settle_epoch(2, vec![contrib(1, 1)]); // 1→50
-        // Provider 1 is owed 60 (epoch 1) + 50 (epoch 2) across records; provider 2 owed 40.
+                                                // Provider 1 is owed 60 (epoch 1) + 50 (epoch 2) across records; provider 2 owed 40.
         assert_eq!(s.owed_to(&prov(1)), 110);
         assert_eq!(s.owed_to(&prov(2)), 40);
         // Claiming epoch 1 drops it out of `owed`.

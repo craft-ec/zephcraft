@@ -98,11 +98,12 @@ pub struct ChequeService {
     pinned: AtomicU64,
     /// The LIVE storage-standing grant (bytes), from the governed `reciprocity:storage_grant` config.
     storage_grant: AtomicU64,
-    /// THIS node's cumulative Pay into the pool (from the durable ledger chain, refreshed periodically) —
-    /// the PAID-tier term: paying lifts the admission budget beyond reciprocity, so a paid user isn't gated.
+    /// THIS node's cumulative Pay into the pool (from the durable ledger chain, refreshed periodically).
+    /// A node with `my_paid > 0` is a PAID user: its fetches are unlimited + routed to `paid_consumed`
+    /// (never touch free headroom), reconciled retroactively at settlement.
     my_paid: AtomicU64,
-    /// Per-peer cumulative Pay into the pool (each peer's `paid_total`, refreshed periodically) — the
-    /// PAID-tier term for the serve gate, so a paid REQUESTER isn't gated by our per-peer reciprocity.
+    /// Per-peer cumulative Pay into the pool (each peer's `paid_total`, refreshed periodically). A peer
+    /// with `peer_paid > 0` is a PAID requester → served without a reciprocity limit (unlimited serve).
     peer_paid: Mutex<HashMap<[u8; 32], u64>>,
     /// Cheques to push (drained by [`run_pusher`](ChequeService::run_pusher)); `on_bytes_received` must
     /// not block, so it enqueues here rather than doing the network push inline.
@@ -477,8 +478,15 @@ mod tests {
         let gb = 1u64 << 30;
         // Free user: exhaust the grant → gated.
         svc.on_bytes_received(NodeId([7u8; 32]), gb);
-        assert!(!svc.reciprocity_admits(1), "free user gated once grant spent");
-        assert_eq!(svc.reciprocity_snapshot().consumed, gb, "free bytes → consumed");
+        assert!(
+            !svc.reciprocity_admits(1),
+            "free user gated once grant spent"
+        );
+        assert_eq!(
+            svc.reciprocity_snapshot().consumed,
+            gb,
+            "free bytes → consumed"
+        );
         assert_eq!(svc.reciprocity_snapshot().paid_consumed, 0);
         // Becoming a PAID user (paid anything into the pool) → unlimited fetch, no headroom impact.
         svc.set_my_paid(1);
@@ -500,7 +508,10 @@ mod tests {
         let pid = peer.node_id().0;
         let grant = 256u64 * 1024 * 1024; // DEFAULT_PEER_GRANT
                                           // Free requester that served us nothing is capped at the per-peer grant.
-        assert!(!svc.should_serve(pid, grant + 1), "free requester capped at grant");
+        assert!(
+            !svc.should_serve(pid, grant + 1),
+            "free requester capped at grant"
+        );
         // Once it has PAID into the pool it is served without reciprocity limit.
         svc.set_peer_paid(pid, 1);
         assert!(
