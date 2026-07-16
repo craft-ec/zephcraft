@@ -43,12 +43,12 @@ pub struct LedgerService {
     /// (a network-owned program has no owner key). One owner, one committee, many accounts.
     owner: [u8; 32],
     /// The epoch-close settlement pool (running `unallocated`/`owed`, §10.1). Providers' reward shares
-    /// are resolved from here for a `RewardClaim`. Fed CROSS-NODE by the settlement loop (Σ every node's
-    /// announced pays), NOT by the local `pay()` — so every node's pool folds the identical aggregate and
-    /// the epoch record is deterministic network-wide.
+    /// are resolved from here for a `RewardClaim`. Fed CROSS-NODE by `settle_from_board` (every node folds
+    /// the identical per-node cumulatives read from the durable settlement chains), NOT by the local
+    /// `pay()` — so the epoch record is deterministic network-wide.
     settlement: tokio::sync::RwLock<SettlementStore>,
     /// This node's CUMULATIVE `Pay` total (monotonic; incremented on each committed `pay`). The settlement
-    /// loop reads its per-epoch DELTA to announce this node's pay-in contribution to the shared pool.
+    /// loop reads it as the node's `paid_cumulative` when authoring its per-epoch settlement report.
     total_paid: AtomicU64,
 }
 
@@ -91,6 +91,30 @@ impl LedgerService {
             // The referenced write isn't a transfer → not a claimable debit.
             LedgerOp::Claim(_) | LedgerOp::Pay(_) | LedgerOp::RewardClaim(_) => None,
         }
+    }
+
+    /// The account's cumulative committed `Pay` total — the sum of its `Pay` writes on the durable,
+    /// committee-ordered ledger chain. This is the DURABLE proof of the paid side of settlement: a node's
+    /// reported `paid_cumulative` is cross-checked against (capped at) this, so it can't inflate the pool
+    /// beyond what it actually paid.
+    pub async fn paid_total(&self, account: [u8; 32]) -> u64 {
+        let Some(seq) = self
+            .sequence
+            .sequence_of(self.owner, self.cid, account)
+            .await
+        else {
+            return 0;
+        };
+        let mut total = 0u64;
+        for nonce in 0..seq.next_nonce() {
+            let Some(payload) = seq.payload_at(nonce) else {
+                break;
+            };
+            if let Ok(LedgerOp::Pay(amount)) = postcard::from_bytes::<LedgerOp>(payload) {
+                total = total.saturating_add(amount);
+            }
+        }
+        total
     }
 
     /// Fold `account`'s committed sequence into its balance state (native — identical to a wasm

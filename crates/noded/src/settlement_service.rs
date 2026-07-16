@@ -10,7 +10,9 @@
 //!    counterparty-signed cheques (one per consumer) that BACK `served_cumulative`. Durable via obj.
 //! 2. **Read** — to settle epoch `E`, a node folds each participant's settlement chain to its latest
 //!    report with `epoch ≤ E`, VERIFYING the cheque proof (every cheque consumer-signed and naming that
-//!    node as server, summing to the claimed `served_cumulative`); an unbacked report is skipped.
+//!    node as server, summing to the claimed `served_cumulative`); an unbacked report is skipped. The
+//!    reported `paid_cumulative` is likewise CAPPED at the node's actual committee-ordered `Pay` total on
+//!    its ledger chain, so neither side of the settlement can be inflated.
 //! 3. **Settle** — feed the per-node cumulatives to [`LedgerService::settle_from_board`], which folds each
 //!    node's WATERMARK DELTA — `paid_cumulative − paid_watermark` into the pool, `served_cumulative −
 //!    served_watermark` as the reward weight — so inflating or replaying cheques earns nothing. Every node
@@ -188,8 +190,14 @@ impl SettlementService {
             }
         }
         let report = best?;
-        let served = report.verified_served(&account)?; // proof must back the claim
-        Some((report.paid_cumulative, served))
+        let served = report.verified_served(&account)?; // proof must back the served claim
+                                                        // PAID proof: cap the reported paid at the node's ACTUAL committee-ordered `Pay` total (durable
+                                                        // on its ledger chain), so it can't inflate the pool beyond what it really paid. Under-reporting
+                                                        // stays possible (it only shrinks the node's own pool contribution — griefing, not theft).
+        let paid = report
+            .paid_cumulative
+            .min(self.ledger.paid_total(account).await);
+        Some((paid, served))
     }
 
     /// The deterministic participant set: self + every census member (self-included so a single node

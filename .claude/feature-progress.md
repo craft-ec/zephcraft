@@ -115,11 +115,16 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       gossip, no anti-entropy, no partition-divergence; a behind node reads the log to catch up and a verifier re-reads it.
       Removed: `tag::SETTLE` gossip (announce/serve/accept + the board; tag 11 RESERVED). Kept: `proven_cumulative`,
       watermark settle, cheque proof. 34 noded tests (proof + report-verify incl. the anti-farm case), fmt, clippy green.
+- [x] **4d-7 — PAID PROOF DONE (2026-07-16).** The paid side is no longer trusted either. `LedgerService::paid_total`
+      sums an account's committed `Pay` writes on its durable, committee-ordered ledger chain; `cumulatives_of` CAPS the
+      reported `paid_cumulative` at that (`min`), so a node can't inflate the pool beyond what it actually paid
+      (under-reporting only shrinks its own contribution — griefing, not theft). Both settlement sides are now
+      proof-bounded (served via cheques, paid via the ledger chain). 34 noded tests, fmt, clippy green.
       **Remaining follow-ons:** committee COMMITS the canonical record (full finality / deterministic participant set vs the
       converged census); proof via obj-cid + fetch (the 64 KiB write frame limits the inline proof on large nets) or proof
-      COMPACTION; a scan-cache for `cumulatives_of` (re-scans each chain per settle); persist watermarks (else lose one
-      epoch's baseline per restart); PAID proof (cross-check `paid` vs the committee-ordered Pay writes); wire the obj gates
-      to a sync-cached reciprocity position; genesis anchor-pin + wasm-publish; an active verification loop; 4e-2 committee snapshots.
+      COMPACTION; a scan-cache for `cumulatives_of`/`paid_total` (re-scans each chain per settle); persist watermarks (else
+      lose one epoch's baseline per restart); wire the obj gates to a sync-cached reciprocity position; genesis anchor-pin +
+      wasm-publish; an active verification loop; 4e-2 committee snapshots. (Verify-board→durable deferred by user 2026-07-16.)
 Open gaps needing a call at their phase: (1) anchor-authority routing RESOLVED (= committee), (2) escrow reclaim lifecycle [4d],
 (3) cold-start grant + identity gate [4d], (4) uniform-pricing floor for the pool-average reward [4c]. (Checkpoint
 acceleration + reward-valuation decomposition RESOLVED; see TOKEN_LEDGER_BUILD.md §9.)
