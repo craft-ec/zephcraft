@@ -240,9 +240,15 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       a single node can NEVER show verified>0). **Remaining = the live multi-node loop:** roll the binary to the 4-node
       Hetzner fleet (deploy tree /opt/zeph-src/zephcraft-standalone, staggered restart, verify peers=4 — see
       [[zeph-fleet-deploy]]), exercise real pay→serve→settle→claim→balance, and confirm `zeph ledger-verification` shows
-      verified>0 / mismatched=0 across nodes. This is OUTWARD-FACING on production infra + a separate standalone deploy
-      tree, so it's a user-driven ops step (the observability hook is wired). **STEP 4 (token ledger) COMPLETE + validated
-      offline; live fleet roll pending operator.**
+      verified>0 / mismatched=0 across nodes. **DONE 2026-07-16 — DEPLOYED LIVE.** Gate 🟢 (fmt/clippy-D/workspace/A-G).
+      Rolled the new binary to all 4 Hetzner nodes (rsync crates/+Cargo.toml/lock → standalone tree → release build 1m39s →
+      staggered restart zeph2→3→4→zeph, each active/0-restarts/3-peers/0-panics). RESPAWNED the Mac node on the new binary
+      (bootstrap+enable+kickstart launchd) — it rejoined via relay + since it was the governor, its genesis::activate PINNED
+      both anchors. MOVED the governor to the Hetzner main `zeph` (d3781b61, on-chain add+remove → 1-of-1 seq 10). Verified
+      live: governance converged 1-of-1 on Hetzner main; `anchor-resolve token-ledger`→17312…/`reward`→f8c24… (interface v1);
+      `ledger-verification`→{verified:0, mismatched:0} (0 verified expected — no economic traffic yet; mismatched:0 = no
+      divergence); full 5-node fleet peers=4, 0 restarts, 0 panics. **STEP 4 (token ledger) COMPLETE + LIVE ON THE FLEET.**
+      Organic economic traffic (pay/serve → records → verified>0) is now usage, not deploy.
       **Remaining follow-ons:** dedicated storage-provided measure + persist `pinned`; reciprocity policy as a full governed
       PROGRAM (only if the formula must be swappable); 4e-2 committee snapshots. (Verify-board→durable deferred by user.)
 Open gaps needing a call at their phase: (1) anchor-authority routing RESOLVED (= committee), (2) escrow reclaim lifecycle [4d],
