@@ -263,6 +263,18 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       4-peers/0-panics; Mac node rebuilt + restarted). **Verified LIVE on the fleet dashboard:** both tabs served, the
       consensus tab shows the real **3-of-4 epoch committee**, economy shows the 2 pinned anchors. Commits 1c25776 (economy),
       fb9ac86 (overview line), 499d704 (consensus). **The UI is now on par with the deployed features.**
+- [x] **4d-22 — DASHBOARD UX PASS + VERIFICATION BOARD (2026-07-16, commit f89a990).** User feedback: the economy numbers were
+      confusing and the metric list rendered as one compressed row. **Layout bug fixed:** the metric lists used `class="kv"`,
+      whose `display:flex` overrode the `dl` grid → every dt/dd collapsed onto one line; replaced with a `.stat` grid
+      (label · value + a plain-language description line per metric). **Reframed for meaning:** added a two-tier-model
+      explainer, led with reciprocity (free tier) + a live standing badge (net contributor / net consumer / over budget),
+      relabeled the ledger "paid tier". **Verification board surfaced** (was built but had NO UI): new
+      `BoardService::dashboard() -> VerifyView/VerifyRow` → `rpc_board` → `/api/board` → a "verification board" card on the
+      consensus tab (per-request k-of-set agreement tally + verified state). Local-logic only (read-only dashboard method +
+      new API route + UI; no wire/ALPN/transport). Gate `--quick` PASSED. Rolled to the whole 5-node fleet (Mac + 4 Hetzner
+      via mv-aside install since the shared /usr/local/bin/zeph was text-file-busy; staggered restart, all active/NRestarts=0/
+      peers=4). **Verified live:** `/api/board` returns real data on both Mac and Hetzner main (2 satisfied verify requests,
+      func `f`, k=1). UI markers served fleet-wide.
       **Remaining follow-ons:** dedicated storage-provided measure + persist `pinned`; reciprocity policy as a full governed
       PROGRAM (only if the formula must be swappable); 4e-2 committee snapshots. (Verify-board→durable deferred by user.)
 Open gaps needing a call at their phase: (1) anchor-authority routing RESOLVED (= committee), (2) escrow reclaim lifecycle [4d],
