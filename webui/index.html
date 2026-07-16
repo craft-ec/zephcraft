@@ -132,6 +132,7 @@
       <dt>relays</dt><dd id="relays" class="muted">…</dd>
       <dt>store</dt><dd id="store" class="muted">…</dd>
       <dt>health</dt><dd id="health" class="muted">…</dd>
+      <dt>economy</dt><dd id="eco-summary" class="muted">…</dd>
       <dt>jobs</dt><dd id="jobs" class="muted">…</dd>
       <dt>listen</dt><dd id="listen" class="muted">…</dd>
       <dt>uptime</dt><dd id="uptime">…</dd>
@@ -371,6 +372,9 @@ function renderEconomy(e){
   $("eco-paid").textContent = fmtBytes(r.paid);
   $("eco-pinned").textContent = fmtBytes(r.pinned) + " / " + fmtBytes((r.earned||0)+(r.storage_grant||0)) + " standing";
   $("eco-grants").textContent = "fetch " + fmtBytes(r.grant) + " · peer " + fmtBytes(r.peer_grant) + " · storage " + fmtBytes(r.storage_grant);
+  const sumEl = $("eco-summary");
+  if(sumEl){ sumEl.textContent = "balance " + (e.balance||0) + " · pool " + (e.pool||0) + " · verified " + (e.verified||0) + (mm>0 ? " · MISMATCH " + mm : "") + " · fetch headroom " + fmtBytes(Math.max(0,head));
+    sumEl.style.color = mm>0 ? "var(--warnc,#d29922)" : ""; }
   const a = e.anchors || [];
   $("eco-anchors").innerHTML = a.length
     ? a.map(x => `<div style="padding:3px 0"><b>${x.name}</b> &nbsp;<code class="muted">${(x.cid||"").slice(0,16)}…</code> &nbsp;<span class="muted">iface v${x.interface_version}</span></div>`).join("")
