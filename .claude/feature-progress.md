@@ -291,6 +291,25 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       traffic) and paid-fetch shows "unlimited". The precise §8 gate split (route paid fetches to a separate unlimited
       allocation vs the current folded `consumed ≤ earned+grant+paid` budget) is also deferred — low-risk while the fleet
       has zero paid traffic.
+- [x] **4d-24 — BOTH ECONOMY FOLLOW-ONS COMPLETED (2026-07-16, commits 2105d71 + e0fe27f).**
+      **Follow-on 2 (gate split, cheque.rs):** the §8 admission/serve gates now enforce two allocations. A PAID
+      user (`my_paid > 0`) fetches UNLIMITED and its bytes route to a new `paid_consumed` counter — never touching
+      free headroom; a FREE user stays capped at `earned + grant` (paid no longer folds into the free budget).
+      Symmetrically a PAID requester (`peer_paid > 0`) is served unlimited. New `Reciprocity.paid_consumed`; 2 new
+      tests (`paid_user_fetches_unlimited_into_the_paid_allocation`, `a_paid_requester_is_served_unlimited`); the
+      obsolete `paying_lifts_both_gate_budgets_past_reciprocity` test removed (it encoded the old finite-lift model).
+      **Follow-on 1 (real reward meters):** `SettlementStore::owed_to` (Σ a provider's unclaimed shares across
+      in-window records; +test) → `LedgerService::reward_owed` → `Economy.reward_owed` on the snapshot. Reward card
+      now shows real **balance / claimable / served**; the usage paid tier shows **paid_consumed**. **Deliberately NOT
+      shown:** the literal per-consumer `settled/served` byte ratio — it's neither locally computable (the FCFS
+      position needs a global per-consumer serving view) nor cross-node verifiable (`served_cumulative` is proven by
+      cheques alone, and a verifier can't recompute another node's consumers' quotas). The honest, wired economics —
+      served bytes → pool-average reward — is what the meters show. All LOCAL-LOGIC (admission decisions + read-only
+      accessors + UI; no wire/consensus/cheque-format change → mixed-version-safe). Gate `--quick` PASSED (after a
+      fmt-only re-roll); rolled to full 5-node fleet (all peers=4). Live-verified: `reward_owed`/`paid_consumed` serve
+      on Mac + Hetzner main. **STILL OPEN (noted, not silently dropped):** overflow-throttle for unlimited paid serving
+      (a paid peer fetching far past what it funded gets subsidised serving — §8 says throttle/pool-bound it); moot at
+      zero paid traffic.
       **Remaining follow-ons:** dedicated storage-provided measure + persist `pinned`; reciprocity policy as a full governed
       PROGRAM (only if the formula must be swappable); 4e-2 committee snapshots. (Verify-board→durable deferred by user.)
 Open gaps needing a call at their phase: (1) anchor-authority routing RESOLVED (= committee), (2) escrow reclaim lifecycle [4d],
