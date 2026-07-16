@@ -12,6 +12,7 @@
 //! the ledger's job (step 4); this service only accumulates + exchanges the signed tallies.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{mpsc, RwLock};
@@ -28,6 +29,10 @@ use zeph_transport::{tag, TaggedStream, Transport};
 const CREDIT_BAND: u64 = 4 * 1024 * 1024;
 /// Max cheque frame (a `ServingCheque` is small — a few fixed fields + a 64-byte sig).
 const MAX_CHEQUE_FRAME: usize = 4096;
+/// Cold-start reciprocity grant (§8): a node with zero contribution may still fetch this much for free
+/// before the admission gate requires reciprocity (having served others) or payment. A governed policy
+/// value later — native default for the MVP.
+const COLD_START_GRANT: u64 = 1 << 30; // 1 GiB
 
 pub struct ChequeService {
     identity: Arc<NodeIdentity>,
@@ -40,6 +45,9 @@ pub struct ChequeService {
     book: Mutex<ChequeBook>,
     /// Per-provider bytes accumulated since the last cheque (the credit band).
     pending: Mutex<HashMap<[u8; 32], u64>>,
+    /// Total bytes this node has fetched from providers (the CONSUMED side of reciprocity). Reciprocity
+    /// headroom = `total_earned − consumed`; the admission gate reads it synchronously.
+    consumed: AtomicU64,
     /// Cheques to push (drained by [`run_pusher`](ChequeService::run_pusher)); `on_bytes_received` must
     /// not block, so it enqueues here rather than doing the network push inline.
     push_tx: mpsc::Sender<ServingCheque>,
@@ -62,9 +70,20 @@ impl ChequeService {
             issuer: Mutex::new(ChequeIssuer::new()),
             book: Mutex::new(ChequeBook::new(me)),
             pending: Mutex::new(HashMap::new()),
+            consumed: AtomicU64::new(0),
             push_tx,
         });
         (svc, push_rx)
+    }
+
+    /// The free-tier admission decision (§8 tit-for-tat): may this node fetch `bytes` right now? Yes while
+    /// its CONSUMED total stays within what it has EARNED (cheque-proven bytes served to others) plus the
+    /// cold-start grant. Beyond that a fetch must be paid for (a cheque) or wait until the node contributes
+    /// more. Synchronous (atomics + the book lock), so the obj admission gate can call it inline.
+    pub fn reciprocity_admits(&self, bytes: u64) -> bool {
+        let consumed = self.consumed.load(Ordering::Relaxed);
+        let budget = self.total_earned().saturating_add(COLD_START_GRANT);
+        consumed.saturating_add(bytes) <= budget
     }
 
     /// Inject the membership handle used to resolve a provider's address for the push.
@@ -141,6 +160,8 @@ impl ByteMeter for ChequeService {
     /// credit band; when it crosses, issue a cumulative cheque and ENQUEUE the push (non-blocking — no
     /// IO here). Below the band we just accumulate (no cheque yet), bounding the push rate.
     fn on_bytes_received(&self, provider: NodeId, bytes: u64) {
+        // Track the CONSUMED side of reciprocity (every byte fetched from a provider).
+        self.consumed.fetch_add(bytes, Ordering::Relaxed);
         let crossed = {
             let mut pending = self.pending.lock().expect("cheque pending lock");
             let acc = pending.entry(provider.0).or_default();
@@ -226,5 +247,29 @@ mod tests {
         let cheque = ServingCheque::sign(&consumer, me, 5000, 1);
         assert!(svc.book.lock().unwrap().record(cheque));
         assert_eq!(svc.total_earned(), 5000);
+    }
+
+    #[tokio::test]
+    async fn reciprocity_grants_free_headroom_then_requires_earning() {
+        let (svc, _rx) = service().await;
+        let gb = 1u64 << 30;
+        // A fresh node's cold-start grant covers up to 1 GiB of free fetching.
+        assert!(svc.reciprocity_admits(gb));
+        assert!(!svc.reciprocity_admits(gb + 1), "over the grant → declined");
+        // Consuming the grant exhausts the free headroom.
+        svc.on_bytes_received(NodeId([7u8; 32]), gb);
+        assert!(
+            !svc.reciprocity_admits(1),
+            "grant spent → must earn or pay to fetch more"
+        );
+        // Earning (serving a consumer) reopens headroom by exactly what was served.
+        let me = svc.identity.node_id().0;
+        let consumer = NodeIdentity::generate();
+        svc.book
+            .lock()
+            .unwrap()
+            .record(ServingCheque::sign(&consumer, me, 5000, 1));
+        assert!(svc.reciprocity_admits(5000));
+        assert!(!svc.reciprocity_admits(5001));
     }
 }

@@ -177,8 +177,20 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       indexes each `SignedRecord` by epoch, and PRUNES epochs older than the claim window (a claim can't resolve against a
       forfeited record) to bound memory. std `Mutex`, no await under the lock, results identical to a full scan. 36 noded
       tests, fmt, clippy green.
-      **Remaining follow-ons:** wire the obj gates to a sync-cached reciprocity position; genesis anchor-pin + wasm-publish;
-      an active verification loop; 4e-2 committee snapshots. (Verify-board→durable deferred by user.)
+- [x] **4d-14 — FREE-TIER ENFORCEMENT: admission gate wired to reciprocity DONE (2026-07-16).** The economic layer was
+      all measurement/settlement; nothing ENFORCED the free tier — the obj `admission_gate` was a permissive no-op. Now
+      `ChequeService` tracks `consumed` (an `AtomicU64` bumped in `on_bytes_received`, the fetched-bytes side) alongside
+      `total_earned` (served side), and exposes `reciprocity_admits(bytes)` = `consumed + bytes ≤ total_earned +
+      COLD_START_GRANT` (§8 tit-for-tat; **grant = 1 GiB**, a governed value later). `main.rs` installs it as the obj
+      admission gate (`set_admission_gate`), so a network fetch in `get()` is now DECLINED once a node exhausts its
+      reciprocity headroom — it must contribute (serve others → earn) or pay. Sync (atomics + book lock), so it runs inline
+      on the fetch path. 1 new test (grant → exhaust → earn reopens). 37 noded tests, fmt, clippy green. **This is a native
+      MVP policy (minimal-kernel: mechanism = the gate; policy = the closure) + CONSUMER-side self-limit** (honest nodes
+      respect their budget). Follow-ons: move the policy into a GOVERNED program (grant/throttle-vs-refuse/paid-override
+      swappable); PROVIDER-side per-peer enforcement (refuse to SERVE a freeloader — robust vs an adversary that disables
+      its own gate); wire the pin_gate to a storage-standing policy (owner-pays-pin, a separate resource from egress).
+      **Remaining follow-ons:** governed reciprocity policy + provider-side enforcement (above); pin_gate→storage policy;
+      genesis anchor-pin + wasm-publish; an active verification loop; 4e-2 committee snapshots. (Verify-board→durable deferred by user.)
 Open gaps needing a call at their phase: (1) anchor-authority routing RESOLVED (= committee), (2) escrow reclaim lifecycle [4d],
 (3) cold-start grant + identity gate [4d], (4) uniform-pricing floor for the pool-average reward [4c]. (Checkpoint
 acceleration + reward-valuation decomposition RESOLVED; see TOKEN_LEDGER_BUILD.md §9.)

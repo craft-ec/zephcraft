@@ -1633,6 +1633,15 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     let (cheque_service, cheque_push_rx) =
         cheque::ChequeService::new(identity.clone(), transport.clock(), transport.clone());
     engine.set_byte_meter(cheque_service.clone());
+    // Free-tier ENFORCEMENT (§8): gate a network fetch on this node's reciprocity headroom — it fetches
+    // freely while `consumed ≤ earned + cold-start grant`, then must contribute (serve others) or pay.
+    // Native MVP policy in the cheque service; a governed program can supersede it later.
+    {
+        let cs = cheque_service.clone();
+        engine.set_admission_gate(std::sync::Arc::new(move |bytes| {
+            cs.reciprocity_admits(bytes)
+        }));
+    }
 
     tracing::info!(
         node_id = %identity.node_id().to_hex(),
