@@ -263,8 +263,11 @@ const GOSSIP_REPEATS: u8 = 6;
 /// dirty, which silently defeated that guarantee — a converged neighbour pushed
 /// nothing, so a straggler was stranded until the 30s shuffle/digest tick, exactly
 /// reproducing the ~35s branch above (it re-broke scenario B's 30s census bar). The
-/// tick therefore falls back to the O(1) `digest_round` when there is no delta to
-/// send: cheap (two 32-byte hashes), and it syncs only on a hash mismatch.
+/// tick therefore ALSO runs `digest_round` every interval — unconditionally, NOT as
+/// an `else` branch: a straggler is by definition still learning, so its `dirty` is
+/// non-empty and an `if !pushed { digest }` starves the very node that needs it until
+/// its dirty drains (GOSSIP_REPEATS × this interval = 30s ⇒ the same ~35s tail, which
+/// measured identically at 35.41s). The digest is O(1) and syncs only on mismatch.
 const EPIDEMIC_PERIODIC: Duration = Duration::from_secs(5);
 
 impl Membership {
@@ -350,17 +353,20 @@ impl Membership {
                         this.digest_round().await;
                     }
                     _ = epidemic_tick.tick() => {
-                        // Deltas first: if we have dirty members, spreading them is the cheap O(Δ) path
-                        // and the digest would only duplicate it (worse: during a join wave EVERY digest
-                        // mismatches, so running both would full-sync every round — a storm).
-                        // Nothing dirty ⇒ we are converged and the delta path is SILENT for us. That is
-                        // exactly when a straggler our cascade missed is stranded, so run the O(1) digest
-                        // check instead: two 32-byte hashes, full sync only on mismatch. This is what
-                        // bounds the tail to ~EPIDEMIC_PERIODIC per hop; without it the straggler waits
-                        // for the 30s shuffle/digest tick (the measured ~35s branch of the bimodal).
-                        if !this.epidemic_push().await {
-                            this.digest_round().await;
-                        }
+                        // BOTH, unconditionally — they answer different questions and gating one on the
+                        // other re-breaks convergence:
+                        //  - push: spread what WE learned (O(Δ), silent when nothing is dirty).
+                        //  - digest: ask whether we are STILL DIVERGENT from a peer (O(1): two 32-byte
+                        //    hashes; full sync only on mismatch).
+                        // The straggler is precisely a node that IS still learning, so its `dirty` is
+                        // non-empty — making the digest conditional on `!pushed` starves the one node
+                        // that needs it until its dirty drains (GOSSIP_REPEATS × this interval = 30s),
+                        // which reproduces the ~35s tail exactly (measured: 35.41s both ways).
+                        // Cost during churn is bounded: the digest syncs with ONE random peer, strictly
+                        // cheaper than the pre-[S1] full-map push to EPIDEMIC_FANOUT peers this replaced.
+                        // Steady state stays O(1) — matching digests, no member data moves.
+                        let _ = this.epidemic_push().await;
+                        this.digest_round().await;
                     }
                     _ = this.epidemic.notified() => {
                         // Epidemic: fan the member map to several active peers
