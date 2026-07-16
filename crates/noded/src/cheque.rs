@@ -53,9 +53,11 @@ pub const STORAGE_GRANT_CONFIG_KEY: &str = "reciprocity:storage_grant";
 pub struct Reciprocity {
     /// Cheque-proven bytes SERVED to others (the contribution side).
     pub earned: u64,
-    /// Bytes FETCHED from providers (the consumption side).
+    /// Bytes FETCHED on the FREE tier (draws headroom). Paid fetches are counted in `paid_consumed`.
     pub consumed: u64,
-    /// Cumulative bytes PAID into the pool (lifts the free-tier budget).
+    /// Bytes FETCHED on the PAID tier (unlimited, never touches headroom; reconciled at settlement).
+    pub paid_consumed: u64,
+    /// Cumulative tokens PAID into the pool (the paid-tier funding; a node with `paid > 0` is a paid user).
     pub paid: u64,
     /// Governed free-tier fetch grant.
     pub grant: u64,
@@ -78,9 +80,13 @@ pub struct ChequeService {
     book: Mutex<ChequeBook>,
     /// Per-provider bytes accumulated since the last cheque (the credit band).
     pending: Mutex<HashMap<[u8; 32], u64>>,
-    /// Total bytes this node has fetched from providers (the CONSUMED side of reciprocity). Reciprocity
-    /// headroom = `total_earned − consumed`; the admission gate reads it synchronously.
+    /// FREE-tier bytes this node has fetched (the CONSUMED side of reciprocity). Headroom =
+    /// `total_earned + grant − consumed`; the admission gate reads it synchronously. A PAID user's
+    /// fetches skip this counter (they go to `paid_consumed`) so paid usage never touches headroom.
     consumed: AtomicU64,
+    /// PAID-tier bytes this node has fetched — unlimited, never gated, reconciled retroactively at
+    /// settlement (§8). Informational only (the dashboard "paid fetch" meter); not a live cap.
+    paid_consumed: AtomicU64,
     /// The LIVE cold-start grant (bytes), refreshed from the governed `reciprocity:grant` config so the
     /// free-tier policy is governance-tunable. Read synchronously by the gate.
     grant: AtomicU64,
@@ -121,6 +127,7 @@ impl ChequeService {
             book: Mutex::new(ChequeBook::new(me)),
             pending: Mutex::new(HashMap::new()),
             consumed: AtomicU64::new(0),
+            paid_consumed: AtomicU64::new(0),
             grant: AtomicU64::new(DEFAULT_COLD_START_GRANT),
             peer_grant: AtomicU64::new(DEFAULT_PEER_GRANT),
             pinned: AtomicU64::new(0),
@@ -181,11 +188,22 @@ impl ChequeService {
         }
     }
 
-    /// PROVIDER-side reciprocity (§8): should this node serve `peer` ~`bytes` right now? Yes while what it
-    /// has served the peer stays within what the peer served IT (reciprocity) + the per-peer grant + what
-    /// the peer has PAID into the pool (the paid tier — a paid requester isn't bound by reciprocity). A
-    /// freeloader — served far more than it served back, and not paying — is refused. Synchronous.
+    /// PROVIDER-side gate (§8): should this node serve `peer` ~`bytes` right now? A **paid** requester
+    /// (`peer_paid > 0`) is served **unlimited** — it isn't bound by reciprocity; its consumption reconciles
+    /// retroactively at settlement (overflow past what it paid is subsidised, but still earns this node
+    /// headroom). A **free** requester is bound by reciprocity: what this node has served it stays within
+    /// what the peer served back + the per-peer grant. A free freeloader is refused. Synchronous.
     pub fn should_serve(&self, peer: [u8; 32], bytes: u64) -> bool {
+        let peer_paid = self
+            .peer_paid
+            .lock()
+            .expect("peer_paid lock")
+            .get(&peer)
+            .copied()
+            .unwrap_or(0);
+        if peer_paid > 0 {
+            return true; // paid requester → unlimited serve (reconciled at settlement)
+        }
         let served_to_peer = self
             .book
             .lock()
@@ -199,31 +217,21 @@ impl ChequeService {
             .expect("cheque issuer lock")
             .owed_to(&peer);
         let grant = self.peer_grant.load(Ordering::Relaxed);
-        let peer_paid = self
-            .peer_paid
-            .lock()
-            .expect("peer_paid lock")
-            .get(&peer)
-            .copied()
-            .unwrap_or(0);
-        served_to_peer.saturating_add(bytes)
-            <= peer_served_me
-                .saturating_add(grant)
-                .saturating_add(peer_paid)
+        served_to_peer.saturating_add(bytes) <= peer_served_me.saturating_add(grant)
     }
 
-    /// The admission decision (§8): may this node fetch `bytes` right now? Yes while its CONSUMED total
-    /// stays within reciprocity (what it EARNED by serving) + the grant + what it has PAID into the pool.
-    /// Reciprocity nets first for everyone; PAYING lifts the budget so a paid user isn't gated — a free
-    /// user (`my_paid = 0`) is capped at earned + grant. Synchronous, so the obj admission gate calls it inline.
+    /// The admission decision (§8): may this node fetch `bytes` right now? A **paid** user
+    /// (`my_paid > 0`) fetches **unlimited** and is never gated — its spend reconciles retroactively at
+    /// settlement, and its bytes go to `paid_consumed`, never touching free headroom. A **free** user is
+    /// capped at reciprocity headroom: `consumed + bytes ≤ total_earned + grant`. Paid no longer *lifts*
+    /// the free budget (the two allocations are separate). Synchronous — the obj admission gate calls it inline.
     pub fn reciprocity_admits(&self, bytes: u64) -> bool {
+        if self.my_paid.load(Ordering::Relaxed) > 0 {
+            return true; // paid user → unlimited fetch (paid allocation, reconciled at settlement)
+        }
         let consumed = self.consumed.load(Ordering::Relaxed);
         let grant = self.grant.load(Ordering::Relaxed);
-        let paid = self.my_paid.load(Ordering::Relaxed);
-        let budget = self
-            .total_earned()
-            .saturating_add(grant)
-            .saturating_add(paid);
+        let budget = self.total_earned().saturating_add(grant);
         consumed.saturating_add(bytes) <= budget
     }
 
@@ -245,6 +253,7 @@ impl ChequeService {
         Reciprocity {
             earned: self.total_earned(),
             consumed: self.consumed.load(Ordering::Relaxed),
+            paid_consumed: self.paid_consumed.load(Ordering::Relaxed),
             paid: self.my_paid.load(Ordering::Relaxed),
             grant: self.grant.load(Ordering::Relaxed),
             peer_grant: self.peer_grant.load(Ordering::Relaxed),
@@ -314,8 +323,13 @@ impl ByteMeter for ChequeService {
     /// credit band; when it crosses, issue a cumulative cheque and ENQUEUE the push (non-blocking — no
     /// IO here). Below the band we just accumulate (no cheque yet), bounding the push rate.
     fn on_bytes_received(&self, provider: NodeId, bytes: u64) {
-        // Track the CONSUMED side of reciprocity (every byte fetched from a provider).
-        self.consumed.fetch_add(bytes, Ordering::Relaxed);
+        // Track the CONSUMED side (every byte fetched), routed by tier: a PAID user's fetches go to the
+        // paid allocation (unlimited, no headroom impact); a FREE user's draw the reciprocity headroom.
+        if self.my_paid.load(Ordering::Relaxed) > 0 {
+            self.paid_consumed.fetch_add(bytes, Ordering::Relaxed);
+        } else {
+            self.consumed.fetch_add(bytes, Ordering::Relaxed);
+        }
         let crossed = {
             let mut pending = self.pending.lock().expect("cheque pending lock");
             let acc = pending.entry(provider.0).or_default();
@@ -458,6 +472,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paid_user_fetches_unlimited_into_the_paid_allocation() {
+        let (svc, _rx) = service().await;
+        let gb = 1u64 << 30;
+        // Free user: exhaust the grant → gated.
+        svc.on_bytes_received(NodeId([7u8; 32]), gb);
+        assert!(!svc.reciprocity_admits(1), "free user gated once grant spent");
+        assert_eq!(svc.reciprocity_snapshot().consumed, gb, "free bytes → consumed");
+        assert_eq!(svc.reciprocity_snapshot().paid_consumed, 0);
+        // Becoming a PAID user (paid anything into the pool) → unlimited fetch, no headroom impact.
+        svc.set_my_paid(1);
+        assert!(
+            svc.reciprocity_admits(1_000 * gb),
+            "paid user is never gated on fetch"
+        );
+        // A paid user's fetches route to the PAID allocation, leaving free `consumed` untouched.
+        svc.on_bytes_received(NodeId([8u8; 32]), 5_000);
+        let r = svc.reciprocity_snapshot();
+        assert_eq!(r.consumed, gb, "paid fetch did not touch free consumed");
+        assert_eq!(r.paid_consumed, 5_000, "paid fetch landed in paid_consumed");
+    }
+
+    #[tokio::test]
+    async fn a_paid_requester_is_served_unlimited() {
+        let (svc, _rx) = service().await;
+        let peer = NodeIdentity::generate();
+        let pid = peer.node_id().0;
+        let grant = 256u64 * 1024 * 1024; // DEFAULT_PEER_GRANT
+                                          // Free requester that served us nothing is capped at the per-peer grant.
+        assert!(!svc.should_serve(pid, grant + 1), "free requester capped at grant");
+        // Once it has PAID into the pool it is served without reciprocity limit.
+        svc.set_peer_paid(pid, 1);
+        assert!(
+            svc.should_serve(pid, 1_000 * grant),
+            "paid requester → unlimited serve"
+        );
+    }
+
+    #[tokio::test]
     async fn owner_pays_pin_grants_then_requires_storage_standing() {
         let (svc, _rx) = service().await;
         let grant = 256u64 * 1024 * 1024; // DEFAULT_STORAGE_GRANT
@@ -478,25 +530,7 @@ mod tests {
         assert!(!svc.pin_admits(1), "standing consumed → declined again");
     }
 
-    #[tokio::test]
-    async fn paying_lifts_both_gate_budgets_past_reciprocity() {
-        let (svc, _rx) = service().await;
-        let gb = 1u64 << 30;
-        // A free node that spent its grant is gated on fetch...
-        svc.on_bytes_received(NodeId([1u8; 32]), gb);
-        assert!(!svc.reciprocity_admits(1), "free: grant spent → gated");
-        // ...until it PAYS → its admission budget lifts by exactly what it paid.
-        svc.set_my_paid(500);
-        assert!(svc.reciprocity_admits(500));
-        assert!(!svc.reciprocity_admits(501));
-
-        // Serve: a peer over its per-peer grant with no reciprocity is refused...
-        let peer = [7u8; 32];
-        let pg = 256u64 * 1024 * 1024;
-        assert!(!svc.should_serve(peer, pg + 1));
-        // ...until the peer has PAID into the pool → served beyond its per-peer grant.
-        svc.set_peer_paid(peer, 1000);
-        assert!(svc.should_serve(peer, pg + 1000));
-        assert!(!svc.should_serve(peer, pg + 1001));
-    }
+    // (Superseded 2026-07-16: the paid tier no longer *lifts* the reciprocity budget by a finite amount —
+    // a paid user/requester is UNLIMITED and metered separately. See `paid_user_fetches_unlimited_into_the
+    // _paid_allocation` and `a_paid_requester_is_served_unlimited`.)
 }

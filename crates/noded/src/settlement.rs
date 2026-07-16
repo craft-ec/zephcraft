@@ -144,6 +144,16 @@ impl SettlementStore {
         self.records.get(&epoch).cloned()
     }
 
+    /// Total unclaimed reward this `provider` is owed across ALL in-window records (Σ `share_of`) — the
+    /// dashboard "reward earned but not yet claimed" figure. Claimed shares already read 0, so they're
+    /// excluded automatically.
+    pub fn owed_to(&self, provider: &[u8; 32]) -> u64 {
+        self.records
+            .keys()
+            .map(|e| self.share_of(*e, provider))
+            .sum()
+    }
+
     /// The unclaimed share owed to `provider` for `epoch` (0 if absent, already claimed, or expired) —
     /// what a `RewardClaim` resolves + credits.
     pub fn share_of(&self, epoch: u64, provider: &[u8; 32]) -> u64 {
@@ -288,6 +298,21 @@ mod tests {
             rec3.shares.is_empty(),
             "replayed cumulatives = zero delta = no reward"
         );
+    }
+
+    #[test]
+    fn owed_to_sums_unclaimed_shares_across_records() {
+        let mut s = SettlementStore::new();
+        s.pay_in(100);
+        s.settle_epoch(1, vec![contrib(1, 60), contrib(2, 40)]); // 1→60, 2→40
+        s.pay_in(50);
+        s.settle_epoch(2, vec![contrib(1, 1)]); // 1→50
+        // Provider 1 is owed 60 (epoch 1) + 50 (epoch 2) across records; provider 2 owed 40.
+        assert_eq!(s.owed_to(&prov(1)), 110);
+        assert_eq!(s.owed_to(&prov(2)), 40);
+        // Claiming epoch 1 drops it out of `owed`.
+        s.claim(1, prov(1));
+        assert_eq!(s.owed_to(&prov(1)), 50);
     }
 
     #[test]

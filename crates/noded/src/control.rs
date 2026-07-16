@@ -164,8 +164,11 @@ pub struct Status {
 /// The economy view (§11 step 4): the token ledger + settlement + reciprocity state for the dashboard.
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 pub struct Economy {
-    /// This node's token-ledger balance (folded from its committed account chain).
+    /// This node's reward-ledger balance (folded from its committed account chain; reward reconciled
+    /// after claim).
     pub balance: u64,
+    /// Reward this node has earned by serving but not yet claimed (Σ owed shares across in-window records).
+    pub reward_owed: u64,
     /// The distributable settlement pool (`unallocated`).
     pub pool: u64,
     /// Settlement re-execution verification tally — epochs whose canonical record matched this node's own.
@@ -283,6 +286,7 @@ impl State {
             }
             Economy {
                 balance: self.ledger.balance(me).await.balance,
+                reward_owed: self.ledger.reward_owed(me).await,
                 pool: self.ledger.pool_unallocated().await,
                 verified,
                 mismatched,

@@ -152,6 +152,12 @@ impl LedgerService {
         self.settlement.read().await.share_of(epoch, account)
     }
 
+    /// Total reward `account` is owed but hasn't yet claimed, across all in-window settlement records —
+    /// the dashboard "reward earned by serving, awaiting claim" figure (the claimed part is in `balance`).
+    pub async fn reward_owed(&self, account: [u8; 32]) -> u64 {
+        self.settlement.read().await.owed_to(&account)
+    }
+
     /// Fold `account`'s committed sequence into its balance state (native — identical to a wasm
     /// re-run). An invalid write (`apply → None`) is a no-op, leaving the prior state.
     pub async fn balance(&self, account: [u8; 32]) -> LedgerBalanceState {

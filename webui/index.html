@@ -318,10 +318,12 @@
       <div class="stats">
         <div class="stat"><span class="lbl">balance</span><span class="val big" id="eco-balance">…</span>
           <span class="desc">reward reconciled into your account <b>after you claim</b> — not a running estimate</span></div>
+        <div class="stat"><span class="lbl">claimable</span><span class="val" id="eco-owed">…</span>
+          <span class="desc">reward you've <b>earned by serving</b>, owed but not yet claimed (Σ your shares across the in-window settlement records)</span></div>
+        <div class="stat"><span class="lbl">served</span><span class="val" id="eco-served">…</span>
+          <span class="desc">cheque-proven bytes you've served — the reward basis. Each epoch the pool pays per byte served at a uniform average rate, bounded by what paid consumers funded (per-consumer FCFS caps the funding, not this byte count).</span></div>
         <div class="stat"><span class="lbl">settlement pool</span><span class="val" id="eco-pool">…</span>
           <span class="desc">unallocated reward pot — paid consumers fund it, providers claim out per byte served</span></div>
-        <div class="stat"><span class="lbl">paid serving</span><span class="val" id="eco-serving">…</span>
-          <span class="desc">settled ÷ served for your paid serving — bounded per-consumer (their quota, FCFS by cheque timestamp) then paid at the pool's average per-byte rate. Unsettled bytes are subsidised (still earn headroom).</span></div>
       </div>
     </div>
 
@@ -438,8 +440,10 @@ function renderEconomy(e){
   const head = earned+(r.grant||0)-consumed;   // free tier only — paid usage never lifts headroom
   $("eco-headroom").textContent = fmtBytes(Math.max(0,head));
   $("eco-paid").textContent = (r.paid||0).toLocaleString();   // tokens paid into the pool
-  const pu = $("eco-paidusage"); if(pu) pu.textContent = "unlimited";
-  const sv = $("eco-serving"); if(sv) sv.textContent = "no paid serving yet";
+  const pc = r.paid_consumed||0;
+  const pu = $("eco-paidusage"); if(pu) pu.textContent = pc>0 ? fmtBytes(pc)+" (unlimited)" : "unlimited";
+  const ow = $("eco-owed"); if(ow) ow.textContent = (e.reward_owed||0).toLocaleString();
+  const sv = $("eco-served"); if(sv) sv.textContent = fmtBytes(earned);
   $("eco-pinned").textContent = fmtBytes(r.pinned) + " / " + fmtBytes(earned+(r.storage_grant||0));
   $("eco-grants").textContent = "fetch " + fmtBytes(r.grant) + " · peer " + fmtBytes(r.peer_grant) + " · storage " + fmtBytes(r.storage_grant);
   const st = $("eco-standing");
