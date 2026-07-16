@@ -179,6 +179,12 @@ fn sum_unclaimed_shares(
         .fold(0u64, |a, b| a.saturating_add(b))
 }
 
+impl Default for EconomyEgressService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,11 +226,5 @@ mod tests {
         // All claimed → nothing owed.
         let both: BTreeSet<u64> = [1u64, 2].into_iter().collect();
         assert_eq!(sum_unclaimed_shares(&prov(1), &window, &both), 0);
-    }
-}
-
-impl Default for EconomyEgressService {
-    fn default() -> Self {
-        Self::new()
     }
 }
