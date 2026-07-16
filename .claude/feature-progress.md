@@ -232,8 +232,17 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       by then). Surfaced via `ledger_verification` RPC + `zeph ledger-verification` CLI (verified/mismatched/pool) — the
       hook #3 will check live. Event-driven per epoch (not a periodic defence-in-depth sweep, per the user's guidance).
       41 noded tests, fmt, clippy green.
-      **NEXT (user: complete #1,#2,#3):** #3 live fleet validation of the full pay→serve→settle→claim→balance loop +
-      `ledger-verification` showing verified>0, mismatched=0 across the cluster.
+- [~] **4d-20 — VALIDATION (#3): local pre-deploy gate DONE; live fleet roll = user ops step (2026-07-16).** Offline gate
+      GREEN: full `cargo build --workspace` + `cargo test --workspace` pass (all suites ok, 0 failed). Local single-node
+      SMOKE confirmed the deployable binary boots with the new wiring LIVE — genesis activation logs published both program
+      wasm + pinned both anchors (token-ledger `17312…`, reward `f8c24…`), and the `ledger-verification` RPC responds
+      `{verified:0, mismatched:0, pool:0}` (0 expected: one node has no serving traffic → no non-empty record to verify;
+      a single node can NEVER show verified>0). **Remaining = the live multi-node loop:** roll the binary to the 4-node
+      Hetzner fleet (deploy tree /opt/zeph-src/zephcraft-standalone, staggered restart, verify peers=4 — see
+      [[zeph-fleet-deploy]]), exercise real pay→serve→settle→claim→balance, and confirm `zeph ledger-verification` shows
+      verified>0 / mismatched=0 across nodes. This is OUTWARD-FACING on production infra + a separate standalone deploy
+      tree, so it's a user-driven ops step (the observability hook is wired). **STEP 4 (token ledger) COMPLETE + validated
+      offline; live fleet roll pending operator.**
       **Remaining follow-ons:** dedicated storage-provided measure + persist `pinned`; reciprocity policy as a full governed
       PROGRAM (only if the formula must be swappable); 4e-2 committee snapshots. (Verify-board→durable deferred by user.)
 Open gaps needing a call at their phase: (1) anchor-authority routing RESOLVED (= committee), (2) escrow reclaim lifecycle [4d],
