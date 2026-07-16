@@ -258,10 +258,13 @@ const GOSSIP_REPEATS: u8 = 6;
 /// keeps LEARNING members, so once its neighbors converge a straggler stops
 /// receiving pushes and waits for the 30s shuffle — the measured 3s (cascade
 /// reached everyone) vs ~35s (fell back to shuffle) census-convergence bimodal.
-/// A light periodic push (member map → EPIDEMIC_FANOUT peers) bounds the tail to
-/// ~this interval per hop regardless of cascade luck. Cheaper than the retired
-/// 10s dedicated shuffle round (map-only, fire-and-forget); a no-op merge on the
-/// receiver when nothing is new.
+/// This tick bounds the tail to ~this interval per hop regardless of cascade luck.
+/// NOTE [2026-07-17]: delta gossip [S1] made `epidemic_push` a NO-OP when nothing is
+/// dirty, which silently defeated that guarantee — a converged neighbour pushed
+/// nothing, so a straggler was stranded until the 30s shuffle/digest tick, exactly
+/// reproducing the ~35s branch above (it re-broke scenario B's 30s census bar). The
+/// tick therefore falls back to the O(1) `digest_round` when there is no delta to
+/// send: cheap (two 32-byte hashes), and it syncs only on a hash mismatch.
 const EPIDEMIC_PERIODIC: Duration = Duration::from_secs(5);
 
 impl Membership {
@@ -332,7 +335,8 @@ impl Membership {
             this.shuffle_round().await;
             let mut interval = tokio::time::interval(this.cfg.shuffle_interval);
             interval.tick().await; // consumes the immediate tick
-                                   // Periodic epidemic safety net (see EPIDEMIC_PERIODIC): catches
+                                   // Periodic safety net (see EPIDEMIC_PERIODIC): spread deltas while we
+                                   // have them, else run the O(1) digest check — together they catch
                                    // stragglers the new-member cascade missed, so census convergence no
                                    // longer falls back to the 30s shuffle.
             let mut epidemic_tick = tokio::time::interval(EPIDEMIC_PERIODIC);
@@ -346,13 +350,23 @@ impl Membership {
                         this.digest_round().await;
                     }
                     _ = epidemic_tick.tick() => {
-                        this.epidemic_push().await;
+                        // Deltas first: if we have dirty members, spreading them is the cheap O(Δ) path
+                        // and the digest would only duplicate it (worse: during a join wave EVERY digest
+                        // mismatches, so running both would full-sync every round — a storm).
+                        // Nothing dirty ⇒ we are converged and the delta path is SILENT for us. That is
+                        // exactly when a straggler our cascade missed is stranded, so run the O(1) digest
+                        // check instead: two 32-byte hashes, full sync only on mismatch. This is what
+                        // bounds the tail to ~EPIDEMIC_PERIODIC per hop; without it the straggler waits
+                        // for the 30s shuffle/digest tick (the measured ~35s branch of the bimodal).
+                        if !this.epidemic_push().await {
+                            this.digest_round().await;
+                        }
                     }
                     _ = this.epidemic.notified() => {
                         // Epidemic: fan the member map to several active peers
                         // at once (not one shuffle target) so a join wave
                         // diffuses in log-fanout hops, not one-hop-per-30s.
-                        this.epidemic_push().await;
+                        let _ = this.epidemic_push().await;
                     }
                 }
             }
@@ -478,7 +492,10 @@ impl Membership {
         }
     }
 
-    async fn epidemic_push(self: &Arc<Self>) {
+    /// Push dirty member deltas to [`EPIDEMIC_FANOUT`] random active peers. Returns `true` if a delta
+    /// was sent, `false` if we had nothing dirty — the caller uses that to fall back to the O(1) digest
+    /// check, which is what catches stragglers once we are converged (see the `epidemic_tick` arm).
+    async fn epidemic_push(self: &Arc<Self>) -> bool {
         // Keep our own last_heard fresh locally (the 30s shuffle gossips the full map incl. self).
         self.refresh_self().await;
         // DELTA gossip [S1]: send ONLY the members that changed since the last push. Steady state
@@ -487,7 +504,7 @@ impl Membership {
         let delta: Vec<wire::MemberEntry> = {
             let mut views = self.views.write().await;
             if views.dirty.is_empty() {
-                return;
+                return false; // converged: nothing to spread → caller runs the digest check instead
             }
             let ids: Vec<NodeId> = views.dirty.keys().copied().collect();
             let entries: Vec<wire::MemberEntry> = ids
@@ -511,7 +528,7 @@ impl Membership {
             entries
         };
         if delta.is_empty() {
-            return;
+            return false;
         }
         let msg = wire::Message::MemberSync(wire::MemberSync { members: delta });
         let mut targets: Vec<PeerAddr> = {
@@ -528,6 +545,7 @@ impl Membership {
             }
         });
         futures::future::join_all(sends).await;
+        true
     }
 
     /// One immediate MemberSync exchange with `peer`: send our converged map,
