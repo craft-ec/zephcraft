@@ -80,6 +80,13 @@ impl ChequeService {
         self.book.lock().expect("cheque book lock").total_earned()
     }
 
+    /// The PROOF behind this node's serving measurement — the latest counterparty-signed cheque per
+    /// consumer (each names this node as `server`). The settlement loop attaches this to its announcement
+    /// so other nodes can VERIFY the claimed served bytes rather than trust them (anti-farming).
+    pub fn serving_proof(&self) -> Vec<ServingCheque> {
+        self.book.lock().expect("cheque book lock").cheques()
+    }
+
     /// Drain the push queue: resolve each cheque's provider address and push it fire-and-forget on
     /// `tag::CHEQUE` (reply ignored, like `tag::BOARD`). No-op targets (unknown addr) are dropped.
     pub async fn run_pusher(self: Arc<Self>, mut rx: mpsc::Receiver<ServingCheque>) {

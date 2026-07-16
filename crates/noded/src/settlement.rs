@@ -30,6 +30,12 @@ pub struct SettlementStore {
     records: BTreeMap<u64, RewardRecord>,
     /// `(epoch, provider)` shares already claimed — so they neither re-claim nor forfeit-on-expiry.
     claimed: BTreeSet<(u64, [u8; 32])>,
+    /// Per-node CUMULATIVE `Pay` total already folded into the pool. An epoch folds only each node's
+    /// `paid_cumulative − watermark` delta, advancing the watermark — so a pay is counted exactly once.
+    paid_watermark: BTreeMap<[u8; 32], u64>,
+    /// Per-node CUMULATIVE cheque-proven served bytes already rewarded. An epoch's reward weight is each
+    /// node's `served_cumulative − watermark` delta — so replaying the same cheques earns nothing twice.
+    served_watermark: BTreeMap<[u8; 32], u64>,
 }
 
 impl SettlementStore {
@@ -68,11 +74,56 @@ impl SettlementStore {
         record
     }
 
-    /// Cross-node epoch close: fold this epoch's AGGREGATED pool (`Σ` all nodes' announced pay-ins) into
-    /// `unallocated`, then settle. Guarded so a re-settle of the same epoch does NOT re-add the pool
-    /// (idempotent) — the settlement loop may re-drive a converged epoch. Every node feeds the identical
-    /// `pool_add` + `contributions` from the same converged announcement board, so the record is bit-for-bit
-    /// identical network-wide (what verification re-runs).
+    /// Cross-node epoch close from each node's PROVEN cumulatives (§10.1). `entries` is `(node,
+    /// paid_cumulative, served_cumulative)` from the converged, proof-verified announcement board. Per
+    /// node we fold only the DELTA past its watermark — `paid_cumulative − paid_watermark` into the pool,
+    /// `served_cumulative − served_watermark` as the reward weight — then advance both watermarks. This is
+    /// what makes `served` un-farmable: the weight is a monotonic delta of counterparty-signed cheque
+    /// totals, so replaying cheques or inflating a single epoch buys nothing. A node's FIRST appearance
+    /// only baselines its watermarks (contributes 0), so no cold-start over-count. Idempotent per epoch
+    /// (watermarks advance once). Deterministic: every node folds the identical entries → identical record.
+    pub fn settle_epoch_cumulative(
+        &mut self,
+        epoch: u64,
+        entries: Vec<([u8; 32], u64, u64)>,
+    ) -> RewardRecord {
+        if let Some(existing) = self.records.get(&epoch) {
+            return existing.clone(); // already settled → don't re-advance watermarks
+        }
+        let mut pool_add = 0u64;
+        let mut contributions = Vec::new();
+        for (node, paid_cumulative, served_cumulative) in entries {
+            match self.paid_watermark.get(&node).copied() {
+                None => {
+                    self.paid_watermark.insert(node, paid_cumulative); // baseline on first sight
+                }
+                Some(w) => {
+                    pool_add = pool_add.saturating_add(paid_cumulative.saturating_sub(w));
+                    self.paid_watermark.insert(node, paid_cumulative.max(w));
+                }
+            }
+            match self.served_watermark.get(&node).copied() {
+                None => {
+                    self.served_watermark.insert(node, served_cumulative);
+                }
+                Some(w) => {
+                    let delta = served_cumulative.saturating_sub(w);
+                    if delta > 0 {
+                        contributions.push(Contribution {
+                            provider: node,
+                            bytes: delta,
+                        });
+                    }
+                    self.served_watermark.insert(node, served_cumulative.max(w));
+                }
+            }
+        }
+        self.pay_in(pool_add);
+        self.settle_epoch(epoch, contributions)
+    }
+
+    /// DEV/manual settle from an explicit pool + contributions (bypasses watermarks). The production path
+    /// is [`settle_epoch_cumulative`]. Idempotent per epoch.
     pub fn settle_epoch_with_pool(
         &mut self,
         epoch: u64,
@@ -203,6 +254,33 @@ mod tests {
         let again = s.settle_epoch_with_pool(1, 100, vec![contrib(1, 60), contrib(2, 40)]);
         assert_eq!(again.share_of(&prov(1)), 60);
         assert_eq!(s.unallocated(), 0, "no double pay-in on re-settle");
+    }
+
+    #[test]
+    fn cumulative_settle_rewards_deltas_and_baselines_first_sight() {
+        let mut s = SettlementStore::new();
+        // Epoch 1: two nodes first seen → both watermarks baseline, contribute 0 (no reward, no pool).
+        let rec1 = s.settle_epoch_cumulative(1, vec![([1u8; 32], 100, 500), ([2u8; 32], 40, 200)]);
+        assert!(
+            rec1.shares.is_empty(),
+            "first sight only baselines watermarks"
+        );
+        assert_eq!(s.unallocated(), 0);
+        // Epoch 2: node 1 paid 100→150 (Δ50), served 500→800 (Δ300); node 2 unchanged (Δ0).
+        // Pool = Σ paid deltas = 50; only node 1 has a serving delta → it takes the whole 50.
+        let rec2 = s.settle_epoch_cumulative(2, vec![([1u8; 32], 150, 800), ([2u8; 32], 40, 200)]);
+        assert_eq!(
+            rec2.share_of(&[1u8; 32]),
+            50,
+            "node 1's Δserved earns the Δpaid pool"
+        );
+        assert_eq!(rec2.share_of(&[2u8; 32]), 0);
+        // Replaying the SAME cumulatives next epoch buys nothing (deltas are 0) — the anti-farm property.
+        let rec3 = s.settle_epoch_cumulative(3, vec![([1u8; 32], 150, 800)]);
+        assert!(
+            rec3.shares.is_empty(),
+            "replayed cumulatives = zero delta = no reward"
+        );
     }
 
     #[test]

@@ -200,21 +200,19 @@ impl LedgerService {
         ok
     }
 
-    /// Cross-node epoch close (§10.1, node-orchestrated by the settlement loop): fold this epoch's
-    /// AGGREGATED pool (`pool_add` = Σ every node's announced pays) into `unallocated`, then distribute to
-    /// `contributions` (Σ every node's announced served bytes) by ratio → the epoch RECORD. Idempotent per
-    /// epoch. Every node calls this with the identical `(pool_add, contributions)` from the same converged
-    /// announcement board, so the record is bit-for-bit identical network-wide.
+    /// Cross-node epoch close (§10.1, node-orchestrated by the settlement loop). `entries` = `(node,
+    /// paid_cumulative, served_cumulative)` from the converged, proof-verified announcement board; the
+    /// store folds each node's watermark DELTA (pays → pool, served → reward weight). Idempotent per
+    /// epoch. Every node passes the identical entries, so the record is bit-for-bit identical network-wide.
     pub async fn settle_from_board(
         &self,
         epoch: u64,
-        pool_add: u64,
-        contributions: Vec<Contribution>,
+        entries: Vec<([u8; 32], u64, u64)>,
     ) -> RewardRecord {
         self.settlement
             .write()
             .await
-            .settle_epoch_with_pool(epoch, pool_add, contributions)
+            .settle_epoch_cumulative(epoch, entries)
     }
 
     /// DEV/manual override (the `ledger-settle-epoch` RPC): inject `pool` + settle `epoch` with the given

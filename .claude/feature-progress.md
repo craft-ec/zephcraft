@@ -92,11 +92,20 @@ Build order (resequenced — 4e before the ledger; invoke_program before 4c):
       paid`, contributions=`{(node,served)}` — via `LedgerService::settle_from_board` → the record is bit-identical
       network-wide (what verification re-runs). Refactor: the pool is now ANNOUNCEMENT-DRIVEN — `pay()` drops local
       `pay_in`, tracks `total_paid`; `SettlementStore::settle_epoch_with_pool` folds `Σ` announced pays idempotently. The
-      old manual `ledger-settle-epoch` RPC is now a DEV override (`dev_settle_epoch(epoch,pool,bytes)`). 3 new tests
-      (aggregate pool+contribs, sign/verify+tamper-reject, idempotent settle-with-pool). 33 noded tests, fmt, clippy green.
-      **Hardening follow-ons:** attach+verify the counterparty-signed cheque PROOF behind `served` (anti-farming — today
-      it's authenticated but self-reported), anti-entropy PULL of missed-epoch announcements (a node that misses an
-      epoch's gossip can't reproduce its record), wire the obj gates to a sync-cached reciprocity position, genesis
+      old manual `ledger-settle-epoch` RPC is now a DEV override (`dev_settle_epoch(epoch,pool,bytes)`).
+- [x] **4d-5 — CHEQUE-PROOF ANTI-FARMING DONE (2026-07-16).** `served` is no longer self-reported. The announcement now
+      carries LIFETIME cumulatives `{paid_cumulative, served_cumulative}` + a `proof: Vec<ServingCheque>` (the latest
+      counterparty-signed cheque per consumer, via new `ChequeService::serving_proof`); `accept` VERIFIES the proof
+      (`proven_cumulative`: every cheque consumer-signed AND names this node as `server`, `Σ` == claimed
+      `served_cumulative`) before folding — a validly-SIGNED but cheque-unbacked served is REJECTED. Settlement moved to a
+      WATERMARK model: `SettlementStore::settle_epoch_cumulative` folds each node's `cumulative − watermark` delta (pays →
+      pool, served → reward weight) and advances the watermark, so inflating one epoch or replaying cheques earns nothing;
+      first-sight only baselines (no cold-start over-count). This also removed the node's boundary-delta bookkeeping (it
+      just announces current cumulatives). `MAX_SETTLE_FRAME`→256 KiB for the proof. 4 new tests incl. the anti-farm case
+      (signed-but-unbacked rejected) + watermark deltas/baseline. 34 noded tests, fmt, clippy green.
+      **Hardening follow-ons:** anti-entropy PULL of missed-epoch announcements (a node that misses an
+      epoch's gossip can't reproduce its record), proof COMPACTION for very large networks (an accumulator vs the full
+      per-consumer cheque set), PAID proof (cross-check `paid` against the committee-ordered Pay writes), wire the obj gates to a sync-cached reciprocity position, genesis
       anchor-pin + wasm-publish, an active verification loop re-running the ledger/reward folds, 4e-2 committee snapshots.
 Open gaps needing a call at their phase: (1) anchor-authority routing RESOLVED (= committee), (2) escrow reclaim lifecycle [4d],
 (3) cold-start grant + identity gate [4d], (4) uniform-pricing floor for the pool-average reward [4c]. (Checkpoint

@@ -2,21 +2,24 @@
 //! TOKEN_LEDGER_BUILD.md §4d, the production follow-on to the single-node demo). It makes the epoch
 //! reward RECORD deterministic network-wide by gossiping a converging per-epoch settlement board:
 //!
-//! 1. **Announce** — at each epoch boundary, every node signs a `{epoch, paid, served}` summary of its
-//!    OWN per-epoch deltas (`paid` = its committed `Pay` total this epoch; `served` = its cheque-proven
-//!    bytes served this epoch) and fire-and-forgets it over `tag::SETTLE`, self-including it.
-//! 2. **Collect** — [`serve`](SettlementService::serve) verifies each inbound announcement's signature
-//!    and folds it into a per-epoch board (`epoch → node → announcement`), which CONVERGES by gossip
-//!    exactly like the verification board / membership census.
-//! 3. **Settle** — after a grace window (so the board converges), every node deterministically settles
-//!    the epoch from the SAME collected set: pool = `Σ paid`, contributions = `{(node, served)}`, fed to
-//!    [`LedgerService::settle_from_board`]. Same inputs on every node ⇒ bit-identical record ⇒ a
-//!    provider's `RewardClaim` resolves the same share everywhere, and verification re-runs it.
+//! 1. **Announce** — at each epoch boundary, every node signs a `{epoch, paid_cumulative,
+//!    served_cumulative, proof}` summary of its OWN lifetime totals, where `proof` is the set of
+//!    counterparty-signed cheques (one per consumer) that BACKS `served_cumulative`, and fire-and-forgets
+//!    it over `tag::SETTLE`, self-including it.
+//! 2. **Collect** — [`serve`](SettlementService::serve) VERIFIES each inbound announcement — the node's
+//!    signature AND its cheque proof (every cheque consumer-signed and naming this node as server, summing
+//!    to the claimed `served_cumulative`) — then folds it into a per-epoch board (`epoch → node → ann`),
+//!    which CONVERGES by gossip exactly like the verification board / membership census.
+//! 3. **Settle** — after a grace window (so the board converges), every node deterministically settles the
+//!    epoch from the SAME collected set. The store folds each node's WATERMARK DELTA — `paid_cumulative −
+//!    paid_watermark` into the pool, `served_cumulative − served_watermark` as the reward weight — so a
+//!    node can't farm by inflating or replaying cheques. Same inputs on every node ⇒ bit-identical record
+//!    ⇒ a provider's `RewardClaim` resolves the same share everywhere, and verification re-runs it.
 //!
-//! **MVP scope (honest):** `served` is self-reported (authenticated, but the counterparty-signed cheque
-//! PROOF that backs it isn't yet attached/verified — a node could over-report served bytes); and a node
-//! that misses an epoch's announcements can't reproduce that epoch's record (no anti-entropy pull yet).
-//! Both are the immediate hardening slices; the loop, its determinism, and its wiring are real here.
+//! **MVP scope (honest):** `served` is now cheque-PROVEN (this file), but `paid` is still self-reported
+//! (its proof is the committee-ordered `Pay` ledger writes — a cross-check that's a separate slice); a
+//! node that misses an epoch's gossip can't reproduce that epoch's record (no anti-entropy pull yet); and
+//! the proof is the full per-consumer cheque set, so very large networks want proof COMPACTION later.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -24,11 +27,11 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, RwLock};
+use zeph_cheque::ServingCheque;
 use zeph_core::hlc::Clock;
 use zeph_core::NodeId;
 use zeph_crypto::NodeIdentity;
 use zeph_membership::Membership;
-use zeph_reward::Contribution;
 use zeph_transport::{tag, PeerAddr, TaggedStream, Transport};
 
 use crate::cheque::ChequeService;
@@ -42,62 +45,82 @@ const EPOCH_MILLIS: u64 = 30_000;
 const SETTLE_GRACE_EPOCHS: u64 = 1;
 /// Loop cadence — sub-epoch so boundary crossings are caught promptly (idempotent within an epoch).
 const TICK: Duration = Duration::from_secs(5);
-/// A settlement announcement is tiny (fixed fields + a 64-byte sig).
-const MAX_SETTLE_FRAME: usize = 4096;
+/// Max announcement frame. Carries the cheque proof (one ~150-byte cheque per consumer), so it must be
+/// generous; 256 KiB fits ~1700 consumers. Very large networks want proof compaction (a follow-on).
+const MAX_SETTLE_FRAME: usize = 256 * 1024;
 /// Reject inbound announcements older than this many epochs behind `now` (anti-bloat / anti-replay).
 const ACCEPT_WINDOW_EPOCHS: u64 = 64;
 /// Signing domain — binds a signature to this message kind so it can't be replayed as another.
 const SETTLE_DOMAIN: &[u8] = b"craftec/settle/1";
 
-/// One node's signed per-epoch settlement summary. `paid`/`served` are the node's DELTAS over `epoch`.
+/// One node's signed per-epoch settlement summary carrying its LIFETIME cumulatives (the network folds
+/// per-node deltas at settle time) plus the cheque `proof` that backs `served_cumulative`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SettlementAnnouncement {
     pub epoch: u64,
     pub node: [u8; 32],
-    /// This node's committed `Pay` total during `epoch` — its contribution to the shared pool.
-    pub paid: u64,
-    /// This node's cheque-proven bytes served during `epoch` — its reward-weight contribution.
-    pub served: u64,
+    /// This node's cumulative committed `Pay` total — its contribution to the shared pool (delta-folded).
+    pub paid_cumulative: u64,
+    /// This node's cumulative cheque-proven bytes served — must equal `Σ proof` (delta-folded as reward
+    /// weight). Un-farmable: backed by `proof` and only the monotonic delta earns.
+    pub served_cumulative: u64,
+    /// The counterparty-signed cheques (latest per consumer) that PROVE `served_cumulative`.
+    pub proof: Vec<ServingCheque>,
     /// The signing node's ed25519 signature over [`signing_bytes`] (a 64-byte sig; `Vec` for serde, as
     /// `ServingCheque` does — serde has no built-in `[u8; 64]` impl).
     pub sig: Vec<u8>,
 }
 
-/// The bytes an announcement's signature covers.
-fn signing_bytes(epoch: u64, node: &[u8; 32], paid: u64, served: u64) -> Vec<u8> {
+/// The bytes an announcement's signature covers (binds the node to its claimed cumulatives).
+fn signing_bytes(
+    epoch: u64,
+    node: &[u8; 32],
+    paid_cumulative: u64,
+    served_cumulative: u64,
+) -> Vec<u8> {
     let mut m = Vec::with_capacity(SETTLE_DOMAIN.len() + 8 + 32 + 8 + 8);
     m.extend_from_slice(SETTLE_DOMAIN);
     m.extend_from_slice(&epoch.to_le_bytes());
     m.extend_from_slice(node);
-    m.extend_from_slice(&paid.to_le_bytes());
-    m.extend_from_slice(&served.to_le_bytes());
+    m.extend_from_slice(&paid_cumulative.to_le_bytes());
+    m.extend_from_slice(&served_cumulative.to_le_bytes());
     m
 }
 
+/// The cheque-proven cumulative bytes `node` has served: each cheque must be consumer-signed AND name
+/// `node` as its `server` (so a node can't claim another's earnings); the total is `Σ` the latest
+/// cumulative per consumer. `None` if any cheque is invalid or names a different server. This is the
+/// anti-farming check — the reward weight can't exceed what counterparties actually signed for.
+fn proven_cumulative(node: &[u8; 32], proof: &[ServingCheque]) -> Option<u64> {
+    let mut per_consumer: BTreeMap<[u8; 32], u64> = BTreeMap::new();
+    for c in proof {
+        if &c.server != node || !c.verify() {
+            return None; // not this node's earnings, or a forged/invalid cheque
+        }
+        let e = per_consumer.entry(c.consumer).or_default();
+        *e = (*e).max(c.cumulative_bytes); // latest (highest) per consumer
+    }
+    Some(per_consumer.values().sum())
+}
+
 impl SettlementAnnouncement {
+    /// Verify the node signature AND that the cheque proof backs exactly the claimed `served_cumulative`.
     fn verify(&self) -> bool {
         let Ok(sig) = <[u8; 64]>::try_from(self.sig.as_slice()) else {
             return false; // wrong-length signature
         };
-        let msg = signing_bytes(self.epoch, &self.node, self.paid, self.served);
-        NodeIdentity::verify(&NodeId(self.node), &msg, &sig)
+        let msg = signing_bytes(
+            self.epoch,
+            &self.node,
+            self.paid_cumulative,
+            self.served_cumulative,
+        );
+        if !NodeIdentity::verify(&NodeId(self.node), &msg, &sig) {
+            return false;
+        }
+        // The proof must justify the claimed served total (anti-farming). An empty proof proves 0 served.
+        proven_cumulative(&self.node, &self.proof) == Some(self.served_cumulative)
     }
-}
-
-/// Aggregate an epoch's collected announcements into the deterministic settlement inputs: the total pool
-/// (`Σ paid`) and the reward contributions (`{(node, served)}` for serving nodes). Pure + order-free
-/// (`reward::compute` canonicalizes by provider), so every node derives the identical inputs.
-fn aggregate(anns: &BTreeMap<[u8; 32], SettlementAnnouncement>) -> (u64, Vec<Contribution>) {
-    let pool = anns.values().map(|a| a.paid).sum();
-    let contributions = anns
-        .values()
-        .filter(|a| a.served > 0)
-        .map(|a| Contribution {
-            provider: a.node,
-            bytes: a.served,
-        })
-        .collect();
-    (pool, contributions)
 }
 
 pub struct SettlementService {
@@ -178,18 +201,29 @@ impl SettlementService {
             .insert(ann.node, ann);
     }
 
-    /// Sign this node's `epoch` summary, self-include it, and gossip it to every census peer.
-    async fn announce(&self, epoch: u64, paid: u64, served: u64) {
+    /// Build this node's `epoch` announcement from its current cumulatives + cheque proof, self-include
+    /// it, and gossip it to every census peer. Returns the `(paid_cumulative, served_cumulative)` sent.
+    async fn announce(&self, epoch: u64) -> (u64, u64) {
         let node = self.identity.node_id().0;
+        let paid_cumulative = self.ledger.total_paid();
+        let proof = self.cheques.serving_proof();
+        // Our own cheques are always valid → the proof justifies our served total by construction.
+        let served_cumulative = proven_cumulative(&node, &proof).unwrap_or(0);
         let sig = self
             .identity
-            .sign(&signing_bytes(epoch, &node, paid, served))
+            .sign(&signing_bytes(
+                epoch,
+                &node,
+                paid_cumulative,
+                served_cumulative,
+            ))
             .to_vec();
         let ann = SettlementAnnouncement {
             epoch,
             node,
-            paid,
-            served,
+            paid_cumulative,
+            served_cumulative,
+            proof,
             sig,
         };
         // Self-include so a single node still settles and we always count our own contribution.
@@ -202,7 +236,7 @@ impl SettlementService {
 
         let me = self.identity.node_id();
         let Some(m) = self.membership.read().await.clone() else {
-            return;
+            return (paid_cumulative, served_cumulative);
         };
         let peers: Vec<(NodeId, PeerAddr)> = m
             .census()
@@ -211,7 +245,7 @@ impl SettlementService {
             .filter(|(id, _)| *id != me)
             .collect();
         let Ok(bytes) = postcard::to_allocvec(&ann) else {
-            return;
+            return (paid_cumulative, served_cumulative);
         };
         let bytes = Arc::new(bytes);
         for (_id, addr) in peers {
@@ -222,20 +256,23 @@ impl SettlementService {
                     .await;
             });
         }
+        (paid_cumulative, served_cumulative)
     }
 
-    /// Settle one epoch deterministically from its converged board and feed the record to the ledger.
+    /// Settle one epoch deterministically from its converged board and feed the ledger the per-node
+    /// cumulatives (`node, paid_cumulative, served_cumulative`) — it folds each node's watermark delta.
     async fn settle(&self, epoch: u64) {
-        let (pool, contributions) = {
+        let entries: Vec<([u8; 32], u64, u64)> = {
             let board = self.board.read().await;
             match board.get(&epoch) {
-                Some(anns) => aggregate(anns),
-                None => (0, Vec::new()),
+                Some(anns) => anns
+                    .values()
+                    .map(|a| (a.node, a.paid_cumulative, a.served_cumulative))
+                    .collect(),
+                None => Vec::new(),
             }
         };
-        self.ledger
-            .settle_from_board(epoch, pool, contributions)
-            .await;
+        self.ledger.settle_from_board(epoch, entries).await;
     }
 
     /// Drop board epochs well below the last settled one — settled epochs never re-settle, so a small
@@ -248,10 +285,11 @@ impl SettlementService {
     /// The epoch-close loop: announce this node's just-closed epoch, then settle every epoch that has
     /// passed its grace window (in order). All loop-local state — no shared mutation but the board.
     pub async fn run(self: Arc<Self>) {
-        let mut boundary_served = 0u64;
-        let mut boundary_paid = 0u64;
         let mut last_announced: Option<u64> = None;
         let mut last_settled: Option<u64> = None;
+        // The cumulatives we last announced — skip re-announcing an epoch when nothing changed.
+        let mut sent_paid = 0u64;
+        let mut sent_served = 0u64;
         let mut initialized = false;
         let mut ticker = tokio::time::interval(TICK);
 
@@ -261,28 +299,27 @@ impl SettlementService {
             if now == 0 {
                 continue;
             }
-            // First tick: baseline to the current cumulative + closed epoch so we don't backfill all of
-            // history into epoch 0's announcement or re-settle the past. We start fresh next boundary.
+            // First tick: baseline the closed/settled epochs so we don't re-announce or re-settle the
+            // past. Cumulatives are read fresh at each announce (no boundary bookkeeping needed).
             if !initialized {
-                boundary_served = self.cheques.total_earned();
-                boundary_paid = self.ledger.total_paid();
                 last_announced = Some(now.saturating_sub(1));
                 last_settled = Some(now.saturating_sub(1 + SETTLE_GRACE_EPOCHS));
+                sent_paid = self.ledger.total_paid();
+                sent_served = self.cheques.total_earned();
                 initialized = true;
                 continue;
             }
 
-            // ANNOUNCE the just-closed epoch's deltas, once.
+            // ANNOUNCE this node's current cumulatives (+ cheque proof) for the just-closed epoch, once —
+            // but only if a cumulative actually grew (an unchanged announcement folds a zero delta anyway).
             let closed = now - 1;
             if last_announced.is_none_or(|e| e < closed) {
-                let served_now = self.cheques.total_earned();
                 let paid_now = self.ledger.total_paid();
-                let d_served = served_now.saturating_sub(boundary_served);
-                let d_paid = paid_now.saturating_sub(boundary_paid);
-                boundary_served = served_now;
-                boundary_paid = paid_now;
-                if d_served > 0 || d_paid > 0 {
-                    self.announce(closed, d_paid, d_served).await;
+                let served_now = self.cheques.total_earned();
+                if paid_now > sent_paid || served_now > sent_served {
+                    let (p, s) = self.announce(closed).await;
+                    sent_paid = p;
+                    sent_served = s;
                 }
                 last_announced = Some(closed);
             }
@@ -307,55 +344,71 @@ impl SettlementService {
 mod tests {
     use super::*;
 
-    fn ann(node: u8, epoch: u64, paid: u64, served: u64) -> SettlementAnnouncement {
-        // Signed by a throwaway identity is unnecessary for the pure-aggregation tests; build directly.
-        SettlementAnnouncement {
-            epoch,
-            node: [node; 32],
-            paid,
-            served,
-            sig: vec![0u8; 64],
-        }
+    /// A cheque from `consumer` acknowledging that `server` served it `cumulative` bytes.
+    fn cheque(consumer: &NodeIdentity, server: [u8; 32], cumulative: u64) -> ServingCheque {
+        ServingCheque::sign(consumer, server, cumulative, 1)
     }
 
     #[test]
-    fn aggregate_sums_pool_and_collects_serving_contributions() {
-        let mut board = BTreeMap::new();
-        board.insert([1u8; 32], ann(1, 5, 30, 100)); // pays 30, serves 100
-        board.insert([2u8; 32], ann(2, 5, 70, 0)); // pays 70, serves nothing (pure consumer)
-        board.insert([3u8; 32], ann(3, 5, 0, 50)); // pays 0, serves 50 (pure provider)
-        let (pool, contribs) = aggregate(&board);
-        assert_eq!(pool, 100, "pool = Σ paid = 30 + 70 + 0");
-        // Only serving nodes are contributions; the pure consumer is excluded.
-        assert_eq!(contribs.len(), 2);
-        assert!(contribs
-            .iter()
-            .any(|c| c.provider == [1u8; 32] && c.bytes == 100));
-        assert!(contribs
-            .iter()
-            .any(|c| c.provider == [3u8; 32] && c.bytes == 50));
-        assert!(!contribs.iter().any(|c| c.provider == [2u8; 32]));
+    fn proven_cumulative_sums_valid_cheques_and_rejects_theft() {
+        let server = NodeIdentity::generate();
+        let s = server.node_id().0;
+        let alice = NodeIdentity::generate();
+        let bob = NodeIdentity::generate();
+        // Two consumers each acknowledge the server → proven = 100 + 250.
+        let proof = vec![cheque(&alice, s, 100), cheque(&bob, s, 250)];
+        assert_eq!(proven_cumulative(&s, &proof), Some(350));
+        // A cheque naming a DIFFERENT server can't be claimed as this node's earnings.
+        let other = [9u8; 32];
+        assert_eq!(proven_cumulative(&s, &[cheque(&alice, other, 100)]), None);
+        // An empty proof proves exactly zero served.
+        assert_eq!(proven_cumulative(&s, &[]), Some(0));
     }
 
     #[test]
-    fn announcement_sign_verify_roundtrips_and_rejects_tampering() {
-        let id = NodeIdentity::generate();
-        let node = id.node_id().0;
-        let sig = id.sign(&signing_bytes(7, &node, 42, 900)).to_vec();
+    fn announcement_verifies_with_matching_proof_and_rejects_farming() {
+        let node_ident = NodeIdentity::generate();
+        let node = node_ident.node_id().0;
+        let alice = NodeIdentity::generate();
+        let proof = vec![cheque(&alice, node, 900)];
+        let (paid, served) = (42u64, 900u64);
+        let sig = node_ident
+            .sign(&signing_bytes(7, &node, paid, served))
+            .to_vec();
         let good = SettlementAnnouncement {
             epoch: 7,
             node,
-            paid: 42,
-            served: 900,
+            paid_cumulative: paid,
+            served_cumulative: served,
+            proof: proof.clone(),
             sig,
         };
-        assert!(good.verify(), "a correctly-signed announcement verifies");
-        // Tampering with any signed field breaks verification (can't inflate served after signing).
-        let mut forged = good.clone();
-        forged.served = 999_999;
-        assert!(!forged.verify(), "an inflated served count fails the sig");
-        let mut wrong_node = good.clone();
-        wrong_node.node = [9u8; 32];
-        assert!(!wrong_node.verify(), "a mismatched node fails the sig");
+        assert!(
+            good.verify(),
+            "a signed announcement whose proof backs served verifies"
+        );
+
+        // Tampering served after signing breaks the node sig.
+        let mut tampered = good.clone();
+        tampered.served_cumulative = 999_999;
+        assert!(!tampered.verify(), "post-sign inflation fails the sig");
+
+        // THE ANTI-FARM CASE: correctly SIGN an inflated served, but the (unchanged) proof only sums to
+        // 900 → the proof doesn't justify the claim, so it's rejected despite a valid signature.
+        let sig_big = node_ident
+            .sign(&signing_bytes(7, &node, paid, 999_999))
+            .to_vec();
+        let farmed = SettlementAnnouncement {
+            epoch: 7,
+            node,
+            paid_cumulative: paid,
+            served_cumulative: 999_999,
+            proof,
+            sig: sig_big,
+        };
+        assert!(
+            !farmed.verify(),
+            "a validly-signed but cheque-unbacked served is rejected (anti-farming)"
+        );
     }
 }
