@@ -2599,6 +2599,17 @@ Phases (each: build + test + gate + commit; roll together where consensus-affect
       average, useless for steady state on a young process** — sample instantaneously, past startup, and hold the
       load (here: dashboard polling) CONSTANT across the A and B. I have now twice drawn a confident conclusion
       from an uncontrolled CPU comparison.
+- [x] **FIXED (2026-07-17) — the dashboard did NETWORK I/O on the request path.** `/api/status` derived the
+      economy inline: `balance()` syncs the account chain (+`resolve_debit` per Claim op) and the records view
+      walks the claim window across committee members' chains — each an iterative DHT lookup. On a high-RTT node
+      (relay-only/NAT/mobile, 250–470ms) that took MINUTES: measured `/api/status` **hung >45s, http=000**, while
+      the dashboard polls ~1/s. PREDATES the economy split (`balance()` was always on this path) — caching/
+      single-flight only rate-limit it; a request handler must not do network I/O. FIX: `economy_refresh_loop`
+      owns the derivation (a LOOP is single-flight BY CONSTRUCTION — an HTTP handler cannot refuse work) and
+      `snapshot` reads its last result; poll rate + network cost decoupled, a slow walk costs staleness not a
+      queue. `ECONOMY_REFRESH=15s` ≪ the 5-min epoch that gates the data. **PROVEN: >45s hang → 0.4–1.3ms,
+      http=200.** Gate 🟢, rolled to all 5 nodes. NOTE: this did NOT fix the bandwidth (below) — it was a real
+      bug, just not that one.
 - [ ] **OPEN ISSUE — Mac (relay-only/NAT) receives ~700KB/s–1.5MB/s idle over a DIRECT IPv6 QUIC path
       (2026-07-17). NOT the economy layer. Traced, not solved.**
       User reported high idle received volume. Traced by elimination + tcpdump:
@@ -2618,6 +2629,13 @@ Phases (each: build + test + gate + commit; roll together where consensus-affect
         phone hotspot (172.20.10.5, RTT 254–468ms) — the lossy path where QUIC retransmit pathologies appear.
       - **NEXT:** iroh connection stats (retransmit counters / path events) or capture whether those packets are
         DISTINCT payloads vs repeats. Needs deliberate instrumentation; do NOT guess again.
+      - **[2026-07-17, later] DASHBOARD STAMPEDE THEORY = FALSIFIED (5th wrong call).** I found `/api/status`
+        HUNG >45s (derives economy inline → `balance()`/records walk → iterative DHT lookups; on the Mac's
+        250–470ms RTT a walk takes minutes while the dashboard polls 1/s ⇒ unbounded pile-up) and concluded that
+        WAS the bandwidth. FIXED the hang (see below) then A/B'd it at steady state: **NO polling = 1818/2166/1460
+        KB/s; WITH 1/s polling = 54/53/1989 KB/s.** Traffic is JUST AS HIGH with the dashboard idle ⇒ polling does
+        NOT drive it. The bandwidth remains UNEXPLAINED and is NOT the economy layer (user said so from the start;
+        they were right).
       - **METHOD NOTE:** I called a cause 4x and was wrong 4x (dashboard scale, health scan, decay, relay) — each
         a plausible story ahead of evidence. What worked: the user's "does the hetzner node also receive as much?"
         (an asymmetry test), then per-CONNECTION accounting (`nettop -x`, not `-P`), then tcpdump.
