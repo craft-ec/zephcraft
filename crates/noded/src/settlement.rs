@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use zeph_economy_egress::subscription::{
     SubscriptionLedger, DEFAULT_BYTES_PER_TOKEN, DEFAULT_WINDOW,
 };
-use zeph_reward::{compute, Contribution, RewardInput, RewardRecord, Spend};
+use zeph_reward::{compute, Contribution, Entitlement, RewardInput, RewardRecord};
 
 /// Governed claim window (§10.1): an unclaimed reward share forfeits back to the pool after this many
 /// epochs, bounding record storage. A config value later; a sane default for now. Also the startup
@@ -97,8 +97,12 @@ impl SettlementStore {
         self.window_epochs = crate::epoch::epochs_in(window);
     }
 
-    /// `consumer`'s remaining unexpired egress entitlement at `epoch` — the dashboard's
-    /// "subscription bytes left".
+    /// `consumer`'s remaining unexpired egress entitlement at `epoch`.
+    ///
+    /// Retained as the store's observable state + asserted by this module's tests; the DASHBOARD now
+    /// reads this figure from the durable records chain instead (`my_view_from_records`), because a
+    /// non-settling node has no local state to read.
+    #[allow(dead_code)]
     pub fn entitlement(&self, consumer: &[u8; 32], epoch: u64) -> u64 {
         self.subs.available(consumer, epoch)
     }
@@ -118,13 +122,13 @@ impl SettlementStore {
     /// record and moving `unallocated → owed` (Σ shares; the dust remainder stays `unallocated`).
     /// Returns the published record. Re-settling the same epoch is refused (returns the existing one).
     ///
-    /// `spends` = which consumers' entitlements funded this epoch's rewardable serving. It is carried into
-    /// the record so the attested artifact fully describes the epoch (see [`RewardRecord`]).
+    /// `entitlements` = each consumer's spend + resulting balance. Carried into the record so the attested
+    /// artifact fully describes the epoch and any node can read its own view off it (see [`RewardRecord`]).
     pub fn settle_epoch(
         &mut self,
         epoch: u64,
         contributions: Vec<Contribution>,
-        spends: Vec<Spend>,
+        entitlements: Vec<Entitlement>,
     ) -> RewardRecord {
         if let Some(existing) = self.records.get(&epoch) {
             return existing.clone(); // idempotent: an epoch settles once
@@ -134,7 +138,7 @@ impl SettlementStore {
             epoch,
             pool: self.unallocated,
             contributions,
-            spends,
+            entitlements,
         });
         let allocated: u64 = record.shares.iter().map(|s| s.amount).sum();
         // Σ shares ≤ unallocated (guaranteed by `compute`), so this never underflows; dust stays.
@@ -215,17 +219,41 @@ impl SettlementStore {
         self.pay_in(pool_add);
         let contributions: Vec<Contribution> = contrib
             .into_iter()
-            .map(|(provider, bytes)| Contribution { provider, bytes })
+            .map(|(provider, bytes)| Contribution {
+                provider,
+                bytes,
+                // The running total AFTER this epoch's allocation (advanced in the loop above) — the
+                // record carries it so a provider reads its settled figure from one row.
+                cumulative_bytes: self.rewardable.get(&provider).copied().unwrap_or(0),
+            })
             .collect();
-        let spends: Vec<Spend> = spent
+        // A row for every consumer that SPENT or still HOLDS entitlement — an idle subscriber's balance
+        // must stay visible, so it cannot be built from the spend map alone.
+        let mut rows: BTreeMap<[u8; 32], (u64, u64)> = BTreeMap::new();
+        for (consumer, bytes) in spent {
+            rows.entry(consumer).or_default().0 = bytes;
+        }
+        for (consumer, remaining) in self.subs.balances(epoch) {
+            rows.entry(consumer).or_default().1 = remaining;
+        }
+        let entitlements: Vec<Entitlement> = rows
             .into_iter()
-            .map(|(consumer, bytes)| Spend { consumer, bytes })
+            .map(|(consumer, (spent, remaining))| Entitlement {
+                consumer,
+                spent,
+                remaining,
+            })
             .collect();
-        self.settle_epoch(epoch, contributions, spends)
+        self.settle_epoch(epoch, contributions, entitlements)
     }
 
     /// This provider's CUMULATIVE rewardable served bytes (the "settled" numerator of settled/served) —
-    /// the portion of its serving that fell within consumers' paid quotas and thus earned reward.
+    /// the portion of its serving that fell within consumers' entitlements and thus earned reward. This
+    /// is the value carried into each record as `Share::cumulative_bytes`.
+    ///
+    /// Retained as the store's observable state + asserted by this module's tests; the DASHBOARD reads it
+    /// from the durable records chain instead (a non-settling node has no local state).
+    #[allow(dead_code)]
     pub fn rewardable_served(&self, provider: &[u8; 32]) -> u64 {
         self.rewardable.get(provider).copied().unwrap_or(0)
     }
@@ -306,6 +334,7 @@ mod tests {
         Contribution {
             provider: prov(p),
             bytes,
+            cumulative_bytes: 0, // these tests assert the pool/ratio, not the carried state
         }
     }
 

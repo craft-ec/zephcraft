@@ -22,36 +22,52 @@ use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 
 /// One provider's rewardable contribution this epoch — its PAID-serving bytes (identified by
-/// `allocate_quota` on the node from the cheques; free/reciprocal serving is excluded).
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+/// `allocate_quota` on the node from the cheques; free/reciprocal serving is excluded), plus its running
+/// cumulative total. The cumulative is node-supplied state carried through to the record so a provider
+/// can read its own settled figure from one row (see [`Share::cumulative_bytes`]).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Contribution {
     pub provider: [u8; 32],
     pub bytes: u64,
+    #[serde(default)]
+    pub cumulative_bytes: u64,
 }
 
-/// One consumer's egress ENTITLEMENT spent this epoch — how much of its subscription actually funded
-/// rewardable serving (`≤` what it was entitled to; serving past it was unrewarded subsidy).
+/// One consumer's egress subscription AFTER this epoch: how much entitlement it spent, and how much is
+/// left unexpired.
+///
+/// `remaining` is deliberately the resulting STATE, not just the delta. A consumer's remaining balance
+/// cannot be replayed from deltas alone: grants are bought at the GOVERNED `bytes_per_token`, which can
+/// change and is recorded nowhere, so a later replay would price old purchases at today's rate and get a
+/// different answer. Recording the state makes a consumer's own view a single lookup off the durable
+/// chain — no replay, no price history, and correct for a node that never settles.
+///
+/// A row appears for every consumer that spent OR still holds entitlement, so an idle subscriber's
+/// balance stays visible instead of vanishing the moment it stops consuming.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct Spend {
+pub struct Entitlement {
     pub consumer: [u8; 32],
-    pub bytes: u64,
+    /// Entitlement spent THIS epoch (funded rewardable serving).
+    pub spent: u64,
+    /// Unexpired entitlement remaining after this epoch — the subscriber's balance.
+    pub remaining: u64,
 }
 
 /// The reward-valuation input: the epoch, its payment pool (Σ consumers' paid egress), every provider's
 /// contribution (duplicate provider entries are summed), and every consumer's entitlement spend.
 ///
-/// `spends` is node-supplied (the per-consumer FCFS allocation happens in the node's settlement, not in
-/// this pure function) and travels through to the record verbatim. It is part of the INPUT precisely so
-/// the record stays a pure function of it — a verifier re-derives the same input from committed chains
-/// and re-runs `compute` to the identical record. Without that, carrying spends in the record would make
-/// it unreproducible and break verification.
+/// `entitlements` is node-supplied (the per-consumer FCFS allocation happens in the node's settlement,
+/// not in this pure function) and travels through to the record verbatim. It is part of the INPUT
+/// precisely so the record stays a pure function of it — a verifier re-derives the same input from
+/// committed chains and re-runs `compute` to the identical record. Without that, carrying it in the
+/// record only would make the record unreproducible and break verification.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct RewardInput {
     pub epoch: u64,
     pub pool: u64,
     pub contributions: Vec<Contribution>,
     #[serde(default)]
-    pub spends: Vec<Spend>,
+    pub entitlements: Vec<Entitlement>,
 }
 
 /// One provider's computed reward share (the amount it may CLAIM for this epoch) plus the REWARDABLE
@@ -63,8 +79,14 @@ pub struct RewardInput {
 pub struct Share {
     pub provider: [u8; 32],
     pub amount: u64,
+    /// Rewardable bytes THIS epoch — the ratio's numerator, previously computed then discarded.
     #[serde(default)]
     pub bytes: u64,
+    /// CUMULATIVE rewardable bytes across all epochs — the running "settled" figure. State, not a delta,
+    /// for the same reason as [`Entitlement::remaining`]: summing deltas would mean reading every record
+    /// ever written, whereas the state makes a provider's own view one lookup of its latest row.
+    #[serde(default)]
+    pub cumulative_bytes: u64,
 }
 
 /// The epoch reward RECORD — per-provider shares and per-consumer spends, both sorted by id (canonical).
@@ -79,7 +101,7 @@ pub struct RewardRecord {
     pub epoch: u64,
     pub shares: Vec<Share>,
     #[serde(default)]
-    pub spends: Vec<Spend>,
+    pub entitlements: Vec<Entitlement>,
 }
 
 impl RewardRecord {
@@ -102,14 +124,32 @@ impl RewardRecord {
             .unwrap_or(0)
     }
 
-    /// The egress entitlement `consumer` spent this epoch (0 if absent) — lets a consumer reconstruct
-    /// its own remaining subscription from its purchases minus its spends, without settling.
+    /// The egress entitlement `consumer` spent this epoch (0 if absent).
     pub fn spent_by(&self, consumer: &[u8; 32]) -> u64 {
-        self.spends
+        self.entitlements
             .iter()
             .find(|s| &s.consumer == consumer)
-            .map(|s| s.bytes)
+            .map(|s| s.spent)
             .unwrap_or(0)
+    }
+
+    /// `consumer`'s subscription balance after this epoch, if this record carries a row for it.
+    /// `None` (not 0) when absent, so a caller can walk back to the consumer's most recent row rather
+    /// than mistake "no row here" for "balance is zero".
+    pub fn remaining_for(&self, consumer: &[u8; 32]) -> Option<u64> {
+        self.entitlements
+            .iter()
+            .find(|s| &s.consumer == consumer)
+            .map(|s| s.remaining)
+    }
+
+    /// `provider`'s CUMULATIVE rewardable bytes as of this epoch, if this record carries a row for it.
+    /// `None` when absent — same reasoning as [`remaining_for`](Self::remaining_for).
+    pub fn cumulative_bytes_of(&self, provider: &[u8; 32]) -> Option<u64> {
+        self.shares
+            .iter()
+            .find(|s| &s.provider == provider)
+            .map(|s| s.cumulative_bytes)
     }
 }
 
@@ -118,14 +158,19 @@ impl RewardRecord {
 /// aggregated + sorted via `BTreeMap`), so every node and every verifier re-run produces the identical
 /// record. A zero pool or zero total contribution → all-zero shares. `Σ shares ≤ pool` always.
 pub fn compute(input: &RewardInput) -> RewardRecord {
-    let mut by_provider: BTreeMap<[u8; 32], u128> = BTreeMap::new();
+    // (bytes THIS epoch, cumulative). Bytes SUM across duplicate entries (they are deltas); the
+    // cumulative takes the MAX — it is state, so summing duplicates would double it. Both are
+    // order-independent, which is what keeps the record canonical.
+    let mut by_provider: BTreeMap<[u8; 32], (u128, u64)> = BTreeMap::new();
     for c in &input.contributions {
-        *by_provider.entry(c.provider).or_default() += c.bytes as u128;
+        let e = by_provider.entry(c.provider).or_default();
+        e.0 += c.bytes as u128;
+        e.1 = e.1.max(c.cumulative_bytes);
     }
-    let total: u128 = by_provider.values().copied().sum();
+    let total: u128 = by_provider.values().map(|(b, _)| *b).sum();
     let shares = by_provider
         .into_iter() // BTreeMap iterates in sorted key order → canonical output
-        .map(|(provider, bytes)| {
+        .map(|(provider, (bytes, cumulative_bytes))| {
             let amount = if total == 0 {
                 0
             } else {
@@ -135,25 +180,32 @@ pub fn compute(input: &RewardInput) -> RewardRecord {
                 provider,
                 amount,
                 bytes: bytes as u64, // the ratio numerator, kept instead of discarded
+                cumulative_bytes,
             }
         })
         .collect();
-    // Spends travel through verbatim, but CANONICALLY: summed per consumer and sorted, so two nodes
-    // handed the same allocation in a different order still produce byte-identical records (the record
-    // is signed + compared by hash, so ordering is a correctness concern, not cosmetic).
-    let mut by_consumer: BTreeMap<[u8; 32], u64> = BTreeMap::new();
-    for s in &input.spends {
-        let e = by_consumer.entry(s.consumer).or_default();
-        *e = e.saturating_add(s.bytes);
+    // Entitlements travel through verbatim, but CANONICALLY: merged per consumer and sorted, so two
+    // nodes handed the same allocation in a different order still produce byte-identical records (the
+    // record is signed + compared by hash, so ordering is correctness, not cosmetics). `spent` sums
+    // (delta); `remaining` takes the max (state) — same reasoning as the cumulative above.
+    let mut by_consumer: BTreeMap<[u8; 32], (u64, u64)> = BTreeMap::new();
+    for e in &input.entitlements {
+        let row = by_consumer.entry(e.consumer).or_default();
+        row.0 = row.0.saturating_add(e.spent);
+        row.1 = row.1.max(e.remaining);
     }
-    let spends = by_consumer
+    let entitlements = by_consumer
         .into_iter()
-        .map(|(consumer, bytes)| Spend { consumer, bytes })
+        .map(|(consumer, (spent, remaining))| Entitlement {
+            consumer,
+            spent,
+            remaining,
+        })
         .collect();
     RewardRecord {
         epoch: input.epoch,
         shares,
-        spends,
+        entitlements,
     }
 }
 
@@ -177,6 +229,10 @@ mod tests {
         Contribution {
             provider: prov(p),
             bytes,
+            // 0: this helper serves the RATIO tests. Tying the cumulative to `bytes` would make a
+            // duplicate-entry input claim different STATE than its pre-summed equivalent, breaking the
+            // canonical-aggregation property those tests check. Cumulative-carrying tests set it.
+            cumulative_bytes: 0,
         }
     }
 
@@ -262,82 +318,91 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_record_describes_the_epoch_bytes_and_spends_not_just_payouts() {
-        // The record is the DURABLE attested summary, and settling is committee-gated — so a node that
-        // never settles must still be able to read its own served bytes + its consumers' entitlement
-        // spend straight off the records chain.
-        let rec = compute(&RewardInput {
-            epoch: 3,
-            pool: 100,
-            contributions: alloc::vec![contrib(1, 60), contrib(2, 40)],
-            spends: alloc::vec![
-                Spend {
-                    consumer: prov(8),
-                    bytes: 70
-                },
-                Spend {
-                    consumer: prov(9),
-                    bytes: 30
-                },
-            ],
-        });
-        // Bytes are the ratio's numerator — carried, not discarded.
-        assert_eq!(rec.bytes_of(&prov(1)), 60);
-        assert_eq!(rec.bytes_of(&prov(2)), 40);
-        assert_eq!(rec.share_of(&prov(1)), 60); // and still the payout
-                                                // Spends travel through, readable per consumer.
-        assert_eq!(rec.spent_by(&prov(8)), 70);
-        assert_eq!(rec.spent_by(&prov(9)), 30);
-        assert_eq!(rec.spent_by(&prov(1)), 0); // absent consumer → 0
+    fn ent(c: u8, spent: u64, remaining: u64) -> Entitlement {
+        Entitlement {
+            consumer: prov(c),
+            spent,
+            remaining,
+        }
     }
 
     #[test]
-    fn spends_are_canonical_so_records_hash_identically() {
+    fn the_record_describes_the_whole_epoch_not_just_payouts() {
+        // The record is the DURABLE attested summary and settling is committee-gated, so a node that
+        // never settles must still read its OWN figures straight off the records chain.
+        let rec = compute(&RewardInput {
+            epoch: 3,
+            pool: 100,
+            contributions: alloc::vec![
+                Contribution {
+                    provider: prov(1),
+                    bytes: 60,
+                    cumulative_bytes: 660
+                },
+                Contribution {
+                    provider: prov(2),
+                    bytes: 40,
+                    cumulative_bytes: 40
+                },
+            ],
+            entitlements: alloc::vec![ent(8, 70, 30), ent(9, 30, 0)],
+        });
+        // Payout, this epoch's bytes, and the running total all present.
+        assert_eq!(rec.share_of(&prov(1)), 60);
+        assert_eq!(rec.bytes_of(&prov(1)), 60);
+        assert_eq!(rec.cumulative_bytes_of(&prov(1)), Some(660));
+        // Consumer view: spend + resulting balance.
+        assert_eq!(rec.spent_by(&prov(8)), 70);
+        assert_eq!(rec.remaining_for(&prov(8)), Some(30));
+        assert_eq!(rec.remaining_for(&prov(9)), Some(0)); // present, exhausted
+                                                          // ABSENT is not zero: None lets a caller walk back to the account's most recent row instead of
+                                                          // mistaking "didn't act this epoch" for "has nothing".
+        assert_eq!(rec.remaining_for(&prov(1)), None);
+        assert_eq!(rec.cumulative_bytes_of(&prov(9)), None);
+    }
+
+    #[test]
+    fn records_are_canonical_so_they_hash_identically() {
         // Records are SIGNED and compared BY HASH across the committee, so a differing field order would
-        // split an otherwise-agreeing quorum. Same allocation, different input order + a duplicate → one
-        // canonical record.
+        // split an otherwise-agreeing quorum. Same epoch, shuffled input + duplicates => one record.
         let a = compute(&RewardInput {
             epoch: 4,
             pool: 10,
-            contributions: alloc::vec![contrib(1, 10)],
-            spends: alloc::vec![
-                Spend {
-                    consumer: prov(9),
-                    bytes: 30
+            contributions: alloc::vec![
+                Contribution {
+                    provider: prov(1),
+                    bytes: 4,
+                    cumulative_bytes: 9
                 },
-                Spend {
-                    consumer: prov(8),
-                    bytes: 40
+                Contribution {
+                    provider: prov(1),
+                    bytes: 6,
+                    cumulative_bytes: 9
                 },
-                Spend {
-                    consumer: prov(8),
-                    bytes: 30
-                }, // duplicate → summed
             ],
+            entitlements: alloc::vec![ent(9, 30, 5), ent(8, 40, 2), ent(8, 30, 2)],
         });
         let b = compute(&RewardInput {
             epoch: 4,
             pool: 10,
-            contributions: alloc::vec![contrib(1, 10)],
-            spends: alloc::vec![
-                Spend {
-                    consumer: prov(8),
-                    bytes: 70
-                },
-                Spend {
-                    consumer: prov(9),
-                    bytes: 30
-                },
-            ],
+            contributions: alloc::vec![Contribution {
+                provider: prov(1),
+                bytes: 10,
+                cumulative_bytes: 9
+            }],
+            entitlements: alloc::vec![ent(8, 70, 2), ent(9, 30, 5)],
         });
-        assert_eq!(a, b, "field order / duplicates must not change the record");
+        assert_eq!(a, b, "input order / duplicates must not change the record");
         assert_eq!(
             postcard::to_allocvec(&a).unwrap(),
             postcard::to_allocvec(&b).unwrap(),
             "and must not change its BYTES (the thing the committee signs)"
         );
-        assert_eq!(a.spent_by(&prov(8)), 70); // duplicates summed, not last-wins
+        // Deltas SUM across duplicates; state does NOT (summing a cumulative would double it).
+        assert_eq!(a.bytes_of(&prov(1)), 10);
+        assert_eq!(a.cumulative_bytes_of(&prov(1)), Some(9));
+        assert_eq!(a.spent_by(&prov(8)), 70);
+        assert_eq!(a.remaining_for(&prov(8)), Some(2));
     }
 
     #[test]

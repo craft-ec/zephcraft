@@ -2530,8 +2530,26 @@ Phases (each: build + test + gate + commit; roll together where consensus-affect
       SURVIVE**; only economy-egress.wasm changes (d075d828…, was f8c24c08…) ⇒ its anchor re-pins.
       Tests: reward 8 (2 new: record describes bytes+spends; spends canonical/hash-identical), noded 54,
       economy 8, token 5; workspace clippy clean.
-      **REMAINING (local, NO roll needed — the data is now in the record):** wire `reward_settled` +
-      `subscription_bytes` to derive from the records chain. Until then they still read 0 on a non-settling node.
+      **COMPLETE WIRE DONE (2026-07-17, user "fold complete wire") — dashboard now reads BOTH from the chain.**
+      Key design point: `reward_settled` + `subscription_bytes` are running STATE, and a delta-replay CANNOT
+      reconstruct them — grants are priced at the GOVERNED `bytes_per_token`, which can change and is recorded
+      nowhere, so replaying old purchases at today's rate gives a wrong balance. So the record carries the
+      RESULTING STATE: `Share.cumulative_bytes` (running settled) + `Entitlement{consumer, spent, remaining}`
+      (replaces the delta-only `Spend`). A row exists for every consumer that SPENT **or still HOLDS**
+      entitlement — built from spend-map ∪ `SubscriptionLedger::balances()` — so an idle subscriber's balance
+      stays visible instead of vanishing when it stops consuming.
+      `my_view_from_records(account, now)` walks BACK to the account's most recent row: the accessors return
+      `Option` so ABSENT ≠ ZERO ("didn't act that epoch" must not read as "has nothing"); provider + consumer
+      walks are independent (a node may be either, both, or neither). Deltas SUM across duplicate input rows;
+      state takes MAX (summing a cumulative would double it) — both order-independent, keeping records
+      canonical. Dropped the dead local readers (`rewardable_served`/`entitlement` service wrappers); the store
+      methods stay `#[allow(dead_code)]` as observable state its own tests assert.
+      Tests: reward 8 (record describes whole epoch incl. absent≠zero; canonical/hash-identical under shuffled
+      + duplicate input), noded 54, economy 8, token 5, full workspace green, clippy clean at the GATE's
+      invocation (`--workspace --all-targets -D warnings` — a crate-scoped clippy missed an
+      `items_after_test_module` earlier).
+      **token.wasm STILL byte-identical ⇒ balances SURVIVE this roll**; only economy-egress moves
+      (62703d6a…, was f8c24c08… live).
       **GATE RED on scenario B (2026-07-17) — PROVEN NOT P5/P6.** Full gate: 7/8, scenario B census-20 at
       35.41s vs a 30s bar (one node stuck at census 10 at cutoff; all 20 converge by ~35.4s). Controlled A/B on
       this Mac:

@@ -122,6 +122,24 @@ impl SubscriptionLedger {
         used
     }
 
+    /// Every consumer holding unexpired entitlement, as `(consumer, remaining)` — the post-settle
+    /// snapshot the epoch record carries so a subscriber can read its balance off the durable chain
+    /// without settling (and without needing the historical price to replay it). Sorted (BTreeMap order)
+    /// so the record stays canonical.
+    pub fn balances(&self, epoch: u64) -> alloc::vec::Vec<([u8; 32], u64)> {
+        self.grants
+            .iter()
+            .filter_map(|(c, q)| {
+                let rem = q
+                    .iter()
+                    .filter(|g| g.expires_at > epoch)
+                    .map(|g| g.remaining)
+                    .fold(0u64, |a, b| a.saturating_add(b));
+                (rem > 0).then_some((*c, rem))
+            })
+            .collect()
+    }
+
     /// `consumer`'s unexpired remaining entitlement — the dashboard "egress left on your subscription".
     pub fn available(&self, consumer: &[u8; 32], epoch: u64) -> u64 {
         self.grants

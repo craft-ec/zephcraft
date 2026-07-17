@@ -127,9 +127,10 @@ mod tests {
             shares: vec![Share {
                 provider: [provider; 32],
                 amount,
-                bytes: 0, // not under test here (attestation/quorum grouping)
+                bytes: 0,            // not under test here (attestation/quorum grouping)
+                cumulative_bytes: 0, // ditto
             }],
-            spends: Vec::new(),
+            entitlements: Vec::new(),
         }
     }
 

@@ -300,6 +300,10 @@ impl State {
             // legitimately holds both handles, so it joins them here rather than coupling the services).
             let token_state = self.ledger.balance(me).await;
             let now_epoch = self.settlement.epoch();
+            // Both are STATE carried in the attested record, read from the durable chain — a node that
+            // does not settle (committee-gated) has no local settlement state and would report 0.
+            let (my_settled, my_subscription) =
+                self.economy.my_view_from_records(me, now_epoch).await;
             Economy {
                 balance: token_state.balance,
                 // From the CANONICAL records, not local settle state: since settling is committee-gated,
@@ -308,9 +312,9 @@ impl State {
                     .economy
                     .owed_from_records(me, &token_state.claimed_epochs, now_epoch)
                     .await,
-                reward_settled: self.economy.rewardable_served(me).await,
+                reward_settled: my_settled,
                 pool: self.economy.pool_unallocated().await,
-                subscription_bytes: self.economy.entitlement(me, self.settlement.epoch()).await,
+                subscription_bytes: my_subscription,
                 verified,
                 mismatched,
                 reciprocity: Some(self.cheque.reciprocity_snapshot()),
@@ -1403,6 +1407,7 @@ async fn rpc_ledger_settle_epoch(
             vec![zeph_reward::Contribution {
                 provider: me,
                 bytes,
+                cumulative_bytes: bytes, // dev override: no running history to carry
             }],
         )
         .await;

@@ -62,10 +62,35 @@ impl EconomyEgressService {
         self.settlement.write().await.set_window(window);
     }
 
-    /// `consumer`'s remaining unexpired egress entitlement at `epoch` — the dashboard's "subscription
-    /// bytes left" (use-it-or-lose-it: it is gone at the window edge, never refunded).
-    pub async fn entitlement(&self, consumer: [u8; 32], epoch: u64) -> u64 {
-        self.settlement.read().await.entitlement(&consumer, epoch)
+    /// An account's own `(cumulative_settled_bytes, subscription_remaining)` read from the CANONICAL
+    /// records chain — so a node that never settles (the common case, since settling is committee-gated)
+    /// still sees its own figures instead of 0.
+    ///
+    /// Both are STATE, so this walks BACK from `now_epoch` to the account's most recent row rather than
+    /// summing deltas: absence from a record means "didn't act that epoch", NOT "zero" — a provider that
+    /// served nothing recently keeps its cumulative, and an idle subscriber keeps its balance. The two
+    /// walks are independent because a node can be a provider, a consumer, both, or neither.
+    pub async fn my_view_from_records(&self, account: [u8; 32], now_epoch: u64) -> (u64, u64) {
+        let Some(records) = self.record_chain.read().await.clone() else {
+            return (0, 0);
+        };
+        let start = now_epoch.saturating_sub(crate::settlement::CLAIM_WINDOW_EPOCHS);
+        let (mut settled, mut remaining) = (None, None);
+        for e in (start..=now_epoch).rev() {
+            if settled.is_some() && remaining.is_some() {
+                break; // both found — no reason to keep walking back
+            }
+            let Some(rec) = records.canonical_record(e).await else {
+                continue;
+            };
+            if settled.is_none() {
+                settled = rec.cumulative_bytes_of(&account);
+            }
+            if remaining.is_none() {
+                remaining = rec.remaining_for(&account);
+            }
+        }
+        (settled.unwrap_or(0), remaining.unwrap_or(0))
     }
 
     /// The reward share owed to `account` for `epoch`: the CANONICAL committee-attested record's share if
@@ -129,12 +154,6 @@ impl EconomyEgressService {
             .write()
             .await
             .settle_epoch_from_cheques(epoch, paid, cheques)
-    }
-
-    /// This provider's cumulative REWARDABLE served bytes (the per-consumer-capped "settled" side of the
-    /// dashboard settled/served meter). Gross served is the cheque `total_earned`.
-    pub async fn rewardable_served(&self, provider: [u8; 32]) -> u64 {
-        self.settlement.read().await.rewardable_served(&provider)
     }
 
     /// DEV/manual override (the `ledger-settle-epoch` RPC): inject `pool` + settle `epoch` with the given
@@ -201,10 +220,11 @@ mod tests {
                 .map(|(provider, amount)| Share {
                     provider: *provider,
                     amount: *amount,
-                    bytes: 0, // irrelevant to the owed sum under test
+                    bytes: 0,            // irrelevant to the owed sum under test
+                    cumulative_bytes: 0, // ditto
                 })
                 .collect(),
-            spends: Vec::new(),
+            entitlements: Vec::new(),
         }
     }
 

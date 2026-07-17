@@ -60,13 +60,15 @@ mod tests {
                 Contribution {
                     provider: provider(1),
                     bytes: 50,
+                    cumulative_bytes: 0,
                 },
                 Contribution {
                     provider: provider(2),
                     bytes: 50,
+                    cumulative_bytes: 0,
                 },
             ],
-            spends: alloc::vec::Vec::new(),
+            entitlements: alloc::vec::Vec::new(),
         };
         let encoded = postcard::to_allocvec(&input).unwrap();
         let out = run_program(&encoded).expect("valid input computes a record");
@@ -92,8 +94,9 @@ mod tests {
             contributions: vec![Contribution {
                 provider: provider(3),
                 bytes: 30,
+                cumulative_bytes: 0,
             }],
-            spends: alloc::vec::Vec::new(),
+            entitlements: alloc::vec::Vec::new(),
         };
         let native = compute(&input);
         let via_program: RewardRecord =
