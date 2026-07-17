@@ -167,10 +167,29 @@ its provider records simply reappear in the DHT, and the surplus is only noticed
 that cid — a bounded but lazy ~1–2h (`recheck_max`), and then only ONE piece per scan. The system reacts to
 a home node vanishing in seconds and to its return in hours.
 
-**The one mercy is accidental.** Because shed is rate-limited to 1 piece/scan and repair mints in bulk, the
-surplus never fully sheds before nightfall — and that leftover surplus is precisely what absorbs X's next
-absence. So it damps to a steady ~7 pieces/cid/night of mint+shed rather than ratcheting without bound. That
-is luck, not design: the loop is bounded by the shed being too slow to finish.
+**At this fleet's scale it merely oscillates. At the target scale it RATCHETS.** Because shed is rate-limited
+to 1 piece/scan and repair mints in bulk, the surplus never fully sheds before nightfall — the leftover is
+what absorbs X's next absence — so on a small fleet it damps to a steady ~7 pieces/cid/night of mint+shed
+rather than growing. That is luck, not design.
+
+And it is luck that RUNS OUT, because it depends on the one thing this design exists to remove. `shed_one` is
+called from exactly one place: inside `health_scan_chunk`. **Every shed rides the periodic health scan** —
+the O(N_cids)/interval sweep measured in §1 at ~252 DHT streams/sec/node, which does not hold at 1M cids and
+which P5 replaces with PDP SAMPLING. Sampling visits cids statistically, not exhaustively; a given cid's
+surplus is then essentially never noticed. So at the target scale:
+
+| | trigger | cost | fires? |
+|---|---|---|---|
+| MINT | SWIM death (event) | O(churn) | promptly, in bulk, at any scale |
+| SHED | periodic scan (sweep) | O(N_cids) | never, at scale |
+
+Every night every home node's absence mints; nothing ever sheds. Storage grows monotonically, forever.
+
+**The general error, which is worth more than the specific bug:** repair was made event-driven while its
+INVERSE was left sweep-driven. That pair cannot be stable at any scale where the sweep is the thing being
+retired — the fast side always wins, and the slow side's cleanup is exactly the O(N_cids) cost this design
+was built to delete. A mechanism that creates work on an event must have its cleanup driven by an event too,
+or it must not create the work at all.
 
 **Why a grace period is NOT the fix.** The obvious patch — wait before treating `Dead` as lost — only
 addresses the night half. The day half still trims X's pieces as cold surplus, so the fleet keeps paying,
@@ -190,7 +209,15 @@ merely unreachable. So:
 - Shedding must judge surplus against pieces that EXIST, so a sleeping holder's pieces are not re-minted at
   night and its waking ones are not trimmed by day.
 
-This makes the returning node a non-event, which is the correct outcome: **it never lost anything.**
+This makes the returning node a non-event, which is the correct outcome: **it never lost anything.** Note
+what that buys beyond efficiency: with no unnecessary mint there is no surplus, so the un-scalable
+scan-driven shed is never needed to clean up after it. The scaling problem is not solved by making the
+cleanup cheaper — it is dissolved by not making the mess.
+
+**If minting on absence is ever kept, the shed MUST become event-driven too** — symmetric to `on_death`. A
+return is a membership event exactly as a death is, and the holder index already knows which cids the
+returning node holds, so `on_return(X)` costs O(|S_x ∩ ours|) with no sweep and no DHT resolve, just like
+§4. Any design that mints on an event and sheds on a sweep is the ratchet above wearing a different hat.
 
 **What this needs that we do not have.** Distinguishing "offline but holding" from "gone forever" requires
 knowing a holder still HAS the bytes while we cannot reach it. A signed holdings manifest is a claim, not
