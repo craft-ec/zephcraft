@@ -2732,7 +2732,28 @@ it dies with the scan at P3) and build the design directly.
       repointing + the add∩remove contradiction (which would make the applied result order-dependent ⇒ two
       readers disagreeing about whether a cid exists).
       Publisher keeps its OWN last set (bounded by our store — not the reader-side O(N) sin) to compute diffs.
-      Removed the now-dead `fetch()`; `changes_since` supersedes it. 67 noded tests; clippy clean.
+      Removed the now-dead `fetch()`; `changes_since` supersedes it.
+- [x] **P4c-fix — the phantom-holder bug the diff structure invited (2026-07-17, review-caught).**
+      The first cut took the cold path whenever a reader was >1 version behind (not just baseline-less), and
+      that path's empty `removed` — correct for a re-baseliner, which cannot know what was dropped before it
+      watched — was read by `check_peer` as "dropped nothing" (`first_sight` was false). SILENT PERMANENT
+      DATA LOSS: every gap removal vanished and nothing corrected it (a peer diffs against its OWN current
+      set, so a dropped cid is never mentioned again) → phantom holder forever → `repair_our_share` elects
+      around a node that doesn't hold it → repair never fires. Falling behind is ORDINARY: publish and
+      anti-entropy are independent 60s timers.
+      ROOT ERROR: two different claims given one shape. Fix = `Changes::Delta | Changes::Reset` as distinct
+      TYPES; `walk_chain` stops at the reader's own baseline when it's on the chain (⇒ fell-behind = true
+      delta, gap folded by `net_delta`); only an unreachable baseline ⇒ `Reset`, which `apply_reset` applies
+      by REPLACING (absence IS the removal), never merging.
+      Same class, also fixed: `check_peer` re-read `peer_head` AFTER `changes_since` resolved one (TOCTOU —
+      a publish between the two calls records a head we never applied ⇒ next tick sees `kc == head_cid` and
+      skips that version FOREVER); head now returns from `changes_since`. `apply_reset` only reports a loss
+      for a cid we still hold (our store shrinks too; we can only repair what we hold).
+      **The gate PASSED on the buggy commit** — the harness cannot see this class. So `walk_chain` now takes
+      its fetch as a PARAMETER: the part with the subtle correctness property must not be the part only
+      production exercises. The fell-behind test was verified to FAIL against the original bug.
+      73 noded tests; clippy clean. Independently re-reviewed: fell-behind / peer-restart-republishing-v1 /
+      forked chain / first_sight / fold order / walk bound all clear.
 - [ ] **P5 — PDP sampling (K5).** Makes manifests trustworthy rather than trusted.
 
 - [ ] **DESIGN WRITTEN — `docs/DURABILITY_DESIGN.md` (2026-07-17).** The periodic scan is O(N_cids)

@@ -179,8 +179,17 @@ working) · census = the shared basis for agreeing *without talking*.
   The DIFF is SIGNED (not just the resulting set): a reader applies it without ever seeing the whole set, so
   from its point of view the diff IS the claim. An unsigned diff would let anyone suppress a reported loss
   (silent data loss) or invent one (manufactured fleet-wide repair).
-- **Sampling is not a fix.** Recorded here because it is the intuitive answer and it is wrong: same axis,
-  smaller constant.
+
+  **The trap this structure sets, and the rule that defuses it.** "It dropped nothing" and "I cannot tell
+  you what it dropped" are DIFFERENT claims, and the diff shape invites collapsing them into one
+  (`removed: []`). The first cut of this did exactly that: any reader more than ONE version behind took the
+  re-baseline path, whose empty `removed` the caller read as "nothing dropped" — losing every removal in the
+  gap, permanently, because a peer diffs against its own current set and never mentions a dropped cid again.
+  A phantom holder is worse than a missing one: repair elects around it and never fires. So `changes_since`
+  returns `Delta | Reset` as distinct TYPES, a reader that merely fell behind folds the gap into a true
+  delta (its baseline is on the chain — the removals are all computable), and a `Reset` REPLACES rather than
+  merges (absence IS the removal). The set-comparing predecessor could not have this bug; anything that
+  trades a full compare for a delta must carry this rule with it.
 
 ---
 
