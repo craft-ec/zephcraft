@@ -14,6 +14,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use zeph_reward::{Contribution, RewardRecord};
 
@@ -29,6 +30,8 @@ pub struct EconomyEgressService {
     /// Committee-attested record finality (set after construction). When present, a `RewardClaim` resolves
     /// its share from the CANONICAL quorum-signed record (durable, restart-safe), else the local record.
     record_chain: tokio::sync::RwLock<Option<Arc<RecordChain>>>,
+    /// Cached records-derived view: `(derived_at, account, view)`. See [`VIEW_TTL`].
+    view_cache: tokio::sync::RwLock<Option<(Instant, [u8; 32], MyView)>>,
 }
 
 impl EconomyEgressService {
@@ -36,6 +39,7 @@ impl EconomyEgressService {
         Self {
             settlement: tokio::sync::RwLock::new(SettlementStore::new()),
             record_chain: tokio::sync::RwLock::new(None),
+            view_cache: tokio::sync::RwLock::new(None),
         }
     }
 
@@ -62,41 +66,70 @@ impl EconomyEgressService {
         self.settlement.write().await.set_window(window);
     }
 
-    /// An account's own `(cumulative_settled_bytes, subscription_remaining)` read from the CANONICAL
-    /// records chain — so a node that never settles (the common case, since settling is committee-gated)
-    /// still sees its own figures instead of 0.
+    /// An account's own economy view — settled bytes, subscription balance, pool, and unclaimed reward —
+    /// derived from the CANONICAL committee-attested records rather than local settle state, so a node
+    /// that never settles (the common case, since settling is committee-gated) still sees its own money
+    /// instead of 0.
     ///
-    /// Both are STATE, so this walks BACK from `now_epoch` to the account's most recent row rather than
-    /// summing deltas: absence from a record means "didn't act that epoch", NOT "zero" — a provider that
-    /// served nothing recently keeps its cumulative, and an idle subscriber keeps its balance. The two
-    /// walks are independent because a node can be a provider, a consumer, both, or neither.
-    pub async fn my_view_from_records(&self, account: [u8; 32], now_epoch: u64) -> MyView {
+    /// ONE walk of the claim window serves all four figures: they read the same records, so walking
+    /// twice doubled the cost for nothing. CACHED for [`VIEW_TTL`] — the records advance once per epoch
+    /// while the dashboard polls every second, and deriving per poll made this the node's hottest path
+    /// (measured: it took an idle node from 3% to ~48% CPU).
+    ///
+    /// `claimed` is the account's own on-chain dedup set: TOKEN is the authority on what it has already
+    /// taken, and economy must not call token (the one-directional boundary), so the caller — which holds
+    /// both handles — passes it in.
+    ///
+    /// Absence is not zero: `pool`/`settled`/`remaining` are STATE, so the newest record carrying a row
+    /// wins (walk newest-first); `owed` is a SUM over every unclaimed in-window epoch.
+    pub async fn my_view_from_records(
+        &self,
+        account: [u8; 32],
+        claimed: &BTreeSet<u64>,
+        now_epoch: u64,
+    ) -> MyView {
+        if let Some((at, who, view)) = *self.view_cache.read().await {
+            if who == account && at.elapsed() < VIEW_TTL {
+                return view;
+            }
+        }
+        let view = self.derive_view(account, claimed, now_epoch).await;
+        *self.view_cache.write().await = Some((Instant::now(), account, view));
+        view
+    }
+
+    async fn derive_view(
+        &self,
+        account: [u8; 32],
+        claimed: &BTreeSet<u64>,
+        now_epoch: u64,
+    ) -> MyView {
         let Some(records) = self.record_chain.read().await.clone() else {
             return MyView::default();
         };
         let start = now_epoch.saturating_sub(crate::settlement::CLAIM_WINDOW_EPOCHS);
-        let (mut settled, mut remaining, mut pool) = (None, None, None);
+        // Collect the window NEWEST-FIRST, then read every figure off it — one traversal of the chain
+        // for all four, instead of one per figure.
+        let mut window = Vec::new();
         for e in (start..=now_epoch).rev() {
-            if settled.is_some() && remaining.is_some() && pool.is_some() {
-                break; // everything found — no reason to keep walking back
-            }
-            let Some(rec) = records.canonical_record(e).await else {
-                continue;
-            };
-            if pool.is_none() {
-                pool = Some(rec.pool_remaining()); // the newest record's residual = the live pool
-            }
-            if settled.is_none() {
-                settled = rec.cumulative_bytes_of(&account);
-            }
-            if remaining.is_none() {
-                remaining = rec.remaining_for(&account);
+            if let Some(rec) = records.canonical_record(e).await {
+                window.push(rec);
             }
         }
         MyView {
-            settled_bytes: settled.unwrap_or(0),
-            subscription_bytes: remaining.unwrap_or(0),
-            pool: pool.unwrap_or(0),
+            // STATE: the newest record carrying a row for this account wins. `find_map` stops at the
+            // first row rather than treating an absent row as zero.
+            settled_bytes: window
+                .iter()
+                .find_map(|r| r.cumulative_bytes_of(&account))
+                .unwrap_or(0),
+            subscription_bytes: window
+                .iter()
+                .find_map(|r| r.remaining_for(&account))
+                .unwrap_or(0),
+            pool: window.first().map(|r| r.pool_remaining()).unwrap_or(0),
+            // SUM over unclaimed epochs — the same pure, unit-tested helper.
+            owed: sum_unclaimed_shares(&account, &window, claimed),
         }
     }
 
@@ -117,33 +150,6 @@ impl EconomyEgressService {
     /// moving it out of the pool's `owed`. Idempotent.
     pub async fn mark_claimed(&self, epoch: u64, node: [u8; 32]) {
         self.settlement.write().await.claim(epoch, node);
-    }
-
-    /// What `account` is owed across in-window epochs, read from the CANONICAL committee-attested records
-    /// instead of local settle state — so a node that does NOT settle (the common case once settling is
-    /// committee-gated) still sees its own money instead of a misleading 0.
-    ///
-    /// `claimed` is the account's own on-chain dedup set: TOKEN is the authority on what it has already
-    /// taken, and economy must not call token (the one-directional boundary), so the caller — which holds
-    /// both handles — passes it in. Cost is bounded: the records chains are keyed per COMMITTEE MEMBER,
-    /// not per epoch, so the whole window costs a handful of (debounced) syncs plus local reads.
-    pub async fn owed_from_records(
-        &self,
-        account: [u8; 32],
-        claimed: &BTreeSet<u64>,
-        now_epoch: u64,
-    ) -> u64 {
-        let Some(records) = self.record_chain.read().await.clone() else {
-            return 0;
-        };
-        let start = now_epoch.saturating_sub(crate::settlement::CLAIM_WINDOW_EPOCHS);
-        let mut window = Vec::new();
-        for e in start..=now_epoch {
-            if let Some(rec) = records.canonical_record(e).await {
-                window.push(rec);
-            }
-        }
-        sum_unclaimed_shares(&account, &window, claimed)
     }
 
     /// Cross-node epoch close (§10.1, node-orchestrated by the settlement loop). `paid` = each node's
@@ -199,7 +205,17 @@ pub struct MyView {
     pub subscription_bytes: u64,
     /// The distributable pool as of the newest record (`pool − Σ shares`).
     pub pool: u64,
+    /// Reward earned but not yet claimed (Σ shares over in-window epochs this account hasn't claimed).
+    pub owed: u64,
 }
+
+/// How long a derived [`MyView`] is served from cache.
+///
+/// The records chain only advances ONCE PER EPOCH (5 min), but the dashboard is polled every second or
+/// so — and each derivation walks the claim window (epochs × committee members → `sequence_of` → DHT).
+/// Deriving per poll made the dashboard the node's hottest path; the data cannot change faster than an
+/// epoch, so anything well under that is free freshness.
+const VIEW_TTL: Duration = Duration::from_secs(20);
 
 /// The pure core of [`EconomyEgressService::owed_from_records`]: sum `account`'s shares across `window`,
 /// skipping epochs it has already claimed (token's `claimed_epochs` is the authority on what was taken —

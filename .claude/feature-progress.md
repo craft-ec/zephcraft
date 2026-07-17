@@ -2572,8 +2572,27 @@ Phases (each: build + test + gate + commit; roll together where consensus-affect
         drift from the fallback and quietly accept a fork.
       - Tests: reward 9 (pool carried + dust residual + idle-epoch pool), noded 54, full workspace green, clippy
         clean at the gate's invocation. token.wasm still byte-identical ⇒ balances survive.
-      **STILL OPEN (named, not resolved):** hetzner `zeph` main ~40% CPU has no baseline — re-measure after this
-      rolls before concluding anything. push-on-commit / SQL-index remains the user's architecture, undesigned.
+- [x] **P9 ROLLED + LIVE (2026-07-17).** Gate 🟢 (A-G 8/8, 785s). Simultaneous 5-node roll; peers=4, no errors.
+      **`token` cid 2bb1ca0f… UNCHANGED ⇒ balances SURVIVED** (published, not re-pinned — already pinned there);
+      only `economy-egress` re-pinned (69fc8d3b…). Exactly as predicted from the byte-comparison.
+- [x] **P10 — MY OWN REGRESSION: the dashboard became the hot path (2026-07-17).**
+      Post-P9 measurement CONTRADICTED my prediction: Mac **3.0% → 47.9%**, zeph2/3/4 ~12.9% → ~15.5%, zeph
+      40.6% → 38.8% (writer-first barely moved it). Profiled instead of guessing: `control::State::snapshot`
+      (80) → `record_chain::canonical_record` (68) → `sequence_of` (82) → `fetch_if_newer` (81) → `DhtNode::get`
+      (191). **The records-derived dashboard WAS the burn**: `owed_from_records` + `my_view_from_records` each
+      walked the claim window (8 epochs × 4 committee members → sequence_of → DHT) on EVERY snapshot, and the
+      dashboard is HTTP-polled ~1/s (a browser was open). I fixed "reads 0" by making it read constantly —
+      writer-first genuinely helped, my own dashboard change swamped it.
+      FIX: (1) ONE walk serves all four figures (they read the same records — walking twice doubled cost for
+      nothing); (2) CACHE it (`VIEW_TTL` 20s) — the records advance once per 5-min EPOCH while the dashboard
+      polls every second, so per-poll derivation was pure waste and 20s is still far fresher than the data.
+      `derive_view` collects the window newest-first then reuses the pure, unit-tested `sum_unclaimed_shares`
+      for `owed` (keeping the tested helper in the live path rather than orphaning it).
+      **LESSON: a "read it from the durable chain" fix is a READ-AMPLIFICATION risk — check the caller's poll
+      rate against the data's change rate BEFORE deriving per call.**
+      **STILL OPEN:** hetzner `zeph` main ~38.8% — writer-first moved it only ~2pts, so its load is NOT the
+      sequencer fan-out (governor/seed/hub work + health_scan_chunk showed up hot in the profile). Needs its own
+      investigation. push-on-commit / SQL-index remains the user's architecture, undesigned.
       **GATE RED on scenario B (2026-07-17) — PROVEN NOT P5/P6.** Full gate: 7/8, scenario B census-20 at
       35.41s vs a 30s bar (one node stuck at census 10 at cutoff; all 20 converge by ~35.4s). Controlled A/B on
       this Mac:
