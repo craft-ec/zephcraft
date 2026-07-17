@@ -152,8 +152,17 @@ impl DeathRepair {
                     departed = ?gone.iter().map(|g| hex::encode(&g[..6])).collect::<Vec<_>>(),
                     "census changed"
                 );
+                // SPAWN, do not await. `on_death`'s execution is O(elected) DHT resolves — minutes to
+                // hours for a large node (measured: 2h36m for 1242 cids on the live fleet). Awaiting it
+                // inline blocks the census watcher for that whole duration, so a SECOND death during the
+                // first one's repair goes undetected until the first finishes — a detector held hostage by
+                // its executor, and worst under the correlated failure death-repair exists for. Spawned,
+                // the watcher keeps detecting; the budget semaphore still bounds total repair concurrency
+                // fleet-wide, so N concurrent deaths become N cheap tasks queued on the same 2 permits, not
+                // a storm. `known` advances below regardless, so each death is dispatched exactly once.
                 for g in gone {
-                    self.on_death(g).await;
+                    let this = Arc::clone(&self);
+                    tokio::spawn(async move { this.on_death(g).await });
                 }
             }
             known = now;
@@ -387,9 +396,21 @@ impl DeathRepair {
         mine.sort_by_key(|(_, holders)| *holders);
 
         let elected = mine.len();
+        // Report the DECISION before the WORK. Execution is O(elected) DHT resolves at
+        // `MAX_CONCURRENT_REPAIRS`, so a large dead node's repair is minutes-to-longer of grinding that,
+        // logging only at the end, is indistinguishable from a hang or a no-op — the exact gap that made
+        // two live death tests read as failures when repair was in fact running. The election itself is
+        // O(1) local (index + rendezvous); it is only this execution that is O(elected) network.
+        tracing::info!(
+            node = %hex::encode(&gone[..6]),
+            candidates = cids.len(),
+            elected,
+            why,
+            "repair START"
+        );
         let mut repaired = 0usize;
         let mut last_holder = 0usize;
-        for (c, n_holders) in mine {
+        for (i, (c, n_holders)) in mine.into_iter().enumerate() {
             if n_holders <= 1 {
                 last_holder += 1; // we may be its only survivor — the most urgent case there is
             }
@@ -404,6 +425,17 @@ impl DeathRepair {
             if self.engine.repair_cid(Cid(c)).await > 0 {
                 repaired += 1;
             }
+            // Progress heartbeat: a long grind must prove it is alive, not just announce its result an hour
+            // later. Every 200 executed keeps the log O(elected/200), not O(elected).
+            if (i + 1) % 200 == 0 {
+                tracing::info!(
+                    node = %hex::encode(&gone[..6]),
+                    done = i + 1,
+                    elected,
+                    repaired,
+                    "repair progress"
+                );
+            }
         }
         tracing::info!(
             node = %hex::encode(&gone[..6]),
@@ -412,7 +444,7 @@ impl DeathRepair {
             repaired,
             last_holder,
             why,
-            "repair"
+            "repair DONE"
         );
     }
 }
