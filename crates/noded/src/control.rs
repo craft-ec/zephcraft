@@ -144,6 +144,11 @@ pub struct Status {
     /// Measured, not inferred: this exists because six successive bandwidth hypotheses were argued from
     /// CPU profiles and process byte-counters, which cannot name a protocol, and all six were wrong.
     pub tag_streams: std::collections::BTreeMap<String, u64>,
+    /// The COMPLETE per-peer QUIC `ConnectionStats` dump: `"<peer12>" -> "<debug>"`. Everything —
+    /// udp bytes/datagrams, the full frame-type breakdown (STREAM/ACK/CRYPTO/PING/…), lost packets and
+    /// bytes. Not a chosen subset: a subset can only confirm the theory it was chosen for, and six
+    /// theories about this node's traffic have already been wrong.
+    pub peer_stats: std::collections::BTreeMap<String, String>,
     pub scan_queue: usize,
     pub scan_due: usize,
     pub peers: Vec<PeerStatus>,
@@ -269,6 +274,9 @@ pub struct State {
     pub settlement: std::sync::Arc<crate::settlement_service::SettlementService>,
     /// Serving-cheque service — reciprocity standing (earned/consumed/paid + grants) for the dashboard.
     pub cheque: std::sync::Arc<crate::cheque::ChequeService>,
+    /// For [`Status::peer_stats`] — QUIC's own per-connection counters, the one instrument that can say
+    /// what this node's traffic actually is rather than what someone inferred it to be.
+    pub transport: std::sync::Arc<zeph_transport::Transport>,
     /// Generic program accounts — any program's single-writer state (the program is the writer).
     pub accounts: std::sync::Arc<crate::account::ProgramAccountStore>,
     /// Per-program attestation quorum chains (the `attest` host fn's backend).
@@ -365,6 +373,14 @@ impl State {
                     .map(|(i, n)| (n.to_string(), counts[*i]))
                     .collect()
             },
+            peer_stats: self
+                .transport
+                .peer_stats_dump()
+                .into_iter()
+                // Key by DIRECTION + peer: a peer that dialed us and a peer we dialed are separate
+                // connections with separate counters, and collapsing them hid half the traffic.
+                .map(|(dir, id, dump)| (format!("{}:{}", dir, hex::encode(&id[..6])), dump))
+                .collect(),
             scan_queue: self.scan_queue.load(std::sync::atomic::Ordering::Relaxed),
             scan_due: self.scan_due.load(std::sync::atomic::Ordering::Relaxed),
             peers: self.peers.read().await.clone(),

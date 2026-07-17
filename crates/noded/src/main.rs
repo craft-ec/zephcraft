@@ -1835,6 +1835,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         ledger: ledger_service.clone(),
         economy: economy_service.clone(),
         economy_cache: tokio::sync::RwLock::new(None),
+        transport: transport.clone(),
         settlement: settlement_service.clone(),
         cheque: cheque_service.clone(),
         epoch_committee: epoch_committee.clone(),

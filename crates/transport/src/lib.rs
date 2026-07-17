@@ -218,6 +218,14 @@ pub struct Transport {
     /// to their OOM cap under churn — measured). Closed entries re-dial lazily;
     /// cleared on rebind.
     mux_pool: std::sync::Mutex<std::collections::HashMap<[u8; 32], Connection>>,
+    /// ACCEPTED (inbound) connections, for statistics only.
+    ///
+    /// `mux_pool` holds only connections WE dialed, so any stats read from it describe half the fleet's
+    /// traffic. That is not a theoretical gap: it made a measured 153 KB/s look authoritative against an
+    /// observed ~5 MB/s, i.e. the instrument under-reported by ~30x while appearing precise. A peer that
+    /// dials us carries its bytes on a connection we never recorded. Weak refs would be tidier; a plain
+    /// map plus prune-on-read keeps this a pure observability addition with no lifecycle coupling.
+    in_conns: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], Connection>>>,
     /// Per-peer dial-collapse locks for the mux connection (mirrors `dials`).
     mux_dials: std::sync::Mutex<
         std::collections::HashMap<[u8; 32], std::sync::Arc<tokio::sync::Mutex<()>>>,
@@ -290,6 +298,7 @@ impl Transport {
             closed: std::sync::atomic::AtomicBool::new(false),
             rebind_lock: tokio::sync::Mutex::new(()),
             mux_pool: std::sync::Mutex::new(std::collections::HashMap::new()),
+            in_conns: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             mux_dials: std::sync::Mutex::new(std::collections::HashMap::new()),
             dial_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DIALS)),
             clock: std::sync::Arc::new(hlc::Clock::new()),
@@ -609,9 +618,16 @@ impl Transport {
             let endpoint = self.current();
             while let Some(incoming) = endpoint.accept().await {
                 let stream_handlers = stream_handlers.clone();
+                let in_conns = self.in_conns.clone();
                 tokio::spawn(async move {
                     let Ok(conn) = incoming.await else { return };
                     if conn.alpn() == MUX_ALPN {
+                        // Record it for stats BEFORE serving: an inbound connection's bytes are
+                        // otherwise invisible (see `in_conns`).
+                        in_conns
+                            .lock()
+                            .expect("in conns")
+                            .insert(*conn.remote_id().as_bytes(), conn.clone());
                         Self::demux_conn(conn, stream_handlers).await;
                     } else {
                         conn.close(1u32.into(), b"unknown alpn");
@@ -637,6 +653,40 @@ impl Transport {
     /// Bounded pipelining (a per-connection permit held through the tag read and
     /// hand-off) backpressures a peer that opens streams faster than handlers
     /// drain them; an unknown tag drops the stream.
+    /// EXACT per-peer QUIC statistics — the COMPLETE `ConnectionStats`, not a chosen subset.
+    ///
+    /// Returns `(peer, debug_dump)`. Deliberately the whole struct: udp_tx/udp_rx (bytes, datagrams,
+    /// ios), the full frame_tx/frame_rx breakdown by QUIC frame type (STREAM vs ACK vs CRYPTO vs PING vs
+    /// MAX_DATA vs PATH_CHALLENGE …), and lost_packets/lost_bytes.
+    ///
+    /// Capturing everything is the point. This exists because an idle-bandwidth investigation produced
+    /// six confident diagnoses (dashboard, health scan, reannounce refresh, relay, poll stampede, scan
+    /// floor) and all six were wrong — each one a hypothesis that picked its own evidence. A subset of
+    /// counters chosen to test a theory can only ever confirm or deny THAT theory; the frame breakdown
+    /// says what is on the wire regardless of what anyone expected. Read it, then form the hypothesis.
+    pub fn peer_stats_dump(&self) -> Vec<(String, [u8; 32], String)> {
+        let mut out = Vec::new();
+        for (id, c) in self.mux_pool.lock().expect("mux pool").iter() {
+            out.push(("dialed".to_string(), *id, format!("{:?}", c.stats())));
+        }
+        // BOTH directions, labelled. Reading only the dialed side under-reported ~30x.
+        let mut dead = Vec::new();
+        for (id, c) in self.in_conns.lock().expect("in conns").iter() {
+            if c.close_reason().is_some() {
+                dead.push(*id);
+                continue;
+            }
+            out.push(("accepted".to_string(), *id, format!("{:?}", c.stats())));
+        }
+        if !dead.is_empty() {
+            let mut m = self.in_conns.lock().expect("in conns");
+            for id in dead {
+                m.remove(&id);
+            }
+        }
+        out
+    }
+
     /// INBOUND stream count per tag — the only direct answer to "what is this node's traffic?".
     ///
     /// Added 2026-07-17 after a long idle-bandwidth investigation in which six successive hypotheses
