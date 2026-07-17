@@ -377,9 +377,16 @@ impl Store {
         Ok(())
     }
 
-    /// The cids this node HOLDS, for the purpose of reporting holdings — everything except the
-    /// bookkeeping that describes the holdings themselves. See [`CidState::meta`].
-    pub fn holdings_cids(&self) -> Vec<Cid> {
+    /// The real CONTENT this node holds — everything except bookkeeping ABOUT this store.
+    ///
+    /// This is the set that both matters and must not include itself: it is what we report as holdings,
+    /// and what the fleet is expected to keep durable. Bookkeeping is neither. It is local-only by
+    /// construction (one copy, ours), so scanning it finds it "at risk" against the durability floor and
+    /// distributes it — which puts it in every peer's store, changes THEIR holdings, and makes them
+    /// republish. That is the same loop as counting it in our own holdings, entered from the other end.
+    ///
+    /// `cids()` still reports everything physically held; only this VIEW excludes the self-description.
+    pub fn content_cids(&self) -> Vec<Cid> {
         self.index
             .lock()
             .expect("index")

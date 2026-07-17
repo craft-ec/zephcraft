@@ -349,12 +349,12 @@ fn bookkeeping_objects_are_never_reported_as_holdings() {
         }
         store.mark_not_holdings(&manifest_cid).unwrap();
 
-        assert_eq!(store.holdings_cids(), vec![data_cid]);
+        assert_eq!(store.content_cids(), vec![data_cid]);
         assert_eq!(store.cids().len(), 2, "we still physically hold both");
     }
 
     // The marker MUST survive a restart. In memory only, a restarted node re-adopts its own old manifests
     // as holdings and republishes them as data — reopening the loop it was meant to close.
     let store = Store::open(dir.path()).unwrap();
-    assert_eq!(store.holdings_cids(), vec![data_cid]);
+    assert_eq!(store.content_cids(), vec![data_cid]);
 }

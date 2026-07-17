@@ -1964,9 +1964,9 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 tick.tick().await;
-                // holdings_cids(), NOT cids(): the manifest objects themselves are META and must never
+                // content_cids(), NOT cids(): the manifest objects themselves are bookkeeping and must never
                 // enter the set they describe, or every publish manufactures the next one's change.
-                let cids = eng.store().holdings_cids();
+                let cids = eng.store().content_cids();
                 if let Some(version) = manifests.publish(cids).await {
                     tracing::info!(version, "published holdings manifest");
                 }
@@ -2488,9 +2488,13 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
             let mut first_pass = true;
             loop {
                 let now = std::time::Instant::now();
+                // content_cids(), NOT cids(): a fresh manifest is scheduled `due = now`, found at-risk
+                // (one provider, by design), and DISTRIBUTED into every peer's store — which changes their
+                // holdings and makes them republish. The scan would re-open the very loop publish_local
+                // closes. Bookkeeping is local-only on purpose; there is nothing here to make durable.
                 let fresh: Vec<Cid> = eng
                     .store()
-                    .cids()
+                    .content_cids()
                     .into_iter()
                     .filter(|cid| seen.lock().expect("seen").insert(*cid))
                     .collect();

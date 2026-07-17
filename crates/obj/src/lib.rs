@@ -2163,7 +2163,7 @@ impl ObjEngine {
             report.fading = fd.len();
             report.surplus = su.len();
         }
-        report.scanned = self.store.cids().len();
+        report.scanned = self.store.content_cids().len();
         report
     }
 
@@ -2171,7 +2171,7 @@ impl ObjEngine {
     /// node's periodic path submits per-chunk `health_scan_chunk` jobs (see noded) instead, so no
     /// job ever sweeps the whole set at once.
     pub async fn health_scan(&self) -> HealthReport {
-        self.health_scan_chunk(&self.store.cids()).await
+        self.health_scan_chunk(&self.store.content_cids()).await
     }
 
     /// Is this cid currently believed at-risk (per its last scan)? Drives the scheduler's
@@ -2276,7 +2276,9 @@ impl ObjEngine {
             .durability_threshold
             .min(candidates.len().max(1));
         let mut out: Vec<([u8; 32], u32, u32)> = Vec::new();
-        for cid in self.store.cids() {
+        // content_cids(): local-only bookkeeping is deliberately a single copy, so distributing it is not
+        // repair — it is how a manifest ends up in every peer's store and restarts the churn loop.
+        for cid in self.store.content_cids() {
             // Everything we hold whole (files + db/app generations) that is not yet complete.
             if self.store.is_tombstoned(&cid)
                 || !self.store.has_content(&cid)
