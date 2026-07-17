@@ -2418,25 +2418,41 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
             tracing::info!(
                 "boot phase: converged — full concurrency restored, scan feed starting (dripped)"
             );
-            // Phase 3: DRIP the initial scan backlog over ~2 minutes instead
-            // of dumping thousands of due-now jobs.
+            // Phase 3: DRIP the initial scan backlog across a FULL re-check interval, so the first pass
+            // runs at exactly the rate the steady state will.
+            //
+            // This used to drip over a fixed ~2 minutes regardless of store size, which decouples the
+            // drip rate from the re-check rate: N cids over 120s is N/120 per second, while steady state
+            // is N/recheck_min. At 2890 cids that is 24/s vs 3.2/s — ~8x too fast, and every cid resolve
+            // is an ITERATIVE DHT lookup fanning out to several peers. With the fleet restarting together
+            // each node measured ~252 INBOUND DHT streams/sec (26,193 in 104s) — four nodes resolving
+            // their whole store at once, i.e. the fleet DDoSing its own DHT after every roll.
+            //
+            // Spreading over `recheck_min` makes the first pass indistinguishable from steady state by
+            // construction: the queue self-paces, and no restart can produce a burst the ongoing workload
+            // would not already sustain. It also scales — a bigger store spreads wider instead of hitting
+            // harder.
             let mut first_pass = true;
             loop {
                 let now = std::time::Instant::now();
-                let mut i: u64 = 0;
-                for cid in eng.store().cids() {
-                    let is_new = seen.lock().expect("seen").insert(cid);
-                    if is_new {
-                        let due = if first_pass {
-                            i += 1;
-                            now + std::time::Duration::from_millis((i % 1200) * 100)
-                        } else {
-                            now
-                        };
-                        q.lock()
-                            .expect("q")
-                            .push(std::cmp::Reverse((due, cid, recheck_min)));
-                    }
+                let fresh: Vec<Cid> = eng
+                    .store()
+                    .cids()
+                    .into_iter()
+                    .filter(|cid| seen.lock().expect("seen").insert(*cid))
+                    .collect();
+                let total = fresh.len().max(1) as f64;
+                for (i, cid) in fresh.into_iter().enumerate() {
+                    let due = if first_pass {
+                        now + recheck_min.mul_f64((i as f64 + 1.0) / total)
+                    } else {
+                        // Later arrivals are genuinely new content: scanning them promptly is the point,
+                        // and they trickle in rather than arriving N-at-once.
+                        now
+                    };
+                    q.lock()
+                        .expect("q")
+                        .push(std::cmp::Reverse((due, cid, recheck_min)));
                 }
                 first_pass = false;
                 tokio::time::sleep(Duration::from_secs(10)).await;
