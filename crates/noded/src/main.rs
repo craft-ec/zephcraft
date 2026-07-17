@@ -1956,6 +1956,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         identity.clone(),
         engine.clone(),
         routing.clone(),
+        data_dir,
     ));
     {
         let manifests = manifests.clone();

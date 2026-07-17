@@ -206,6 +206,22 @@ pub struct ManifestStore {
     /// from a full set. Publishing on a timer regardless of change is the habit this design exists to
     /// remove, so an unchanged set publishes nothing at all.
     last: tokio::sync::Mutex<Option<Published>>,
+    /// Where the version high-water mark is persisted. See [`ManifestStore::resume_version`].
+    version_file: std::path::PathBuf,
+}
+
+/// Read the persisted version high-water mark. Unreadable/corrupt/absent all mean 0 — publishing from 1 is
+/// exactly the old behaviour, so a bad read degrades to the old bug rather than to a node that cannot
+/// publish at all.
+fn resume_version(path: &std::path::Path) -> u64 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+fn save_version(path: &std::path::Path, version: u64) -> std::io::Result<()> {
+    std::fs::write(path, version.to_string())
 }
 
 /// Walk `prev` back from `head` until we reach EITHER the reader's own baseline or a snapshot, returning
@@ -294,12 +310,37 @@ impl ManifestStore {
         identity: Arc<NodeIdentity>,
         obj: Arc<ObjEngine>,
         routing: Arc<dyn ContentRouting>,
+        data_dir: &std::path::Path,
     ) -> Self {
         Self {
             identity,
             obj,
             routing,
             last: tokio::sync::Mutex::new(None),
+            version_file: data_dir.join("holdings_version"),
+        }
+    }
+
+    /// The version this process must publish ABOVE — the high-water mark of every previous process.
+    ///
+    /// The version is not a private counter: `announce_app` uses it as the DHT record's `seq`, and the
+    /// record store rejects `seq <= existing`. A restart that resets to 1 therefore meets its OWN
+    /// pre-restart record and every republish is refused until the count climbs back past it — the node's
+    /// holdings head frozen at a stale manifest, every change it makes invisible, for up to the record TTL
+    /// (1h). A long absence self-heals when the record expires; a quick restart does not, which is the
+    /// common case, and a home node restarting daily hits it every morning.
+    ///
+    /// Unreadable or corrupt is treated as 0: publishing from 1 is exactly today's behaviour, so a bad
+    /// read degrades to the old bug rather than to a node that cannot publish at all.
+    fn resume_version(&self) -> u64 {
+        resume_version(&self.version_file)
+    }
+
+    /// Record the high-water mark. Best-effort: a failed write costs us the old restart bug next boot, not
+    /// this publish, so it must not fail the publish.
+    fn save_version(&self, version: u64) {
+        if let Err(e) = save_version(&self.version_file, version) {
+            tracing::warn!(error = %e, "could not persist holdings version — a restart may stall republish");
         }
     }
 
@@ -314,7 +355,12 @@ impl ManifestStore {
         let mut last = self.last.lock().await;
 
         let (version, body) = match last.as_ref() {
-            None => (1, Body::Snapshot(sorted(&now))),
+            // First publish of THIS process. Resume above every previous process's version (see
+            // `resume_version`) and send a SNAPSHOT: we deliberately do not persist the last SET — that is
+            // the ~32 MB write this whole design exists to avoid — so we have no baseline to diff against.
+            // Readers whose baseline is now unreachable take `Changes::Reset` and re-baseline, which costs
+            // one full-set fetch per peer per restart. That is the correct trade at any sane restart rate.
+            None => (self.resume_version() + 1, Body::Snapshot(sorted(&now))),
             Some(p) => {
                 let added: HashSet<[u8; 32]> = now.difference(&p.cids).copied().collect();
                 let removed: HashSet<[u8; 32]> = p.cids.difference(&now).copied().collect();
@@ -360,6 +406,7 @@ impl ManifestStore {
             cids: now,
             cid: cid.0,
         });
+        self.save_version(version);
         Some(version)
     }
 
@@ -602,6 +649,33 @@ mod tests {
         entries: &[([u8; 32], HoldingsManifest)],
     ) -> std::collections::HashMap<[u8; 32], HoldingsManifest> {
         entries.iter().cloned().collect()
+    }
+
+    #[test]
+    fn the_version_survives_a_restart() {
+        // The version is not a private counter: announce_app uses it as the DHT record's seq, and the
+        // record store rejects seq <= existing. A restart that resets to 1 meets its OWN pre-restart
+        // record (seq=N) and every republish is REFUSED until it climbs back past N — holdings head frozen
+        // at a stale manifest for up to the 1h record TTL. A home node restarting daily hits this every
+        // morning, which is the fleet this is for.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("holdings_version");
+
+        assert_eq!(
+            resume_version(&f),
+            0,
+            "no file yet: publish from 1, as before"
+        );
+        save_version(&f, 7).unwrap();
+        assert_eq!(
+            resume_version(&f),
+            7,
+            "a 'restart' must resume above the old high-water mark"
+        );
+
+        // Corrupt/truncated must not wedge publishing — degrade to the old behaviour, never to silence.
+        std::fs::write(&f, "not-a-number").unwrap();
+        assert_eq!(resume_version(&f), 0);
     }
 
     #[tokio::test]
