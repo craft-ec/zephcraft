@@ -40,8 +40,14 @@ fleet to tune).
       OFFSET (part of §5.2): shed_cid re-checks `have > floor+delta` at execution, so a shed queued
       when a holder returned no-ops if the holder left again before it drained. Partial offset via
       re-check; full night-length debounce still needs part 3.
-- [ ] P5 — Execution-time re-check is the offset: confirm repair job no-ops on `have >= floor`
-      and shed job no-ops on `have <= band`; add tests proving transient churn self-cancels
+- [x] P5-safety — REVIEW-CAUGHT DATA LOSS in shed_cid, fixed (commit 97649f8). It summed raw
+      stale-HIGH provider counts (shed never re-announces → records stale ~22h) with no probe →
+      could destroy real pieces below the floor. Fix: probe-verify (unverifiable=0), shed ONE
+      piece/invocation (bounds the epoch-boundary concurrent-shedder race to 1 piece each),
+      re-announce lower count. Also fixed `shed:` misclassified as Other not Eviction. The offset
+      is the probe-verified re-check: `have <= floor+delta` → no-op.
+- [ ] P5-remaining — full night-length offset (debounce keyed on urgency) = §5 part 3, needs
+      mixed fleet. NOT built.
 - [ ] P6 — Keep the periodic scan as backstop (still submits the same job type) — do NOT retire
       it (needs PDP/K5), just make it one more producer of the same queue
 - [ ] P7 — Gate + roll + live test (kill/restore, assert queue drains, no competing sweeps)
