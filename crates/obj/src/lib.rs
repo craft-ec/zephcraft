@@ -2756,13 +2756,17 @@ impl ObjEngine {
         if winner != Some(&me) {
             return 0;
         }
-        // Shed our excess above our fair share, and never take the TOTAL below the floor.
+        // Shed our excess above our fair share, and never take the TOTAL below the BAND TOP (floor+delta),
+        // not merely the floor. Event-shed removes only the CLEAR surplus above the band and leaves the
+        // whole cushion intact; the scan's Schmitt trims the band itself if it stays cold. The extra delta
+        // of headroom is deliberate slack: two nodes could both win the shedder election at an epoch
+        // boundary (clock skew), and each stopping at floor+delta keeps their combined shed off the floor.
         let holders = shedders.len().max(1);
         let fair_share = (floor / holders).max(2);
         let mut shed = 0usize;
         let mut total = have;
         while self.store.piece_count(&cid) > fair_share
-            && total > floor
+            && total > floor + delta
             && !self.store.is_pinned(&cid)
             && self.shed_one(&cid)
         {
