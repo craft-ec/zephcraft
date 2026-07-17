@@ -127,7 +127,86 @@ Arm repair **only on converged `Dead`**, never on `Suspect`. SWIM's Suspect stat
 
 ---
 
-## 5. The convergence hazard (the one real correctness risk)
+## 5. Liveness is not durability — the diurnal oscillator
+
+**This is the gap that decides whether the design works for home nodes, and today it does not.**
+
+Everything in §4 arms repair on converged `Dead`. That is correct when death is permanent. It is wrong when
+the fleet is home machines that go to sleep at midnight and come back at 08:00 — because *at the moment of
+departure, "asleep" and "dead" are indistinguishable*. Only waiting tells them apart, and repair does not
+wait.
+
+**The one number doing two jobs.** Repair and shed are both driven by
+
+    effective = own_pieces + Σ (piece_count of LIVE providers)
+
+That single quantity is being asked to answer two different questions: *do the bytes still exist*
+(DURABILITY) and *can I reach k of them right now* (AVAILABILITY). On an always-on fleet those are the same
+number, which is why this never surfaced. For a node that is present 12h a day they diverge every single
+night, and both mechanisms treat the divergence as real: a sleeping node's bytes are counted as LOST, and a
+waking node's bytes are counted as SURPLUS.
+
+**The closed loop.** Neither half is wrong on its own; together they oscillate forever.
+
+| phase | `effective` | mechanism | action |
+|---|---|---|---|
+| night — X sleeps | `floor − X` | death-driven repair (§4) | MINT, in bulk, within seconds |
+| day — X wakes | `floor + X` | cold-surplus shed | SHED, 1 piece per scan |
+
+The day's shed destroys exactly the redundancy the night's repair built, because while X is awake its pieces
+make the cid *look* over-replicated. Then X sleeps and it is a deficit again. Nothing converges to a stable
+set of pieces; it converges to a stable **churn**.
+
+It is not marginal at real parameters. The Schmitt band is `delta = max(floor/8, 2)`, so at k=32 (floor ≈ 96)
+delta ≈ 12, while a holder on a ~5-way spread carries ≈ 19 pieces. Any node holding more than delta sustains
+the cycle — i.e. every ordinary holder.
+
+**The asymmetry is structural, not a tuning bug.** Absence is PUSHED: SWIM tells the whole fleet in ~25s and
+repair fires off the local index with no scan. Presence is PULLED: nobody is notified that a node came back;
+its provider records simply reappear in the DHT, and the surplus is only noticed when some holder next scans
+that cid — a bounded but lazy ~1–2h (`recheck_max`), and then only ONE piece per scan. The system reacts to
+a home node vanishing in seconds and to its return in hours.
+
+**The one mercy is accidental.** Because shed is rate-limited to 1 piece/scan and repair mints in bulk, the
+surplus never fully sheds before nightfall — and that leftover surplus is precisely what absorbs X's next
+absence. So it damps to a steady ~7 pieces/cid/night of mint+shed rather than ratcheting without bound. That
+is luck, not design: the loop is bounded by the shed being too slow to finish.
+
+**Why a grace period is NOT the fix.** The obvious patch — wait before treating `Dead` as lost — only
+addresses the night half. The day half still trims X's pieces as cold surplus, so the fleet keeps paying,
+and the grace window buys the reduced durability of an under-replicated cid for nothing. A timer cannot fix
+a mis-measurement.
+
+**The fix is to stop conflating the two.** An absent-but-not-dead holder's pieces still EXIST; they are
+merely unreachable. So:
+
+- **Durability accounting** counts pieces that exist — including those on a known holder that is currently
+  offline. Below-floor here means bytes are actually gone, and only that should MINT.
+- **Availability accounting** counts pieces reachable now. Below-k here means "cannot serve right now", and
+  the answer is to serve from elsewhere or wait for the holder — NOT to manufacture new pieces.
+- **Provision for the expected online fraction.** If a `p` fraction of holders is typically online, the
+  steady-state spread must put `k/p` pieces out so that a normal night never crosses the availability line.
+  Then absence is a NO-OP, there is nothing to shed in the morning, and the oscillator never starts.
+- Shedding must judge surplus against pieces that EXIST, so a sleeping holder's pieces are not re-minted at
+  night and its waking ones are not trimmed by day.
+
+This makes the returning node a non-event, which is the correct outcome: **it never lost anything.**
+
+**What this needs that we do not have.** Distinguishing "offline but holding" from "gone forever" requires
+knowing a holder still HAS the bytes while we cannot reach it. A signed holdings manifest is a claim, not
+proof, and a claim from a node that is not answering is worth even less. This is the same trust boundary PDP
+(K5) exists to close, and it is why the honest sequencing is: measure the online fraction on a real mixed
+fleet FIRST, then set the provisioning target, and only then consider a durability-vs-availability split in
+the accounting.
+
+**Status: OPEN. Not exercised by the current fleet** (4 always-on Hetzner nodes, where the two numbers are
+identical by construction), so nothing here is measured — it is derived from the mechanisms above. The A-G
+harness cannot see it either: `scenario_h_mass_death` kills nodes permanently. A diurnal scenario (kill,
+wait past the scan backoff, restore, assert no net mint/shed churn) is the test that would.
+
+---
+
+## 6. The convergence hazard (the one real correctness risk)
 
 Everything above rests on "every node computes the same answer". That holds only while the **census is
 converged**. The tracker already records this hazard on the settlement path: *"the participant SET is the
@@ -151,12 +230,22 @@ working) · census = the shared basis for agreeing *without talking*.
 
 ---
 
-## 6. Honest gaps
+## 7. Honest gaps
 
 - **Last-holder loss.** A cid in `S_x` that **no** survivor holds appears in nobody's intersection — it is
   invisible to death-driven repair. It is already-lost data (X was the last holder), so preventing it is
   the placement/erasure policy's job, not repair's. Stated explicitly because the design otherwise quietly
   assumes coverage it does not have. Manifest anti-entropy is the backstop that would *surface* it.
+- **A restarting node cannot republish its holdings for up to the record TTL (1h). CONCRETE BUG, unfixed.**
+  `ManifestStore.last` is in-memory, so a restart resets the manifest version to 1. `announce_app` uses that
+  version as the DHT record's `seq`, and `RecordStore::put` rejects `existing.seq >= rec.seq` — so a node
+  that restarts meets its OWN pre-restart record (seq=N) and every republish is rejected until its version
+  climbs back past N. Its holdings head stays frozen at the pre-restart manifest, and any change it makes in
+  that window is invisible. A long absence self-heals (the record TTLs out after 1h and `seq=1` is accepted
+  again); a quick restart does not, which is the common case. The version is a chain identity, not just a
+  counter, so the fix is to PERSIST it rather than to special-case the seq. Note the diff chain itself
+  survives a rewind correctly — a peer whose baseline is unreachable gets `Changes::Reset` and re-baselines
+  — so this is purely the DHT seq rule, not a manifest-format problem.
 - **Lying nodes** are only caught by PDP sampling (K5, unbuilt). Until then a manifest is trusted.
 - **Unaware loss** (bytes gone, index intact) is invisible to manifests *by construction* — the node reports
   what it believes, and it believes wrongly. Only asking for the bytes settles it (K8 probe / K5 PDP). This
@@ -193,7 +282,7 @@ working) · census = the shared basis for agreeing *without talking*.
 
 ---
 
-## 7. Phases
+## 8. Phases
 
 1. **P1 — manifests.** Publish a signed holdings manifest (Merkle root + diff) per node; read a peer's.
    No behaviour change yet — purely additive.
@@ -219,7 +308,7 @@ outage than the polling it replaces.
 
 ---
 
-## 8. What this changes, numerically
+## 9. What this changes, numerically
 
 | | today (polling) | this design |
 |---|---|---|
