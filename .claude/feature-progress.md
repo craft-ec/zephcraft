@@ -2504,8 +2504,34 @@ Phases (each: build + test + gate + commit; roll together where consensus-affect
         made pub for it.
       - Verified: 8 economy (5 new subscription) + 16 settlement (2 new: price multiplies, entitlement expires) +
         50 noded tests green; fmt/clippy clean. Old quota tests kept as invariants, pinned to unit price.
-- [ ] **P7 — deploy** (wire+consensus → SIMULTANEOUS fleet roll). BLOCKED on (a) a green gate and (b) user
-      go-ahead. NOT rolled — fleet untouched.
+- [x] **P7 — ROLLED + LIVE (2026-07-17, user "roll simultaneous"; balance wipe accepted — "no live protocol yet").**
+      Gate 🟢 (fmt+clippy+workspace+A-G 8/8). SIMULTANEOUS roll of all 5 nodes (4 Hetzner + Mac launchd).
+      LIVE-VERIFIED: `peers=4`, `census=4`, no errors/panics; anchor `token`→2bb1ca0f… (NEW cid ⇒ account
+      chains restart empty, as accepted) + anchor `economy-egress`→f8c24c08… — **the SAME cid the old
+      `reward` anchor had**, confirming live that economy-egress.wasm is byte-identical to reward.wasm and
+      that rename was name-only. Both published + pinned via governance (1-of-1 Hetzner main).
+      **IDLE CPU (the point of the sequencer/settlement fixes): Mac node 59.4% → 3.0% (~20x).** Only the Mac
+      has a before-measurement, so it is the only claimable number; hetzner `zeph` main sits at ~40% (governor
+      + seed/hub work the others don't do — no baseline, NOT claimed as good or bad; separate question).
+      zeph2/3/4 ~13%.
+- [ ] **P8 — RewardRecord extension (built 2026-07-17, NOT yet rolled).** `Share` gains `bytes` (the ratio's
+      numerator, previously computed then discarded) + `RewardRecord`/`RewardInput` gain `spends: Vec<Spend
+      {consumer,bytes}>` (per-consumer entitlement spent). `spends` is INPUT-carried so the record stays a pure
+      function of its input — a verifier re-derives the input from committed chains and re-runs `compute` to the
+      identical record; carrying it record-only would break verification. Canonicalized (summed per consumer +
+      sorted) because records are SIGNED and compared BY HASH — field order is correctness, not cosmetics
+      (unit-tested both ways).
+      **Why:** the records chain is DURABLE (I wrongly claimed records "expire" — that is only the in-memory
+      `SettlementStore.records` map; `share_of_member` reads the append-only chain and keeps every epoch). So the
+      blocker on the dashboard was never persistence — it was that the settle computed bytes/spends and threw
+      them away. Now any node can reconstruct its own served/settled + subscription view from the durable chain
+      without ever settling.
+      **Roll impact is GENTLE:** token.wasm is byte-IDENTICAL (zeph-token untouched) ⇒ same cid ⇒ **balances
+      SURVIVE**; only economy-egress.wasm changes (d075d828…, was f8c24c08…) ⇒ its anchor re-pins.
+      Tests: reward 8 (2 new: record describes bytes+spends; spends canonical/hash-identical), noded 54,
+      economy 8, token 5; workspace clippy clean.
+      **REMAINING (local, NO roll needed — the data is now in the record):** wire `reward_settled` +
+      `subscription_bytes` to derive from the records chain. Until then they still read 0 on a non-settling node.
       **GATE RED on scenario B (2026-07-17) — PROVEN NOT P5/P6.** Full gate: 7/8, scenario B census-20 at
       35.41s vs a 30s bar (one node stuck at census 10 at cutoff; all 20 converge by ~35.4s). Controlled A/B on
       this Mac:

@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use zeph_economy_egress::subscription::{
     SubscriptionLedger, DEFAULT_BYTES_PER_TOKEN, DEFAULT_WINDOW,
 };
-use zeph_reward::{compute, Contribution, RewardInput, RewardRecord};
+use zeph_reward::{compute, Contribution, RewardInput, RewardRecord, Spend};
 
 /// Governed claim window (§10.1): an unclaimed reward share forfeits back to the pool after this many
 /// epochs, bounding record storage. A config value later; a sane default for now. Also the startup
@@ -117,7 +117,15 @@ impl SettlementStore {
     /// distribute the current `unallocated` to `contributions` by contribution ratio, publishing the
     /// record and moving `unallocated → owed` (Σ shares; the dust remainder stays `unallocated`).
     /// Returns the published record. Re-settling the same epoch is refused (returns the existing one).
-    pub fn settle_epoch(&mut self, epoch: u64, contributions: Vec<Contribution>) -> RewardRecord {
+    ///
+    /// `spends` = which consumers' entitlements funded this epoch's rewardable serving. It is carried into
+    /// the record so the attested artifact fully describes the epoch (see [`RewardRecord`]).
+    pub fn settle_epoch(
+        &mut self,
+        epoch: u64,
+        contributions: Vec<Contribution>,
+        spends: Vec<Spend>,
+    ) -> RewardRecord {
         if let Some(existing) = self.records.get(&epoch) {
             return existing.clone(); // idempotent: an epoch settles once
         }
@@ -126,6 +134,7 @@ impl SettlementStore {
             epoch,
             pool: self.unallocated,
             contributions,
+            spends,
         });
         let allocated: u64 = record.shares.iter().map(|s| s.amount).sum();
         // Σ shares ≤ unallocated (guaranteed by `compute`), so this never underflows; dust stays.
@@ -184,6 +193,7 @@ impl SettlementStore {
         // consumer's subscription entitles = subsidy, unrewarded).
         cheques.sort_by(|a, b| (a.3, a.0, a.1).cmp(&(b.3, b.0, b.1)));
         let mut contrib: BTreeMap<[u8; 32], u64> = BTreeMap::new();
+        let mut spent: BTreeMap<[u8; 32], u64> = BTreeMap::new();
         for (provider, consumer, cum, _ts) in cheques {
             let key = (provider, consumer);
             let w = self.served_pair_wm.get(&key).copied().unwrap_or(0);
@@ -197,6 +207,9 @@ impl SettlementStore {
                 continue;
             }
             *contrib.entry(provider).or_default() += rewardable;
+            // The consumer's entitlement that funded it — recorded so the epoch's attested summary says
+            // whose subscription paid for the serving, not just who got paid.
+            *spent.entry(consumer).or_default() += rewardable;
             *self.rewardable.entry(provider).or_default() += rewardable;
         }
         self.pay_in(pool_add);
@@ -204,7 +217,11 @@ impl SettlementStore {
             .into_iter()
             .map(|(provider, bytes)| Contribution { provider, bytes })
             .collect();
-        self.settle_epoch(epoch, contributions)
+        let spends: Vec<Spend> = spent
+            .into_iter()
+            .map(|(consumer, bytes)| Spend { consumer, bytes })
+            .collect();
+        self.settle_epoch(epoch, contributions, spends)
     }
 
     /// This provider's CUMULATIVE rewardable served bytes (the "settled" numerator of settled/served) —
@@ -225,7 +242,9 @@ impl SettlementStore {
             return existing.clone(); // already settled → do NOT re-add the pool
         }
         self.pay_in(pool_add);
-        self.settle_epoch(epoch, contributions)
+        // DEV path: injects contributions directly, bypassing the per-consumer allocation, so there are
+        // no entitlement spends to record.
+        self.settle_epoch(epoch, contributions, Vec::new())
     }
 
     /// This node's own computed record for `epoch` (from its settle re-execution), for verification
@@ -296,7 +315,7 @@ mod tests {
         s.pay_in(100); // consumers paid 100 into the pool
         assert_eq!(s.unallocated(), 100);
         // Settle epoch 1: two providers 60/40 → shares 60/40; unallocated → 0 (no dust here).
-        let rec = s.settle_epoch(1, vec![contrib(1, 60), contrib(2, 40)]);
+        let rec = s.settle_epoch(1, vec![contrib(1, 60), contrib(2, 40)], vec![]);
         assert_eq!(rec.share_of(&prov(1)), 60);
         assert_eq!(s.unallocated(), 0); // all moved to `owed`
         assert_eq!(s.share_of(1, &prov(1)), 60);
@@ -306,7 +325,8 @@ mod tests {
         assert_eq!(s.share_of(1, &prov(2)), 40);
         // Re-settling epoch 1 is idempotent.
         assert_eq!(
-            s.settle_epoch(1, vec![contrib(3, 999)]).share_of(&prov(1)),
+            s.settle_epoch(1, vec![contrib(3, 999)], vec![])
+                .share_of(&prov(1)),
             60
         );
     }
@@ -316,10 +336,10 @@ mod tests {
         let mut s = SettlementStore::new();
         s.pay_in(10);
         // 3 equal providers → floor(10/3)=3 each, Σ=9, dust 1 stays unallocated.
-        s.settle_epoch(1, vec![contrib(1, 1), contrib(2, 1), contrib(3, 1)]);
+        s.settle_epoch(1, vec![contrib(1, 1), contrib(2, 1), contrib(3, 1)], vec![]);
         assert_eq!(s.unallocated(), 1);
         // The rolled dust (1) is what the NEXT epoch distributes (no new pay-ins here).
-        let rec = s.settle_epoch(2, vec![contrib(1, 5)]);
+        let rec = s.settle_epoch(2, vec![contrib(1, 5)], vec![]);
         assert_eq!(rec.share_of(&prov(1)), 1);
         assert_eq!(s.unallocated(), 0, "the dust was distributed, nothing left");
     }
@@ -328,10 +348,10 @@ mod tests {
     fn unclaimed_shares_forfeit_back_after_the_claim_window() {
         let mut s = SettlementStore::new();
         s.pay_in(50);
-        s.settle_epoch(1, vec![contrib(1, 1)]); // provider 1 owed 50, never claims
+        s.settle_epoch(1, vec![contrib(1, 1)], vec![]); // provider 1 owed 50, never claims
         assert_eq!(s.unallocated(), 0);
         // Advance past the window: settling a far-future epoch expires epoch 1 → its 50 forfeits back.
-        s.settle_epoch(1 + CLAIM_WINDOW_EPOCHS + 1, vec![]);
+        s.settle_epoch(1 + CLAIM_WINDOW_EPOCHS + 1, vec![], vec![]);
         assert_eq!(s.share_of(1, &prov(1)), 0, "expired record is gone");
         assert_eq!(
             s.unallocated(),
@@ -525,9 +545,9 @@ mod tests {
     fn a_claimed_share_does_not_forfeit_on_expiry() {
         let mut s = SettlementStore::new();
         s.pay_in(50);
-        s.settle_epoch(1, vec![contrib(1, 1)]);
+        s.settle_epoch(1, vec![contrib(1, 1)], vec![]);
         s.claim(1, prov(1)); // provider claimed its 50 (owed → paid, out of the pool)
-        s.settle_epoch(1 + CLAIM_WINDOW_EPOCHS + 1, vec![]); // expire epoch 1
+        s.settle_epoch(1 + CLAIM_WINDOW_EPOCHS + 1, vec![], vec![]); // expire epoch 1
         assert_eq!(s.unallocated(), 0, "claimed shares don't double-forfeit");
     }
 }

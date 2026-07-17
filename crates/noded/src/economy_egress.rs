@@ -201,8 +201,10 @@ mod tests {
                 .map(|(provider, amount)| Share {
                     provider: *provider,
                     amount: *amount,
+                    bytes: 0, // irrelevant to the owed sum under test
                 })
                 .collect(),
+            spends: Vec::new(),
         }
     }
 

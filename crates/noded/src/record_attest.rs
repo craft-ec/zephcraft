@@ -127,7 +127,9 @@ mod tests {
             shares: vec![Share {
                 provider: [provider; 32],
                 amount,
+                bytes: 0, // not under test here (attestation/quorum grouping)
             }],
+            spends: Vec::new(),
         }
     }
 
