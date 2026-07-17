@@ -1706,6 +1706,13 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // establish and converge sequentially, never storm) — restored to full
     // width once the post-boot wave drains (see the scan feeder phases).
     jobs.set_active_cap(2);
+    // Bound REPAIR concurrency (was the DeathRepair budget semaphore, now unified here since death,
+    // anti-entropy, and scan all submit `repair:{cid}` jobs). §4.2: repair must stay bounded under
+    // CORRELATED failure — a rack dying enqueues thousands of repair jobs at the highest priority, and
+    // uncapped they would take all 8 global slots and starve everything else into a second outage. Cap 2
+    // preserves the value the design chose; repair is throughput-bound (fetch k, regenerate, push n), so
+    // more than a couple in flight buys queueing, not speed.
+    jobs.set_class_cap(zeph_sched::JobClass::Repair, 2);
 
     // Demand-driven scaling: the serve path fires a CID here the instant its served-pull count
     // crosses scale_threshold; a bounded worker recruits one more provider right then. Scaling

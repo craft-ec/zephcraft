@@ -2659,6 +2659,23 @@ impl ObjEngine {
         .await
     }
 
+    /// Front door for repair: ENQUEUE `cid` as a Repair-priority scheduler job (deduped per cid) rather
+    /// than repairing inline. This is what death-driven and anti-entropy repair call so they share the
+    /// scan's queue — same `repair:{cid}` key, so a death and a scan that both want the same cid COALESCE
+    /// into one job instead of two, and the scheduler bounds concurrency across all of them. It also means
+    /// enqueueing is O(1): the caller submits N jobs and returns instead of grinding N DHT resolves inline,
+    /// which is what let one death block the census watcher for hours.
+    ///
+    /// Unwired (tests/library, no coordinator): repair inline so behaviour is unchanged there.
+    pub async fn request_repair(&self, cid: Cid) {
+        self.emit(zeph_events::Event::RepairNeeded(cid));
+        if let Some(tx) = self.work_trigger.get() {
+            let _ = tx.send(EngineWork::Repair(cid));
+        } else {
+            self.repair_cid(cid).await;
+        }
+    }
+
     /// The body of a Repair coordinator job: re-detect and (if this node is
     /// still the elected repairer) repair ONE at-risk cid. Re-derives the NEED
     /// (durability floor + want/Fade gate) AND the election from scratch — the
