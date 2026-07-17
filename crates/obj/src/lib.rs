@@ -2698,15 +2698,17 @@ impl ObjEngine {
     }
 
     /// The body of a Shed coordinator job — the mirror of [`repair_cid`]. Re-derives the surplus verdict
-    /// from scratch (the event that queued this may be stale: the holder that made it surplus could have
-    /// left again, in which case we shed NOTHING — that re-check is exactly the epoch offset), and if this
-    /// node wins the shedder rendezvous, trims its OWN pieces down toward its fair share so the cid rests
-    /// in the band. Returns the number of pieces shed.
+    /// from PROBE-VERIFIED ground truth (the event that queued this may be stale: the holder that made it
+    /// surplus could have left again, in which case verified `have` is back in the band and we shed NOTHING
+    /// — that re-check is exactly the epoch offset), and if this node wins the shedder rendezvous, sheds
+    /// exactly ONE piece. Returns 0 or 1.
     ///
-    /// Fair-share, not to-the-floor: the elected shedder drops its excess above `floor / holders`, never
-    /// below, so one node cannot strip itself while others stay fat — the spread stays balanced. Large or
-    /// unevenly-distributed surplus still leans on the periodic scan's rotation to finish; this handles the
-    /// common case (a returning holder's modest surplus) as an event.
+    /// One piece per invocation is the SAFETY model, not a fair-share loop: shed is destructive, so the
+    /// floor must be provable, and it is — we only fire when verified `have > floor + delta` (delta ≥ 2)
+    /// and remove one piece, so a single call lands at ≥ floor + delta, and even two nodes both winning at
+    /// an epoch boundary remove ≤ 2 total, still ≥ floor. Larger surplus drains across repeated events plus
+    /// the scan backstop; with §5 part 3 (don't mint on absence) there is no large surplus to drain anyway.
+    /// A multi-piece loop here would reopen the review-caught data-loss class — do not add one.
     pub async fn shed_cid(&self, cid: Cid) -> usize {
         let Some(gen) = self.store.generation(&cid) else {
             return 0;
@@ -2774,6 +2776,11 @@ impl ObjEngine {
         // margin: if two nodes both win at an epoch boundary (clock skew), the race costs at most one piece
         // each — a couple of surplus pieces, never the floor. Larger surplus drains across repeated events
         // and the scan backstop; with §5 part 3 (don't mint on absence) there is no large surplus anyway.
+        // Only stand for election if we still hold enough to spare one — a concurrent op (rebalance,
+        // eviction) may have drained us during the probe await, and `shed_one` has no floor of its own.
+        if self.store.piece_count(&cid) <= 2 {
+            return 0;
+        }
         shedders.push(me);
         let winner = shedders
             .iter()

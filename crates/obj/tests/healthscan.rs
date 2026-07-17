@@ -1320,3 +1320,110 @@ async fn each_file_segment_is_repaired_independently() {
         "the multi-segment file survives per-segment repair, byte-identical"
     );
 }
+
+/// shed_cid must PROBE-VERIFY before shedding — a stale-high provider record from a DEAD holder must
+/// NOT be counted as surplus. This is the review-caught data-loss regression: a shed is never
+/// re-announced, so records run stale-high for hours; trusting them raw let shed_cid destroy real
+/// pieces against phantom copies and drop a cid below its floor. Verify: with only our own real pieces
+/// (at the floor) plus a dead node's phantom record, shed_cid sheds NOTHING.
+#[tokio::test]
+async fn shed_does_not_trust_a_dead_holders_stale_high_record() {
+    let tracker = start_tracker();
+    let dirs: Vec<tempfile::TempDir> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
+    let floor = 32usize; // n = target_pieces(K=8)
+
+    // s0 holds the whole generation — exactly the floor, which is NOT surplus on its own.
+    let s0 = node(&tracker, dirs[0].path()).await;
+    s0.routing.announce_node(0, 0).await.unwrap();
+    let publisher = node(&tracker, dirs[1].path()).await;
+    let payload: Vec<u8> = (0..120_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 5) as u8)
+        .collect();
+    let cid = publisher.engine.publish(&payload, false).await.unwrap().cid;
+    wait_have(std::slice::from_ref(&s0), cid, floor).await;
+    let before = s0.engine.store().piece_count(&cid);
+    assert!(before >= floor, "s0 holds the full generation");
+
+    // A phantom holder announces a big piece_count for the same cid, then DIES. Its record lingers
+    // stale-high (nothing re-announces a departure), but the node is unreachable.
+    let phantom = node(&tracker, dirs[2].path()).await;
+    phantom.routing.announce(cid, 64, false).await.unwrap();
+    phantom.kill().await;
+
+    // If shed_cid trusted the record, have = s0(32) + phantom(64) = 96 >> floor+delta → it would shed.
+    // Probe-verified, the dead phantom counts as ZERO, so have = 32 <= floor+delta → shed NOTHING.
+    let shed = s0.engine.shed_cid(cid).await;
+    assert_eq!(
+        shed, 0,
+        "must not shed against a dead holder's phantom pieces"
+    );
+    assert_eq!(
+        s0.engine.store().piece_count(&cid),
+        before,
+        "no real piece was destroyed"
+    );
+}
+
+/// The happy path: with a GENUINE, live, verified surplus, shed_cid trims exactly ONE piece (never a
+/// loop) and the content stays at/above the floor.
+#[tokio::test]
+async fn shed_trims_one_verified_surplus_piece() {
+    let tracker = start_tracker();
+    let dirs: Vec<tempfile::TempDir> = (0..12).map(|_| tempfile::tempdir().unwrap()).collect();
+    let floor = 32usize;
+
+    let s0 = node(&tracker, dirs[0].path()).await;
+    s0.routing.announce_node(0, 0).await.unwrap();
+    let publisher = node(&tracker, dirs[1].path()).await;
+    let payload: Vec<u8> = (0..120_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 7) as u8)
+        .collect();
+    let cid = publisher.engine.publish(&payload, false).await.unwrap().cid;
+    wait_have(std::slice::from_ref(&s0), cid, floor).await;
+
+    // Build a real, verifiable surplus above the band via scaling (same as the degrade test).
+    let mut nodes = vec![s0];
+    for dir in dirs.iter().skip(2).take(8) {
+        let n = node(&tracker, dir.path()).await;
+        n.routing.announce_node(0, 0).await.unwrap();
+        nodes.push(n);
+    }
+    let total = |nodes: &[Node]| -> usize {
+        nodes
+            .iter()
+            .map(|n| n.engine.store().piece_count(&cid))
+            .sum()
+    };
+    let high = floor + (floor / 8).max(2);
+    let fetcher = node(&tracker, dirs[10].path()).await;
+    for _ in 0..8 {
+        for _ in 0..3 {
+            let _ = fetcher.engine.get(cid, ConsumeMode::Drop).await.unwrap();
+        }
+        for n in &nodes {
+            n.engine.scale().await;
+        }
+    }
+    let surplus = total(&nodes);
+    assert!(
+        surplus > high,
+        "scaling created surplus {surplus} above band top {high}"
+    );
+
+    // One shed_cid pass across all holders: exactly ONE elected shedder removes exactly ONE piece.
+    let before = total(&nodes);
+    let mut shed_total = 0usize;
+    for n in &nodes {
+        shed_total += n.engine.shed_cid(cid).await;
+    }
+    assert_eq!(
+        shed_total, 1,
+        "exactly one piece shed per pass, never a fair-share loop"
+    );
+    assert_eq!(
+        total(&nodes),
+        before - 1,
+        "exactly one real piece left the cluster"
+    );
+    assert!(total(&nodes) >= floor, "still at/above the floor");
+}
