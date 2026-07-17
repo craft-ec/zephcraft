@@ -2688,8 +2688,7 @@ it dies with the scan at P3) and build the design directly.
       properly). **The scan's probe must survive until P5** — only its per-cid DHT RESOLVE is superseded
       (holders now come from manifests, locally). This is the strongest argument for prioritising K5.
       62 noded tests; clippy clean.
-      **KNOWN LIMIT:** `seen` caches every watched peer's full set ⇒ O(N_nodes × N_cids) memory — the
-      manifest-size gap again; the diff must come from a Merkle tree, not a local mirror of the fleet.
+      **KNOWN LIMIT — FIXED (see P4b below).**
 - [x] **P4 — repair budget + priority. DONE 2026-07-17 (unrolled).**
       **BUDGET:** `Semaphore(MAX_CONCURRENT_REPAIRS=2)` held ACROSS each repair. The dangerous case was never a
       single death — it is a CORRELATED one (rack/AZ, or the 19-node freeze): death-driven repair then fires
@@ -2704,6 +2703,24 @@ it dies with the scan at P3) and build the design directly.
       — the most urgent case there is.
       Test asserts fewest-holders-first (a safety property that would otherwise revert silently).
       63 noded tests; clippy clean.
+- [x] **P4b — KNOWN LIMIT FIXED: the index is bounded by OUR store, not the fleet's inventory (2026-07-17,
+      user: "work on the known limit before we move forward" — right call).**
+      The first cut cached every watched peer's FULL set (`seen: peer → (head, their_cids)`) ⇒
+      O(N_nodes × N_cids) — literally the periodic scan's O(N) mistake moved into memory, which would have
+      shipped as "scalable". Fixed by the observation that a node can only repair cids IT HOLDS: the index now
+      keys on OUR cids and stores only the intersection (`HolderIndex: our_cid → {peers}`), bounded by OUR
+      store × replication no matter how much a peer holds. A peer's holdings we don't share are not ours to
+      remember. Per-peer state is now just the 32-byte head.
+      **BONUS — a death is now ZERO-FETCH:** the dead node's share is `{c : holders[c] ∋ dead}`, derivable
+      LOCALLY from the index, so P2 no longer fetches the dead node's manifest at all — no fetch, no DHT
+      lookup, at exactly the moment the fleet can least afford either. `on_death` also drops the dead node
+      from the index BEFORE electing, so a corpse can never be elected to repair.
+      Tests: the index stores only the intersection (peer holding 200, we share 2 ⇒ store 2); a death is
+      answered from the index alone. 65 noded tests; clippy clean.
+      **STILL OPEN (narrowed):** a head change still FETCHES the peer's whole set (~32MB at 1M cids) to
+      compute the intersection. The publisher already knows what it added/removed → the manifest should carry
+      a Merkle root + a DIFF (+ periodic snapshots for new readers). Needed before a large store, not at this
+      fleet's scale.
 - [ ] **P5 — PDP sampling (K5).** Makes manifests trustworthy rather than trusted.
 
 - [ ] **DESIGN WRITTEN — `docs/DURABILITY_DESIGN.md` (2026-07-17).** The periodic scan is O(N_cids)

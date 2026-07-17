@@ -161,11 +161,19 @@ working) · census = the shared basis for agreeing *without talking*.
 - **Unaware loss** (bytes gone, index intact) is invisible to manifests *by construction* — the node reports
   what it believes, and it believes wrongly. Only asking for the bytes settles it (K8 probe / K5 PDP). This
   is why P3 cannot retire the probe, and it is the strongest argument for prioritising K5.
-- **Manifest size.** A million-cid manifest is not a small object. Needs a Merkle root + diffs, not a full
-  set per publish; the root must be cheap to compare and the diff cheap to fetch.
-- **Reverse index cost.** "Who holds c?" is answered today by DHT provider records (a network read per
-  cid). Building it from manifests instead is local but O(N_nodes × |S|) to assemble. Unresolved: probably
-  keep provider records for the *fast path* and use manifests for *death handling*.
+- **Reverse index cost — RESOLVED [2026-07-17, during P4].** The first cut cached every watched peer's full
+  set (O(N_nodes × N_cids)) — the scan's O(N) mistake moved into memory. Fixed by the observation that a node
+  can only repair cids **it holds**: the index therefore keys on OUR cids and stores only the intersection
+  (`HolderIndex: our_cid → {peers}`), bounded by OUR store × replication regardless of fleet inventory. A
+  peer's holdings we do not share are not ours to remember. Bonus: a death is now answered ENTIRELY from the
+  index — `{c : holders[c] ∋ dead}` — so it costs no manifest fetch and no DHT lookup at the moment the fleet
+  can least afford either.
+- **Manifest size — PARTIALLY OPEN.** Storage is fixed (above), but a head change still FETCHES the peer's
+  whole set (~32 MB at 1M cids) to compute the intersection, even though only a handful of entries matter.
+  The publisher knows exactly what it added/removed, so the real fix is for the manifest to carry a Merkle
+  root + a DIFF against the previous version, with periodic full snapshots for new readers — readers then
+  apply an O(Δ) diff instead of re-reading a set to re-derive a change the publisher already knew. Needed
+  before a large store; not needed at this fleet's scale.
 - **Sampling is not a fix.** Recorded here because it is the intuitive answer and it is wrong: same axis,
   smaller constant.
 

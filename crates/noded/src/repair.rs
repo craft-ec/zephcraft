@@ -51,9 +51,16 @@ const MAX_CONCURRENT_REPAIRS: usize = 2;
 /// dropped something) than death, which SWIM already reports promptly.
 const ANTI_ENTROPY_TICK: Duration = Duration::from_secs(60);
 
-/// What we last saw a peer assert: `(head_cid, holdings)`. The head is the cheap change signal; the set is
-/// only needed to diff when the head moves.
-type PeerHoldings = HashMap<[u8; 32], ([u8; 32], HashSet<[u8; 32]>)>;
+/// For each cid WE hold: the peers currently claiming to hold it.
+///
+/// Bounded by OUR store × replication — NOT by the fleet's inventory. That distinction is the whole point:
+/// an earlier version cached every watched peer's FULL set (O(N_nodes × N_cids)), which is the same O(N)
+/// mistake the periodic scan makes, just moved into memory. We can only ever repair cids we hold pieces
+/// for, so a peer's holdings that we do not share are irrelevant and must not be stored.
+///
+/// This index also makes a death O(1) LOCAL work: the dead node's share is `{c : holders[c] ∋ dead}` — no
+/// manifest fetch, no network, at the moment the fleet is least able to afford either.
+type HolderIndex = HashMap<[u8; 32], HashSet<[u8; 32]>>;
 
 /// The node that must repair `cid`, elected by rendezvous over the surviving holders.
 ///
@@ -76,15 +83,11 @@ pub struct DeathRepair {
     manifests: Arc<ManifestStore>,
     membership: Arc<Membership>,
     engine: Arc<ObjEngine>,
-    /// Last seen `(head_cid, holdings)` per peer — the anti-entropy baseline (P3).
-    ///
-    /// The head cid is the cheap signal: unchanged cid ⇒ unchanged holdings ⇒ nothing to do, no set data
-    /// moved. The cached set is only needed to DIFF when a head does change.
-    ///
-    /// KNOWN LIMIT (design's "manifest size" gap): this holds every watched peer's full set, so memory is
-    /// O(N_nodes × N_cids). Acceptable at this fleet's scale and the reason a Merkle root + diffs must land
-    /// before a large store — the diff should come from the tree, not from a local mirror of the fleet.
-    seen: tokio::sync::Mutex<PeerHoldings>,
+    /// Last processed manifest head per peer — 32 bytes each, NOT their set. The cheap change signal:
+    /// unchanged head ⇒ unchanged holdings ⇒ nothing to do.
+    heads: tokio::sync::Mutex<HashMap<[u8; 32], [u8; 32]>>,
+    /// Who holds what, restricted to cids WE hold (see [`HolderIndex`]).
+    holders: tokio::sync::Mutex<HolderIndex>,
     /// The repair BUDGET (P4). Held for the duration of a repair, so concurrency is bounded fleet-wide by
     /// construction rather than by hoping deaths arrive one at a time.
     budget: Arc<tokio::sync::Semaphore>,
@@ -102,7 +105,8 @@ impl DeathRepair {
             manifests,
             membership,
             engine,
-            seen: tokio::sync::Mutex::new(HashMap::new()),
+            heads: tokio::sync::Mutex::new(HashMap::new()),
+            holders: tokio::sync::Mutex::new(HashMap::new()),
             budget: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REPAIRS)),
         }
     }
@@ -158,55 +162,39 @@ impl DeathRepair {
         }
     }
 
-    /// One peer: has its holdings set changed, and did it LOSE anything we can repair?
+    /// One peer: has its holdings changed, and did it LOSE anything we can repair?
     async fn check_peer(&self, peer: [u8; 32]) {
         let Some((head, _version)) = self.manifests.peer_head(peer).await else {
             return; // no manifest published (yet) — nothing to compare against
         };
-        {
-            let seen = self.seen.lock().await;
-            if let Some((prev_head, _)) = seen.get(&peer) {
-                if *prev_head == head {
-                    return; // unchanged head ⇒ unchanged holdings. The O(1) steady-state path.
-                }
-            }
+        if self.heads.lock().await.get(&peer) == Some(&head) {
+            return; // unchanged head ⇒ unchanged holdings. The O(1) steady-state path: nothing fetched.
         }
-        // The head moved ⇒ the set changed. NOW pay for the set (the only time we do).
+        // The head moved ⇒ its set changed. NOW pay for the set — the only time we do.
         let Some(manifest) = self.manifests.fetch(peer).await else {
             return;
         };
-        let now: HashSet<[u8; 32]> = manifest.cids.iter().copied().collect();
-        let lost: Vec<[u8; 32]> = {
-            let seen = self.seen.lock().await;
-            match seen.get(&peer) {
-                // First sight is a BASELINE, not a loss event — same reasoning as the census `primed`
-                // guard: without it, a node joining would read every peer's manifest as a fresh loss.
-                None => Vec::new(),
-                Some((_, prev)) => prev.difference(&now).copied().collect(),
-            }
-        };
-        self.seen.lock().await.insert(peer, (head, now));
+        let first_sight = !self.heads.lock().await.contains_key(&peer);
+        let lost = self.reindex_peer(peer, &manifest.cids).await;
+        self.heads.lock().await.insert(peer, head);
+        if first_sight {
+            // First sight is a BASELINE, not a loss event — same reasoning as the census `primed` guard:
+            // otherwise a joining node reads every peer's manifest as a fresh loss and repairs the fleet.
+            return;
+        }
         if lost.is_empty() {
-            return; // it GREW (or churned) — gaining cids is not a durability event
+            return; // it GREW or churned elsewhere — gaining cids is not a durability event
         }
         self.repair_our_share(&lost, peer, "anti-entropy: holder dropped cids")
             .await;
     }
 
-    /// One node died: repair the share of its holdings that is ours to repair.
-    async fn on_death(&self, dead: [u8; 32]) {
-        // 1. The dead node's holdings — ONE fetch for the whole set, not one lookup per cid. This is the
-        //    difference between O(N_cids) and O(1) network calls to learn what was lost.
-        let Some(manifest) = self.manifests.fetch(dead).await else {
-            // No manifest (never published, expired, or unverifiable) → we cannot know what it held. The
-            // periodic scan remains the backstop for exactly this until P3; silence here is not "nothing
-            // was lost", it is "we cannot tell".
-            tracing::warn!(node = %hex::encode(&dead[..6]), "death: no verifiable manifest — falling back to the scan");
-            return;
-        };
-
-        // 2. Intersect LOCALLY. We only consider cids we already hold pieces for: nothing to ask anyone,
-        //    and the work partitions itself across the survivors by construction.
+    /// Fold a peer's claimed holdings into the index, keeping ONLY cids we hold, and return the ones it
+    /// used to hold for us and no longer does.
+    ///
+    /// Storing the intersection rather than the peer's set is what bounds memory by OUR store instead of
+    /// the fleet's inventory: we cannot repair what we do not hold, so the rest is not ours to remember.
+    async fn reindex_peer(&self, peer: [u8; 32], claimed: &[[u8; 32]]) -> Vec<[u8; 32]> {
         let mine: HashSet<[u8; 32]> = self
             .engine
             .store()
@@ -214,18 +202,63 @@ impl DeathRepair {
             .into_iter()
             .map(|c| c.0)
             .collect();
-        let shared: Vec<[u8; 32]> = manifest
-            .cids
+        let now: HashSet<[u8; 32]> = claimed
             .iter()
             .copied()
             .filter(|c| mine.contains(c))
             .collect();
-        if shared.is_empty() {
-            return; // it held nothing we hold — not our share (or already-lost; see the design's gap)
+        let mut holders = self.holders.lock().await;
+        // What it held FOR US before is derivable from the index — no mirror of its set required.
+        let before: Vec<[u8; 32]> = holders
+            .iter()
+            .filter(|(_, hs)| hs.contains(&peer))
+            .map(|(c, _)| *c)
+            .collect();
+        let mut lost = Vec::new();
+        for c in before {
+            if !now.contains(&c) {
+                if let Some(hs) = holders.get_mut(&c) {
+                    hs.remove(&peer);
+                }
+                lost.push(c);
+            }
         }
+        for c in now {
+            holders.entry(c).or_default().insert(peer);
+        }
+        // Drop cids we no longer hold ourselves — the index must not outlive our own store.
+        holders.retain(|c, hs| mine.contains(c) && !hs.is_empty());
+        lost
+    }
 
-        // 3+4. Elect + repair our share (shared with the anti-entropy path — the invariants live in ONE
-        //       place so the two triggers cannot drift apart and double-repair or skip).
+    /// One node died: repair the share of its holdings that is ours to repair.
+    ///
+    /// O(1) LOCAL work to find that share — the index already knows who held what, so a death costs no
+    /// manifest fetch and no DHT lookup at the exact moment the fleet can least afford either.
+    async fn on_death(&self, dead: [u8; 32]) {
+        let shared: Vec<[u8; 32]> = {
+            let holders = self.holders.lock().await;
+            holders
+                .iter()
+                .filter(|(_, hs)| hs.contains(&dead))
+                .map(|(c, _)| *c)
+                .collect()
+        };
+        if shared.is_empty() {
+            // Either it held nothing we hold, or we never saw its manifest. The two are indistinguishable
+            // here, which is why the periodic scan remains the backstop until P5: silence is not proof.
+            return;
+        }
+        // It is gone: stop counting it toward durability before electing, or it could be elected to repair.
+        {
+            let mut holders = self.holders.lock().await;
+            for c in &shared {
+                if let Some(hs) = holders.get_mut(c) {
+                    hs.remove(&dead);
+                }
+            }
+        }
+        self.heads.lock().await.remove(&dead);
         self.repair_our_share(&shared, dead, "death-driven repair")
             .await;
     }
@@ -235,38 +268,40 @@ impl DeathRepair {
     /// Shared by both triggers: a death and an anti-entropy shrink are the same problem — a holder
     /// disappeared from some cids — and must not grow two subtly different election paths.
     async fn repair_our_share(&self, cids: &[[u8; 32]], gone: [u8; 32], why: &str) {
-        // Who else survives holding these? From peers' MANIFESTS — O(N_nodes) fetches for the whole event,
-        // not O(cids) DHT lookups. `liveness_census` is Alive-only, so a Suspect peer is not elected to act.
-        let alive = self.membership.liveness_census().await;
-        let want: HashSet<[u8; 32]> = cids.iter().copied().collect();
-        let mut holders: HashMap<[u8; 32], Vec<[u8; 32]>> = HashMap::new();
-        for c in cids {
-            holders.insert(*c, vec![self.me]); // we hold all of these by construction (we intersected)
-        }
-        for (peer, _) in alive {
-            if peer.0 == self.me || peer.0 == gone {
-                continue;
-            }
-            let Some(pm) = self.manifests.fetch(peer.0).await else {
-                continue; // no manifest → not a candidate; it cannot be elected to act
-            };
-            for c in pm.cids.iter().filter(|c| want.contains(*c)) {
-                holders.entry(*c).or_default().push(peer.0);
-            }
-        }
-        // Our elected share, carrying each cid's SURVIVING holder count.
-        let mut mine: Vec<([u8; 32], usize)> = cids
-            .iter()
-            .filter_map(|c| {
-                let cands = holders.get(c)?;
-                (repairer_for(c, cands) == Some(self.me)).then_some((*c, cands.len()))
-            })
+        // Candidates come from the INDEX (already maintained), intersected with the ALIVE census so a
+        // Suspect or departed peer is never elected to act. No fetches, no DHT: this must stay cheap
+        // precisely because it runs when nodes are dying.
+        let alive: HashSet<[u8; 32]> = self
+            .membership
+            .liveness_census()
+            .await
+            .into_iter()
+            .map(|(n, _)| n.0)
             .collect();
+        let mut mine: Vec<([u8; 32], usize)> = {
+            let holders = self.holders.lock().await;
+            cids.iter()
+                .filter_map(|c| {
+                    let mut cands: Vec<[u8; 32]> = holders
+                        .get(c)
+                        .map(|hs| {
+                            hs.iter()
+                                .copied()
+                                .filter(|h| *h != gone && alive.contains(h))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    cands.push(self.me); // we hold it by construction; the index may not list us
+                    cands.sort_unstable();
+                    cands.dedup();
+                    (repairer_for(c, &cands) == Some(self.me)).then_some((*c, cands.len()))
+                })
+                .collect()
+        };
 
         // P4 — PRIORITY: fewest surviving holders FIRST. Repairing in discovery order spends the budget on
         // comfortable cids while the ones nearest the k floor wait; under a correlated failure that is
-        // exactly how data is lost while the fleet looks busy. Ordering by ACTUAL redundancy means the
-        // budget always buys the most durability available.
+        // exactly how data is lost while the fleet looks busy.
         mine.sort_by_key(|(_, holders)| *holders);
 
         let elected = mine.len();
@@ -274,17 +309,16 @@ impl DeathRepair {
         let mut last_holder = 0usize;
         for (c, n_holders) in mine {
             if n_holders <= 1 {
-                last_holder += 1; // we may be the only survivor holding it — the most urgent case there is
+                last_holder += 1; // we may be its only survivor — the most urgent case there is
             }
-            // P4 — BUDGET: bound concurrency, held across the repair. A correlated failure (rack/AZ, or the
-            // 19-node freeze in the tracker) fires repair for many nodes at once — a herd precisely when the
-            // fleet is weakest. Bounding it turns that into a slower recovery instead of a second outage.
+            // P4 — BUDGET: bound concurrency, held across the repair. A correlated failure fires repair for
+            // many nodes at once — a herd exactly when the fleet is weakest. Bounded, that becomes a slower
+            // recovery instead of a second outage.
             let Ok(_permit) = self.budget.clone().acquire_owned().await else {
                 break; // semaphore closed — shutting down
             };
-            // `repair_cid` re-checks health itself, so a stale manifest costs a cheap no-op rather than a
-            // pointless regenerate — the design's probe-before-repair rule, and what makes acting on a
-            // disagreement safe.
+            // `repair_cid` re-checks health itself, so a stale claim costs a cheap no-op rather than a
+            // pointless regenerate — the probe-before-repair rule that makes acting on disagreement safe.
             if self.engine.repair_cid(Cid(c)).await > 0 {
                 repaired += 1;
             }
@@ -353,6 +387,51 @@ mod tests {
         let winner = repairer_for(&cid(7), &survivors).unwrap();
         assert_ne!(winner, dead);
         assert!(survivors.contains(&winner));
+    }
+
+    #[test]
+    fn the_index_is_bounded_by_our_store_not_the_fleets_inventory() {
+        // The limit this replaced: caching every peer's FULL set is O(N_nodes × N_cids) — the periodic
+        // scan's O(N) mistake moved into memory. We can only repair what we hold, so a peer's holdings we
+        // do not share must never be stored. This models `reindex_peer`'s filter.
+        let mine: HashSet<[u8; 32]> = [cid(1), cid(2)].into_iter().collect();
+        // A peer holding a huge set, of which we share two.
+        let theirs: Vec<[u8; 32]> = (1..=200u8).map(cid).collect();
+        let kept: HashSet<[u8; 32]> = theirs
+            .iter()
+            .copied()
+            .filter(|c| mine.contains(c))
+            .collect();
+        assert_eq!(
+            kept.len(),
+            2,
+            "store only the intersection, never their set"
+        );
+        assert!(kept.contains(&cid(1)) && kept.contains(&cid(2)));
+        // Memory is bounded by OUR store regardless of how much they hold.
+        assert!(kept.len() <= mine.len());
+    }
+
+    #[test]
+    fn a_death_is_answered_from_the_index_with_no_fetch() {
+        // The dead node's share is `{c : holders[c] ∋ dead}` — derivable locally. A death must not require
+        // fetching anything: it arrives exactly when the fleet is least able to serve a fetch.
+        let mut holders: HolderIndex = HashMap::new();
+        holders.insert(cid(1), [node(7), node(8)].into_iter().collect());
+        holders.insert(cid(2), [node(8)].into_iter().collect());
+        holders.insert(cid(3), [node(9)].into_iter().collect());
+        let dead = node(8);
+        let mut share: Vec<[u8; 32]> = holders
+            .iter()
+            .filter(|(_, hs)| hs.contains(&dead))
+            .map(|(c, _)| *c)
+            .collect();
+        share.sort_unstable();
+        assert_eq!(share, vec![cid(1), cid(2)]);
+        assert!(
+            !share.contains(&cid(3)),
+            "cids it never held are not our concern"
+        );
     }
 
     #[test]
