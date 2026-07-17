@@ -31,6 +31,18 @@ use crate::manifest::ManifestStore;
 /// per-cid work — so it can be brisk: this is the latency between a converged `Dead` and repair starting.
 const WATCH_TICK: Duration = Duration::from_secs(5);
 
+/// Max repairs this node runs at once (P4 budget).
+///
+/// The dangerous case is not a single death — it is a CORRELATED one (a rack, an AZ, or the 19-node freeze
+/// in the tracker). Death-driven repair then fires for many nodes at once, i.e. it stampedes precisely when
+/// the fleet is weakest and can least afford a thundering herd of k-piece fetches. An unbudgeted repair
+/// under correlated failure is a WORSE outage than the polling it replaces, which is why the design marks
+/// this phase mandatory before scale rather than an optimisation.
+///
+/// Small on purpose: repair is throughput-bound (fetch k pieces, regenerate, distribute), so concurrency
+/// past a couple of jobs buys queueing, not speed — while making the herd worse.
+const MAX_CONCURRENT_REPAIRS: usize = 2;
+
 /// How often peers' manifest HEADS are checked for change (P3 anti-entropy).
 ///
 /// O(N_nodes) head reads — one tiny DHT record each, no set data — versus the scan's O(N_cids) resolves.
@@ -73,6 +85,9 @@ pub struct DeathRepair {
     /// O(N_nodes × N_cids). Acceptable at this fleet's scale and the reason a Merkle root + diffs must land
     /// before a large store — the diff should come from the tree, not from a local mirror of the fleet.
     seen: tokio::sync::Mutex<PeerHoldings>,
+    /// The repair BUDGET (P4). Held for the duration of a repair, so concurrency is bounded fleet-wide by
+    /// construction rather than by hoping deaths arrive one at a time.
+    budget: Arc<tokio::sync::Semaphore>,
 }
 
 impl DeathRepair {
@@ -88,6 +103,7 @@ impl DeathRepair {
             membership,
             engine,
             seen: tokio::sync::Mutex::new(HashMap::new()),
+            budget: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REPAIRS)),
         }
     }
 
@@ -238,19 +254,38 @@ impl DeathRepair {
                 holders.entry(*c).or_default().push(peer.0);
             }
         }
-        let (mut elected, mut repaired) = (0usize, 0usize);
-        for c in cids {
-            let Some(cands) = holders.get(c) else {
-                continue;
-            };
-            if repairer_for(c, cands) != Some(self.me) {
-                continue; // someone else's share — they compute the same winner and will take it
+        // Our elected share, carrying each cid's SURVIVING holder count.
+        let mut mine: Vec<([u8; 32], usize)> = cids
+            .iter()
+            .filter_map(|c| {
+                let cands = holders.get(c)?;
+                (repairer_for(c, cands) == Some(self.me)).then_some((*c, cands.len()))
+            })
+            .collect();
+
+        // P4 — PRIORITY: fewest surviving holders FIRST. Repairing in discovery order spends the budget on
+        // comfortable cids while the ones nearest the k floor wait; under a correlated failure that is
+        // exactly how data is lost while the fleet looks busy. Ordering by ACTUAL redundancy means the
+        // budget always buys the most durability available.
+        mine.sort_by_key(|(_, holders)| *holders);
+
+        let elected = mine.len();
+        let mut repaired = 0usize;
+        let mut last_holder = 0usize;
+        for (c, n_holders) in mine {
+            if n_holders <= 1 {
+                last_holder += 1; // we may be the only survivor holding it — the most urgent case there is
             }
-            elected += 1;
+            // P4 — BUDGET: bound concurrency, held across the repair. A correlated failure (rack/AZ, or the
+            // 19-node freeze in the tracker) fires repair for many nodes at once — a herd precisely when the
+            // fleet is weakest. Bounding it turns that into a slower recovery instead of a second outage.
+            let Ok(_permit) = self.budget.clone().acquire_owned().await else {
+                break; // semaphore closed — shutting down
+            };
             // `repair_cid` re-checks health itself, so a stale manifest costs a cheap no-op rather than a
             // pointless regenerate — the design's probe-before-repair rule, and what makes acting on a
             // disagreement safe.
-            if self.engine.repair_cid(Cid(*c)).await > 0 {
+            if self.engine.repair_cid(Cid(c)).await > 0 {
                 repaired += 1;
             }
         }
@@ -259,6 +294,7 @@ impl DeathRepair {
             candidates = cids.len(),
             elected,
             repaired,
+            last_holder,
             why,
             "repair"
         );
@@ -317,6 +353,27 @@ mod tests {
         let winner = repairer_for(&cid(7), &survivors).unwrap();
         assert_ne!(winner, dead);
         assert!(survivors.contains(&winner));
+    }
+
+    #[test]
+    fn repair_order_is_by_actual_redundancy_not_discovery_order() {
+        // P4's priority rule, isolated: the budget must always buy the most durability available. Under a
+        // correlated failure the budget is the binding constraint, so spending it in discovery order means
+        // comfortable cids get repaired while the ones nearest the k floor wait — that is how data is lost
+        // while the fleet looks busy.
+        let mut mine: Vec<([u8; 32], usize)> = vec![
+            (cid(1), 4), // comfortable
+            (cid(2), 1), // LAST holder — most urgent
+            (cid(3), 3),
+            (cid(4), 2),
+        ];
+        mine.sort_by_key(|(_, holders)| *holders);
+        assert_eq!(
+            mine.iter().map(|(_, n)| *n).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4],
+            "fewest surviving holders must be repaired first"
+        );
+        assert_eq!(mine[0].0, cid(2), "the last-holder cid goes first");
     }
 
     #[test]

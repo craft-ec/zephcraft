@@ -2690,8 +2690,20 @@ it dies with the scan at P3) and build the design directly.
       62 noded tests; clippy clean.
       **KNOWN LIMIT:** `seen` caches every watched peer's full set ⇒ O(N_nodes × N_cids) memory — the
       manifest-size gap again; the diff must come from a Merkle tree, not a local mirror of the fleet.
-- [ ] **P4 — repair budget + priority by ACTUAL redundancy** (k+1 before k+3). MANDATORY before scale: an
-      unbudgeted death-driven repair under correlated failure is a worse outage than the polling it replaces.
+- [x] **P4 — repair budget + priority. DONE 2026-07-17 (unrolled).**
+      **BUDGET:** `Semaphore(MAX_CONCURRENT_REPAIRS=2)` held ACROSS each repair. The dangerous case was never a
+      single death — it is a CORRELATED one (rack/AZ, or the 19-node freeze): death-driven repair then fires
+      for many nodes at once, i.e. stampedes exactly when the fleet is weakest and can least afford a herd of
+      k-piece fetches. Bounded ⇒ a correlated failure degrades to a SLOWER RECOVERY instead of a second
+      outage. Small on purpose: repair is throughput-bound (fetch k → regenerate → distribute), so more
+      concurrency buys queueing, not speed, while making the herd worse.
+      **PRIORITY:** elected share carries each cid's SURVIVING holder count and is sorted fewest-first.
+      Discovery order spends the budget on comfortable cids while the ones nearest the k floor wait — under
+      correlated failure that is precisely how data is lost while the fleet looks busy. Sorting by ACTUAL
+      redundancy makes the budget always buy the most durability available. Logs `last_holder` (n_holders<=1)
+      — the most urgent case there is.
+      Test asserts fewest-holders-first (a safety property that would otherwise revert silently).
+      63 noded tests; clippy clean.
 - [ ] **P5 — PDP sampling (K5).** Makes manifests trustworthy rather than trusted.
 
 - [ ] **DESIGN WRITTEN — `docs/DURABILITY_DESIGN.md` (2026-07-17).** The periodic scan is O(N_cids)
