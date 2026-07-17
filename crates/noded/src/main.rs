@@ -483,7 +483,16 @@ impl Default for Config {
             fade_grace_secs: 24 * 60 * 60,
             pace_delay_secs: 1,
             eviction_cooldown_secs: 30 * 24 * 60 * 60,
-            health_scan_secs: 30,
+            // 15 MINUTES [2026-07-17, was 30s]. This is the re-check FLOOR for at-risk and
+            // freshly-discovered cids, and every held cid is "freshly discovered" after a restart — so at
+            // 30s a node holding N cids issued ~N/30 DHT resolves PER SECOND until the backoff caught up
+            // (measured: 3046 cids => ~100 lookups/s => ~1-2 MB/s of iterative-DHT traffic on a
+            // relay-only node, sustained for the whole first pass and reset by every roll).
+            // Durability does not need 30s granularity: pieces are lost by node death, which SWIM already
+            // detects in seconds, and repair reads the census — the scan is the slow BACKSTOP, not the
+            // detector. 15 min still bounds worst-case detection far below any realistic durability risk
+            // at n/k=8, while cutting steady-state scan traffic ~30x.
+            health_scan_secs: 900,
             reannounce_secs: 120,
             governance_governors: Vec::new(),
             governance_threshold: 1,
@@ -2358,7 +2367,12 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // Adaptive re-check bounds: at-risk (and freshly discovered) cids re-check at recheck_min;
     // healthy cids back off geometrically up to recheck_max (min * 64).
     let recheck_min = Duration::from_secs(health_scan_secs);
-    let recheck_max = Duration::from_secs(health_scan_secs.saturating_mul(64));
+    // Healthy cids back off to 2h (8x the 15-min floor). The old multiplier was 64x, chosen when the
+    // floor was 30s (=> 32 min); keeping 64x on a 15-min floor would mean 16 HOURS, which is a real
+    // durability gap rather than a saving. 8x keeps the ceiling at a defensible 2h: a cid that has looked
+    // healthy for hours is re-verified twice a shift, and anything AT RISK drops straight back to the
+    // floor — the backoff only rewards cids that keep passing.
+    let recheck_max = Duration::from_secs(health_scan_secs.saturating_mul(8));
     // Elected-scan safety net (v2 element 4): a non-winner's own snapshot older
     // than this forces an unconditional refresh scan, so a phantom-elected cid
     // (winner still alive + cached but no longer holds it) can't go unscanned.

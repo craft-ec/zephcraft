@@ -28,6 +28,28 @@ pub const MUX_ALPN: &[u8] = b"/craftec/mux/1";
 /// the accept side reads this byte and routes the stream to the matching
 /// handler (replacing the old per-connection ALPN dispatch). Stable on the
 /// wire — never renumber; only append.
+/// Inbound stream counters, indexed by tag byte (see [`tag`]). Read via
+/// `Transport::tag_stream_counts`; index 0 and 11..15 are unused padding so a tag byte can index
+/// directly without a bounds dance.
+static TAG_STREAMS: [std::sync::atomic::AtomicU64; 16] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
 pub mod tag {
     pub const PING: u8 = 1;
     pub const MEMBER: u8 = 2;
@@ -615,6 +637,22 @@ impl Transport {
     /// Bounded pipelining (a per-connection permit held through the tag read and
     /// hand-off) backpressures a peer that opens streams faster than handlers
     /// drain them; an unknown tag drops the stream.
+    /// INBOUND stream count per tag — the only direct answer to "what is this node's traffic?".
+    ///
+    /// Added 2026-07-17 after a long idle-bandwidth investigation in which six successive hypotheses
+    /// (dashboard, health scan, reannounce refresh, relay, poll stampede, scan floor) were each argued
+    /// from CPU profiles and process-level byte counters, and each was wrong. Neither instrument can name
+    /// a protocol: a CPU profile misses I/O-bound work, and `nettop` sees one process, not ten tags. This
+    /// counts what actually arrives, by tag, so the question is answered by measurement rather than
+    /// inference. Cheap: one relaxed add per inbound stream.
+    pub fn tag_stream_counts() -> [u64; 16] {
+        let mut out = [0u64; 16];
+        for (i, c) in TAG_STREAMS.iter().enumerate() {
+            out[i] = c.load(std::sync::atomic::Ordering::Relaxed);
+        }
+        out
+    }
+
     async fn demux_conn(
         conn: Connection,
         handlers: std::sync::Arc<Vec<(u8, tokio::sync::mpsc::Sender<TaggedStream>)>>,
@@ -631,6 +669,9 @@ impl Transport {
                 let mut tag = [0u8; 1];
                 if recv.read_exact(&mut tag).await.is_err() {
                     return;
+                }
+                if let Some(c) = TAG_STREAMS.get(tag[0] as usize) {
+                    c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 if let Some((_, tx)) = handlers.iter().find(|(t, _)| *t == tag[0]) {
                     let _ = tx.send(TaggedStream { remote, send, recv }).await;

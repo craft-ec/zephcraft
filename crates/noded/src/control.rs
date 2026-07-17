@@ -140,6 +140,10 @@ pub struct Status {
     pub health_fading: u64,
     pub health_offloaded: u64,
     pub health_surplus: usize,
+    /// INBOUND streams by transport tag since boot — `{"ping": n, "dht": n, "piece": n, ...}`.
+    /// Measured, not inferred: this exists because six successive bandwidth hypotheses were argued from
+    /// CPU profiles and process byte-counters, which cannot name a protocol, and all six were wrong.
+    pub tag_streams: std::collections::BTreeMap<String, u64>,
     pub scan_queue: usize,
     pub scan_due: usize,
     pub peers: Vec<PeerStatus>,
@@ -339,6 +343,28 @@ impl State {
             health_fading: self.health.read().await.6,
             health_offloaded: self.health.read().await.7,
             health_surplus: self.health.read().await.8,
+            tag_streams: {
+                // Name the tags so the answer reads directly off the dashboard instead of needing a
+                // profile + a hypothesis. Zero-count tags are omitted to keep it legible.
+                const NAMES: [(usize, &str); 10] = [
+                    (1, "ping"),
+                    (2, "member"),
+                    (3, "piece"),
+                    (4, "sqlpage"),
+                    (5, "invoke"),
+                    (6, "registry"),
+                    (7, "dht"),
+                    (8, "board"),
+                    (9, "sign_solicit"),
+                    (10, "cheque"),
+                ];
+                let counts = zeph_transport::Transport::tag_stream_counts();
+                NAMES
+                    .iter()
+                    .filter(|(i, _)| counts[*i] > 0)
+                    .map(|(i, n)| (n.to_string(), counts[*i]))
+                    .collect()
+            },
             scan_queue: self.scan_queue.load(std::sync::atomic::Ordering::Relaxed),
             scan_due: self.scan_due.load(std::sync::atomic::Ordering::Relaxed),
             peers: self.peers.read().await.clone(),
