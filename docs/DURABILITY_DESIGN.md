@@ -263,16 +263,15 @@ working) · census = the shared basis for agreeing *without talking*.
   invisible to death-driven repair. It is already-lost data (X was the last holder), so preventing it is
   the placement/erasure policy's job, not repair's. Stated explicitly because the design otherwise quietly
   assumes coverage it does not have. Manifest anti-entropy is the backstop that would *surface* it.
-- **A restarting node cannot republish its holdings for up to the record TTL (1h). CONCRETE BUG, unfixed.**
-  `ManifestStore.last` is in-memory, so a restart resets the manifest version to 1. `announce_app` uses that
-  version as the DHT record's `seq`, and `RecordStore::put` rejects `existing.seq >= rec.seq` — so a node
-  that restarts meets its OWN pre-restart record (seq=N) and every republish is rejected until its version
-  climbs back past N. Its holdings head stays frozen at the pre-restart manifest, and any change it makes in
-  that window is invisible. A long absence self-heals (the record TTLs out after 1h and `seq=1` is accepted
-  again); a quick restart does not, which is the common case. The version is a chain identity, not just a
-  counter, so the fix is to PERSIST it rather than to special-case the seq. Note the diff chain itself
-  survives a rewind correctly — a peer whose baseline is unreachable gets `Changes::Reset` and re-baselines
-  — so this is purely the DHT seq rule, not a manifest-format problem.
+- **A restarting node's republish. FIXED [2026-07-17].** `ManifestStore.last` was in-memory, so a restart
+  reset the manifest version to 1 — but `announce_app` uses that version as the DHT record's `seq` and
+  `RecordStore::put` rejects `existing.seq >= rec.seq`, so a restarted node met its OWN pre-restart record
+  and every republish was refused until the count climbed back past it. Holdings head frozen at a stale
+  manifest, every change invisible, for up to the 1h record TTL. A long absence self-healed (the record
+  expires); a quick restart did not, and a home node restarting daily hit it every morning. Now resumed from
+  a persisted high-water mark. The last SET is deliberately NOT persisted — that is the ~32 MB write this
+  design exists to avoid — so a process's first publish is a `Snapshot` and readers re-baseline via
+  `Changes::Reset`, costing one full-set fetch per peer per restart.
 - **Lying nodes** are only caught by PDP sampling (K5, unbuilt). Until then a manifest is trusted.
 - **Unaware loss** (bytes gone, index intact) is invisible to manifests *by construction* — the node reports
   what it believes, and it believes wrongly. Only asking for the bytes settles it (K8 probe / K5 PDP). This
