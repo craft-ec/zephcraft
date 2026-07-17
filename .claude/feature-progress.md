@@ -2670,8 +2670,26 @@ it dies with the scan at P3) and build the design directly.
       that published no manifest ("we cannot tell" ≠ "nothing was lost"). 62 noded tests; clippy clean. SWIM converged `Dead` → fetch the dead node's manifest ONCE → intersect
       with own set LOCALLY → HRW-elect among surviving holders → probe (K8) → repair. Ranked failover.
       Runs ALONGSIDE the scan (which becomes a long-period backstop).
-- [ ] **P3 — manifest anti-entropy → RETIRE the scan's per-cid resolve.** Root comparison covers silent loss.
-      This is the phase that deletes the O(N_cids) polling (and the drip fix with it).
+- [x] **P3 — manifest anti-entropy. DONE 2026-07-17 (unrolled). SCOPE CORRECTED — it does NOT retire the scan.**
+      `DeathRepair::run_anti_entropy`: 60s tick over `liveness_census`, read each peer's HEAD (O(1) — one tiny
+      DHT record, no set data). Unchanged head ⇒ unchanged holdings ⇒ return (the O(1) steady-state path; a
+      peer that lost nothing costs one cid comparison). Head moved ⇒ fetch the set ONCE → diff vs the cached
+      baseline → the REMOVED cids are potential loss → same elect+repair path as the death trigger.
+      `repair_our_share` is now SHARED by both triggers: a death and a shrink are the same problem (a holder
+      vanished from some cids) and must not grow two subtly different election paths.
+      First sight of a peer = BASELINE, not a loss event (same reasoning as the census `primed` guard, else a
+      joining node reads every peer's manifest as fresh loss). A GROWING set is not a durability event.
+      **MY DESIGN DOC WAS WRONG AND IS CORRECTED IN-PLACE:** the draft said P3 retires the periodic scan.
+      Shipping that would have been a durability REGRESSION. `store.cids()` enumerates the INDEX, not the
+      bytes — a node whose disk failed with its index intact publishes an UNCHANGED manifest because it does
+      not KNOW it lost anything. A manifest is a claim about what a node BELIEVES it holds, and it can believe
+      wrongly. Anti-entropy therefore covers only holder-AWARE loss (eviction, deliberate drops) + missed
+      deaths; UNAWARE loss is caught only by asking for the bytes (K8 `AvailabilityProbe` now, K5 PDP
+      properly). **The scan's probe must survive until P5** — only its per-cid DHT RESOLVE is superseded
+      (holders now come from manifests, locally). This is the strongest argument for prioritising K5.
+      62 noded tests; clippy clean.
+      **KNOWN LIMIT:** `seen` caches every watched peer's full set ⇒ O(N_nodes × N_cids) memory — the
+      manifest-size gap again; the diff must come from a Merkle tree, not a local mirror of the fleet.
 - [ ] **P4 — repair budget + priority by ACTUAL redundancy** (k+1 before k+3). MANDATORY before scale: an
       unbudgeted death-driven repair under correlated failure is a worse outage than the polling it replaces.
 - [ ] **P5 — PDP sampling (K5).** Makes manifests trustworthy rather than trusted.

@@ -67,7 +67,8 @@ This is the same pattern the codebase already uses twice and should not invent a
 | Layer | Catches | Cost |
 |---|---|---|
 | **Death-driven repair** — SWIM `Dead` → read the dead node's last manifest → repair its cids | node death (the common case) | O(dead node's set), only on an event |
-| **Manifest anti-entropy** — compare signed roots, drill into diffs | silent loss (disk failure, eviction, corruption) + missed death events | O(1) compare, O(diff) reconcile |
+| **Manifest anti-entropy** — compare signed roots, drill into diffs | loss the holder KNOWS about (eviction, deliberate drops) + missed death events. **NOT** unaware loss — see below | O(1) compare, O(diff) reconcile |
+| **Availability probe (K8)** — ask a holder for a cid | loss the holder does NOT know about (bytes gone, index intact) | O(probed cids) |
 | **PDP sampling** (K5) | a node **lying** — claiming a manifest it cannot back | O(k) challenges, independent of N |
 | **Repair-on-read** | hot data | free |
 | **Erasure margin (n/k)** | buys time so repair can be lazy + batched | free |
@@ -157,6 +158,9 @@ working) · census = the shared basis for agreeing *without talking*.
   the placement/erasure policy's job, not repair's. Stated explicitly because the design otherwise quietly
   assumes coverage it does not have. Manifest anti-entropy is the backstop that would *surface* it.
 - **Lying nodes** are only caught by PDP sampling (K5, unbuilt). Until then a manifest is trusted.
+- **Unaware loss** (bytes gone, index intact) is invisible to manifests *by construction* — the node reports
+  what it believes, and it believes wrongly. Only asking for the bytes settles it (K8 probe / K5 PDP). This
+  is why P3 cannot retire the probe, and it is the strongest argument for prioritising K5.
 - **Manifest size.** A million-cid manifest is not a small object. Needs a Merkle root + diffs, not a full
   set per publish; the root must be cheap to compare and the diff cheap to fetch.
 - **Reverse index cost.** "Who holds c?" is answered today by DHT provider records (a network read per
@@ -173,10 +177,20 @@ working) · census = the shared basis for agreeing *without talking*.
    No behaviour change yet — purely additive.
 2. **P2 — death-driven repair.** SWIM converged `Dead` → intersect → HRW elect → probe → repair. Ranked
    failover. Runs ALONGSIDE the periodic scan, which becomes the backstop with a long period.
-3. **P3 — manifest anti-entropy.** Root comparison replaces the scan's silent-loss coverage; the periodic
-   scan's per-cid resolve is retired.
+3. **P3 — manifest anti-entropy.** Watch peers' heads (O(1) each); a changed head means changed holdings →
+   fetch → diff → the cids they no longer hold are potential loss → elect → repair. Replaces the scan's
+   `resolve(cid)`-per-cid **provider lookup** (holders now come from manifests, locally).
+   **CORRECTION [2026-07-17, during implementation].** An earlier draft said this retires the periodic scan.
+   It does not, and shipping that would have been a durability REGRESSION. `store.cids()` enumerates the
+   INDEX, not the bytes: a node whose disk failed while its index survived publishes an UNCHANGED manifest —
+   it does not know it lost anything. A manifest is a claim about what a node *believes* it holds, so
+   anti-entropy can only catch loss the holder is AWARE of (eviction, deliberate drops). Unaware loss is
+   caught only by asking for the bytes: K8's `AvailabilityProbe` today, PDP (K5) properly. **The scan's
+   probe must therefore survive P3** — only its per-cid DHT resolve goes. Retiring the probe requires P5.
 4. **P4 — budget + priority.** Repair rate cap; order by actual redundancy. Needed before any large fleet.
-5. **P5 — PDP sampling (K5).** Makes manifests trustworthy rather than trusted.
+5. **P5 — PDP sampling (K5).** Makes manifests trustworthy rather than trusted — and is what finally allows
+   the periodic probe to be replaced by sampling rather than merely made cheaper. Until P5 lands, a
+   probe of some form MUST keep running: manifests + death events cover honest, self-known loss only.
 
 **Do not skip P4 before scale**: an unbudgeted death-driven repair on a correlated failure is a worse
 outage than the polling it replaces.

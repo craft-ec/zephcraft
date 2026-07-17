@@ -31,6 +31,18 @@ use crate::manifest::ManifestStore;
 /// per-cid work — so it can be brisk: this is the latency between a converged `Dead` and repair starting.
 const WATCH_TICK: Duration = Duration::from_secs(5);
 
+/// How often peers' manifest HEADS are checked for change (P3 anti-entropy).
+///
+/// O(N_nodes) head reads — one tiny DHT record each, no set data — versus the scan's O(N_cids) resolves.
+/// A peer that has lost nothing costs one unchanged cid comparison, which is the entire point: steady state
+/// must be silent. Slower than [`WATCH_TICK`] because this covers a *rarer* event (a holder noticing it
+/// dropped something) than death, which SWIM already reports promptly.
+const ANTI_ENTROPY_TICK: Duration = Duration::from_secs(60);
+
+/// What we last saw a peer assert: `(head_cid, holdings)`. The head is the cheap change signal; the set is
+/// only needed to diff when the head moves.
+type PeerHoldings = HashMap<[u8; 32], ([u8; 32], HashSet<[u8; 32]>)>;
+
 /// The node that must repair `cid`, elected by rendezvous over the surviving holders.
 ///
 /// Every survivor computes this from the same inputs and therefore agrees without exchanging a message —
@@ -52,6 +64,15 @@ pub struct DeathRepair {
     manifests: Arc<ManifestStore>,
     membership: Arc<Membership>,
     engine: Arc<ObjEngine>,
+    /// Last seen `(head_cid, holdings)` per peer — the anti-entropy baseline (P3).
+    ///
+    /// The head cid is the cheap signal: unchanged cid ⇒ unchanged holdings ⇒ nothing to do, no set data
+    /// moved. The cached set is only needed to DIFF when a head does change.
+    ///
+    /// KNOWN LIMIT (design's "manifest size" gap): this holds every watched peer's full set, so memory is
+    /// O(N_nodes × N_cids). Acceptable at this fleet's scale and the reason a Merkle root + diffs must land
+    /// before a large store — the diff should come from the tree, not from a local mirror of the fleet.
+    seen: tokio::sync::Mutex<PeerHoldings>,
 }
 
 impl DeathRepair {
@@ -66,6 +87,7 @@ impl DeathRepair {
             manifests,
             membership,
             engine,
+            seen: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -99,6 +121,62 @@ impl DeathRepair {
         }
     }
 
+    /// P3 — manifest anti-entropy: watch peers' heads; react when a holder's set SHRINKS.
+    ///
+    /// Covers loss a holder KNOWS about (eviction, deliberate drops) and death events this node missed. It
+    /// does NOT cover unaware loss — a node whose bytes vanished while its index survived publishes an
+    /// unchanged manifest, because `store.cids()` enumerates the index, not the bytes. A manifest is a claim
+    /// about what a node BELIEVES it holds, and it can believe wrongly. Only asking for the bytes settles
+    /// that: K8's `AvailabilityProbe` today (still carried by the periodic scan), PDP (K5) properly. This is
+    /// why P3 does not retire the scan — that would trade a real check for a self-report.
+    pub async fn run_anti_entropy(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(ANTI_ENTROPY_TICK).await;
+            let alive = self.membership.liveness_census().await;
+            for (peer, _) in alive {
+                if peer.0 == self.me {
+                    continue;
+                }
+                self.check_peer(peer.0).await;
+            }
+        }
+    }
+
+    /// One peer: has its holdings set changed, and did it LOSE anything we can repair?
+    async fn check_peer(&self, peer: [u8; 32]) {
+        let Some((head, _version)) = self.manifests.peer_head(peer).await else {
+            return; // no manifest published (yet) — nothing to compare against
+        };
+        {
+            let seen = self.seen.lock().await;
+            if let Some((prev_head, _)) = seen.get(&peer) {
+                if *prev_head == head {
+                    return; // unchanged head ⇒ unchanged holdings. The O(1) steady-state path.
+                }
+            }
+        }
+        // The head moved ⇒ the set changed. NOW pay for the set (the only time we do).
+        let Some(manifest) = self.manifests.fetch(peer).await else {
+            return;
+        };
+        let now: HashSet<[u8; 32]> = manifest.cids.iter().copied().collect();
+        let lost: Vec<[u8; 32]> = {
+            let seen = self.seen.lock().await;
+            match seen.get(&peer) {
+                // First sight is a BASELINE, not a loss event — same reasoning as the census `primed`
+                // guard: without it, a node joining would read every peer's manifest as a fresh loss.
+                None => Vec::new(),
+                Some((_, prev)) => prev.difference(&now).copied().collect(),
+            }
+        };
+        self.seen.lock().await.insert(peer, (head, now));
+        if lost.is_empty() {
+            return; // it GREW (or churned) — gaining cids is not a durability event
+        }
+        self.repair_our_share(&lost, peer, "anti-entropy: holder dropped cids")
+            .await;
+    }
+
     /// One node died: repair the share of its holdings that is ours to repair.
     async fn on_death(&self, dead: [u8; 32]) {
         // 1. The dead node's holdings — ONE fetch for the whole set, not one lookup per cid. This is the
@@ -130,50 +208,59 @@ impl DeathRepair {
             return; // it held nothing we hold — not our share (or already-lost; see the design's gap)
         }
 
-        // 3. Who else survives holding these? Built from peers' MANIFESTS — O(N_nodes) fetches for the
-        //    whole death, not O(shared) DHT lookups. `liveness_census` is Alive-only, so a Suspect peer
-        //    does not count toward durability and the elected set is the set that can actually act.
+        // 3+4. Elect + repair our share (shared with the anti-entropy path — the invariants live in ONE
+        //       place so the two triggers cannot drift apart and double-repair or skip).
+        self.repair_our_share(&shared, dead, "death-driven repair")
+            .await;
+    }
+
+    /// Given cids that just lost a holder (`gone`), repair the subset this node is elected for.
+    ///
+    /// Shared by both triggers: a death and an anti-entropy shrink are the same problem — a holder
+    /// disappeared from some cids — and must not grow two subtly different election paths.
+    async fn repair_our_share(&self, cids: &[[u8; 32]], gone: [u8; 32], why: &str) {
+        // Who else survives holding these? From peers' MANIFESTS — O(N_nodes) fetches for the whole event,
+        // not O(cids) DHT lookups. `liveness_census` is Alive-only, so a Suspect peer is not elected to act.
         let alive = self.membership.liveness_census().await;
-        let shared_set: HashSet<[u8; 32]> = shared.iter().copied().collect();
+        let want: HashSet<[u8; 32]> = cids.iter().copied().collect();
         let mut holders: HashMap<[u8; 32], Vec<[u8; 32]>> = HashMap::new();
-        for c in &shared {
-            holders.insert(*c, vec![self.me]); // we hold all of `shared` by definition
+        for c in cids {
+            holders.insert(*c, vec![self.me]); // we hold all of these by construction (we intersected)
         }
         for (peer, _) in alive {
-            if peer.0 == self.me || peer.0 == dead {
+            if peer.0 == self.me || peer.0 == gone {
                 continue;
             }
             let Some(pm) = self.manifests.fetch(peer.0).await else {
-                continue; // no manifest → cannot count it as a holder; it simply is not a candidate
+                continue; // no manifest → not a candidate; it cannot be elected to act
             };
-            for c in pm.cids.iter().filter(|c| shared_set.contains(*c)) {
+            for c in pm.cids.iter().filter(|c| want.contains(*c)) {
                 holders.entry(*c).or_default().push(peer.0);
             }
         }
-
-        // 4. Elect + repair our share. `repair_cid` re-checks health itself, so a stale manifest costs a
-        //    cheap no-op rather than a pointless regenerate — the design's probe-before-repair rule.
-        let mut repaired = 0usize;
-        let mut mine_to_do = 0usize;
-        for c in &shared {
+        let (mut elected, mut repaired) = (0usize, 0usize);
+        for c in cids {
             let Some(cands) = holders.get(c) else {
                 continue;
             };
             if repairer_for(c, cands) != Some(self.me) {
                 continue; // someone else's share — they compute the same winner and will take it
             }
-            mine_to_do += 1;
+            elected += 1;
+            // `repair_cid` re-checks health itself, so a stale manifest costs a cheap no-op rather than a
+            // pointless regenerate — the design's probe-before-repair rule, and what makes acting on a
+            // disagreement safe.
             if self.engine.repair_cid(Cid(*c)).await > 0 {
                 repaired += 1;
             }
         }
         tracing::info!(
-            node = %hex::encode(&dead[..6]),
-            held = manifest.cids.len(),
-            shared = shared.len(),
-            elected = mine_to_do,
+            node = %hex::encode(&gone[..6]),
+            candidates = cids.len(),
+            elected,
             repaired,
-            "death-driven repair"
+            why,
+            "repair"
         );
     }
 }

@@ -2172,15 +2172,20 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // converged-Dead signal (census retains Suspect), so this reacts in seconds and does nothing at all
     // while the fleet is stable. Runs ALONGSIDE the periodic scan, which stays as the backstop until P3
     // retires it — notably for the case this path cannot cover: a dead node that published no manifest.
-    tokio::spawn(
-        std::sync::Arc::new(repair::DeathRepair::new(
+    {
+        let repairer = std::sync::Arc::new(repair::DeathRepair::new(
             identity.node_id().0,
             manifests.clone(),
             membership.clone(),
             engine.clone(),
-        ))
-        .run(),
-    );
+        ));
+        tokio::spawn(repairer.clone().run());
+        // P3: anti-entropy — watch peers' manifest HEADS (O(1) each) and react when a holder's set SHRINKS.
+        // Covers loss a holder KNOWS about (eviction) and deaths this node missed. It does NOT cover unaware
+        // loss (bytes gone, index intact ⇒ the manifest is unchanged), which is why the periodic scan's
+        // AvailabilityProbe still runs: replacing a real check with a self-report would be a regression.
+        tokio::spawn(repairer.run_anti_entropy());
+    }
 
     membership.start(peers, member_stream_rx);
     // The cheque pusher resolves a provider's address through membership before pushing a cheque.
