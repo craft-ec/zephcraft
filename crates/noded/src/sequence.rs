@@ -402,7 +402,15 @@ impl SequenceStore {
             // we lack — the local copy IS the authority and syncing it is pure waste. This matters more
             // than it looks: `balance(me)` runs on every dashboard poll, so before this the hottest read
             // on the node fanned out to the whole census to ask about a chain only we can write.
-            if key.2 == self.me() {
+            //
+            // ONLY while we actually HOLD it. A FRESH node — reinstalled, restored identity, moved
+            // machine — has no local data while the network holds its whole history, and "we are the
+            // writer" is a claim about authorship, NOT about possession: an empty local copy is authority
+            // over nothing. So fall through to the census when we have nothing, or such a node would read
+            // its own balance as 0 forever. (A PARTIAL copy — we authored 10, hold 3 after data loss —
+            // is caught by the periodic FULL_ANTI_ENTROPY round instead; it is indistinguishable from a
+            // complete one without asking.)
+            if key.2 == self.me() && self.local_len(key).await > 0 {
                 return;
             }
             let local_len = self.local_len(key).await;
