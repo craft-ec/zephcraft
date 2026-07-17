@@ -134,12 +134,27 @@ impl DeathRepair {
             if !primed {
                 // The FIRST view is a baseline, not an event. Without this, every node treats its own
                 // startup as the death of everyone it has not met yet and repairs the entire fleet.
+                tracing::info!(census = now.len(), "death watch primed");
                 known = now;
                 primed = true;
                 continue;
             }
-            for gone in known.difference(&now).copied().collect::<Vec<_>>() {
-                self.on_death(gone).await;
+            // Report every census CHANGE, not just the deaths. A watcher that only speaks when it decides
+            // to repair is indistinguishable from one that is not running at all — which is exactly how a
+            // dead death-repair path passed as a healthy quiet fleet. Changes are rare, so this is cheap.
+            if now != known {
+                let gone: Vec<[u8; 32]> = known.difference(&now).copied().collect();
+                let joined = now.difference(&known).count();
+                tracing::info!(
+                    census = now.len(),
+                    gone = gone.len(),
+                    joined,
+                    departed = ?gone.iter().map(|g| hex::encode(&g[..6])).collect::<Vec<_>>(),
+                    "census changed"
+                );
+                for g in gone {
+                    self.on_death(g).await;
+                }
             }
             known = now;
         }
