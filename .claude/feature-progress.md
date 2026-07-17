@@ -2627,7 +2627,39 @@ Phases (each: build + test + gate + commit; roll together where consensus-affect
       STREAMS_BLOCKED_BIDI=146 vs MAX_STREAMS_BIDI=1142 (we open streams faster than peers permit) that a
       lost_*-only instrument would have hidden; "why is your measurement so low?" → `mux_pool` held only DIALED
       conns, a ~30x under-report, now both directions.
-- [ ] **DESIGN WRITTEN, UNBUILT — `docs/DURABILITY_DESIGN.md` (2026-07-17).** The periodic scan is O(N_cids)
+# DURABILITY REBUILD — per-node manifests + death-driven repair (docs/DURABILITY_DESIGN.md)
+User directive 2026-07-17: skip further scan tuning (the drip fix 5dddee9 stays committed-but-unrolled;
+it dies with the scan at P3) and build the design directly.
+
+- [x] **P1 — holdings manifest. DONE 2026-07-17 (additive, unrolled).** `crates/noded/src/manifest.rs`:
+      `HoldingsManifest{node, version, cids(sorted), sig}` + `ManifestStore{publish, peer_head, fetch}`.
+      Publish = sign over (node,version,cids) → obj `publish_system` → `announce_app("craftec/holdings/1")`,
+      reusing the SequenceStore pattern. Wired in main.rs on a 60s tick that is a CHANGE CHECK, not a publish:
+      `publish` no-ops when holdings are unchanged, so steady state is SILENT (the property the scan lacked).
+      `verify()` rejects: wrong signer, tampered set, replayed version, AND non-canonical (unsorted/duped)
+      cids — canonical bytes are load-bearing, since head-comparison stands in for set-comparison only if
+      identical holdings content-address identically. `fetch()` rejects a manifest whose `node` != the peer
+      asked (else one node could fabricate another's holdings → manufacture fleet-wide repair work at P2).
+      Read path (`verify`/`peer_head`/`fetch`) is `#[allow(dead_code)]` — P2/P3 are its consumers; kept +
+      TESTED now so the read path is proven before anything depends on it. 4 new tests (incl. the
+      intersection property P2 rests on). 58 noded tests, clippy clean.
+      **KNOWN LIMIT (design gap):** `cids()` collects + encodes the whole set (~32MB at 1M cids). Fine at this
+      fleet size; needs Merkle root + diffs before a large store.
+- [ ] **P1-followup — holdings manifest.** A node publishes a SIGNED manifest of its held cids; any node can fetch a
+      peer's. Purely additive, no behaviour change, no wire break. Split matters for scale: the DHT head
+      (peer → manifest_cid@version) is the CHEAP signal — a changed cid means a changed set, so anti-entropy
+      is O(1) — while the full set lives in obj and is fetched ONLY on an event (a death, or a root mismatch).
+      The manifest's content-address IS its root; no separate Merkle field needed at this size.
+- [ ] **P2 — death-driven repair.** SWIM converged `Dead` → fetch the dead node's manifest ONCE → intersect
+      with own set LOCALLY → HRW-elect among surviving holders → probe (K8) → repair. Ranked failover.
+      Runs ALONGSIDE the scan (which becomes a long-period backstop).
+- [ ] **P3 — manifest anti-entropy → RETIRE the scan's per-cid resolve.** Root comparison covers silent loss.
+      This is the phase that deletes the O(N_cids) polling (and the drip fix with it).
+- [ ] **P4 — repair budget + priority by ACTUAL redundancy** (k+1 before k+3). MANDATORY before scale: an
+      unbudgeted death-driven repair under correlated failure is a worse outage than the polling it replaces.
+- [ ] **P5 — PDP sampling (K5).** Makes manifests trustworthy rather than trusted.
+
+- [ ] **DESIGN WRITTEN — `docs/DURABILITY_DESIGN.md` (2026-07-17).** The periodic scan is O(N_cids)
       per interval: at 1M cids even a 2h period is ~139 resolves/sec/node (~1.1k DHT ops/s) — the period is a
       constant factor on the wrong axis, and SAMPLING IS NOT A FIX (it is polling with a smaller constant).
       Design: account per NODE (signed holdings manifests) not per CID; death-driven repair (SWIM converged
