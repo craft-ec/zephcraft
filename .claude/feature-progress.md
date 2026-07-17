@@ -2610,6 +2610,36 @@ Phases (each: build + test + gate + commit; roll together where consensus-affect
       queue. `ECONOMY_REFRESH=15s` ≪ the 5-min epoch that gates the data. **PROVEN: >45s hang → 0.4–1.3ms,
       http=200.** Gate 🟢, rolled to all 5 nodes. NOTE: this did NOT fix the bandwidth (below) — it was a real
       bug, just not that one.
+- [x] **BANDWIDTH ROOT CAUSE FOUND — MEASURED, not inferred (2026-07-17).** Rolled per-tag transport counters
+      fleet-wide; a node 104s after restart reported **dht: 26,193 inbound streams (~252/sec)**, piece: 6,219,
+      alongside `store_cids=2890`. The health scan resolves EVERY cid (`routing.resolve` = an iterative DHT
+      lookup fanning out to several peers) and every cid is due at boot ⇒ four nodes restarting together each
+      resolved their whole store at once = **the fleet DDoSing its own DHT after every roll**.
+      FIXES: (a) `health_scan_secs` 30 → 900 (the RE-check floor); (b) the first-pass drip was a fixed ~120s
+      REGARDLESS of store size — N/120 per sec (24/s at 2890 cids) vs the steady-state N/recheck_min (3.2/s),
+      ~8x too fast — now dripped across a full `recheck_min` so the first pass runs at the steady-state rate BY
+      CONSTRUCTION and scales (a bigger store spreads wider, not harder). Gated 🟢 + counters rolled; the drip
+      fix (5dddee9) is committed but NOT yet rolled.
+      **The instruments were the story:** six hypotheses (dashboard, health scan, reannounce, relay, poll
+      stampede, scan floor) were each argued from CPU profiles + process byte-counters and each was WRONG —
+      neither instrument can name a protocol. The user forced the fix: "measure instead of assume" → per-tag
+      counters; "why only lost packets? measure ALL" → the full ConnectionStats dump, which surfaced
+      STREAMS_BLOCKED_BIDI=146 vs MAX_STREAMS_BIDI=1142 (we open streams faster than peers permit) that a
+      lost_*-only instrument would have hidden; "why is your measurement so low?" → `mux_pool` held only DIALED
+      conns, a ~30x under-report, now both directions.
+- [ ] **DESIGN WRITTEN, UNBUILT — `docs/DURABILITY_DESIGN.md` (2026-07-17).** The periodic scan is O(N_cids)
+      per interval: at 1M cids even a 2h period is ~139 resolves/sec/node (~1.1k DHT ops/s) — the period is a
+      constant factor on the wrong axis, and SAMPLING IS NOT A FIX (it is polling with a smaller constant).
+      Design: account per NODE (signed holdings manifests) not per CID; death-driven repair (SWIM converged
+      `Dead` → fetch the dead node's manifest ONCE → intersect with own set LOCALLY → HRW-elect the repairer
+      among surviving holders → probe → repair), ranked failover, repair budget + priority by ACTUAL redundancy
+      (k+1 before k+3), hysteresis (never repair on `Suspect`). Coordination-free: same census + same manifests
+      ⇒ same answer, no messages. Cost O(what died) on an event, ZERO idle; detection seconds (SWIM) vs 15min–2h.
+      Convergence hazard documented (census divergence ⇒ divergent elections) with the asymmetry that decides it:
+      duplicate repair costs bandwidth, missed repair costs DATA ⇒ repair must be IDEMPOTENT and nodes must ACT
+      when views disagree. Gaps stated: last-holder loss (placement's job, not repair's), lying nodes (needs
+      K5/PDP), manifest size, reverse-index cost. Phases P1–P5; **do not skip P4 (budget) before scale** — an
+      unbudgeted death-driven repair under correlated failure is a worse outage than the polling it replaces.
 - [ ] **OPEN ISSUE — Mac (relay-only/NAT) receives ~700KB/s–1.5MB/s idle over a DIRECT IPv6 QUIC path
       (2026-07-17). NOT the economy layer. Traced, not solved.**
       User reported high idle received volume. Traced by elimination + tcpdump:
