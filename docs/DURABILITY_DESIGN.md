@@ -207,6 +207,15 @@ surplus is then essentially never noticed. So at the target scale:
 
 Every night every home node's absence mints; nothing ever sheds. Storage grows monotonically, forever.
 
+**Correction — the MINT path is not itself wrong; it is floor-gated.** `repair_cid` recounts live providers
+into `have = own + Σ live piece_counts` and returns early on `have >= floor`. So a departure only mints when
+it genuinely drops the cid below the durability floor. It fires on an ordinary absence for a narrower reason
+than "mint is broken": the standing margin is the Schmitt band `delta ≈ 12` (at k=32), while one holder on a
+~5-way spread carries `≈ 19` pieces — so a single absence really does cross the floor. And what pins the
+margin that thin is the SHED, which trims `effective` down toward the floor *while counting the soon-absent
+node's pieces*. So the fault is two-sided: the margin is provisioned smaller than one node's share, and the
+shed actively removes what margin remains. The mint is the one part behaving correctly.
+
 **The general error, which is worth more than the specific bug:** repair was made event-driven while its
 INVERSE was left sweep-driven. That pair cannot be stable at any scale where the sweep is the thing being
 retired — the fast side always wins, and the slow side's cleanup is exactly the O(N_cids) cost this design
@@ -218,40 +227,58 @@ addresses the night half. The day half still trims X's pieces as cold surplus, s
 and the grace window buys the reduced durability of an under-replicated cid for nothing. A timer cannot fix
 a mis-measurement.
 
-**The fix is to stop conflating the two.** An absent-but-not-dead holder's pieces still EXIST; they are
-merely unreachable. So:
+**The fix has three parts, ordered by how load-bearing they are.**
 
-- **Durability accounting** counts pieces that exist — including those on a known holder that is currently
-  offline. Below-floor here means bytes are actually gone, and only that should MINT.
-- **Availability accounting** counts pieces reachable now. Below-k here means "cannot serve right now", and
-  the answer is to serve from elsewhere or wait for the holder — NOT to manufacture new pieces.
-- **Provision for the expected online fraction.** If a `p` fraction of holders is typically online, the
-  steady-state spread must put `k/p` pieces out so that a normal night never crosses the availability line.
-  Then absence is a NO-OP, there is nothing to shed in the morning, and the oscillator never starts.
-- Shedding must judge surplus against pieces that EXIST, so a sleeping holder's pieces are not re-minted at
-  night and its waking ones are not trimmed by day.
+**(1) Unify repair and shed into ONE queued job type, per cid — not a per-event sweep [BUILT 2026-07-18].**
+This is the structural correction under everything else. Death repair used to run as one giant per-death
+task looping ~1200 cids, holding a budget permit across the whole sweep; spawning it (so it stopped blocking
+the census watcher) only gave the sweep its own thread — the sweep itself is still the wrong unit. The right
+unit is the health scan's: a single `PieceJob { cid, kind }` submitted to the shared scheduler, one per cid,
+drained at a bounded worker count with per-cid dedup and priority. A death then ENQUEUES `|S_x ∩ ours|` jobs
+and returns immediately; the scheduler does the rest. Multiple deaths add jobs to the same queue instead of
+spawning competing sweeps. Repair and shed are the *same* job with opposite `kind`, because they are the
+same operation — "move `effective` toward the band" — in opposite directions, and must not grow two
+divergent execution paths.
 
-This makes the returning node a non-event, which is the correct outcome: **it never lost anything.** Note
-what that buys beyond efficiency: with no unnecessary mint there is no surplus, so the un-scalable
-scan-driven shed is never needed to clean up after it. The scaling problem is not solved by making the
-cleanup cheaper — it is dissolved by not making the mess.
+**(2) The queue latency IS the epoch offset — no moving average needed.** A job re-checks current state at
+EXECUTION time (`repair_cid` already re-resolves and no-ops on `have >= floor`; shed will mirror it). So a
+repair job enqueued when X leaves, drained after a deliberate debounce, simply no-ops if X (or an equivalent
+holder) is back by then. Transient churn self-cancels through queue delay + execution-time re-check — the
+"absolute net over an epoch" idea, realised as a property of the queue rather than a statistic anyone
+computes. Urgency sets the delay: below-k / last-holder jobs run at the front with ~no debounce (real loss
+cannot wait); margin-restoration jobs (above-k, below-band) carry a debounce long enough that a normal
+sleep/wake offsets before they fire. A true moving average was rejected earlier for a timescale reason — the
+window that hides a night also delays real-loss detection by a night — and the per-job debounce sidesteps it
+by keying the delay on URGENCY, not on a fixed time.
 
-**If minting on absence is ever kept, the shed MUST become event-driven too** — symmetric to `on_death`. A
-return is a membership event exactly as a death is, and the holder index already knows which cids the
-returning node holds, so `on_return(X)` costs O(|S_x ∩ ours|) with no sweep and no DHT resolve, just like
-§4. Any design that mints on an event and sheds on a sweep is the ratchet above wearing a different hat.
+**(3) Placement across the availability dimension is the primary lever; accounting split + provisioning are
+the backup.** The deepest fix needs a mixed fleet to tune, so it is sequenced last:
+- **Phase-diverse placement.** "One region sleeps as another wakes" only helps a given cid if THAT cid's
+  pieces span the anti-correlated regions. Today placement is `peer_source.peers()` — timezone-blind, it
+  spreads onto whoever is reachable at publish, i.e. onto the awake cohort that then sleeps together. Spread
+  each cid's `n` pieces across the diurnal-phase dimension (a failure-domain-style spread) and a roughly
+  constant fraction of every cid's holders is always awake, so instantaneous `effective` never crosses the
+  floor and the EXISTING gate handles absence with nothing added. Needs peers' phase, which is observable
+  (uptime pattern), not declared.
+- **Accounting split + `k/p` provisioning.** Count pieces that EXIST for durability (only that mints), pieces
+  REACHABLE for availability, and hold `k/p` for the expected online fraction `p` so a normal night never
+  crosses the line. This is the static version of the same idea; placement is the adaptive one.
 
-**What this needs that we do not have.** Distinguishing "offline but holding" from "gone forever" requires
-knowing a holder still HAS the bytes while we cannot reach it. A signed holdings manifest is a claim, not
-proof, and a claim from a node that is not answering is worth even less. This is the same trust boundary PDP
-(K5) exists to close, and it is why the honest sequencing is: measure the online fraction on a real mixed
-fleet FIRST, then set the provisioning target, and only then consider a durability-vs-availability split in
-the accounting.
+Together these make the returning node a non-event — **it never lost anything** — and, crucially, with no
+unnecessary mint there is no surplus, so the scan-driven shed is never needed to clean up after it. The
+scaling problem is not solved by cheaper cleanup; it is dissolved by not making the mess.
 
-**Status: OPEN. Not exercised by the current fleet** (4 always-on Hetzner nodes, where the two numbers are
-identical by construction), so nothing here is measured — it is derived from the mechanisms above. The A-G
-harness cannot see it either: `scenario_h_mass_death` kills nodes permanently. A diurnal scenario (kill,
-wait past the scan backoff, restore, assert no net mint/shed churn) is the test that would.
+**What (3) needs that we do not have.** Distinguishing "offline but holding" from "gone forever" requires
+knowing a holder still HAS the bytes while we cannot reach it — a signed manifest is a claim, worth even less
+from a node that is not answering. Same trust boundary PDP (K5) closes. So the honest sequencing is: build
+(1) and (2) now (they are correct at any `p` and testable via ordinary surplus/deficit), measure the online
+fraction on a real mixed fleet, then tune (3).
+
+**Status.** (1) and (2) BUILT and rolled 2026-07-18. (3) OPEN — not exercised by the current fleet (4
+always-on Hetzner nodes, where durability and availability are identical by construction), so its tuning is
+unmeasured. The A-G harness cannot see the diurnal case either: `scenario_h_mass_death` kills permanently. A
+diurnal scenario (stop/restore on offset phases, assert net mint/shed churn ≈ 0) is the test that would, and
+is the natural home for validating (3) once there is a fleet with real phase diversity.
 
 ---
 
