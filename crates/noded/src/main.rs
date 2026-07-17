@@ -1825,6 +1825,7 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         anchor: anchor_dispatcher.clone(),
         ledger: ledger_service.clone(),
         economy: economy_service.clone(),
+        economy_cache: tokio::sync::RwLock::new(None),
         settlement: settlement_service.clone(),
         cheque: cheque_service.clone(),
         epoch_committee: epoch_committee.clone(),
@@ -1928,6 +1929,13 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
             }
         }
     });
+
+    // Refresh the economy view OFF the request path. Deriving it touches the network (account-chain
+    // syncs + DHT lookups across committee members' record chains), and the dashboard polls status ~1/s
+    // — so deriving per request let slow walks pile up on a high-RTT node into a self-inflicted DHT
+    // lookup storm. A loop is single-flight by construction: the handler now only ever reads this
+    // task's last result, and poll rate no longer drives network cost.
+    tokio::spawn(state.clone().economy_refresh_loop());
 
     let control_state = state.clone();
     let sock_path = data_dir.join("zeph.sock");

@@ -161,8 +161,12 @@ pub struct Status {
     pub economy: Economy,
 }
 
+/// How often the economy view is re-derived off the request path (see `State::economy_refresh_loop`).
+/// Well under the 5-min epoch that gates how fast the underlying records can change.
+const ECONOMY_REFRESH: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// The economy view (§11 step 4): the token ledger + settlement + reciprocity state for the dashboard.
-#[derive(serde::Serialize, serde::Deserialize, Default)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct Economy {
     /// This node's reward-ledger balance (folded from its committed account chain; reward reconciled
     /// after claim).
@@ -188,7 +192,7 @@ pub struct Economy {
 }
 
 /// One governance-pinned canonical program anchor.
-#[derive(serde::Serialize, serde::Deserialize, Default)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct AnchorRow {
     pub name: String,
     pub cid: String,
@@ -251,6 +255,12 @@ pub struct State {
     pub ledger: std::sync::Arc<crate::ledger::LedgerService>,
     /// Economy-egress policy service (settlement pool + records) — P4 split from the token ledger.
     pub economy: std::sync::Arc<crate::economy_egress::EconomyEgressService>,
+    /// The economy view, refreshed off-request by [`State::economy_refresh_loop`]. `snapshot` READS this
+    /// and never derives — deriving touches the network (chain syncs + DHT lookups), and this handler is
+    /// polled ~1/s, so on a high-RTT node the derivations outran the polls and piled up into a lookup
+    /// storm. `None` until the first refresh completes (the dashboard shows zeros briefly at boot rather
+    /// than blocking the whole status endpoint on the network).
+    pub economy_cache: tokio::sync::RwLock<Option<Economy>>,
     /// Settlement service — the epoch-close loop + its re-execution verification tally.
     pub settlement: std::sync::Arc<crate::settlement_service::SettlementService>,
     /// Serving-cheque service — reciprocity standing (earned/consumed/paid + grants) for the dashboard.
@@ -276,50 +286,23 @@ impl State {
 
     pub async fn snapshot(&self) -> Status {
         let hlc = self.clock.now();
-        // Economy view: ledger balance/pool, settlement verification tally, reciprocity, pinned anchors.
-        let economy = {
-            let me = parse_node_id(&self.node_id)
-                .map(|n| n.0)
-                .unwrap_or([0u8; 32]);
-            let (verified, mismatched) = self.settlement.verification_stats();
-            let mut anchors = Vec::new();
-            for name in [
-                crate::anchor::TOKEN_ANCHOR,
-                crate::anchor::ECONOMY_EGRESS_ANCHOR,
-            ] {
-                if let Some(res) = self.anchor.resolve(name).await {
-                    anchors.push(AnchorRow {
-                        name: name.to_string(),
-                        cid: hex::encode(res.cid),
-                        interface_version: res.interface_version as i64,
-                    });
-                }
-            }
-            // ONE token fold serves both the balance and the claimed-set that `owed_from_records` needs
-            // (token owns the dedup; economy owns the valuation — the dashboard is the only place that
-            // legitimately holds both handles, so it joins them here rather than coupling the services).
-            let token_state = self.ledger.balance(me).await;
-            let now_epoch = self.settlement.epoch();
-            // Both are STATE carried in the attested record, read from the durable chain — a node that
-            // does not settle (committee-gated) has no local settlement state and would report 0.
-            let my = self
-                .economy
-                .my_view_from_records(me, &token_state.claimed_epochs, now_epoch)
-                .await;
-            Economy {
-                balance: token_state.balance,
-                // From the CANONICAL records, not local settle state: since settling is committee-gated,
-                // most nodes have no local record and would otherwise report 0 of their own money.
-                reward_owed: my.owed,
-                reward_settled: my.settled_bytes,
-                pool: my.pool,
-                subscription_bytes: my.subscription_bytes,
-                verified,
-                mismatched,
-                reciprocity: Some(self.cheque.reciprocity_snapshot()),
-                anchors,
-            }
-        };
+        // Economy view: served from the BACKGROUND-REFRESHED cache — never derived here.
+        //
+        // This handler is polled ~1/s by the dashboard, and deriving the economy touches the NETWORK:
+        // `balance()` syncs the account chain (and resolves a debit per `Claim` op), and the records
+        // view walks the claim window across committee members' chains. Each of those is an iterative
+        // DHT lookup, which on a high-RTT node (relay-only / NAT / mobile) takes seconds — so a snapshot
+        // could take MINUTES while polls kept arriving every second, piling up unboundedly into a
+        // self-inflicted DHT lookup storm (measured ~700 KB/s on a hotspot-attached node; sub-ms-RTT
+        // nodes running the identical binary showed nothing, because their walks finished before the
+        // next poll — the bug NEEDED latency to appear).
+        //
+        // Predates the economy split: `balance()` was on this path from the start. Caching or
+        // single-flighting the derivation only rate-limits the damage; the fix is that a request handler
+        // must not do network I/O at all. `economy_refresh_loop` owns the derivation (a loop is
+        // single-flight by construction) and this reads its last result.
+        let economy = self.economy_cache.read().await.clone().unwrap_or_default();
+
         Status {
             economy,
             hlc_ms: hlc.millis(),
@@ -377,6 +360,67 @@ impl State {
             recent_jobs: self.jobs.recent_jobs(),
             in_flight_jobs: self.jobs.in_flight_jobs(),
             settings: self.settings.clone(),
+        }
+    }
+
+    /// Derive the economy view — chain syncs + DHT lookups, i.e. the SLOW, network-touching work that
+    /// must never sit on a request path. Called only by [`economy_refresh_loop`](Self::economy_refresh_loop).
+    async fn derive_economy(&self) -> Economy {
+        let me = parse_node_id(&self.node_id)
+            .map(|n| n.0)
+            .unwrap_or([0u8; 32]);
+        let (verified, mismatched) = self.settlement.verification_stats();
+        let mut anchors = Vec::new();
+        for name in [
+            crate::anchor::TOKEN_ANCHOR,
+            crate::anchor::ECONOMY_EGRESS_ANCHOR,
+        ] {
+            if let Some(res) = self.anchor.resolve(name).await {
+                anchors.push(AnchorRow {
+                    name: name.to_string(),
+                    cid: hex::encode(res.cid),
+                    interface_version: res.interface_version as i64,
+                });
+            }
+        }
+        // ONE token fold serves both the balance and the claimed-set the records view needs (token owns
+        // the dedup; economy owns the valuation — this is the one place legitimately holding both).
+        let token_state = self.ledger.balance(me).await;
+        let now_epoch = self.settlement.epoch();
+        let my = self
+            .economy
+            .my_view_from_records(me, &token_state.claimed_epochs, now_epoch)
+            .await;
+        Economy {
+            balance: token_state.balance,
+            // From the CANONICAL records, not local settle state: settling is committee-gated, so most
+            // nodes have no local record and would otherwise report 0 of their own money.
+            reward_owed: my.owed,
+            reward_settled: my.settled_bytes,
+            pool: my.pool,
+            subscription_bytes: my.subscription_bytes,
+            verified,
+            mismatched,
+            reciprocity: Some(self.cheque.reciprocity_snapshot()),
+            anchors,
+        }
+    }
+
+    /// Refresh the economy view off the request path, forever.
+    ///
+    /// A LOOP is single-flight by construction: the next derivation cannot start until this one
+    /// finishes, however long it takes. That is the property the dashboard needs and could never get from
+    /// polling — an HTTP handler has no way to refuse work, so a derivation slower than the poll interval
+    /// piles up without bound. Here a slow derivation only means a staler number.
+    ///
+    /// The data justifies the cadence: a balance changes when this node transacts, and records advance
+    /// once per EPOCH (5 min), so [`ECONOMY_REFRESH`] is far fresher than the data can change — while the
+    /// dashboard stays as live as the operator likes. Poll rate and derivation cost are now decoupled.
+    pub async fn economy_refresh_loop(self: std::sync::Arc<Self>) {
+        loop {
+            let eco = self.derive_economy().await;
+            *self.economy_cache.write().await = Some(eco);
+            tokio::time::sleep(ECONOMY_REFRESH).await;
         }
     }
 

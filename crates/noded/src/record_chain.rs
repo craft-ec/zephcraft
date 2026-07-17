@@ -38,6 +38,14 @@ pub struct RecordChain {
     records_owner: [u8; 32],
     /// Per-member scan cache of signed records (append-only chain → resume from the last nonce).
     record_scan: Mutex<HashMap<[u8; 32], MemberRecordCache>>,
+    /// FINALIZED canonical records by epoch. A record that a quorum has attested is IMMUTABLE — the
+    /// committee for a past epoch is fixed and its signatures cannot be un-signed — so the answer can
+    /// never change and re-deriving it is pure waste. It was not free waste: `LedgerService::balance`
+    /// resolves a share per `RewardClaim` op while folding, and the dashboard folds a balance on every
+    /// poll (~1/s), so each poll re-walked committee members' record chains through the DHT for epochs
+    /// that were settled long ago. Only `Some` (quorum-reached) results are cached; an epoch still short
+    /// of quorum must stay live.
+    canonical_cache: Mutex<HashMap<u64, RewardRecord>>,
 }
 
 impl RecordChain {
@@ -55,6 +63,7 @@ impl RecordChain {
             records_cid,
             records_owner,
             record_scan: Mutex::new(HashMap::new()),
+            canonical_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -145,6 +154,10 @@ impl RecordChain {
     /// they signed, and return the record a quorum agreed on. `None` if no committee or no record reached
     /// the threshold (not yet finalized). Robust to a minority signing a divergent record.
     pub async fn canonical_record(&self, epoch: u64) -> Option<RewardRecord> {
+        // A finalized record is immutable (see `canonical_cache`) — serve it without touching the DHT.
+        if let Some(rec) = self.canonical_cache.lock().unwrap().get(&epoch) {
+            return Some(rec.clone());
+        }
         let committee = self
             .committee
             .committee_for_epoch(&self.records_cid, epoch)
@@ -167,9 +180,18 @@ impl RecordChain {
                 }
             }
         }
-        groups
+        let found = groups
             .into_values()
             .find(|att| att.is_canonical(&committee))
-            .map(|att| att.record)
+            .map(|att| att.record);
+        // Cache ONLY a quorum-reached record: it is final and cannot change. An epoch still short of
+        // quorum must stay live, or a node that looked too early would never see it finalize.
+        if let Some(rec) = &found {
+            self.canonical_cache
+                .lock()
+                .unwrap()
+                .insert(epoch, rec.clone());
+        }
+        found
     }
 }

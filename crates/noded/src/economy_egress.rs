@@ -32,6 +32,14 @@ pub struct EconomyEgressService {
     record_chain: tokio::sync::RwLock<Option<Arc<RecordChain>>>,
     /// Cached records-derived view: `(derived_at, account, view)`. See [`VIEW_TTL`].
     view_cache: tokio::sync::RwLock<Option<(Instant, [u8; 32], MyView)>>,
+    /// SINGLE-FLIGHT gate for [`derive_view`](Self::derive_view). A TTL cache alone does NOT stop a
+    /// stampede: the derivation walks the claim window over the DHT, which on a high-RTT node takes
+    /// MINUTES, while the dashboard polls every SECOND — so every poll missed the still-empty cache and
+    /// launched another derivation, piling up hundreds of concurrent walks and turning the dashboard into
+    /// a self-inflicted DHT lookup storm (measured: ~700 KB/s on a hotspot-attached node, while the
+    /// sub-ms-RTT nodes running identical code showed nothing, because their walks finished before the
+    /// next poll). One derivation at a time; everyone else serves the previous value.
+    derive_lock: tokio::sync::Mutex<()>,
 }
 
 impl EconomyEgressService {
@@ -40,6 +48,7 @@ impl EconomyEgressService {
             settlement: tokio::sync::RwLock::new(SettlementStore::new()),
             record_chain: tokio::sync::RwLock::new(None),
             view_cache: tokio::sync::RwLock::new(None),
+            derive_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -88,14 +97,40 @@ impl EconomyEgressService {
         claimed: &BTreeSet<u64>,
         now_epoch: u64,
     ) -> MyView {
-        if let Some((at, who, view)) = *self.view_cache.read().await {
-            if who == account && at.elapsed() < VIEW_TTL {
-                return view;
-            }
+        if let Some(view) = self.cached_view(account).await {
+            return view;
+        }
+        // SINGLE-FLIGHT: one derivation at a time (see `derive_lock`). `try_lock` rather than `lock` —
+        // a waiter that blocked here would still be an outstanding request piling up behind a walk that
+        // can take minutes, which is the stampede itself. Serve the last known value instead; it is at
+        // most VIEW_TTL+ stale, against data that only changes once per epoch.
+        let Ok(_guard) = self.derive_lock.try_lock() else {
+            return self.last_view(account).await.unwrap_or_default();
+        };
+        // Re-check under the guard: a derivation may have completed while we were acquiring it.
+        if let Some(view) = self.cached_view(account).await {
+            return view;
         }
         let view = self.derive_view(account, claimed, now_epoch).await;
         *self.view_cache.write().await = Some((Instant::now(), account, view));
         view
+    }
+
+    /// The cached view if it is fresh enough to serve.
+    async fn cached_view(&self, account: [u8; 32]) -> Option<MyView> {
+        match *self.view_cache.read().await {
+            Some((at, who, view)) if who == account && at.elapsed() < VIEW_TTL => Some(view),
+            _ => None,
+        }
+    }
+
+    /// The last derived view REGARDLESS of age — served to callers that lost the single-flight race, so a
+    /// slow walk degrades freshness rather than queueing another walk behind it.
+    async fn last_view(&self, account: [u8; 32]) -> Option<MyView> {
+        match *self.view_cache.read().await {
+            Some((_, who, view)) if who == account => Some(view),
+            _ => None,
+        }
     }
 
     async fn derive_view(
