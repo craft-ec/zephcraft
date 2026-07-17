@@ -30,8 +30,16 @@ fleet to tune).
       preserving the old budget value. 74 tests, clippy clean. Not yet gated/rolled.
 - [ ] P2/urgency — the debounce/urgency tiers are STAGE C (below); Stage A submits all at
       Priority::Repair immediately (no offset yet, but correct + coalescing).
-- [ ] P4 — Event-driven SHED: the `added`/surplus signal `check_peer` currently discards enqueues
-      shed jobs; `shed_one` reachable outside the scan
+- [x] P4 — STAGE B DONE: event-driven SHED. `EngineWork::Shed(cid)` (Eviction priority) +
+      `ObjEngine::request_shed` front door + `ObjEngine::shed_cid` executor (mirror of repair_cid:
+      resolve providers, compute `have`, surplus check, rendezvous-elect ONE shedder, shed OWN
+      pieces down to `floor/holders` fair-share, never below floor). Trigger: `apply_delta`/
+      `apply_reset` now return `(lost, gained)`; `check_peer` routes `gained` → `request_shed`
+      (the surplus signal it used to discard). first_sight still shed-exempt. Drainers updated in
+      main.rs AND tests/src/lib.rs. 74 tests, clippy clean. Not yet gated/rolled.
+      OFFSET (part of §5.2): shed_cid re-checks `have > floor+delta` at execution, so a shed queued
+      when a holder returned no-ops if the holder left again before it drained. Partial offset via
+      re-check; full night-length debounce still needs part 3.
 - [ ] P5 — Execution-time re-check is the offset: confirm repair job no-ops on `have >= floor`
       and shed job no-ops on `have <= band`; add tests proving transient churn self-cancels
 - [ ] P6 — Keep the periodic scan as backstop (still submits the same job type) — do NOT retire

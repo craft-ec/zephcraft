@@ -202,7 +202,7 @@ impl DeathRepair {
         // The head is whatever `changes_since` actually RESOLVED against. Re-reading it here would be a
         // race: the peer can publish between the two calls, and recording a head we never applied would
         // make the next tick see `kc == head_cid` and skip that version's changes forever.
-        let (version, head, lost) = match changes {
+        let (version, head, lost, gained) = match changes {
             Changes::Delta {
                 version,
                 head,
@@ -213,38 +213,51 @@ impl DeathRepair {
                     self.heads.lock().await.insert(peer, (version, head));
                     return true; // unchanged — the O(1) steady state: nothing fetched, nothing indexed
                 }
-                let lost = self.apply_delta(peer, &added, &removed).await;
-                (version, head, lost)
+                let (lost, gained) = self.apply_delta(peer, &added, &removed).await;
+                (version, head, lost, gained)
             }
             Changes::Reset { version, head, set } => {
-                let lost = self.apply_reset(peer, &set).await;
-                (version, head, lost)
+                let (lost, gained) = self.apply_reset(peer, &set).await;
+                (version, head, lost, gained)
             }
         };
         self.heads.lock().await.insert(peer, (version, head));
-        if first_sight || lost.is_empty() {
-            return true; // a baseline, or it GREW/churned elsewhere — gaining cids is not a durability event
+        if first_sight {
+            return true; // a baseline: neither a loss nor a surplus event, just learning the world
         }
-        self.repair_our_share(&lost, peer, "anti-entropy: holder dropped cids")
-            .await;
+        // A holder DROPPED cids of ours → repair (durability). A holder GAINED cids of ours → shed
+        // (surplus): the event-driven mirror the old code threw away with "gaining is not a durability
+        // event" — true, but it IS a surplus event, and dropping it is why the shed rode the O(N_cids) scan.
+        if !lost.is_empty() {
+            self.repair_our_share(&lost, peer, "anti-entropy: holder dropped cids")
+                .await;
+        }
+        for c in gained {
+            // shed_cid re-checks surplus, so an over-eager request costs a no-op — and that re-check is the
+            // offset: if the holder that made this cid surplus has already left, nothing sheds.
+            self.engine.request_shed(Cid(c)).await;
+        }
         true
     }
 
-    /// Fold a peer's ADDED/REMOVED into the index, keeping only cids we hold, and return the ones it used
-    /// to hold for us and no longer does.
+    /// Fold a peer's ADDED/REMOVED into the index, keeping only cids we hold. Returns `(lost, gained)`:
+    /// cids of ours this peer stopped holding (→ repair) and started holding (→ shed).
     ///
-    /// Both filters are the same rule: we can only repair what we hold, so a peer's changes outside our set
-    /// are not ours to remember or act on.
+    /// Same filter throughout: we only remember and act on cids we hold, since those are the only ones we
+    /// could ever repair or shed.
     async fn apply_delta(
         &self,
         peer: [u8; 32],
         added: &[[u8; 32]],
         removed: &[[u8; 32]],
-    ) -> Vec<[u8; 32]> {
+    ) -> (Vec<[u8; 32]>, Vec<[u8; 32]>) {
         let mine = self.our_cids();
         let mut holders = self.holders.lock().await;
+        let mut gained = Vec::new();
         for c in added.iter().filter(|c| mine.contains(*c)) {
-            holders.entry(*c).or_default().insert(peer);
+            if holders.entry(*c).or_default().insert(peer) {
+                gained.push(*c); // a NEW holder for a cid we hold — one more copy than before → surplus?
+            }
         }
         let mut lost = Vec::new();
         for c in removed.iter().filter(|c| mine.contains(*c)) {
@@ -256,22 +269,28 @@ impl DeathRepair {
         }
         // The index must not outlive our own store.
         holders.retain(|c, hs| mine.contains(c) && !hs.is_empty());
-        lost
+        (lost, gained)
     }
 
-    /// REPLACE what we believed about a peer with its whole set, and return the cids of ours it used to
-    /// hold and no longer claims.
+    /// REPLACE what we believed about a peer with its whole set. Returns `(lost, gained)` as [`apply_delta`].
     ///
     /// A reset carries no `removed` list because there is nobody to diff against — so absence IS the
     /// removal. Merging additively instead would leave every stale belief in place permanently: the peer's
     /// later diffs are computed against its own current set, so a cid it already dropped is never mentioned
     /// again and the phantom holder never clears.
-    async fn apply_reset(&self, peer: [u8; 32], set: &[[u8; 32]]) -> Vec<[u8; 32]> {
+    async fn apply_reset(
+        &self,
+        peer: [u8; 32],
+        set: &[[u8; 32]],
+    ) -> (Vec<[u8; 32]>, Vec<[u8; 32]>) {
         let mine = self.our_cids();
         let claimed: HashSet<[u8; 32]> = set.iter().copied().filter(|c| mine.contains(c)).collect();
         let mut holders = self.holders.lock().await;
+        let mut gained = Vec::new();
         for c in &claimed {
-            holders.entry(*c).or_default().insert(peer);
+            if holders.entry(*c).or_default().insert(peer) {
+                gained.push(*c); // newly attributed to this peer → one more copy than we knew of
+            }
         }
         let mut lost = Vec::new();
         for (c, hs) in holders.iter_mut() {
@@ -283,7 +302,7 @@ impl DeathRepair {
             }
         }
         holders.retain(|c, hs| mine.contains(c) && !hs.is_empty());
-        lost
+        (lost, gained)
     }
 
     /// The cids WE hold. Every index decision is filtered through this: we can only repair what we hold.

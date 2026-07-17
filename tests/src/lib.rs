@@ -293,6 +293,21 @@ impl TestNode {
                                 },
                             );
                         }
+                        EngineWork::Shed(cid) => {
+                            let eng = work_engine.clone();
+                            work_jobs.submit(
+                                format!("shed:{}", cid.to_hex()),
+                                Priority::Eviction,
+                                1,
+                                move || {
+                                    let eng = eng.clone();
+                                    async move {
+                                        let _shed = eng.shed_cid(cid).await;
+                                        Ok(())
+                                    }
+                                },
+                            );
+                        }
                     }
                 }
             }));

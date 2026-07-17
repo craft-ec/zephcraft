@@ -254,6 +254,12 @@ pub enum EngineWork {
     /// Durability repair for one at-risk cid (Repair priority — preempts all
     /// routine work; found by the health scan, executed by the coordinator).
     Repair(Cid),
+    /// Surplus shed for one over-replicated cid (Eviction priority — the lowest;
+    /// shedding a cushion is never urgent, and must never contend with repair or
+    /// serving). The event-driven mirror of `Repair`: a returning/appearing holder
+    /// makes a cid surplus, and this trims it back toward the band instead of
+    /// waiting for the O(N_cids) periodic scan to notice.
+    Shed(Cid),
 }
 
 /// Outcome of publishing a file (content + its manifest).
@@ -2674,6 +2680,96 @@ impl ObjEngine {
         } else {
             self.repair_cid(cid).await;
         }
+    }
+
+    /// Front door for SHED — the event-driven mirror of [`request_repair`]. Enqueue `cid` as an
+    /// Eviction-priority scheduler job (deduped per cid) rather than shedding inline. Called when a holder
+    /// APPEARS or RETURNS (the anti-entropy `added` signal, which used to be discarded), so surplus is
+    /// trimmed as an EVENT — O(churn) — instead of only when the O(N_cids) periodic scan next visits the
+    /// cid. `shed_cid` re-checks surplus at execution, so an over-eager request costs a no-op.
+    ///
+    /// Unwired (tests/library): shed inline so behaviour is unchanged there.
+    pub async fn request_shed(&self, cid: Cid) {
+        if let Some(tx) = self.work_trigger.get() {
+            let _ = tx.send(EngineWork::Shed(cid));
+        } else {
+            self.shed_cid(cid).await;
+        }
+    }
+
+    /// The body of a Shed coordinator job — the mirror of [`repair_cid`]. Re-derives the surplus verdict
+    /// from scratch (the event that queued this may be stale: the holder that made it surplus could have
+    /// left again, in which case we shed NOTHING — that re-check is exactly the epoch offset), and if this
+    /// node wins the shedder rendezvous, trims its OWN pieces down toward its fair share so the cid rests
+    /// in the band. Returns the number of pieces shed.
+    ///
+    /// Fair-share, not to-the-floor: the elected shedder drops its excess above `floor / holders`, never
+    /// below, so one node cannot strip itself while others stay fat — the spread stays balanced. Large or
+    /// unevenly-distributed surplus still leans on the periodic scan's rotation to finish; this handles the
+    /// common case (a returning holder's modest surplus) as an event.
+    pub async fn shed_cid(&self, cid: Cid) -> usize {
+        let Some(_gen) = self.store.generation(&cid) else {
+            return 0;
+        };
+        if self.store.is_tombstoned(&cid) || self.store.is_pinned(&cid) {
+            return 0; // a pin is a deliberate "keep it"; never shed under one
+        }
+        let k = _gen.k as usize;
+        let me = self.transport.node_id();
+        let epoch = self.transport.clock().now().0 / HEALTH_EPOCH_MS;
+        let providers = self.routing.resolve(cid).await.unwrap_or_default();
+        let alive_set = self.alive_peers().await;
+        let mut have = self.store.piece_count(&cid);
+        let mut shedders: Vec<NodeId> = Vec::new();
+        for p in &providers {
+            if p.node_id == me {
+                continue;
+            }
+            let is_alive = match &alive_set {
+                Some(set) => set.contains(&p.node_id),
+                None => self.probe_alive(p.node_id, &p.addr).await,
+            };
+            if !is_alive {
+                continue;
+            }
+            have += p.piece_count as usize;
+            if p.piece_count > 2 && !p.pinned {
+                shedders.push(p.node_id);
+            }
+        }
+        let floor = target_pieces(k);
+        let delta = (floor / 8).max(2);
+        // OFFSET, re-checked at execution: only cold surplus ABOVE the band sheds. If the holder that made
+        // this surplus has since left, `have` is back in (or below) the band and we shed nothing — the
+        // departure and this queued shed have cancelled, which is the whole point of doing it lazily.
+        let cold = self.served_pulls(&cid) < self.config.degrade_threshold;
+        if !cold || have <= floor + delta {
+            return 0;
+        }
+        // Elect ONE shedder (rendezvous, epoch-rotated) so survivors do not all shed the same cid at once.
+        if self.store.piece_count(&cid) > 2 {
+            shedders.push(me);
+        }
+        let winner = shedders
+            .iter()
+            .max_by_key(|id| rendezvous_score(id, &cid, epoch));
+        if winner != Some(&me) {
+            return 0;
+        }
+        // Shed our excess above our fair share, and never take the TOTAL below the floor.
+        let holders = shedders.len().max(1);
+        let fair_share = (floor / holders).max(2);
+        let mut shed = 0usize;
+        let mut total = have;
+        while self.store.piece_count(&cid) > fair_share
+            && total > floor
+            && !self.store.is_pinned(&cid)
+            && self.shed_one(&cid)
+        {
+            shed += 1;
+            total -= 1;
+        }
+        shed
     }
 
     /// The body of a Repair coordinator job: re-detect and (if this node is

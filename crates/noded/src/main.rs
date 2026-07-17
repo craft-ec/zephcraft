@@ -1929,6 +1929,25 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                             },
                         );
                     }
+                    zeph_obj::EngineWork::Shed(cid) => {
+                        let eng = work_engine.clone();
+                        // Eviction priority: shedding a cushion is never urgent and must yield to repair
+                        // and serving. Same per-cid dedup key family, distinct prefix so `JobClass::from_key`
+                        // does not fold it into Repair's cap. max_attempts=1: shedding nothing is a valid
+                        // outcome (not surplus, or another node won the shedder election), not an error.
+                        work_jobs.submit(
+                            format!("shed:{}", cid.to_hex()),
+                            zeph_sched::Priority::Eviction,
+                            1,
+                            move || {
+                                let eng = eng.clone();
+                                async move {
+                                    eng.shed_cid(cid).await;
+                                    Ok(())
+                                }
+                            },
+                        );
+                    }
                 }
             }
         });
