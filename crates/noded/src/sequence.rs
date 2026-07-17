@@ -396,10 +396,15 @@ impl SequenceStore {
         // resolve_debit per Claim) multiplied that into the quadratic that burned an idle fleet.
         //
         // This does NOT depend on the account being online: `resolve_app` is a DHT GET of its published
-        // record, and the bytes come from obj. Skipped only when a FULL round is due (the record may have
-        // expired while peers still announce copies) or when we ARE the account (our own record tells us
-        // nothing we do not already hold).
-        if !self.full_round_due(key).await && key.2 != self.me() {
+        // record, and the bytes come from obj.
+        if !self.full_round_due(key).await {
+            // OUR OWN chain: we authored every write on it (single-writer), so no peer can hold anything
+            // we lack — the local copy IS the authority and syncing it is pure waste. This matters more
+            // than it looks: `balance(me)` runs on every dashboard poll, so before this the hottest read
+            // on the node fanned out to the whole census to ask about a chain only we can write.
+            if key.2 == self.me() {
+                return;
+            }
             let local_len = self.local_len(key).await;
             match self.fetch_if_newer(key, key.2, local_len).await {
                 HeadReply::Newer(fetched) => {
@@ -407,8 +412,8 @@ impl SequenceStore {
                         return; // authoritative + adopted
                     }
                 }
-                HeadReply::UpToDate => return, // the sole writer says we are current — done
-                HeadReply::NoAnswer => {}      // writer offline → fall through to the census
+                HeadReply::UpToDate => return, // the sole writer's record says we are current — done
+                HeadReply::NoAnswer => {}      // no record found → fall through to the census
             }
         }
         let targets: Vec<[u8; 32]> = {
