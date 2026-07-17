@@ -54,6 +54,7 @@ mod record_attest;
 mod record_chain;
 mod registry_heads;
 mod registry_net;
+mod repair;
 mod sequence;
 mod settlement;
 mod settlement_service;
@@ -1954,12 +1955,13 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // KNOWN LIMIT (design's "manifest size" gap): `cids()` collects the whole set, and a publish encodes it
     // whole (~32 MB at 1M cids). Fine at this fleet's scale, and the reason P1 must gain a Merkle root +
     // diffs before any large store.
+    let manifests = std::sync::Arc::new(manifest::ManifestStore::new(
+        identity.clone(),
+        engine.clone(),
+        routing.clone(),
+    ));
     {
-        let manifests = std::sync::Arc::new(manifest::ManifestStore::new(
-            identity.clone(),
-            engine.clone(),
-            routing.clone(),
-        ));
+        let manifests = manifests.clone();
         let eng = engine.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -2166,6 +2168,20 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
             ..Default::default()
         },
     );
+    // P2: repair on a node's DEATH rather than by sweeping every cid on a timer. Leaving the census IS the
+    // converged-Dead signal (census retains Suspect), so this reacts in seconds and does nothing at all
+    // while the fleet is stable. Runs ALONGSIDE the periodic scan, which stays as the backstop until P3
+    // retires it — notably for the case this path cannot cover: a dead node that published no manifest.
+    tokio::spawn(
+        std::sync::Arc::new(repair::DeathRepair::new(
+            identity.node_id().0,
+            manifests.clone(),
+            membership.clone(),
+            engine.clone(),
+        ))
+        .run(),
+    );
+
     membership.start(peers, member_stream_rx);
     // The cheque pusher resolves a provider's address through membership before pushing a cheque.
     cheque_service.set_membership(membership.clone()).await;

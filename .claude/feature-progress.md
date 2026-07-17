@@ -2650,7 +2650,24 @@ it dies with the scan at P3) and build the design directly.
       (peer → manifest_cid@version) is the CHEAP signal — a changed cid means a changed set, so anti-entropy
       is O(1) — while the full set lives in obj and is fetched ONLY on an event (a death, or a root mismatch).
       The manifest's content-address IS its root; no separate Merkle field needed at this size.
-- [ ] **P2 — death-driven repair.** SWIM converged `Dead` → fetch the dead node's manifest ONCE → intersect
+- [x] **P2 — death-driven repair. DONE 2026-07-17 (unrolled).** `crates/noded/src/repair.rs` `DeathRepair`:
+      watches the census on a 5s LOCAL tick (O(N_nodes) set diff, no network); a member LEAVING the census is
+      the CONVERGED-Dead signal — `census()` retains `Suspect` and drops only gossiped `Dead`, so the design's
+      "never repair a flap" hysteresis is FREE, not another timer. On a death: fetch the dead node's manifest
+      ONCE (not one lookup per cid) → intersect with own cids LOCALLY (the differing sets ARE the partition)
+      → build holders from ALIVE peers' MANIFESTS (O(N_nodes) fetches for the whole death, not O(shared) DHT
+      reads; `liveness_census` = Alive-only so a Suspect peer isn't elected) → `repairer_for` = rendezvous
+      min over the SURVIVING HOLDERS → if elected, `repair_cid` (which re-checks health itself = the
+      probe-before-repair rule, so a stale manifest costs a no-op not a pointless regenerate).
+      **Candidates MUST be holders, not the census**: a non-holder winner would never look (only holders
+      compute an intersection containing that cid) ⇒ electing outside the holder set silently elects NOBODY.
+      **`primed` guard**: the first census view is a BASELINE, not an event — without it every node treats its
+      own startup as the death of everyone it hasn't met and repairs the whole fleet.
+      Tests (4): exactly-one elected + all holders agree + order-independent; load SPREADS across holders
+      (hash on the CID, else one node inherits the dead node's entire load); a dead holder is never elected;
+      no holders ⇒ None (already-lost data, the design's last-holder gap — not an arbitrary pick).
+      Runs ALONGSIDE the scan (backstop until P3), notably for the case this path CANNOT cover: a dead node
+      that published no manifest ("we cannot tell" ≠ "nothing was lost"). 62 noded tests; clippy clean. SWIM converged `Dead` → fetch the dead node's manifest ONCE → intersect
       with own set LOCALLY → HRW-elect among surviving holders → probe (K8) → repair. Ranked failover.
       Runs ALONGSIDE the scan (which becomes a long-period backstop).
 - [ ] **P3 — manifest anti-entropy → RETIRE the scan's per-cid resolve.** Root comparison covers silent loss.
