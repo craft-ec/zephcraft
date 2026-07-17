@@ -25,7 +25,7 @@ use zeph_core::Cid;
 use zeph_membership::Membership;
 use zeph_obj::ObjEngine;
 
-use crate::manifest::ManifestStore;
+use crate::manifest::{Changes, ManifestStore};
 
 /// How often the census is re-read for departures. A LOCAL O(N_nodes) set comparison — no network, no
 /// per-cid work — so it can be brisk: this is the latency between a converged `Dead` and repair starting.
@@ -169,28 +169,38 @@ impl DeathRepair {
     /// One peer: has its holdings changed, and did it LOSE anything we can repair?
     async fn check_peer(&self, peer: [u8; 32]) {
         let known = self.heads.lock().await.get(&peer).copied();
-        let Some((version, added, removed)) = self.manifests.changes_since(peer, known).await
-        else {
+        let Some(changes) = self.manifests.changes_since(peer, known).await else {
             return; // no manifest, or an unusable chain — the scan is the backstop for that
         };
-        let head = match self.manifests.peer_head(peer).await {
-            Some((c, _)) => c,
-            None => return,
-        };
-        if added.is_empty() && removed.is_empty() {
-            self.heads.lock().await.insert(peer, (version, head));
-            return; // unchanged — the O(1) steady-state path: nothing fetched, nothing indexed
-        }
+        // First sight is a BASELINE, not a loss event — same reasoning as the census `primed` guard:
+        // otherwise a joining node reads every peer's manifest as fresh loss and repairs the fleet.
         let first_sight = known.is_none();
-        let lost = self.apply_changes(peer, &added, &removed).await;
+
+        // The head is whatever `changes_since` actually RESOLVED against. Re-reading it here would be a
+        // race: the peer can publish between the two calls, and recording a head we never applied would
+        // make the next tick see `kc == head_cid` and skip that version's changes forever.
+        let (version, head, lost) = match changes {
+            Changes::Delta {
+                version,
+                head,
+                added,
+                removed,
+            } => {
+                if added.is_empty() && removed.is_empty() {
+                    self.heads.lock().await.insert(peer, (version, head));
+                    return; // unchanged — the O(1) steady state: nothing fetched, nothing indexed
+                }
+                let lost = self.apply_delta(peer, &added, &removed).await;
+                (version, head, lost)
+            }
+            Changes::Reset { version, head, set } => {
+                let lost = self.apply_reset(peer, &set).await;
+                (version, head, lost)
+            }
+        };
         self.heads.lock().await.insert(peer, (version, head));
-        if first_sight {
-            // First sight is a BASELINE, not a loss event — same reasoning as the census `primed` guard:
-            // otherwise a joining node reads every peer's manifest as fresh loss and repairs the fleet.
-            return;
-        }
-        if lost.is_empty() {
-            return; // it GREW or churned elsewhere — gaining cids is not a durability event
+        if first_sight || lost.is_empty() {
+            return; // a baseline, or it GREW/churned elsewhere — gaining cids is not a durability event
         }
         self.repair_our_share(&lost, peer, "anti-entropy: holder dropped cids")
             .await;
@@ -201,19 +211,13 @@ impl DeathRepair {
     ///
     /// Both filters are the same rule: we can only repair what we hold, so a peer's changes outside our set
     /// are not ours to remember or act on.
-    async fn apply_changes(
+    async fn apply_delta(
         &self,
         peer: [u8; 32],
         added: &[[u8; 32]],
         removed: &[[u8; 32]],
     ) -> Vec<[u8; 32]> {
-        let mine: HashSet<[u8; 32]> = self
-            .engine
-            .store()
-            .cids()
-            .into_iter()
-            .map(|c| c.0)
-            .collect();
+        let mine = self.our_cids();
         let mut holders = self.holders.lock().await;
         for c in added.iter().filter(|c| mine.contains(*c)) {
             holders.entry(*c).or_default().insert(peer);
@@ -229,6 +233,43 @@ impl DeathRepair {
         // The index must not outlive our own store.
         holders.retain(|c, hs| mine.contains(c) && !hs.is_empty());
         lost
+    }
+
+    /// REPLACE what we believed about a peer with its whole set, and return the cids of ours it used to
+    /// hold and no longer claims.
+    ///
+    /// A reset carries no `removed` list because there is nobody to diff against — so absence IS the
+    /// removal. Merging additively instead would leave every stale belief in place permanently: the peer's
+    /// later diffs are computed against its own current set, so a cid it already dropped is never mentioned
+    /// again and the phantom holder never clears.
+    async fn apply_reset(&self, peer: [u8; 32], set: &[[u8; 32]]) -> Vec<[u8; 32]> {
+        let mine = self.our_cids();
+        let claimed: HashSet<[u8; 32]> = set.iter().copied().filter(|c| mine.contains(c)).collect();
+        let mut holders = self.holders.lock().await;
+        for c in &claimed {
+            holders.entry(*c).or_default().insert(peer);
+        }
+        let mut lost = Vec::new();
+        for (c, hs) in holders.iter_mut() {
+            // `mine` is re-read each pass and our store shrinks too, so the index can hold a cid we have
+            // since dropped. Skipping those keeps the same rule as every other path: we only report a loss
+            // for a cid we could actually repair.
+            if mine.contains(c) && !claimed.contains(c) && hs.remove(&peer) {
+                lost.push(*c); // we thought it held this; its own set says otherwise
+            }
+        }
+        holders.retain(|c, hs| mine.contains(c) && !hs.is_empty());
+        lost
+    }
+
+    /// The cids WE hold. Every index decision is filtered through this: we can only repair what we hold.
+    fn our_cids(&self) -> HashSet<[u8; 32]> {
+        self.engine
+            .store()
+            .cids()
+            .into_iter()
+            .map(|c| c.0)
+            .collect()
     }
 
     /// One node died: repair the share of its holdings that is ours to repair.
