@@ -21,6 +21,7 @@
 //! `AvailabilityProbe` verifies before repair acts on it, and PDP sampling (K5) is what would make the
 //! claim itself trustworthy. Recorded here so no caller mistakes a signature for possession.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -29,14 +30,46 @@ use zeph_crypto::NodeIdentity;
 use zeph_obj::{ConsumeMode, ObjEngine};
 use zeph_routing::ContentRouting;
 
+/// Canonical (sorted) form — the invariant `verify` enforces and every reader depends on.
+fn sorted(set: &HashSet<[u8; 32]>) -> Vec<[u8; 32]> {
+    let mut v: Vec<[u8; 32]> = set.iter().copied().collect();
+    v.sort_unstable();
+    v
+}
+
 /// The DHT app-record name a node publishes its holdings head under. One per node: the record's publisher
 /// IS the subject, so a name collision across nodes is impossible.
 const HOLDINGS_NAME: &str = "craftec/holdings/1";
 
-/// A node's signed holdings claim.
+/// How many versions between full snapshots.
 ///
-/// `cids` is SORTED — canonical, so the same holdings always serialize to the same bytes and therefore the
-/// same content-address. That is what lets a head comparison stand in for a set comparison.
+/// Bounds a reader with no baseline: it follows `prev` at most this many hops to reach a snapshot it can
+/// apply forward from. Lower = cheaper cold start, more frequent big publishes; higher = the reverse.
+const SNAPSHOT_EVERY: u64 = 16;
+
+/// What a manifest version says about the holdings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Body {
+    /// The COMPLETE set, sorted. Published every [`SNAPSHOT_EVERY`] versions so a reader with no baseline
+    /// (a fresh node, or one that fell behind) always has a bounded path to a usable state.
+    Snapshot(Vec<[u8; 32]>),
+    /// What changed since `version - 1`, whose manifest is at `prev`.
+    ///
+    /// This is the point of the whole structure: the PUBLISHER knows exactly what it added and removed, so
+    /// making every reader re-fetch the entire set to re-derive that change is pure waste — ~32 MB at 1M
+    /// cids, to learn that one cid moved. A reader holding the previous version applies an O(Δ) update.
+    Diff {
+        added: Vec<[u8; 32]>,
+        removed: Vec<[u8; 32]>,
+        /// The previous version's manifest cid — the chain a cold reader walks back to a snapshot.
+        prev: [u8; 32],
+    },
+}
+
+/// A node's signed holdings claim, as of `version`.
+///
+/// Both bodies are SORTED — canonical, so the same claim always serializes to the same bytes and therefore
+/// the same content-address. That is what lets a head comparison stand in for a set comparison.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HoldingsManifest {
     /// The claiming node. Checked against the record's publisher on read, so one node cannot publish a
@@ -45,20 +78,45 @@ pub struct HoldingsManifest {
     /// Monotonic, bumped on every publish. The DHT head carries it, so a stale record can never displace
     /// a newer one (`announce_app` keeps the max version).
     pub version: u64,
-    /// The held cids, sorted.
-    pub cids: Vec<[u8; 32]>,
-    /// Signature by `node` over `(node, version, cids)` — see [`signing_bytes`].
+    /// Snapshot or diff — see [`Body`].
+    pub body: Body,
+    /// Signature by `node` over `(node, version, body)` — see [`signing_bytes`].
     pub sig: Vec<u8>,
 }
 
 /// The exact bytes a manifest signature covers. Separate from `postcard(manifest)` because the signature
-/// cannot cover itself; sorted `cids` make this deterministic.
-fn signing_bytes(node: &[u8; 32], version: u64, cids: &[[u8; 32]]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(40 + cids.len() * 32);
+/// cannot cover itself; sorted bodies make this deterministic.
+///
+/// The DIFF is signed too, not just the resulting set: a reader applies the diff without ever seeing the
+/// whole set, so the diff IS the claim from its point of view. An unsigned diff would let anyone rewrite
+/// what a node said it dropped — i.e. manufacture or suppress repair.
+fn signing_bytes(node: &[u8; 32], version: u64, body: &Body) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64);
     buf.extend_from_slice(node);
     buf.extend_from_slice(&version.to_le_bytes());
-    for c in cids {
-        buf.extend_from_slice(c);
+    match body {
+        Body::Snapshot(cids) => {
+            buf.push(0);
+            for c in cids {
+                buf.extend_from_slice(c);
+            }
+        }
+        Body::Diff {
+            added,
+            removed,
+            prev,
+        } => {
+            buf.push(1);
+            buf.extend_from_slice(prev);
+            buf.push(2);
+            for c in added {
+                buf.extend_from_slice(c);
+            }
+            buf.push(3);
+            for c in removed {
+                buf.extend_from_slice(c);
+            }
+        }
     }
     buf
 }
@@ -74,18 +132,41 @@ impl HoldingsManifest {
     /// so the read path is verified before anything depends on it.
     #[allow(dead_code)]
     pub fn verify(&self) -> bool {
-        if !self.cids.windows(2).all(|w| w[0] < w[1]) {
-            return false; // unsorted or duplicated → not canonical
+        let canonical = |v: &Vec<[u8; 32]>| v.windows(2).all(|w| w[0] < w[1]);
+        match &self.body {
+            Body::Snapshot(cids) => {
+                if !canonical(cids) {
+                    return false;
+                }
+            }
+            Body::Diff { added, removed, .. } => {
+                if !canonical(added) || !canonical(removed) {
+                    return false;
+                }
+                // A cid cannot be both gained and dropped in one version — that is not a state any real
+                // change produces, and accepting it would make the applied result order-dependent.
+                if added.iter().any(|a| removed.binary_search(a).is_ok()) {
+                    return false;
+                }
+            }
         }
         let Ok(sig) = <[u8; 64]>::try_from(self.sig.as_slice()) else {
             return false;
         };
         NodeIdentity::verify(
             &NodeId(self.node),
-            &signing_bytes(&self.node, self.version, &self.cids),
+            &signing_bytes(&self.node, self.version, &self.body),
             &sig,
         )
     }
+}
+
+/// Our last publish: the version, the exact set it asserted, and its manifest cid (the `prev` link the
+/// next diff points at).
+struct Published {
+    version: u64,
+    cids: HashSet<[u8; 32]>,
+    cid: [u8; 32],
 }
 
 /// Publishes this node's holdings manifest and fetches peers'.
@@ -93,9 +174,13 @@ pub struct ManifestStore {
     identity: Arc<NodeIdentity>,
     obj: Arc<ObjEngine>,
     routing: Arc<dyn ContentRouting>,
-    /// Last published `(version, cid_count)` — so an unchanged holdings set does not republish. Publishing
-    /// on a timer regardless of change is the very habit this design exists to remove.
-    last: tokio::sync::Mutex<Option<(u64, usize)>>,
+    /// Our own last published `(version, set, manifest_cid)`.
+    ///
+    /// Retaining OUR set is not the O(N) sin the reader side avoids: it is our own store, which we hold
+    /// anyway, and it is what lets us publish a DIFF instead of making every reader re-derive the change
+    /// from a full set. Publishing on a timer regardless of change is the habit this design exists to
+    /// remove, so an unchanged set publishes nothing at all.
+    last: tokio::sync::Mutex<Option<Published>>,
 }
 
 impl ManifestStore {
@@ -112,44 +197,63 @@ impl ManifestStore {
         }
     }
 
-    /// Publish `cids` as this node's holdings, if they changed since the last publish. Returns the new
-    /// version, or `None` when nothing changed (the common case — steady state must be silent).
-    pub async fn publish(&self, mut cids: Vec<Cid>) -> Option<u64> {
-        cids.sort_unstable();
-        cids.dedup();
-        let raw: Vec<[u8; 32]> = cids.iter().map(|c| c.0).collect();
-
+    /// Publish `cids` as this node's holdings, if they changed. Returns the new version, or `None` when
+    /// nothing changed (the common case — steady state must be silent).
+    ///
+    /// Publishes a DIFF against the last version, or a full [`Body::Snapshot`] on the first publish and
+    /// every [`SNAPSHOT_EVERY`] versions thereafter — the periodic snapshot is what bounds a cold reader's
+    /// walk back down the `prev` chain.
+    pub async fn publish(&self, cids: Vec<Cid>) -> Option<u64> {
+        let now: HashSet<[u8; 32]> = cids.into_iter().map(|c| c.0).collect();
         let mut last = self.last.lock().await;
-        let version = last.map(|(v, _)| v + 1).unwrap_or(1);
-        // Cheap change check: a different count is definitely a change. Equal counts still republish only
-        // if the SET differs — but comparing sets needs the previous set, which we deliberately do not
-        // retain (it is the thing that is O(N) in memory). The version bump on every real publish plus the
-        // content-address means a redundant publish is wasteful, never wrong; `unchanged` below keeps the
-        // steady state quiet, which is what matters.
-        let unchanged = matches!(*last, Some((_, n)) if n == raw.len());
-        if unchanged {
-            return None;
-        }
+
+        let (version, body) = match last.as_ref() {
+            None => (1, Body::Snapshot(sorted(&now))),
+            Some(p) => {
+                let added: HashSet<[u8; 32]> = now.difference(&p.cids).copied().collect();
+                let removed: HashSet<[u8; 32]> = p.cids.difference(&now).copied().collect();
+                if added.is_empty() && removed.is_empty() {
+                    return None; // unchanged → say nothing. Steady state MUST be silent.
+                }
+                let version = p.version + 1;
+                if version % SNAPSHOT_EVERY == 0 {
+                    (version, Body::Snapshot(sorted(&now)))
+                } else {
+                    (
+                        version,
+                        Body::Diff {
+                            added: sorted(&added),
+                            removed: sorted(&removed),
+                            prev: p.cid,
+                        },
+                    )
+                }
+            }
+        };
 
         let node = self.identity.node_id().0;
         let sig = self
             .identity
-            .sign(&signing_bytes(&node, version, &raw))
+            .sign(&signing_bytes(&node, version, &body))
             .to_vec();
         let manifest = HoldingsManifest {
             node,
             version,
-            cids: raw.clone(),
+            body,
             sig,
         };
         let bytes = postcard::to_allocvec(&manifest).ok()?;
         let cid = self.obj.publish_system(&bytes).await.ok()?;
-        // The head is the cheap signal: content-addressed, so a changed cid IS a changed holdings set.
+        // The head is the cheap signal: content-addressed, so a changed cid IS a changed claim.
         self.routing
             .announce_app(HOLDINGS_NAME, cid, version)
             .await
             .ok()?;
-        *last = Some((version, raw.len()));
+        *last = Some(Published {
+            version,
+            cids: now,
+            cid: cid.0,
+        });
         Some(version)
     }
 
@@ -175,10 +279,12 @@ impl ManifestStore {
     /// authority over its own holdings, so a peer cannot speak for another (which would otherwise let one
     /// node fabricate a death-repair workload for the whole fleet).
     ///
-    /// Consumed by P2 (death-driven repair); P1 only publishes.
-    #[allow(dead_code)]
-    pub async fn fetch(&self, peer: [u8; 32]) -> Option<HoldingsManifest> {
-        let (cid, _version) = self.peer_head(peer).await?;
+    /// Fetch + verify one specific manifest by cid.
+    ///
+    /// Rejects a manifest whose `node` is not the peer we asked about: the record's publisher is the only
+    /// authority over its own holdings, so a peer cannot speak for another (which would otherwise let one
+    /// node fabricate a repair workload for the whole fleet).
+    async fn fetch_at(&self, peer: [u8; 32], cid: [u8; 32]) -> Option<HoldingsManifest> {
         let bytes = self
             .obj
             .get_following_manifest(Cid(cid), ConsumeMode::Drop)
@@ -190,19 +296,111 @@ impl ManifestStore {
         }
         Some(manifest)
     }
+
+    /// A peer's holdings CHANGE, resolved against the version a reader already has.
+    ///
+    /// This is where the diff pays off. A reader holding `known_version` gets an O(Δ) answer: one small
+    /// fetch naming exactly what moved. Only a reader with NO usable baseline pays for a set, and even
+    /// then the walk back down the `prev` chain is bounded by [`SNAPSHOT_EVERY`].
+    ///
+    /// Returns `(version, added, removed)` — relative to `known_version` when it can be, or relative to
+    /// nothing (i.e. `added` = the full set) when the reader must re-baseline.
+    pub async fn changes_since(
+        &self,
+        peer: [u8; 32],
+        known: Option<(u64, [u8; 32])>,
+    ) -> Option<(u64, Vec<[u8; 32]>, Vec<[u8; 32]>)> {
+        let (head_cid, head_version) = self.peer_head(peer).await?;
+        if let Some((kv, kc)) = known {
+            if kc == head_cid {
+                return Some((kv, Vec::new(), Vec::new())); // unchanged — the O(1) path
+            }
+        }
+        let head = self.fetch_at(peer, head_cid).await?;
+
+        // FAST PATH: the head is exactly one diff past what we know. One small object, no set.
+        if let Body::Diff {
+            added,
+            removed,
+            prev,
+        } = &head.body
+        {
+            if let Some((kv, kc)) = known {
+                if head.version == kv + 1 && *prev == kc {
+                    return Some((head.version, added.clone(), removed.clone()));
+                }
+            }
+        }
+
+        // COLD PATH: no baseline, or we fell behind by more than one version. Walk back to a snapshot and
+        // apply forward. Bounded by SNAPSHOT_EVERY — the reason snapshots exist at all.
+        let mut chain = vec![head];
+        loop {
+            let Body::Diff { prev, .. } = &chain.last()?.body else {
+                break; // reached a snapshot
+            };
+            let prev = *prev;
+            if chain.len() as u64 > SNAPSHOT_EVERY * 2 {
+                return None; // chain longer than it should ever be — refuse rather than walk forever
+            }
+            chain.push(self.fetch_at(peer, prev).await?);
+        }
+        // chain is head..snapshot; fold forward from the snapshot.
+        let mut set: HashSet<[u8; 32]> = match &chain.last()?.body {
+            Body::Snapshot(cids) => cids.iter().copied().collect(),
+            Body::Diff { .. } => return None, // unreachable: the loop only exits on a snapshot
+        };
+        for m in chain.iter().rev().skip(1) {
+            if let Body::Diff { added, removed, .. } = &m.body {
+                for c in removed {
+                    set.remove(c);
+                }
+                for c in added {
+                    set.insert(*c);
+                }
+            }
+        }
+        // A re-baselining reader has nothing to diff against: report the whole set as `added`, and let the
+        // caller reconcile against its own index. `removed` is empty because we cannot know what it dropped
+        // before we were watching — and inventing losses would manufacture repair work.
+        Some((head_version, sorted(&set), Vec::new()))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn manifest_for(id: &NodeIdentity, version: u64, cids: &[[u8; 32]]) -> HoldingsManifest {
+    fn snapshot_for(id: &NodeIdentity, version: u64, cids: &[[u8; 32]]) -> HoldingsManifest {
         let node = id.node_id().0;
+        let body = Body::Snapshot(cids.to_vec());
+        let sig = id.sign(&signing_bytes(&node, version, &body)).to_vec();
         HoldingsManifest {
             node,
             version,
-            cids: cids.to_vec(),
-            sig: id.sign(&signing_bytes(&node, version, cids)).to_vec(),
+            body,
+            sig,
+        }
+    }
+
+    fn diff_for(
+        id: &NodeIdentity,
+        version: u64,
+        added: &[[u8; 32]],
+        removed: &[[u8; 32]],
+    ) -> HoldingsManifest {
+        let node = id.node_id().0;
+        let body = Body::Diff {
+            added: added.to_vec(),
+            removed: removed.to_vec(),
+            prev: [9u8; 32],
+        };
+        let sig = id.sign(&signing_bytes(&node, version, &body)).to_vec();
+        HoldingsManifest {
+            node,
+            version,
+            body,
+            sig,
         }
     }
 
@@ -210,13 +408,15 @@ mod tests {
     fn a_signed_manifest_verifies_and_a_tampered_one_does_not() {
         let id = NodeIdentity::generate();
         let cids = [[1u8; 32], [2u8; 32], [3u8; 32]];
-        let m = manifest_for(&id, 1, &cids);
+        let m = snapshot_for(&id, 1, &cids);
         assert!(m.verify());
 
         // Adding a cid to someone's claim must not verify — otherwise a peer could inflate another node's
         // holdings and, at P2, manufacture repair work for the whole fleet.
         let mut forged = m.clone();
-        forged.cids.push([4u8; 32]);
+        if let Body::Snapshot(v) = &mut forged.body {
+            v.push([4u8; 32]);
+        }
         assert!(!forged.verify());
 
         // Nor may the version be replayed onto a different set.
@@ -227,7 +427,7 @@ mod tests {
         // Nor may another identity's signature be pasted in.
         let other = NodeIdentity::generate();
         let mut swapped = m.clone();
-        swapped.sig = manifest_for(&other, 1, &cids).sig;
+        swapped.sig = snapshot_for(&other, 1, &cids).sig;
         assert!(!swapped.verify());
     }
 
@@ -238,16 +438,57 @@ mod tests {
         let id = NodeIdentity::generate();
         let unsorted = [[2u8; 32], [1u8; 32]];
         assert!(
-            !manifest_for(&id, 1, &unsorted).verify(),
+            !snapshot_for(&id, 1, &unsorted).verify(),
             "unsorted cids must not verify"
         );
         let duped = [[1u8; 32], [1u8; 32]];
         assert!(
-            !manifest_for(&id, 1, &duped).verify(),
+            !snapshot_for(&id, 1, &duped).verify(),
             "duplicate cids must not verify"
         );
         let sorted = [[1u8; 32], [2u8; 32]];
-        assert!(manifest_for(&id, 1, &sorted).verify());
+        assert!(snapshot_for(&id, 1, &sorted).verify());
+    }
+
+    #[test]
+    fn a_diff_is_signed_so_it_cannot_be_rewritten() {
+        // The diff IS the claim from a reader's point of view — a reader applies it without ever seeing the
+        // full set. An unsigned or malleable diff would let anyone rewrite what a node said it dropped, i.e.
+        // manufacture repair work or suppress it. Both are worse than the bandwidth this saves.
+        let id = NodeIdentity::generate();
+        let m = diff_for(&id, 2, &[[5u8; 32]], &[[3u8; 32]]);
+        assert!(m.verify());
+
+        // Rewriting what it DROPPED must not verify (suppressing a loss = silent data loss).
+        let mut suppressed = m.clone();
+        if let Body::Diff { removed, .. } = &mut suppressed.body {
+            removed.clear();
+        }
+        assert!(!suppressed.verify());
+
+        // Inventing a loss must not verify (manufactured repair work for the whole fleet).
+        let mut invented = m.clone();
+        if let Body::Diff { removed, .. } = &mut invented.body {
+            *removed = vec![[1u8; 32], [3u8; 32]];
+        }
+        assert!(!invented.verify());
+
+        // Repointing `prev` must not verify — the chain a cold reader walks is part of the claim.
+        let mut repointed = m.clone();
+        if let Body::Diff { prev, .. } = &mut repointed.body {
+            *prev = [0xAAu8; 32];
+        }
+        assert!(!repointed.verify());
+    }
+
+    #[test]
+    fn a_diff_cannot_both_add_and_remove_the_same_cid() {
+        // Not a state any real change produces, and accepting it would make the applied result depend on
+        // whether the reader applies `added` or `removed` first — i.e. two readers could disagree about
+        // whether a cid still exists.
+        let id = NodeIdentity::generate();
+        let c = [4u8; 32];
+        assert!(!diff_for(&id, 2, &[c], &[c]).verify());
     }
 
     #[test]
@@ -257,11 +498,11 @@ mod tests {
         let a = NodeIdentity::generate();
         let b = NodeIdentity::generate();
         let cids = [[7u8; 32], [9u8; 32]];
-        let ma = manifest_for(&a, 1, &cids);
-        let mb = manifest_for(&b, 1, &cids);
+        let ma = snapshot_for(&a, 1, &cids);
+        let mb = snapshot_for(&b, 1, &cids);
         assert_eq!(
-            postcard::to_allocvec(&ma.cids).unwrap(),
-            postcard::to_allocvec(&mb.cids).unwrap()
+            postcard::to_allocvec(&ma.body).unwrap(),
+            postcard::to_allocvec(&mb.body).unwrap()
         );
     }
 

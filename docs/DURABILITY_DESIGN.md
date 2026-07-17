@@ -168,12 +168,17 @@ working) · census = the shared basis for agreeing *without talking*.
   peer's holdings we do not share are not ours to remember. Bonus: a death is now answered ENTIRELY from the
   index — `{c : holders[c] ∋ dead}` — so it costs no manifest fetch and no DHT lookup at the moment the fleet
   can least afford either.
-- **Manifest size — PARTIALLY OPEN.** Storage is fixed (above), but a head change still FETCHES the peer's
-  whole set (~32 MB at 1M cids) to compute the intersection, even though only a handful of entries matter.
-  The publisher knows exactly what it added/removed, so the real fix is for the manifest to carry a Merkle
-  root + a DIFF against the previous version, with periodic full snapshots for new readers — readers then
-  apply an O(Δ) diff instead of re-reading a set to re-derive a change the publisher already knew. Needed
-  before a large store; not needed at this fleet's scale.
+- **Manifest size — RESOLVED [2026-07-17].** The manifest is now `Body::Snapshot | Body::Diff{added,
+  removed, prev}`: the publisher emits a DIFF against the previous version (it already knows what it
+  added/removed — making every reader re-fetch the set to re-derive that was the waste), with a full
+  snapshot every `SNAPSHOT_EVERY` versions to bound a cold reader's walk back down the `prev` chain.
+  `changes_since(peer, known)` gives readers an O(Δ) answer — one small object naming exactly what moved —
+  and only a reader with NO usable baseline pays for a set. NOTE: no Merkle field was needed; the manifest
+  is content-addressed, so the head cid already IS the root, and an extra tree would only duplicate it —
+  readers never hold a peer's full set to verify a root against anyway.
+  The DIFF is SIGNED (not just the resulting set): a reader applies it without ever seeing the whole set, so
+  from its point of view the diff IS the claim. An unsigned diff would let anyone suppress a reported loss
+  (silent data loss) or invent one (manufactured fleet-wide repair).
 - **Sampling is not a fix.** Recorded here because it is the intuitive answer and it is wrong: same axis,
   smaller constant.
 

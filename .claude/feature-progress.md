@@ -2717,10 +2717,22 @@ it dies with the scan at P3) and build the design directly.
       from the index BEFORE electing, so a corpse can never be elected to repair.
       Tests: the index stores only the intersection (peer holding 200, we share 2 ⇒ store 2); a death is
       answered from the index alone. 65 noded tests; clippy clean.
-      **STILL OPEN (narrowed):** a head change still FETCHES the peer's whole set (~32MB at 1M cids) to
-      compute the intersection. The publisher already knows what it added/removed → the manifest should carry
-      a Merkle root + a DIFF (+ periodic snapshots for new readers). Needed before a large store, not at this
-      fleet's scale.
+- [x] **P4c — MANIFEST SIZE GAP CLOSED: snapshot|diff manifests (2026-07-17).**
+      `Body::Snapshot(cids) | Body::Diff{added, removed, prev}`. The publisher emits a DIFF against its last
+      version (it already KNOWS what changed — making every reader re-fetch ~32MB to re-derive it was the
+      waste), with a full Snapshot every `SNAPSHOT_EVERY=16` versions to bound a cold reader's walk down the
+      `prev` chain. `changes_since(peer, known)`: unchanged head ⇒ O(1); head == known+1 ⇒ O(Δ) FAST PATH
+      (one small object naming exactly what moved); no baseline / fell behind ⇒ walk to a snapshot + fold
+      forward (bounded, refuses a chain > 2×SNAPSHOT_EVERY rather than walking forever).
+      **NO Merkle field needed** — the manifest is content-addressed so the head cid already IS the root; an
+      extra tree would duplicate it, and readers never hold a peer's full set to verify a root against.
+      **The DIFF is SIGNED**, not just the resulting set: a reader applies it WITHOUT ever seeing the whole
+      set, so from its point of view the diff IS the claim. Unsigned ⇒ anyone could suppress a reported loss
+      (silent data loss) or invent one (manufactured fleet-wide repair). Tested both directions + `prev`
+      repointing + the add∩remove contradiction (which would make the applied result order-dependent ⇒ two
+      readers disagreeing about whether a cid exists).
+      Publisher keeps its OWN last set (bounded by our store — not the reader-side O(N) sin) to compute diffs.
+      Removed the now-dead `fetch()`; `changes_since` supersedes it. 67 noded tests; clippy clean.
 - [ ] **P5 — PDP sampling (K5).** Makes manifests trustworthy rather than trusted.
 
 - [ ] **DESIGN WRITTEN — `docs/DURABILITY_DESIGN.md` (2026-07-17).** The periodic scan is O(N_cids)

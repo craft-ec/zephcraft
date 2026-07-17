@@ -62,6 +62,10 @@ const ANTI_ENTROPY_TICK: Duration = Duration::from_secs(60);
 /// manifest fetch, no network, at the moment the fleet is least able to afford either.
 type HolderIndex = HashMap<[u8; 32], HashSet<[u8; 32]>>;
 
+/// Per peer: the last `(version, head_cid)` we processed. 40 bytes each — the version is what lets
+/// `changes_since` take the O(Δ) fast path instead of re-reading a set.
+type PeerHeads = HashMap<[u8; 32], (u64, [u8; 32])>;
+
 /// The node that must repair `cid`, elected by rendezvous over the surviving holders.
 ///
 /// Every survivor computes this from the same inputs and therefore agrees without exchanging a message —
@@ -83,9 +87,9 @@ pub struct DeathRepair {
     manifests: Arc<ManifestStore>,
     membership: Arc<Membership>,
     engine: Arc<ObjEngine>,
-    /// Last processed manifest head per peer — 32 bytes each, NOT their set. The cheap change signal:
-    /// unchanged head ⇒ unchanged holdings ⇒ nothing to do.
-    heads: tokio::sync::Mutex<HashMap<[u8; 32], [u8; 32]>>,
+    /// Last processed `(version, head_cid)` per peer — 40 bytes each, NOT their set. The version is what
+    /// lets `changes_since` take the O(Δ) fast path (one small diff) instead of re-reading a whole set.
+    heads: tokio::sync::Mutex<PeerHeads>,
     /// Who holds what, restricted to cids WE hold (see [`HolderIndex`]).
     holders: tokio::sync::Mutex<HolderIndex>,
     /// The repair BUDGET (P4). Held for the duration of a repair, so concurrency is bounded fleet-wide by
@@ -164,22 +168,25 @@ impl DeathRepair {
 
     /// One peer: has its holdings changed, and did it LOSE anything we can repair?
     async fn check_peer(&self, peer: [u8; 32]) {
-        let Some((head, _version)) = self.manifests.peer_head(peer).await else {
-            return; // no manifest published (yet) — nothing to compare against
+        let known = self.heads.lock().await.get(&peer).copied();
+        let Some((version, added, removed)) = self.manifests.changes_since(peer, known).await
+        else {
+            return; // no manifest, or an unusable chain — the scan is the backstop for that
         };
-        if self.heads.lock().await.get(&peer) == Some(&head) {
-            return; // unchanged head ⇒ unchanged holdings. The O(1) steady-state path: nothing fetched.
+        let head = match self.manifests.peer_head(peer).await {
+            Some((c, _)) => c,
+            None => return,
+        };
+        if added.is_empty() && removed.is_empty() {
+            self.heads.lock().await.insert(peer, (version, head));
+            return; // unchanged — the O(1) steady-state path: nothing fetched, nothing indexed
         }
-        // The head moved ⇒ its set changed. NOW pay for the set — the only time we do.
-        let Some(manifest) = self.manifests.fetch(peer).await else {
-            return;
-        };
-        let first_sight = !self.heads.lock().await.contains_key(&peer);
-        let lost = self.reindex_peer(peer, &manifest.cids).await;
-        self.heads.lock().await.insert(peer, head);
+        let first_sight = known.is_none();
+        let lost = self.apply_changes(peer, &added, &removed).await;
+        self.heads.lock().await.insert(peer, (version, head));
         if first_sight {
             // First sight is a BASELINE, not a loss event — same reasoning as the census `primed` guard:
-            // otherwise a joining node reads every peer's manifest as a fresh loss and repairs the fleet.
+            // otherwise a joining node reads every peer's manifest as fresh loss and repairs the fleet.
             return;
         }
         if lost.is_empty() {
@@ -189,12 +196,17 @@ impl DeathRepair {
             .await;
     }
 
-    /// Fold a peer's claimed holdings into the index, keeping ONLY cids we hold, and return the ones it
-    /// used to hold for us and no longer does.
+    /// Fold a peer's ADDED/REMOVED into the index, keeping only cids we hold, and return the ones it used
+    /// to hold for us and no longer does.
     ///
-    /// Storing the intersection rather than the peer's set is what bounds memory by OUR store instead of
-    /// the fleet's inventory: we cannot repair what we do not hold, so the rest is not ours to remember.
-    async fn reindex_peer(&self, peer: [u8; 32], claimed: &[[u8; 32]]) -> Vec<[u8; 32]> {
+    /// Both filters are the same rule: we can only repair what we hold, so a peer's changes outside our set
+    /// are not ours to remember or act on.
+    async fn apply_changes(
+        &self,
+        peer: [u8; 32],
+        added: &[[u8; 32]],
+        removed: &[[u8; 32]],
+    ) -> Vec<[u8; 32]> {
         let mine: HashSet<[u8; 32]> = self
             .engine
             .store()
@@ -202,31 +214,19 @@ impl DeathRepair {
             .into_iter()
             .map(|c| c.0)
             .collect();
-        let now: HashSet<[u8; 32]> = claimed
-            .iter()
-            .copied()
-            .filter(|c| mine.contains(c))
-            .collect();
         let mut holders = self.holders.lock().await;
-        // What it held FOR US before is derivable from the index — no mirror of its set required.
-        let before: Vec<[u8; 32]> = holders
-            .iter()
-            .filter(|(_, hs)| hs.contains(&peer))
-            .map(|(c, _)| *c)
-            .collect();
+        for c in added.iter().filter(|c| mine.contains(*c)) {
+            holders.entry(*c).or_default().insert(peer);
+        }
         let mut lost = Vec::new();
-        for c in before {
-            if !now.contains(&c) {
-                if let Some(hs) = holders.get_mut(&c) {
-                    hs.remove(&peer);
+        for c in removed.iter().filter(|c| mine.contains(*c)) {
+            if let Some(hs) = holders.get_mut(c) {
+                if hs.remove(&peer) {
+                    lost.push(*c); // it WAS a holder for us and no longer claims to be
                 }
-                lost.push(c);
             }
         }
-        for c in now {
-            holders.entry(c).or_default().insert(peer);
-        }
-        // Drop cids we no longer hold ourselves — the index must not outlive our own store.
+        // The index must not outlive our own store.
         holders.retain(|c, hs| mine.contains(c) && !hs.is_empty());
         lost
     }
