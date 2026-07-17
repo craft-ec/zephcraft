@@ -2549,7 +2549,31 @@ Phases (each: build + test + gate + commit; roll together where consensus-affect
       invocation (`--workspace --all-targets -D warnings` — a crate-scoped clippy missed an
       `items_after_test_module` earlier).
       **token.wasm STILL byte-identical ⇒ balances SURVIVE this roll**; only economy-egress moves
-      (62703d6a…, was f8c24c08… live).
+      (a1aeca61…, was f8c24c08… live).
+- [x] **P9 — pool in the record + WRITER-FIRST sync: the last flagged gaps (2026-07-17, user "resolve all").**
+      - **`pool` folded into `RewardRecord`** (the 4th zero-reading dashboard field — I had claimed the wire was
+        "complete" with 3 of 4 done; audit caught it). `pool_remaining() = pool − Σ shares` gives the residual,
+        so BOTH the distributed + live pool come from one field. Dashboard now returns a `MyView {settled_bytes,
+        subscription_bytes, pool}` — all three read off the durable chain, none from local settle state.
+      - **`sync` is WRITER-FIRST — the structural fix, not the debounce band-aid.** The account chain is
+        single-writer (`owner_authentic`-gated), so the ACCOUNT's own head record is authoritative on its length:
+        one DHT GET settles what a census fan-out was being used to sample ⇒ O(census) → O(1) per read. This
+        also DISSOLVES the cheque tick's O(N²)/30s (`paid_total` per census node) with no change to that code —
+        each of its N reads is now O(1).
+      - **`fetch_if_newer` → tri-state `HeadReply{Newer,UpToDate,NoAnswer}`**: required, because the old `None`
+        conflated "nothing newer" with "nothing said", and the whole fix rests on the writer's UpToDate being
+        FINAL while a missing record is not.
+      - **USER CORRECTION (important, comments were wrong):** `resolve_app` is a DHT GET of the record the
+        publisher announced — NOT a dial — and the bytes live in obj (content-addressed, replicated). So
+        writer-first does NOT depend on the account being online, and `NoAnswer` means "record missing/expired",
+        NOT "node offline". The rare `FULL_ANTI_ENTROPY` (60s/key) census round covers the real gap: the record
+        expired while peers still announce copies. Comments corrected.
+      - Both paths share `adopt()` (account + quorum verify + non-equivocation/extends) so the fast path cannot
+        drift from the fallback and quietly accept a fork.
+      - Tests: reward 9 (pool carried + dust residual + idle-epoch pool), noded 54, full workspace green, clippy
+        clean at the gate's invocation. token.wasm still byte-identical ⇒ balances survive.
+      **STILL OPEN (named, not resolved):** hetzner `zeph` main ~40% CPU has no baseline — re-measure after this
+      rolls before concluding anything. push-on-commit / SQL-index remains the user's architecture, undesigned.
       **GATE RED on scenario B (2026-07-17) — PROVEN NOT P5/P6.** Full gate: 7/8, scenario B census-20 at
       35.41s vs a 30s bar (one node stuck at census 10 at cutoff; all 20 converge by ~35.4s). Controlled A/B on
       this Mac:

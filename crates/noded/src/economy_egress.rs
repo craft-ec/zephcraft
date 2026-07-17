@@ -70,19 +70,22 @@ impl EconomyEgressService {
     /// summing deltas: absence from a record means "didn't act that epoch", NOT "zero" — a provider that
     /// served nothing recently keeps its cumulative, and an idle subscriber keeps its balance. The two
     /// walks are independent because a node can be a provider, a consumer, both, or neither.
-    pub async fn my_view_from_records(&self, account: [u8; 32], now_epoch: u64) -> (u64, u64) {
+    pub async fn my_view_from_records(&self, account: [u8; 32], now_epoch: u64) -> MyView {
         let Some(records) = self.record_chain.read().await.clone() else {
-            return (0, 0);
+            return MyView::default();
         };
         let start = now_epoch.saturating_sub(crate::settlement::CLAIM_WINDOW_EPOCHS);
-        let (mut settled, mut remaining) = (None, None);
+        let (mut settled, mut remaining, mut pool) = (None, None, None);
         for e in (start..=now_epoch).rev() {
-            if settled.is_some() && remaining.is_some() {
-                break; // both found — no reason to keep walking back
+            if settled.is_some() && remaining.is_some() && pool.is_some() {
+                break; // everything found — no reason to keep walking back
             }
             let Some(rec) = records.canonical_record(e).await else {
                 continue;
             };
+            if pool.is_none() {
+                pool = Some(rec.pool_remaining()); // the newest record's residual = the live pool
+            }
             if settled.is_none() {
                 settled = rec.cumulative_bytes_of(&account);
             }
@@ -90,7 +93,11 @@ impl EconomyEgressService {
                 remaining = rec.remaining_for(&account);
             }
         }
-        (settled.unwrap_or(0), remaining.unwrap_or(0))
+        MyView {
+            settled_bytes: settled.unwrap_or(0),
+            subscription_bytes: remaining.unwrap_or(0),
+            pool: pool.unwrap_or(0),
+        }
     }
 
     /// The reward share owed to `account` for `epoch`: the CANONICAL committee-attested record's share if
@@ -182,6 +189,18 @@ impl EconomyEgressService {
     }
 }
 
+/// An account's own economy view, read from the durable records chain rather than local settle state —
+/// what a node can report about itself without ever settling (settling is committee-gated).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MyView {
+    /// CUMULATIVE rewardable bytes this account has served.
+    pub settled_bytes: u64,
+    /// Unexpired egress entitlement remaining (its subscription balance).
+    pub subscription_bytes: u64,
+    /// The distributable pool as of the newest record (`pool − Σ shares`).
+    pub pool: u64,
+}
+
 /// The pure core of [`EconomyEgressService::owed_from_records`]: sum `account`'s shares across `window`,
 /// skipping epochs it has already claimed (token's `claimed_epochs` is the authority on what was taken —
 /// a claimed share is in `balance`, not owed). Split out so the sum/dedup logic stays unit-testable
@@ -215,6 +234,7 @@ mod tests {
     fn rec(epoch: u64, shares: &[([u8; 32], u64)]) -> RewardRecord {
         RewardRecord {
             epoch,
+            pool: 0, // not under test (owed sum)
             shares: shares
                 .iter()
                 .map(|(provider, amount)| Share {

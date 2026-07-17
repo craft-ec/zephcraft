@@ -99,6 +99,12 @@ pub struct Share {
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct RewardRecord {
     pub epoch: u64,
+    /// The DISTRIBUTABLE pool this epoch divided (the input's `pool`). Carried so the record is
+    /// self-describing — the shares' denominator is otherwise invisible — and so any node can report the
+    /// pool without settling: what is left after this epoch is `pool − Σ shares` (the dust), so both the
+    /// distributed and the residual figures come from this one field plus the shares.
+    #[serde(default)]
+    pub pool: u64,
     pub shares: Vec<Share>,
     #[serde(default)]
     pub entitlements: Vec<Entitlement>,
@@ -141,6 +147,14 @@ impl RewardRecord {
             .iter()
             .find(|s| &s.consumer == consumer)
             .map(|s| s.remaining)
+    }
+
+    /// What remained UNALLOCATED after this epoch's distribution — the integer dust `compute` could not
+    /// divide (`pool − Σ shares`). This is the running pool's value at this settle, so a node that never
+    /// settles can still report the pool from the durable record.
+    pub fn pool_remaining(&self) -> u64 {
+        let allocated: u64 = self.shares.iter().map(|s| s.amount).sum();
+        self.pool.saturating_sub(allocated)
     }
 
     /// `provider`'s CUMULATIVE rewardable bytes as of this epoch, if this record carries a row for it.
@@ -204,6 +218,7 @@ pub fn compute(input: &RewardInput) -> RewardRecord {
         .collect();
     RewardRecord {
         epoch: input.epoch,
+        pool: input.pool,
         shares,
         entitlements,
     }
@@ -324,6 +339,41 @@ mod tests {
             spent,
             remaining,
         }
+    }
+
+    #[test]
+    fn the_record_carries_the_pool_so_any_node_can_report_it() {
+        // The pool is the shares' denominator and the dashboard's headline number; without it in the
+        // record, a node that never settles (committee-gated) reports 0 for it.
+        let rec = compute(&RewardInput {
+            epoch: 5,
+            pool: 100,
+            contributions: alloc::vec![contrib(1, 30), contrib(2, 30)],
+            ..Default::default()
+        });
+        assert_eq!(rec.pool, 100);
+        // 100 split evenly over 60 bytes = 50 each, nothing left.
+        assert_eq!(rec.pool_remaining(), 0);
+        // Integer dust stays in the pool: 100 over 3 equal providers pays 33 each, 1 remains.
+        let dusty = compute(&RewardInput {
+            epoch: 6,
+            pool: 100,
+            contributions: alloc::vec![contrib(1, 10), contrib(2, 10), contrib(3, 10)],
+            ..Default::default()
+        });
+        assert_eq!(
+            dusty.pool_remaining(),
+            1,
+            "pool − Σ shares = the undividable dust"
+        );
+        // A zero-contribution epoch distributes nothing, so the whole pool carries.
+        let idle = compute(&RewardInput {
+            epoch: 7,
+            pool: 42,
+            contributions: alloc::vec![],
+            ..Default::default()
+        });
+        assert_eq!(idle.pool_remaining(), 42);
     }
 
     #[test]

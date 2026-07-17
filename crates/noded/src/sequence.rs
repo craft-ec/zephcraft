@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, RwLock};
 use zeph_com::{
-    AccountSequence, MemberSignature, SequenceBackend, SequencedCommit, SequencedWrite,
+    AccountSequence, MemberSignature, Quorum, SequenceBackend, SequencedCommit, SequencedWrite,
 };
 use zeph_core::{Cid, NodeId};
 use zeph_crypto::NodeIdentity;
@@ -43,6 +43,36 @@ use zeph_transport::{tag, TaggedStream, Transport};
 #[allow(unused_imports)]
 use crate::attest::AttestStore;
 use crate::quorum_source::QuorumSource;
+
+/// What a publisher's DHT head record says about a sequence. The three cases must stay distinct: the
+/// ACCOUNT's own record saying "nothing newer" is AUTHORITATIVE (it is the chain's only writer), whereas
+/// a missing record says nothing at all — collapsing both into `None` is what forced the old
+/// fan-out-to-everyone.
+///
+/// NOTE: none of this dials the publisher. `resolve_app` is a DHT GET of the record that publisher
+/// announced, and the sequence bytes it points at live in obj (content-addressed, replicated) — so a head
+/// resolves whether or not its publisher is currently online. [`NoAnswer`](Self::NoAnswer) therefore means
+/// "no record found", NOT "node offline".
+enum HeadReply {
+    /// This publisher's record points at a longer sequence than ours.
+    Newer(AccountSequence),
+    /// Its record resolved and holds nothing we lack.
+    UpToDate,
+    /// No record found (never announced / expired), or its content was unfetchable/undecodable.
+    NoAnswer,
+}
+
+/// How often a sequence still gets a FULL census fan-out despite the writer fast path [2026-07-17].
+///
+/// [`SequenceStore::sync`] resolves the ACCOUNT's own head record first, because the chain is
+/// single-writer (`owner_authentic`-gated, self-authored) — so that record is authoritative on the
+/// chain's length and ends the question. This costs nothing in availability: it is a DHT GET, not a dial,
+/// and the bytes come from obj, so it works while the account is offline.
+///
+/// What it cannot cover is the record itself going missing — expired and never republished (e.g. the
+/// account is long gone), while a peer still announces a copy. This periodic full round is the recovery
+/// net for that, kept rare because it costs O(census) lookups.
+const FULL_ANTI_ENTROPY: Duration = Duration::from_secs(60);
 
 /// Min interval between cross-node anti-entropy syncs of the SAME sequence [2026-07-17].
 ///
@@ -109,6 +139,9 @@ pub struct SequenceStore {
     signed: RwLock<HashMap<SignedKey, [u8; 32]>>,
     /// Last cross-node anti-entropy sync per sequence — the READ path debounce (see [`SYNC_DEBOUNCE`]).
     last_sync: RwLock<HashMap<SeqKey, Instant>>,
+    /// Last FULL census fan-out per sequence (see [`FULL_ANTI_ENTROPY`]) — the writer fast path handles
+    /// every other round.
+    last_full: RwLock<HashMap<SeqKey, Instant>>,
 }
 
 impl SequenceStore {
@@ -162,6 +195,7 @@ impl SequenceStore {
             transport,
             signed: RwLock::new(signed),
             last_sync: RwLock::new(HashMap::new()),
+            last_full: RwLock::new(HashMap::new()),
         })
     }
 
@@ -271,26 +305,75 @@ impl SequenceStore {
         }
     }
 
-    async fn fetch_if_newer(
-        &self,
-        key: &SeqKey,
-        from: [u8; 32],
-        local_len: u64,
-    ) -> Option<AccountSequence> {
-        let rec = self
+    async fn fetch_if_newer(&self, key: &SeqKey, from: [u8; 32], local_len: u64) -> HeadReply {
+        let rec = match self
             .routing
             .resolve_app(NodeId(from), &sequence_head_name(&key.0, &key.1, &key.2))
             .await
-            .ok()??;
+        {
+            Ok(Some(rec)) => rec,
+            // No head published, or the lookup failed: either way this peer told us NOTHING. It must not
+            // be read as "nothing newer" — that distinction is what lets the writer's answer be final.
+            Ok(None) | Err(_) => return HeadReply::NoAnswer,
+        };
         if rec.version <= local_len + 1 {
-            return None;
+            return HeadReply::UpToDate; // it answered: it has nothing we lack
         }
-        let bytes = self
+        match self
             .obj
             .get_following_manifest(rec.wasm_cid, ConsumeMode::Drop)
             .await
-            .ok()?;
-        AccountSequence::decode(&bytes)
+        {
+            Ok(bytes) => match AccountSequence::decode(&bytes) {
+                Some(seq) => HeadReply::Newer(seq),
+                None => HeadReply::NoAnswer, // undecodable → treat as no answer, keep looking
+            },
+            Err(_) => HeadReply::NoAnswer, // announced a head we cannot fetch → keep looking
+        }
+    }
+
+    /// This sequence's committed length as we hold it.
+    async fn local_len(&self, key: &SeqKey) -> u64 {
+        self.sequences
+            .read()
+            .await
+            .get(key)
+            .map_or(0, |s| s.next_nonce())
+    }
+
+    /// Is a FULL census round due for `key` (see [`FULL_ANTI_ENTROPY`])? Check-and-set, so the writer
+    /// fast path serves every other read.
+    async fn full_round_due(&self, key: &SeqKey) -> bool {
+        let mut last = self.last_full.write().await;
+        match last.get(key) {
+            Some(t) if t.elapsed() < FULL_ANTI_ENTROPY => false,
+            _ => {
+                last.insert(*key, Instant::now());
+                true
+            }
+        }
+    }
+
+    /// Validate `fetched` and adopt it if it strictly extends what we hold. Returns whether we now hold
+    /// it (or already did) — i.e. whether the question is settled. Enforces the same two invariants as
+    /// the census path: it must be THIS account's sequence, fully quorum-authorized, and it must EXTEND
+    /// our committed prefix (a divergence at any committed nonce is a fork — refuse it, safety over
+    /// liveness), which is exactly why the writer's word is not taken on trust.
+    async fn adopt(&self, key: &SeqKey, fetched: AccountSequence, quorum: &Quorum) -> bool {
+        if fetched.account != key.2 || !fetched.verify(quorum) {
+            return false;
+        }
+        let mut seqs = self.sequences.write().await;
+        let cur = seqs.get(key);
+        let cur_len = cur.map_or(0, |s| s.next_nonce());
+        if cur.is_some_and(|c| !extends(c, &fetched)) {
+            return false; // fork — refuse, and let the census path look for an honest replica
+        }
+        if fetched.next_nonce() > cur_len {
+            self.persist(key, &fetched);
+            seqs.insert(*key, fetched);
+        }
+        true
     }
 
     /// Pull an account's sequence from census peers and adopt the longest one that (a) verifies under
@@ -303,6 +386,30 @@ impl SequenceStore {
         };
         if !quorum.is_intersection_sized() {
             return; // a non-intersection-sized quorum can equivocate; never sequence under it
+        }
+        // WRITER FIRST. `key.2` is the account, and an account chain has exactly ONE author (the
+        // sequencer gates every write on `owner_authentic`), so THAT account's head record is
+        // authoritative on the chain's length: if it says nothing is newer, that is a fact, not a sample.
+        // Resolving every census peer's record to answer a question one record settles was the actual
+        // cost here — it made a single read O(census) signed lookups, and the economy's readers
+        // (settlement per participant, the cheque tick's paid_total per census node, a balance fold's
+        // resolve_debit per Claim) multiplied that into the quadratic that burned an idle fleet.
+        //
+        // This does NOT depend on the account being online: `resolve_app` is a DHT GET of its published
+        // record, and the bytes come from obj. Skipped only when a FULL round is due (the record may have
+        // expired while peers still announce copies) or when we ARE the account (our own record tells us
+        // nothing we do not already hold).
+        if !self.full_round_due(key).await && key.2 != self.me() {
+            let local_len = self.local_len(key).await;
+            match self.fetch_if_newer(key, key.2, local_len).await {
+                HeadReply::Newer(fetched) => {
+                    if self.adopt(key, fetched, &quorum).await {
+                        return; // authoritative + adopted
+                    }
+                }
+                HeadReply::UpToDate => return, // the sole writer says we are current — done
+                HeadReply::NoAnswer => {}      // writer offline → fall through to the census
+            }
         }
         let targets: Vec<[u8; 32]> = {
             let guard = self.membership.read().await;
@@ -317,30 +424,14 @@ impl SequenceStore {
                 .collect()
         };
         for peer in targets {
-            let local_len = self
-                .sequences
-                .read()
-                .await
-                .get(key)
-                .map_or(0, |s| s.next_nonce());
-            let Some(fetched) = self.fetch_if_newer(key, peer, local_len).await else {
-                continue;
+            let local_len = self.local_len(key).await;
+            let HeadReply::Newer(fetched) = self.fetch_if_newer(key, peer, local_len).await else {
+                continue; // nothing newer here, or nothing said
             };
-            if fetched.account != key.2 || !fetched.verify(&quorum) {
-                continue; // must be for this account and fully quorum-authorized
-            }
-            let mut seqs = self.sequences.write().await;
-            let cur = seqs.get(key);
-            let cur_len = cur.map_or(0, |s| s.next_nonce());
-            // Non-equivocation: the fetched sequence must EXTEND ours — identical commits on the
-            // shared prefix. A divergence at any committed nonce is a fork; refuse it.
-            if cur.is_some_and(|c| !extends(c, &fetched)) {
-                continue;
-            }
-            if fetched.next_nonce() > cur_len {
-                self.persist(key, &fetched);
-                seqs.insert(*key, fetched);
-            }
+            // Same `adopt` the writer path uses — the account/quorum/non-equivocation invariants live in
+            // ONE place, so the fast path cannot drift from the fallback and quietly accept a fork.
+            // Keep walking: this adopts progressively, ending on the longest honest sequence offered.
+            self.adopt(key, fetched, &quorum).await;
         }
     }
 

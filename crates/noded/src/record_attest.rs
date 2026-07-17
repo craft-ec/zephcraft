@@ -124,6 +124,7 @@ mod tests {
     fn record(epoch: u64, provider: u8, amount: u64) -> RewardRecord {
         RewardRecord {
             epoch,
+            pool: 0, // not under test (attestation grouping)
             shares: vec![Share {
                 provider: [provider; 32],
                 amount,
