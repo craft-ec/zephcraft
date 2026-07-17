@@ -2575,21 +2575,30 @@ Phases (each: build + test + gate + commit; roll together where consensus-affect
 - [x] **P9 ROLLED + LIVE (2026-07-17).** Gate 🟢 (A-G 8/8, 785s). Simultaneous 5-node roll; peers=4, no errors.
       **`token` cid 2bb1ca0f… UNCHANGED ⇒ balances SURVIVED** (published, not re-pinned — already pinned there);
       only `economy-egress` re-pinned (69fc8d3b…). Exactly as predicted from the byte-comparison.
-- [x] **P10 — MY OWN REGRESSION: the dashboard became the hot path (2026-07-17).**
-      Post-P9 measurement CONTRADICTED my prediction: Mac **3.0% → 47.9%**, zeph2/3/4 ~12.9% → ~15.5%, zeph
-      40.6% → 38.8% (writer-first barely moved it). Profiled instead of guessing: `control::State::snapshot`
-      (80) → `record_chain::canonical_record` (68) → `sequence_of` (82) → `fetch_if_newer` (81) → `DhtNode::get`
-      (191). **The records-derived dashboard WAS the burn**: `owed_from_records` + `my_view_from_records` each
-      walked the claim window (8 epochs × 4 committee members → sequence_of → DHT) on EVERY snapshot, and the
-      dashboard is HTTP-polled ~1/s (a browser was open). I fixed "reads 0" by making it read constantly —
-      writer-first genuinely helped, my own dashboard change swamped it.
+- [x] **P10 — dashboard read-amplification, cached (2026-07-17). NOTE: my "regression" claim was OVERSTATED —
+      user caught it.**
+      I reported Mac **3.0% → 47.9%** post-P9 and called it a 16x regression. WRONG, two ways: (1) `ps -o pcpu`
+      is a LIFETIME average — 47.9% at 8min uptime was dominated by an expensive startup; the same process read
+      **14.7% at 17min**, and instantaneous samples were 9.8–23.8% (user independently observed 8–15%). (2) The
+      comparison was CONFOUNDED: `State::snapshot` was 80 profile samples during my measurement vs 4 later — the
+      dashboard was being actively HTTP-polled then and not now — so I compared P7-without-polling against
+      P9-with-polling and blamed the delta entirely on my code.
+      **What SURVIVES the correction (the reason the fix still ships):** the profile unambiguously showed
+      `control::State::snapshot` (80) → `record_chain::canonical_record` (68) → `sequence_of` (82) →
+      `fetch_if_newer` (81) → `DhtNode::get` (191) — so the records-derived dashboard IS the hot path WHEN
+      POLLED. `owed_from_records` + `my_view_from_records` each walked the claim window (8 epochs × 4 committee
+      members → sequence_of → DHT) on EVERY snapshot, ~1/s. Re-deriving per-second data that changes per 5-min
+      epoch is waste at any magnitude.
       FIX: (1) ONE walk serves all four figures (they read the same records — walking twice doubled cost for
       nothing); (2) CACHE it (`VIEW_TTL` 20s) — the records advance once per 5-min EPOCH while the dashboard
       polls every second, so per-poll derivation was pure waste and 20s is still far fresher than the data.
       `derive_view` collects the window newest-first then reuses the pure, unit-tested `sum_unclaimed_shares`
       for `owed` (keeping the tested helper in the live path rather than orphaning it).
-      **LESSON: a "read it from the durable chain" fix is a READ-AMPLIFICATION risk — check the caller's poll
-      rate against the data's change rate BEFORE deriving per call.**
+      **LESSONS:** (a) a "read it from the durable chain" fix is a READ-AMPLIFICATION risk — check the caller's
+      poll rate against the data's change rate BEFORE deriving per call. (b) **`ps -o pcpu` is a LIFETIME
+      average, useless for steady state on a young process** — sample instantaneously, past startup, and hold the
+      load (here: dashboard polling) CONSTANT across the A and B. I have now twice drawn a confident conclusion
+      from an uncontrolled CPU comparison.
       **STILL OPEN:** hetzner `zeph` main ~38.8% — writer-first moved it only ~2pts, so its load is NOT the
       sequencer fan-out (governor/seed/hub work + health_scan_chunk showed up hot in the profile). Needs its own
       investigation. push-on-commit / SQL-index remains the user's architecture, undesigned.

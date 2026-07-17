@@ -73,8 +73,8 @@ impl EconomyEgressService {
     ///
     /// ONE walk of the claim window serves all four figures: they read the same records, so walking
     /// twice doubled the cost for nothing. CACHED for [`VIEW_TTL`] — the records advance once per epoch
-    /// while the dashboard polls every second, and deriving per poll made this the node's hottest path
-    /// (measured: it took an idle node from 3% to ~48% CPU).
+    /// while the dashboard polls every second, and profiling a polled node showed this derivation at the
+    /// top of the stack.
     ///
     /// `claimed` is the account's own on-chain dedup set: TOKEN is the authority on what it has already
     /// taken, and economy must not call token (the one-directional boundary), so the caller — which holds
@@ -211,10 +211,13 @@ pub struct MyView {
 
 /// How long a derived [`MyView`] is served from cache.
 ///
-/// The records chain only advances ONCE PER EPOCH (5 min), but the dashboard is polled every second or
-/// so — and each derivation walks the claim window (epochs × committee members → `sequence_of` → DHT).
-/// Deriving per poll made the dashboard the node's hottest path; the data cannot change faster than an
-/// epoch, so anything well under that is free freshness.
+/// The records chain only advances ONCE PER EPOCH (5 min), but the dashboard is HTTP-polled every second
+/// or so — and each derivation walks the claim window (epochs × committee members → `sequence_of` →
+/// DHT). Profiling a polled node put `snapshot → canonical_record → sequence_of → DhtNode::get` at the
+/// top, so the derivation is the hot path WHEN POLLED. (An earlier note here claimed it cost ~45pts of
+/// CPU; that compared `ps` LIFETIME averages across runs with different poll load and is withdrawn — the
+/// justification is the profile, not that number.) Re-deriving data that cannot change faster than an
+/// epoch, once per second, is waste at any magnitude; anything well under an epoch is free freshness.
 const VIEW_TTL: Duration = Duration::from_secs(20);
 
 /// The pure core of [`EconomyEgressService::owed_from_records`]: sum `account`'s shares across `window`,
