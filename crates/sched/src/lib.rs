@@ -103,8 +103,8 @@ impl JobClass {
             JobClass::Scale // scale:{cid} AND scale_quota
         } else if key == "distribute_pending" {
             JobClass::Distribute
-        } else if key == "eviction" {
-            JobClass::Eviction
+        } else if key == "eviction" || key.starts_with("shed:") {
+            JobClass::Eviction // periodic eviction AND per-cid surplus shed (shed:{cid})
         } else {
             JobClass::Other
         }
@@ -896,6 +896,7 @@ mod tests {
             ("scale_quota", Scale),
             ("distribute_pending", Distribute),
             ("eviction", Eviction),
+            ("shed:abc", Eviction),
         ];
         for (key, want) in cases {
             assert_eq!(

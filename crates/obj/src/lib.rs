@@ -2708,72 +2708,87 @@ impl ObjEngine {
     /// unevenly-distributed surplus still leans on the periodic scan's rotation to finish; this handles the
     /// common case (a returning holder's modest surplus) as an event.
     pub async fn shed_cid(&self, cid: Cid) -> usize {
-        let Some(_gen) = self.store.generation(&cid) else {
+        let Some(gen) = self.store.generation(&cid) else {
             return 0;
         };
-        if self.store.is_tombstoned(&cid) || self.store.is_pinned(&cid) {
-            return 0; // a pin is a deliberate "keep it"; never shed under one
+        // Never shed under a pin (a deliberate "keep it") or a tombstone, and never below a safe floor of
+        // our own pieces.
+        if self.store.is_tombstoned(&cid)
+            || self.store.is_pinned(&cid)
+            || self.store.piece_count(&cid) <= 2
+        {
+            return 0;
         }
-        let k = _gen.k as usize;
+        let k = gen.k as usize;
         let me = self.transport.node_id();
         let epoch = self.transport.clock().now().0 / HEALTH_EPOCH_MS;
         let providers = self.routing.resolve(cid).await.unwrap_or_default();
         let alive_set = self.alive_peers().await;
+
+        // PROBE-VERIFY every holder before trusting its count — shedding is DESTRUCTIVE and asymmetric with
+        // repair. A shed is never re-announced (until this fn's own re-announce below shipped, and still not
+        // by the scan), so provider records run stale-HIGH for up to REPUBLISH_MS (~22h). Summing them raw
+        // — which repair may safely do, since an over-count there only UNDER-repairs — would let us shed
+        // real pieces against phantom copies and drive the TRUE total below the floor (unrecoverable once
+        // below k). So we count only pieces a holder CONFIRMS it holds right now; an unverifiable holder
+        // (evicted, slow, unreachable) counts as ZERO. The scan can trust a slow probe because it sheds one
+        // piece per pass and re-checks; for the destructive multi-consumer path we must not.
+        let candidates: Vec<(NodeId, PeerAddr)> = providers
+            .iter()
+            .filter(|p| p.node_id != me)
+            .filter(|p| alive_set.as_ref().is_none_or(|s| s.contains(&p.node_id)))
+            .map(|p| (p.node_id, p.addr.clone()))
+            .collect();
+        let verified: Vec<(NodeId, u32, bool)> = futures::stream::iter(candidates)
+            .map(|(id, addr)| async move {
+                match self.probe_availability(cid, &addr).await {
+                    Some(ack) if ack.has => (id, ack.piece_count, ack.pinned),
+                    _ => (id, 0, false),
+                }
+            })
+            .buffer_unordered(PROBE_CONCURRENCY)
+            .collect()
+            .await;
         let mut have = self.store.piece_count(&cid);
         let mut shedders: Vec<NodeId> = Vec::new();
-        for p in &providers {
-            if p.node_id == me {
-                continue;
+        for (id, count, pinned) in verified {
+            if count == 0 && !pinned {
+                continue; // verified non-holder — do not count it toward surplus
             }
-            let is_alive = match &alive_set {
-                Some(set) => set.contains(&p.node_id),
-                None => self.probe_alive(p.node_id, &p.addr).await,
-            };
-            if !is_alive {
-                continue;
-            }
-            have += p.piece_count as usize;
-            if p.piece_count > 2 && !p.pinned {
-                shedders.push(p.node_id);
+            have += count as usize;
+            if count > 2 && !pinned {
+                shedders.push(id);
             }
         }
+
         let floor = target_pieces(k);
         let delta = (floor / 8).max(2);
-        // OFFSET, re-checked at execution: only cold surplus ABOVE the band sheds. If the holder that made
-        // this surplus has since left, `have` is back in (or below) the band and we shed nothing — the
+        // OFFSET, re-checked at execution: only COLD surplus above the band sheds. If the holder that made
+        // this surplus has since left, verified `have` is back in the band and we shed nothing — the
         // departure and this queued shed have cancelled, which is the whole point of doing it lazily.
         let cold = self.served_pulls(&cid) < self.config.degrade_threshold;
         if !cold || have <= floor + delta {
             return 0;
         }
-        // Elect ONE shedder (rendezvous, epoch-rotated) so survivors do not all shed the same cid at once.
-        if self.store.piece_count(&cid) > 2 {
-            shedders.push(me);
-        }
+        // Elect ONE shedder by rendezvous and shed exactly ONE piece. One-per-invocation is the safety
+        // margin: if two nodes both win at an epoch boundary (clock skew), the race costs at most one piece
+        // each — a couple of surplus pieces, never the floor. Larger surplus drains across repeated events
+        // and the scan backstop; with §5 part 3 (don't mint on absence) there is no large surplus anyway.
+        shedders.push(me);
         let winner = shedders
             .iter()
             .max_by_key(|id| rendezvous_score(id, &cid, epoch));
-        if winner != Some(&me) {
+        if winner != Some(&me) || !self.shed_one(&cid) {
             return 0;
         }
-        // Shed our excess above our fair share, and never take the TOTAL below the BAND TOP (floor+delta),
-        // not merely the floor. Event-shed removes only the CLEAR surplus above the band and leaves the
-        // whole cushion intact; the scan's Schmitt trims the band itself if it stays cold. The extra delta
-        // of headroom is deliberate slack: two nodes could both win the shedder election at an epoch
-        // boundary (clock skew), and each stopping at floor+delta keeps their combined shed off the floor.
-        let holders = shedders.len().max(1);
-        let fair_share = (floor / holders).max(2);
-        let mut shed = 0usize;
-        let mut total = have;
-        while self.store.piece_count(&cid) > fair_share
-            && total > floor + delta
-            && !self.store.is_pinned(&cid)
-            && self.shed_one(&cid)
-        {
-            shed += 1;
-            total -= 1;
-        }
-        shed
+        // Re-announce our new, LOWER count so peers stop counting the shed piece. The MISSING re-announce
+        // after a shed is exactly what let records run stale-high; closing it here keeps this path's own
+        // future decisions honest even before a global fix.
+        let _ = self
+            .routing
+            .announce(cid, self.store.piece_count(&cid) as u32, false)
+            .await;
+        1
     }
 
     /// The body of a Repair coordinator job: re-detect and (if this node is
