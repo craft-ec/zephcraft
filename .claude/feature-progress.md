@@ -2599,6 +2599,28 @@ Phases (each: build + test + gate + commit; roll together where consensus-affect
       average, useless for steady state on a young process** — sample instantaneously, past startup, and hold the
       load (here: dashboard polling) CONSTANT across the A and B. I have now twice drawn a confident conclusion
       from an uncontrolled CPU comparison.
+- [ ] **OPEN ISSUE — Mac (relay-only/NAT) receives ~700KB/s–1.5MB/s idle over a DIRECT IPv6 QUIC path
+      (2026-07-17). NOT the economy layer. Traced, not solved.**
+      User reported high idle received volume. Traced by elimination + tcpdump:
+      - **NOT the dashboard** (0 `snapshot` samples with it closed — though it IS a real read-amplifier when
+        open, fixed separately), **NOT repairs** (`repaired=0` fleet-wide), **NOT post-restart reannounce**
+        (predicted decay; measured NO decay 22min in), **NOT the relay** (relay TCP:443 flows are ~1.7 KB/s each).
+      - **IT IS:** a direct IPv6 QUIC flow `zeph4:36343 ↔ mac:60839` — **704 KB/s sustained, 6092 pkts/10s**;
+        the Mac's udp6 socket has taken **2.19 GB** (vs udp4 120MB, relays ~11MB). Despite `reach=relayed`,
+        iroh hole-punched a direct IPv6 path and that carries ALL the volume.
+      - **KEY ASYMMETRY (the user's question that cracked it):** hetzner box eth0 rx = **64 KB/s TOTAL for 4
+        nodes** (~16 KB/s each) vs the Mac's ~1.5 MB/s — ~90x. It is ONE node (zeph4), not the fleet. That
+        single fact killed every fleet-wide hypothesis at once.
+      - **The signature:** Mac store +0 KB and dht_records +0 B over 45s while ~67MB should have arrived ⇒ the
+        bytes are RECEIVED AND NOT STORED; zeph4's log shows only pings; invisible to CPU profiling (I/O-bound).
+        Data nobody logs and nobody stores = a TRANSPORT-level loop (retransmits / wedged stream / churn), not
+        application work. Fits [[zeph-iroh-endpoint-wedge]] + [[zeph-connection-churn-flapping]]; the Mac is on a
+        phone hotspot (172.20.10.5, RTT 254–468ms) — the lossy path where QUIC retransmit pathologies appear.
+      - **NEXT:** iroh connection stats (retransmit counters / path events) or capture whether those packets are
+        DISTINCT payloads vs repeats. Needs deliberate instrumentation; do NOT guess again.
+      - **METHOD NOTE:** I called a cause 4x and was wrong 4x (dashboard scale, health scan, decay, relay) — each
+        a plausible story ahead of evidence. What worked: the user's "does the hetzner node also receive as much?"
+        (an asymmetry test), then per-CONNECTION accounting (`nettop -x`, not `-P`), then tcpdump.
       **STILL OPEN:** hetzner `zeph` main ~38.8% — writer-first moved it only ~2pts, so its load is NOT the
       sequencer fan-out (governor/seed/hub work + health_scan_chunk showed up hot in the profile). Needs its own
       investigation. push-on-commit / SQL-index remains the user's architecture, undesigned.
