@@ -324,3 +324,37 @@ fn put_content_without_generation_fails_loud() {
         "put_content without put_generation must error, not orphan"
     );
 }
+
+#[test]
+fn bookkeeping_objects_are_never_reported_as_holdings() {
+    // The holdings manifest is stored like anything else, so without this flag it lands in the very set it
+    // describes: publishing a manifest changes the holdings, which publishes another manifest, forever.
+    // Measured on the live fleet before the flag existed: +3-4 cids/min/node on an IDLE fleet, against a
+    // provably flat store once manifests were off. `cids()` keeps reporting everything we physically hold;
+    // only the holdings VIEW excludes the bookkeeping about itself.
+    let dir = tempfile::tempdir().unwrap();
+    let mut rng = StdRng::seed_from_u64(7);
+    let data: Vec<u8> = (0..K * PIECE_LEN).map(|_| rng.gen()).collect();
+    let manifest: Vec<u8> = (0..K * PIECE_LEN).map(|_| rng.gen()).collect();
+    let (data_cid, manifest_cid) = (Cid::of(&data), Cid::of(&manifest));
+
+    {
+        let store = Store::open(dir.path()).unwrap();
+        for (cid, bytes) in [(data_cid, &data), (manifest_cid, &manifest)] {
+            let (gen, sources) = generation(bytes, &mut rng);
+            store.put_generation(cid, gen).unwrap();
+            for piece in encode_n(&sources, 2, &mut rng).unwrap() {
+                store.put_piece(cid, &piece).unwrap();
+            }
+        }
+        store.mark_not_holdings(&manifest_cid).unwrap();
+
+        assert_eq!(store.holdings_cids(), vec![data_cid]);
+        assert_eq!(store.cids().len(), 2, "we still physically hold both");
+    }
+
+    // The marker MUST survive a restart. In memory only, a restarted node re-adopts its own old manifests
+    // as holdings and republishes them as data — reopening the loop it was meant to close.
+    let store = Store::open(dir.path()).unwrap();
+    assert_eq!(store.holdings_cids(), vec![data_cid]);
+}

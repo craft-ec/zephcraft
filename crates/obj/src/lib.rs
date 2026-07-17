@@ -1398,6 +1398,44 @@ impl ObjEngine {
     /// NOT pinned (no whole-content copy on the owner). Instead a WANT keeps it
     /// alive network-wide so it never fades; the `system` marker excludes it from
     /// user commands + local eviction. Returns its CID.
+    /// Publish an object that must be FETCHABLE while we are alive, but must NEVER spread to the fleet:
+    /// no erasure distribution, no peer copies, and never counted as our own holdings.
+    ///
+    /// The holdings manifest is the case this exists for, and distributing one is worse than useless.
+    /// It is a live self-description: readers fold it into their own index long before its author can die,
+    /// and `on_death` then works off that index without ever fetching — so a dead node's manifest has no
+    /// readers, and fleet-durability for it buys nothing. What it COSTS is severe: every distributed copy
+    /// lands in another node's store, changing that node's holdings, which makes it republish its own
+    /// manifest, which lands in ours. N nodes then republish every tick forever, each publish guaranteeing
+    /// the next. Measured on the live fleet: +3-4 cids/min/node on an IDLE fleet, against a provably flat
+    /// store with manifests off. The object is marked not-holdings so it never re-enters the set it describes.
+    pub async fn publish_local(&self, data: &[u8]) -> anyhow::Result<Cid> {
+        anyhow::ensure!(!data.is_empty(), "refusing to publish empty content");
+        let cid = Cid::of(data);
+        let piece_len = data.len().div_ceil(self.config.k).max(1);
+        let sources = self.split_sources(data, piece_len, self.config.k);
+        let mut rng = OsRng;
+        let tags = vtags::generate(&sources, &mut rng)?;
+        let gen = Generation {
+            k: self.config.k as u32,
+            piece_len: piece_len as u64,
+            total_len: data.len() as u64,
+            vtags: postcard::to_allocvec(&tags)?,
+        };
+        self.store.put_generation(cid, gen)?;
+        // SYSTEM so our own copy is exempt from eviction (nothing else keeps it alive: no want, no pin),
+        // and not-holdings so it never counts as part of the set it describes.
+        self.store.mark_system(&cid)?;
+        self.store.mark_not_holdings(&cid)?;
+        if !self.store.has_content(&cid) {
+            self.store.put_content(cid, data, false)?;
+        }
+        // Announce ourselves as the provider: we are the ONLY one, so a reader that cannot reach us simply
+        // does not learn our holdings — which is the correct outcome, not a durability loss.
+        let _ = self.routing.announce(cid, 1, false).await;
+        Ok(cid)
+    }
+
     pub async fn publish_system(&self, data: &[u8]) -> anyhow::Result<Cid> {
         let report = self.publish_impl(data, false, true, self.config.k).await?;
         Ok(report.cid)

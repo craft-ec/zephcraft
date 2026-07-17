@@ -71,6 +71,13 @@ struct CidState {
     /// System object (a CraftSQL page generation): managed by the DB layer, not
     /// the user — excluded from user pin/unpin/delete/want and from eviction.
     system: bool,
+    /// Bookkeeping ABOUT this store, so it must never be counted as part of what the store holds.
+    ///
+    /// The holdings manifest is what this exists for. A manifest that listed itself would change the set
+    /// it describes every time it published — manufacturing the very churn it reports, forever. Measured
+    /// on the live fleet before this flag: +3-4 cids/min/node on an IDLE fleet, versus a provably flat
+    /// store with manifests off.
+    not_holdings: bool,
     has_content: bool,
     last_access: u64,
 }
@@ -206,6 +213,7 @@ impl Store {
                 let has_content = dir.join("content").exists();
                 let pinned = dir.join("pinned").exists();
                 let system = dir.join("system").exists();
+                let not_holdings = dir.join("not-holdings").exists();
                 index.insert(
                     cid,
                     CidState {
@@ -213,6 +221,7 @@ impl Store {
                         piece_ids,
                         pinned,
                         system,
+                        not_holdings,
                         has_content,
                         last_access: now(),
                     },
@@ -243,6 +252,7 @@ impl Store {
             piece_ids: HashSet::new(),
             pinned: false,
             system: false,
+            not_holdings: false,
             has_content: false,
             last_access: now(),
         });
@@ -350,6 +360,33 @@ impl Store {
             state.system = false;
         }
         Ok(())
+    }
+
+    /// Mark a cid as bookkeeping ABOUT the store — never part of the holdings it reports.
+    ///
+    /// NB the marker file is `not-holdings`, NOT `meta`: `meta` is already the generation metadata, and
+    /// writing an empty marker there erases it, dropping the object from the index on the next reopen.
+    ///
+    /// Persisted as a marker file so it survives a restart — otherwise a restarted node would re-adopt
+    /// its own old manifests as holdings and republish them as if they were data.
+    pub fn mark_not_holdings(&self, cid: &Cid) -> Result<()> {
+        write_atomic(&self.cid_dir(cid).join("not-holdings"), b"")?;
+        if let Some(state) = self.index.lock().expect("index").get_mut(cid) {
+            state.not_holdings = true;
+        }
+        Ok(())
+    }
+
+    /// The cids this node HOLDS, for the purpose of reporting holdings — everything except the
+    /// bookkeeping that describes the holdings themselves. See [`CidState::meta`].
+    pub fn holdings_cids(&self) -> Vec<Cid> {
+        self.index
+            .lock()
+            .expect("index")
+            .iter()
+            .filter(|(_, s)| !s.not_holdings)
+            .map(|(c, _)| *c)
+            .collect()
     }
 
     pub fn is_system(&self, cid: &Cid) -> bool {

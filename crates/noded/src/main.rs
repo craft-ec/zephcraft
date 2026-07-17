@@ -1952,9 +1952,6 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
     // rather than a store hook only because the store has no change signal yet; the cost is one cheap
     // comparison, not an O(N) DHT sweep.
     //
-    // KNOWN LIMIT (design's "manifest size" gap): `cids()` collects the whole set, and a publish encodes it
-    // whole (~32 MB at 1M cids). Fine at this fleet's scale, and the reason P1 must gain a Merkle root +
-    // diffs before any large store.
     let manifests = std::sync::Arc::new(manifest::ManifestStore::new(
         identity.clone(),
         engine.clone(),
@@ -1967,7 +1964,9 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 tick.tick().await;
-                let cids = eng.store().cids();
+                // holdings_cids(), NOT cids(): the manifest objects themselves are META and must never
+                // enter the set they describe, or every publish manufactures the next one's change.
+                let cids = eng.store().holdings_cids();
                 if let Some(version) = manifests.publish(cids).await {
                     tracing::info!(version, "published holdings manifest");
                 }

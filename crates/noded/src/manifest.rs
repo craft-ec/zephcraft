@@ -349,7 +349,7 @@ impl ManifestStore {
             sig,
         };
         let bytes = postcard::to_allocvec(&manifest).ok()?;
-        let cid = self.obj.publish_system(&bytes).await.ok()?;
+        let cid = self.obj.publish_local(&bytes).await.ok()?;
         // The head is the cheap signal: content-addressed, so a changed cid IS a changed claim.
         self.routing
             .announce_app(HOLDINGS_NAME, cid, version)

@@ -157,20 +157,37 @@ impl DeathRepair {
         loop {
             tokio::time::sleep(ANTI_ENTROPY_TICK).await;
             let alive = self.membership.liveness_census().await;
+            let (mut checked, mut readable) = (0usize, 0usize);
             for (peer, _) in alive {
                 if peer.0 == self.me {
                     continue;
                 }
-                self.check_peer(peer.0).await;
+                checked += 1;
+                if self.check_peer(peer.0).await {
+                    readable += 1;
+                }
             }
+            // A pass that reads NOTHING looks exactly like a healthy quiet fleet from the outside, and an
+            // unpopulated index makes death-driven repair a silent no-op. Report the pass so the
+            // difference is visible without a redeploy.
+            let indexed = self.holders.lock().await.len();
+            tracing::info!(
+                peers = checked,
+                readable,
+                indexed_cids = indexed,
+                "manifest anti-entropy pass"
+            );
         }
     }
 
     /// One peer: has its holdings changed, and did it LOSE anything we can repair?
-    async fn check_peer(&self, peer: [u8; 32]) {
+    ///
+    /// Returns whether its manifest was READABLE — an unreadable peer contributes nothing to the index,
+    /// and an empty index makes every death a silent no-op.
+    async fn check_peer(&self, peer: [u8; 32]) -> bool {
         let known = self.heads.lock().await.get(&peer).copied();
         let Some(changes) = self.manifests.changes_since(peer, known).await else {
-            return; // no manifest, or an unusable chain — the scan is the backstop for that
+            return false; // no manifest head, or an unusable chain — the scan is the backstop for that
         };
         // First sight is a BASELINE, not a loss event — same reasoning as the census `primed` guard:
         // otherwise a joining node reads every peer's manifest as fresh loss and repairs the fleet.
@@ -188,7 +205,7 @@ impl DeathRepair {
             } => {
                 if added.is_empty() && removed.is_empty() {
                     self.heads.lock().await.insert(peer, (version, head));
-                    return; // unchanged — the O(1) steady state: nothing fetched, nothing indexed
+                    return true; // unchanged — the O(1) steady state: nothing fetched, nothing indexed
                 }
                 let lost = self.apply_delta(peer, &added, &removed).await;
                 (version, head, lost)
@@ -200,10 +217,11 @@ impl DeathRepair {
         };
         self.heads.lock().await.insert(peer, (version, head));
         if first_sight || lost.is_empty() {
-            return; // a baseline, or it GREW/churned elsewhere — gaining cids is not a durability event
+            return true; // a baseline, or it GREW/churned elsewhere — gaining cids is not a durability event
         }
         self.repair_our_share(&lost, peer, "anti-entropy: holder dropped cids")
             .await;
+        true
     }
 
     /// Fold a peer's ADDED/REMOVED into the index, keeping only cids we hold, and return the ones it used
@@ -286,8 +304,16 @@ impl DeathRepair {
                 .collect()
         };
         if shared.is_empty() {
-            // Either it held nothing we hold, or we never saw its manifest. The two are indistinguishable
-            // here, which is why the periodic scan remains the backstop until P5: silence is not proof.
+            // Either it held nothing we hold, or we never saw its manifest — REPORT which. Silently
+            // returning made a totally broken index (nothing indexed, ever) look exactly like a healthy
+            // "nothing to do", which is precisely how this path shipped dead: the fleet logged nothing on a
+            // real death and nothing is what a working quiet fleet logs too.
+            let indexed = self.holders.lock().await.len();
+            tracing::warn!(
+                node = %hex::encode(&dead[..6]),
+                indexed_cids = indexed,
+                "death: nothing of ours indexed for this peer — no repair (index empty ⇒ we never read its manifest)"
+            );
             return;
         }
         // It is gone: stop counting it toward durability before electing, or it could be elected to repair.
