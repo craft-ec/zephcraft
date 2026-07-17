@@ -66,7 +66,7 @@ This is the same pattern the codebase already uses twice and should not invent a
 
 | Layer | Catches | Cost |
 |---|---|---|
-| **Death-driven repair** — SWIM `Dead` → read the dead node's last manifest → repair its cids | node death (the common case) | O(dead node's set), only on an event |
+| **Death-driven repair** — SWIM `Dead` → intersect the local index → rendezvous-elect → repair | node death (the common case) | election O(1) local; **execution O(elected) DHT resolves** — see note | 
 | **Manifest anti-entropy** — compare signed roots, drill into diffs | loss the holder KNOWS about (eviction, deliberate drops) + missed death events. **NOT** unaware loss — see below | O(1) compare, O(diff) reconcile |
 | **Availability probe (K8)** — ask a holder for a cid | loss the holder does NOT know about (bytes gone, index intact) | O(probed cids) |
 | **PDP sampling** (K5) | a node **lying** — claiming a manifest it cannot back | O(k) challenges, independent of N |
@@ -80,6 +80,28 @@ They cover each other's blind spots, and none is sufficient alone:
 
 **PDP is what makes a manifest trustworthy.** A signed claim + random spot-checks is a far stronger
 primitive than either half. K5 is already in the tracker; this design is its first real consumer.
+
+**Measured on the live fleet [2026-07-17], and a correction to the cost column.** Killing a node holding
+~3600 cids: SWIM converged to `Dead` in 25s, the per-cid rendezvous election partitioned the set across the
+three survivors (1214 / 1259 / 1242 elected, sum 3715 vs ~3600 candidates ≈ 3% overlap — the safe kind:
+two survivors both elect, one mints, the other's `repair_cid` finds it already at floor and no-ops), 281
+pieces re-minted, last-holder cases first. So the coordination-free election is validated (on an easy,
+high-overlap topology — see §6). BUT the *execution* took **2h36m**. The election is O(1) local; the
+execution is O(elected) DHT resolves (`repair_cid` re-resolves providers per cid, the probe-before-repair
+safety), and at ~3.8s/resolve that is hours for a large node. Two fixes this forced:
+- **`on_death` is now SPAWNED, not awaited inline.** It ran on the census-watcher thread, so the watcher was
+  blind to any further death for the whole 2h36m — proven by the victim's rejoin not registering until the
+  instant repair finished. A detector must not be held hostage by its executor, least of all under the
+  correlated failure this whole layer is for.
+- **`repair_our_share` now logs START + progress + DONE**, not only DONE. A multi-hour grind that speaks only
+  at the end is indistinguishable from a hang or a no-op — which is why two earlier live tests read as
+  failures while repair was in fact running correctly.
+
+**Open — execution cost.** O(elected) DHT resolves per death is the real remaining cost, and most are
+no-ops (1242 elected, 87 minted). A pre-filter — skip the resolve when the local index still shows enough
+holders — would cut it ~14x, but the index tracks holder NODES not piece COUNTS, so it cannot compute the
+piece floor directly; closing that needs per-holder counts in the index or a cheaper availability signal.
+Deferred, and noted so the "cheap local" framing is not trusted at scale.
 
 ---
 

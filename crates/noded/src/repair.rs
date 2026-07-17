@@ -316,8 +316,11 @@ impl DeathRepair {
 
     /// One node died: repair the share of its holdings that is ours to repair.
     ///
-    /// O(1) LOCAL work to find that share — the index already knows who held what, so a death costs no
-    /// manifest fetch and no DHT lookup at the exact moment the fleet can least afford either.
+    /// Finding and electing the share is O(1) LOCAL — the index already knows who held what, so DECIDING
+    /// what to repair costs no manifest fetch and no DHT lookup. EXECUTING it does not: `repair_our_share`
+    /// runs `repair_cid` per elected cid, each a DHT resolve (probe-before-repair), so the execution is
+    /// O(elected) network and can run for hours (measured: 2h36m for 1242 cids). That is why the caller
+    /// SPAWNS this — a slow execution must not block the census watcher from seeing the next death.
     async fn on_death(&self, dead: [u8; 32]) {
         let shared: Vec<[u8; 32]> = {
             let holders = self.holders.lock().await;
