@@ -3035,3 +3035,37 @@ read it as a seeding bound — wrong frame.)
 path (token purchase, grants, other distributions) draws against the SAME `cumulative_issued` counter
 that `issuance_for` checks and `RewardRecord.cumulative_issued` carries. Today only the seed does. A
 purchase mechanism that minted independently would bypass the cap silently and nothing would detect it.
+
+## FEATURE: LITERAL POOL + TOKEN-OWNED SUPPLY (user decision, 2026-07-18)
+User: "token have multiple use and general counter. it should not be separate. each token has its own
+counter" then "seed also need to handle transfer or mint of token into pool. it should be literal rather
+than advisory. reward claim mint point sounds weird".
+
+**VERIFIED DEFECT (both correct):**
+- `Pay` BURNED: `state.balance.checked_sub(amount)` and nothing else — no account received the tokens.
+- `RewardClaim` MINTED: `state.balance.checked_add(share)` with no debit anywhere.
+- The pool was a NUMBER derived by summing Pay writes. Supply was untracked across the whole cycle, and
+  the pool could never be over-drawn because it did not exist. The two errors netted out in aggregate,
+  which is why nothing caught it.
+- The token program had NO supply concept at all (`grep -ci supply` = 0), while the cap lived in the
+  VALUATION layer — so a future purchase/grant path would bypass it silently.
+
+**CORRECT MODEL (built):** supply changes at exactly ONE point.
+  | Pay         | payer → pool   | conserved |
+  | Seed        | MINT → pool    | +granted (the only mint, behind the cap gate) |
+  | RewardClaim | pool → provider| conserved |
+
+- [x] P1 — `crates/token`: `SupplyState` (minted/cap, `authorize_mint` = THE single mint gate,
+      `total_supply` for CTS-1 L0, monotonic `observe_minted`) + `ProtocolState` (the literal pool:
+      `fold_pay`, `mint_into_pool`, `debit_for_claim`, `conserves`). 4 new tests incl. the invariant
+      `Σ balances + pool == total_supply` walked across a full pay→seed→claim cycle, and
+      `a_claim_cannot_overdraw_the_pool` — which the old mint-on-claim path could not have refused.
+      9/9 token tests green.
+- [ ] P2 — wire it through settlement: `SettlementStore.unallocated` (a bare u64) becomes the real
+      pool; `pay_in` → `fold_pay`; issuance → `mint_into_pool` (replacing the cap check in
+      `reward::issuance_for`, which must stop owning the cap); `claim` → `debit_for_claim`.
+      NOTE: `owed` (settled-but-unclaimed shares) is ALSO protocol-held, so the real invariant is
+      `Σ balances + unallocated + Σ unclaimed owed == total_supply`.
+- [ ] P3 — the authoritative pool + counter persist on the governance-owned chain (design: "the subsidy
+      pool, issuance counter, epoch clock" live there, touched at EPOCH CADENCE not per transfer).
+- [ ] P4 — gate + roll. NOTHING MINTS until the conservation invariant holds end-to-end.

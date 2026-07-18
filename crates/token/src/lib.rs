@@ -37,6 +37,157 @@ pub const DECIMALS: u8 = 8;
 /// `u64` holds ~1.8e11 whole tokens at this scale — vast headroom over any planned cap.
 pub const ONE_TOKEN: u64 = 100_000_000;
 
+/// THE SUPPLY LEDGER — one counter per token, which every path that creates tokens must pass through.
+///
+/// **This is the token's own state, not the valuation layer's.** Deciding *who gets what share* is the
+/// reward program's job; deciding *how much money exists* is the token's, exactly as an ERC-20/SPL
+/// contract owns its `total_supply` while nothing else may mint behind its back. The counter previously
+/// lived in the reward/settlement layer, which meant a second distribution path (token purchase, grants,
+/// anything future) could credit balances without the cap ever seeing it.
+///
+/// **Contract for anyone adding a new distribution mechanism:** call [`SupplyState::authorize_mint`] and
+/// mint only what it grants. It is the single gate; a path that mints without it is not capped by
+/// anything, and no test or invariant elsewhere will catch that.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct SupplyState {
+    /// Total base units brought into existence so far, across ALL issuance paths.
+    minted: u64,
+    /// Hard ceiling on `minted`. Governed; 0 means nothing may ever be minted.
+    cap: u64,
+}
+
+impl SupplyState {
+    pub fn new(minted: u64, cap: u64) -> Self {
+        Self { minted, cap }
+    }
+
+    /// Total supply in existence — the CTS-1 L0 `total_supply` any token must be able to report.
+    pub fn total_supply(&self) -> u64 {
+        self.minted
+    }
+
+    /// The ceiling currently in force.
+    pub fn cap(&self) -> u64 {
+        self.cap
+    }
+
+    /// Base units that may still be minted before the cap binds.
+    pub fn headroom(&self) -> u64 {
+        self.cap.saturating_sub(self.minted)
+    }
+
+    /// Set the GOVERNED cap. Monotonic in the SAFE direction only for lowering is NOT enforced here —
+    /// governance may raise or lower it — but `minted` is never rewritten, so lowering the cap below what
+    /// already exists simply means zero headroom, never a negative supply.
+    pub fn set_cap(&mut self, cap: u64) {
+        self.cap = cap;
+    }
+
+    /// Raise `minted` to at least `value` — used to restore the counter from durable history. Monotonic,
+    /// so a stale or out-of-order read can only ever raise it, never hand back spent headroom.
+    pub fn observe_minted(&mut self, value: u64) {
+        self.minted = self.minted.max(value);
+    }
+
+    /// THE MINT GATE. Grants at most the remaining headroom and advances the counter by exactly what it
+    /// granted. Returns the amount actually authorized, which may be less than requested and may be zero.
+    ///
+    /// Every path that creates tokens goes through here, which is what makes the cap structural rather
+    /// than a convention each path is trusted to honour.
+    pub fn authorize_mint(&mut self, want: u64) -> u64 {
+        let granted = want.min(self.headroom());
+        self.minted = self.minted.saturating_add(granted);
+        granted
+    }
+}
+
+/// The protocol's SHARED economic state — the one PDA-analog. Per `ECONOMIC_LAYER_DESIGN.md`, "the
+/// subsidy pool, issuance counter, epoch clock" live on a governance-owned chain, touched at EPOCH
+/// CADENCE rather than per transfer.
+///
+/// **The pool is LITERAL: it holds tokens.** It used to be a number derived by summing `Pay` writes,
+/// which made the value movement fictional in both directions — `Pay` DESTROYED the payer's tokens (a
+/// debit with no credit anywhere) and `RewardClaim` CREATED the provider's (a credit with no debit). The
+/// two happened to net out in aggregate, so nothing caught it, but supply was untracked across the whole
+/// cycle and the "pool" could never be over-drawn because it did not exist.
+///
+/// Now value moves for real, and supply changes at exactly ONE point:
+///
+/// | operation      | movement                | supply    |
+/// |----------------|-------------------------|-----------|
+/// | `Pay`          | payer  → pool           | conserved |
+/// | seed           | **mint** → pool         | +granted  |
+/// | `RewardClaim`  | pool   → provider       | conserved |
+///
+/// The invariant that proves it: `Σ account balances + pool == total_supply` ([`Self::conserves`]).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProtocolState {
+    supply: SupplyState,
+    /// Tokens the protocol HOLDS, awaiting distribution to providers.
+    pool: u64,
+}
+
+impl ProtocolState {
+    pub fn new(supply: SupplyState, pool: u64) -> Self {
+        Self { supply, pool }
+    }
+
+    /// Tokens currently held by the pool.
+    pub fn pool(&self) -> u64 {
+        self.pool
+    }
+
+    /// Total supply in existence (CTS-1 L0 `total_supply`).
+    pub fn total_supply(&self) -> u64 {
+        self.supply.total_supply()
+    }
+
+    pub fn supply(&self) -> &SupplyState {
+        &self.supply
+    }
+
+    pub fn supply_mut(&mut self) -> &mut SupplyState {
+        &mut self.supply
+    }
+
+    /// Fold a payer's `Pay` into the pool — the CREDIT half of a transfer whose debit already happened on
+    /// the payer's own chain. Supply is unchanged: this moves tokens, it does not create them.
+    ///
+    /// Deliberately at epoch cadence rather than per transfer: the pool is shared state on a single
+    /// governance-owned chain, so crediting it synchronously with every payer's write would need a
+    /// cross-account transaction the account-chain model does not have.
+    pub fn fold_pay(&mut self, amount: u64) {
+        self.pool = self.pool.saturating_add(amount);
+    }
+
+    /// MINT fresh tokens into the pool — the ONLY operation in the system that creates supply, and it is
+    /// gated by the cap. Returns what was actually granted, which may be less than asked or zero.
+    pub fn mint_into_pool(&mut self, want: u64) -> u64 {
+        let granted = self.supply.authorize_mint(want);
+        self.pool = self.pool.saturating_add(granted);
+        granted
+    }
+
+    /// Debit the pool to fund a provider's claim — the DEBIT half of a transfer whose credit lands on the
+    /// provider's chain. Refuses if the pool cannot cover it, so claims can never draw money that does not
+    /// exist (which the old mint-on-claim path had no way to prevent).
+    pub fn debit_for_claim(&mut self, amount: u64) -> bool {
+        match self.pool.checked_sub(amount) {
+            Some(rest) => {
+                self.pool = rest;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// THE conservation invariant: every token that exists is either in someone's balance or in the pool.
+    /// Callers supply the summed account balances (the token cannot see other chains itself).
+    pub fn conserves(&self, sum_of_balances: u64) -> bool {
+        sum_of_balances.saturating_add(self.pool) == self.supply.total_supply()
+    }
+}
+
 /// Render base units as a decimal token amount (display only — never feed this back into arithmetic).
 pub fn format_amount(base_units: u64) -> alloc::string::String {
     let whole = base_units / ONE_TOKEN;
@@ -364,5 +515,113 @@ mod tests {
             reward_share: Some(0),
         };
         assert!(apply_token(st, &LedgerOp::RewardClaim(8), &p, &zero).is_none());
+    }
+
+    // ── The pool is LITERAL: value moves, and supply changes at exactly one point ──────────────────
+
+    /// THE invariant that distinguishes a real pool from a derived number: every token that exists is
+    /// either in an account balance or in the pool. Walked across a full pay → seed → claim cycle.
+    #[test]
+    fn every_token_is_either_in_a_balance_or_in_the_pool() {
+        // Genesis: nothing exists. A cap alone mints nothing.
+        let mut p = ProtocolState::new(SupplyState::new(0, 1_000), 0);
+        let mut balances = 0u64;
+        assert!(p.conserves(balances));
+        assert_eq!(p.total_supply(), 0);
+
+        // SEED — the only operation that creates supply. It lands in the pool, not in a balance.
+        let minted = p.mint_into_pool(100);
+        assert_eq!(minted, 100);
+        assert_eq!(p.pool(), 100);
+        assert_eq!(
+            p.total_supply(),
+            100,
+            "supply rose by exactly what was minted"
+        );
+        assert!(
+            p.conserves(balances),
+            "minted tokens are accounted for in the pool"
+        );
+
+        // CLAIM — pool → provider. Supply unchanged; the tokens moved.
+        assert!(p.debit_for_claim(60));
+        balances += 60; // credited on the provider's own chain
+        assert_eq!(p.pool(), 40);
+        assert_eq!(
+            p.total_supply(),
+            100,
+            "a claim MOVES tokens, it does not create them"
+        );
+        assert!(p.conserves(balances));
+
+        // PAY — payer → pool. Supply unchanged again.
+        balances -= 25; // debited on the payer's own chain
+        p.fold_pay(25);
+        assert_eq!(p.pool(), 65);
+        assert_eq!(
+            p.total_supply(),
+            100,
+            "a payment MOVES tokens, it does not destroy them"
+        );
+        assert!(p.conserves(balances), "conserved across the whole cycle");
+    }
+
+    /// A claim can never draw money that does not exist. The old mint-on-claim path had no way to refuse
+    /// this — it credited the provider from nothing, so an over-large share simply created supply.
+    #[test]
+    fn a_claim_cannot_overdraw_the_pool() {
+        let mut p = ProtocolState::new(SupplyState::new(0, 1_000), 0);
+        p.mint_into_pool(50);
+        assert!(!p.debit_for_claim(51), "refused: the pool cannot cover it");
+        assert_eq!(p.pool(), 50, "and nothing moved");
+        assert!(p.debit_for_claim(50), "exactly the balance is fine");
+        assert_eq!(p.pool(), 0);
+        assert!(!p.debit_for_claim(1), "an empty pool funds nothing");
+    }
+
+    /// The cap binds the ONE mint path, and every other path is supply-neutral — so no amount of paying
+    /// or claiming can inflate supply past it.
+    #[test]
+    fn the_cap_binds_minting_and_nothing_else_can_inflate_supply() {
+        let mut p = ProtocolState::new(SupplyState::new(0, 100), 0);
+        assert_eq!(p.mint_into_pool(70), 70);
+        assert_eq!(
+            p.mint_into_pool(70),
+            30,
+            "only the headroom left under the cap"
+        );
+        assert_eq!(
+            p.mint_into_pool(70),
+            0,
+            "cap reached → nothing further, ever"
+        );
+        assert_eq!(p.total_supply(), 100);
+
+        // Paying in and claiming out churn the pool without touching supply.
+        p.fold_pay(500);
+        assert!(p.debit_for_claim(400));
+        assert_eq!(
+            p.total_supply(),
+            100,
+            "supply is untouched by value movement"
+        );
+        assert_eq!(p.supply().headroom(), 0);
+    }
+
+    /// Restoring the counter from durable history is monotonic — a stale read can never hand back spent
+    /// minting headroom.
+    #[test]
+    fn observing_minted_history_can_only_raise_the_counter() {
+        let mut s = SupplyState::new(0, 1_000);
+        s.authorize_mint(400);
+        s.observe_minted(100);
+        assert_eq!(
+            s.total_supply(),
+            400,
+            "a lower observation does not lower supply"
+        );
+        s.observe_minted(900);
+        assert_eq!(s.total_supply(), 900, "a higher one raises it");
+        assert_eq!(s.headroom(), 100);
     }
 }
