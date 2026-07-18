@@ -69,6 +69,7 @@ mod tests {
                 },
             ],
             entitlements: alloc::vec::Vec::new(),
+            ..Default::default()
         };
         let encoded = postcard::to_allocvec(&input).unwrap();
         let out = run_program(&encoded).expect("valid input computes a record");
@@ -97,6 +98,7 @@ mod tests {
                 cumulative_bytes: 0,
             }],
             entitlements: alloc::vec::Vec::new(),
+            ..Default::default()
         };
         let native = compute(&input);
         let via_program: RewardRecord =

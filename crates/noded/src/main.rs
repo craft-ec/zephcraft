@@ -1786,6 +1786,15 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         epoch_committee.clone(),
     );
     economy_service.set_record_chain(record_chain.clone()).await;
+    // Restore the lifetime issuance counter from the DURABLE chain before any settle can mint: the
+    // settlement store is in-memory, so without this a restart would reset the supply cap. Bounded walk
+    // (30 days of epochs) — see `seed_issuance_from_chain` for the known limit and its real fix.
+    economy_service
+        .seed_issuance_from_chain(
+            epoch::epoch_at(transport.clock().now().millis()),
+            epoch::epochs_in(std::time::Duration::from_secs(30 * 24 * 3600)),
+        )
+        .await;
     // The cross-node epoch-close loop (§10.1): each node authors a per-epoch {paid, served, proof} report
     // as a COMMITTEE-ORDERED write on its settlement chain (the same durable sequencer the ledger rides);
     // every node settles each epoch by reading the SAME committed reports, so the reward record is
@@ -2240,6 +2249,24 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                 {
                     if v > 0 {
                         eco.set_bytes_per_token(v as u64).await;
+                    }
+                }
+                // §10.3 bootstrap ISSUANCE: the fair-launch subsidy rate + its lifetime ceiling. Both
+                // governed so every node computes the identical issuance inside the reward program —
+                // divergence here would make records fail verification. `>= 0` (not `> 0`) for the rate
+                // and cap: ZERO is a meaningful setting, it turns issuance OFF.
+                if let Some(rate) = gov
+                    .resolve_config(zeph_reward::ISSUANCE_PER_DAY_CONFIG_KEY)
+                    .await
+                {
+                    if rate >= 0 {
+                        let cap = gov
+                            .resolve_config(zeph_reward::ISSUANCE_TOTAL_CAP_CONFIG_KEY)
+                            .await
+                            .filter(|c| *c >= 0)
+                            .map(|c| c as u64)
+                            .unwrap_or(zeph_reward::DEFAULT_ISSUANCE_TOTAL_CAP);
+                        eco.set_issuance(rate as u64, cap).await;
                     }
                 }
                 if let Some(v) = gov

@@ -62,6 +62,28 @@ pub struct SettlementStore {
     /// Per-provider CUMULATIVE rewardable served (Σ allocated to it across consumers) — the observable
     /// "settled" numerator of the dashboard settled/served meter.
     rewardable: BTreeMap<[u8; 32], u64>,
+    /// GOVERNED bootstrap issuance target for ONE epoch, in tokens — derived from the governed
+    /// `economy:issuance_tokens_per_day` RATE via `epoch::epochs_in`, so retuning the epoch period
+    /// re-derives it rather than silently rescaling real issuance (same discipline as `window_epochs`).
+    issuance_target_per_epoch: u64,
+    /// GOVERNED lifetime ceiling on cumulative fresh issuance, in tokens (`economy:issuance_total_cap`).
+    issuance_total_cap: u64,
+    /// Cumulative fresh issuance so far. RUNNING state, but this store is entirely in-memory (like
+    /// `unallocated` and every watermark here), so it MUST be seeded from the durable records chain at
+    /// startup — otherwise a restart would reset the lifetime supply cap and re-open minting. The record
+    /// carries `cumulative_issued` precisely so the durable chain, not this field, is the source of truth.
+    cumulative_issued: u64,
+}
+
+/// Convert a governed TOKENS-PER-DAY issuance rate into a per-epoch target, using this node's epoch
+/// period — the same discipline as `window_epochs`: the governed value is a rate in TIME, so retuning
+/// `EPOCH_MILLIS` re-derives the per-epoch figure instead of silently rescaling real issuance.
+///
+/// Integer division rounds DOWN, so the realised daily rate is at most the governed one. That is the
+/// conservative direction for a MINT: this can under-issue slightly, never over-issue.
+pub fn issuance_per_epoch(tokens_per_day: u64) -> u64 {
+    let epochs_per_day = crate::epoch::epochs_in(core::time::Duration::from_secs(24 * 3600)).max(1);
+    tokens_per_day / epochs_per_day
 }
 
 impl Default for SettlementStore {
@@ -76,6 +98,11 @@ impl Default for SettlementStore {
             bytes_per_token: DEFAULT_BYTES_PER_TOKEN,
             window_epochs: crate::epoch::epochs_in(DEFAULT_WINDOW),
             rewardable: BTreeMap::new(),
+            issuance_target_per_epoch: issuance_per_epoch(
+                zeph_reward::DEFAULT_ISSUANCE_TOKENS_PER_DAY,
+            ),
+            issuance_total_cap: zeph_reward::DEFAULT_ISSUANCE_TOTAL_CAP,
+            cumulative_issued: 0,
         }
     }
 }
@@ -105,6 +132,27 @@ impl SettlementStore {
     #[allow(dead_code)]
     pub fn entitlement(&self, consumer: &[u8; 32], epoch: u64) -> u64 {
         self.subs.available(consumer, epoch)
+    }
+
+    /// Set the GOVERNED issuance schedule for this node: the per-epoch bootstrap target (already derived
+    /// from the tokens/day rate by the caller, which knows the epoch period) and the lifetime cap.
+    pub fn set_issuance(&mut self, target_per_epoch: u64, total_cap: u64) {
+        self.issuance_target_per_epoch = target_per_epoch;
+        self.issuance_total_cap = total_cap;
+    }
+
+    /// Seed cumulative issuance from the DURABLE records chain (startup). Monotonic — takes the max, so a
+    /// late or out-of-order chain read can only ever raise it, never re-open minting headroom.
+    pub fn seed_cumulative_issued(&mut self, from_chain: u64) {
+        self.cumulative_issued = self.cumulative_issued.max(from_chain);
+    }
+
+    /// Cumulative fresh issuance so far — observable state its own tests assert (same treatment as the
+    /// other store observables). Not read by the binary yet; the natural consumer is a dashboard
+    /// "issued supply" figure, which is worth surfacing once issuance actually runs on a fleet.
+    #[allow(dead_code)]
+    pub fn cumulative_issued(&self) -> u64 {
+        self.cumulative_issued
     }
 
     /// A consumer paid `amount` into the pool (from a committed `Pay` write) → `unallocated`.
@@ -139,7 +187,17 @@ impl SettlementStore {
             pool: self.unallocated,
             contributions,
             entitlements,
+            cumulative_issued: self.cumulative_issued,
+            issuance: zeph_reward::IssuanceParams {
+                target_per_epoch: self.issuance_target_per_epoch,
+                total_cap: self.issuance_total_cap,
+            },
         });
+        // Fresh issuance (0 in steady state, and 0 whenever nobody contributed) enters the pool here, so
+        // the shares below are funded by paid + issued. Taking it from the RECORD, not recomputing it,
+        // keeps this node's books identical to what every verifier re-derives.
+        self.unallocated = self.unallocated.saturating_add(record.issued);
+        self.cumulative_issued = record.cumulative_issued;
         let allocated: u64 = record.shares.iter().map(|s| s.amount).sum();
         // Σ shares ≤ unallocated (guaranteed by `compute`), so this never underflows; dust stays.
         self.unallocated -= allocated;
@@ -360,9 +418,57 @@ mod tests {
         );
     }
 
+    /// Store-level integration of §10.3 bootstrap issuance: fresh supply tops the PAID pool up to the
+    /// governed target, the shares divide the topped-up total, and the lifetime counter advances by
+    /// exactly what was issued — the counter being the thing that must survive to enforce the cap.
+    #[test]
+    fn bootstrap_issuance_tops_up_the_pool_and_advances_the_counter() {
+        let mut s = SettlementStore::new();
+        s.set_issuance(100, 1_000_000); // target 100/epoch, generous lifetime cap
+        s.pay_in(40); // consumers paid 40
+        let rec = s.settle_epoch(1, vec![contrib(1, 1)], vec![]);
+        assert_eq!(rec.issued, 60, "topped 40 paid up to the 100 target");
+        assert_eq!(rec.pool, 100, "the sole provider divides paid + issued");
+        assert_eq!(rec.share_of(&prov(1)), 100);
+        assert_eq!(
+            s.cumulative_issued(),
+            60,
+            "counter advanced by exactly the mint"
+        );
+
+        // Seeding from the durable chain is monotonic — it can only ever RAISE the counter, so a stale
+        // or out-of-order read can never restore spent minting headroom.
+        s.seed_cumulative_issued(10);
+        assert_eq!(
+            s.cumulative_issued(),
+            60,
+            "a lower chain read does not lower the counter"
+        );
+        s.seed_cumulative_issued(500);
+        assert_eq!(s.cumulative_issued(), 500, "a higher chain read raises it");
+    }
+
+    /// The lifetime cap holds at the STORE level too: once cumulative issuance reaches it, settles stop
+    /// minting entirely and the epoch distributes only what was actually paid.
+    #[test]
+    fn the_lifetime_cap_stops_minting_at_the_store_level() {
+        let mut s = SettlementStore::new();
+        s.set_issuance(100, 50); // cap below one epoch's target
+        s.pay_in(10);
+        let rec = s.settle_epoch(1, vec![contrib(1, 1)], vec![]);
+        assert_eq!(rec.issued, 50, "only the headroom under the cap");
+        s.pay_in(10);
+        let rec2 = s.settle_epoch(2, vec![contrib(1, 1)], vec![]);
+        assert_eq!(rec2.issued, 0, "cap reached → no further minting, ever");
+        assert_eq!(rec2.pool, 10, "the epoch distributes only what was paid");
+    }
+
     #[test]
     fn dust_stays_unallocated_and_folds_into_the_next_epoch() {
         let mut s = SettlementStore::new();
+        // Isolate REDISTRIBUTION: bootstrap issuance off, so the dust arithmetic under test is not also
+        // being topped up by a subsidy. Issuance has its own tests in `zeph-reward`.
+        s.set_issuance(0, 0);
         s.pay_in(10);
         // 3 equal providers → floor(10/3)=3 each, Σ=9, dust 1 stays unallocated.
         s.settle_epoch(1, vec![contrib(1, 1), contrib(2, 1), contrib(3, 1)], vec![]);
@@ -485,6 +591,8 @@ mod tests {
         // P6: the governed price converts paid TOKENS into an egress BYTE budget. Before P6 the cap
         // compared bytes against tokens directly (an implicit 1 token = 1 byte).
         let mut s = SettlementStore::new();
+        // Isolate the PRICE property: no bootstrap issuance, so "the whole pool" is exactly what was paid.
+        s.set_issuance(0, 0);
         s.set_bytes_per_token(1000);
         let c = prov(9);
         s.settle_epoch_from_cheques(1, vec![(c, 0)], vec![]); // first sight

@@ -132,6 +132,7 @@ mod tests {
                 cumulative_bytes: 0, // ditto
             }],
             entitlements: Vec::new(),
+            ..Default::default()
         }
     }
 

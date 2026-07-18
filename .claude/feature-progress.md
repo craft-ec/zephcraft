@@ -2850,3 +2850,51 @@ self-claims against the committee-attested record; Σ claims ≤ pool), never a 
 NO atomic multi-program transaction primitive to build. CPI = a deterministic cross-program READ (token's
 claim-fold reads economy `share_of`), replacing node-resolved `Resolved.reward_share` — carries no atomicity
 requirement, never mutates a callee. Awaiting user confirm on this framing before executing P1+.
+
+## FEATURE: token ISSUANCE (§10.3 fair-launch bootstrap) — started 2026-07-18
+**Why:** the economic layer is a complete machine with NO FUEL. There is no mint/issue anywhere
+(token = transfer/claim/balance only), so every balance is 0, nobody can pay into the pool, no epoch
+ever has a pool, and no reward is ever settled or claimed. This is why the fleet reads
+balance 0 / pool 0 / verified 0, and why P8's chain-reconstruction path can't be exercised.
+
+**Design (docs/ECONOMIC_LAYER_DESIGN.md):** issuance TOPS UP THE POOL during bootstrap — it does NOT
+mint to accounts — so it reuses the whole existing distribution path (contribution-ratio shares,
+claims, verification). No premine; tokens are earned by contribution from genesis. The curve tapers as
+paid demand grows; steady state is fee-recycled. Schedule + cap are GOVERNED parameters.
+
+**Key constraint (the P8 lesson):** issuance CREATES money, so it must be a pure function of committed
+input — computed inside `reward::compute`, never node-local — or a verifier can't reproduce the record
+and an inflated mint would be unverifiable.
+
+- [x] P1 — DONE. pure issuance in `crates/reward`: `IssuanceParams`, `issuance_for()`, RewardInput gains
+      `cumulative_issued` + `issuance`, RewardRecord gains `issued` + `cumulative_issued`, `compute`
+      distributes paid+issued. Governed defaults + config keys. Tests.
+- [x] P2 — DONE. node wiring: read the governed values (K1 config) and supply them at settle; convert the
+      tokens/day RATE to a per-epoch target at the node layer (where EPOCH_MILLIS is known).
+- [ ] P3 — design-check + code-review + integration-check, gate, roll.
+- [ ] P4 — EXERCISE IT: watch a real epoch issue → distribute → claim → balance on the fleet. This is
+      the validation debt this feature exists to clear.
+
+**Defaults chosen (governed, not baked):** rate expressed in TOKENS PER DAY, not per epoch — the
+`DEFAULT_WINDOW` lesson (a per-epoch figure silently changes meaning when the epoch period is retuned;
+30s→5min would shift it 10x). 1024 tokens/day ≈ 1 GiB/day subsidised egress at 1 MiB/token; lifetime
+cap 1_000_000 tokens.
+**Guard:** no issuance when there is NO contribution — shares are a ratio, so with none the whole pool
+falls to dust and issuing would mint supply on an idle network with nobody earning it.
+
+### P1+P2 notes (2026-07-18)
+- `issuance_for(paid, cumulative, has_contribution, params)` = `min(target − paid, cap − cumulative)`,
+  0 when no contribution. The TAPER IS STRUCTURAL: the gap shrinks as paid demand grows and hits 0 at
+  the target → steady state is pure fee-recycling, with no clock to tune and no cliff to mistime.
+- Computed INSIDE `reward::compute` (not handed in as an inflated pool) because issuance creates money:
+  verifiers re-derive the input from committed chains and re-run it, so an over-mint fails verification.
+- Rate governed in TOKENS PER DAY, converted per-epoch by `issuance_per_epoch()` — the `DEFAULT_WINDOW`
+  lesson. Rounds DOWN, the conservative direction for a mint.
+- 7 new tests (5 reward + 2 settlement store). Two PRE-EXISTING settlement tests now call
+  `set_issuance(0,0)` to isolate redistribution — the subsidy would otherwise silently change what they
+  assert; each test still tests one thing.
+- **KNOWN LIMIT (recorded, not hidden):** `cumulative_issued` is seeded from the durable records chain
+  over a BOUNDED 30-day walk. A longer gap under-seeds, and under-seeding RESTORES minting headroom (the
+  unsafe direction). The design's real answer is the issuance counter on the governance-owned chain
+  ("the subsidy pool, issuance counter, epoch clock" live there); this is a bounded proxy until that
+  exists. Seeding is monotonic (`max`) so a stale read can only raise, never lower.

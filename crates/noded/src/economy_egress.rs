@@ -68,6 +68,51 @@ impl EconomyEgressService {
             .set_bytes_per_token(bytes_per_token);
     }
 
+    /// Seed cumulative fresh issuance from the DURABLE records chain at startup.
+    ///
+    /// This store is entirely in-memory (like `unallocated` and every watermark), so without this a
+    /// RESTART would reset the lifetime supply cap and re-open minting headroom. The record carries
+    /// `cumulative_issued` exactly so the durable chain — not process memory — is the source of truth.
+    ///
+    /// **Known limit, deliberately recorded:** the walk is bounded by `look_back` epochs, so a gap longer
+    /// than that finds no record and under-seeds — and under-seeding is the UNSAFE direction (it restores
+    /// headroom). The design's real answer is the issuance counter living on the governance-owned chain
+    /// (ECONOMIC_LAYER_DESIGN: "the subsidy pool, issuance counter, epoch clock ... lives on a
+    /// governance-owned chain"); this is a bounded proxy until that exists. Monotonic (`max`), so a later
+    /// or out-of-order read can only raise the counter, never lower it.
+    pub async fn seed_issuance_from_chain(&self, now_epoch: u64, look_back: u64) {
+        let Some(records) = self.record_chain.read().await.clone() else {
+            return;
+        };
+        let floor = now_epoch.saturating_sub(look_back);
+        for e in (floor..=now_epoch).rev() {
+            if let Some(r) = records.canonical_record(e).await {
+                // Cumulative is monotonic, so the most recent record is the highest — stop at the first.
+                self.settlement
+                    .write()
+                    .await
+                    .seed_cumulative_issued(r.cumulative_issued);
+                return;
+            }
+        }
+    }
+
+    /// Apply the GOVERNED bootstrap ISSUANCE schedule (§10.3 fair launch): a rate in TOKENS PER DAY plus
+    /// a lifetime ceiling on fresh supply. The rate is converted to a per-epoch target HERE, where the
+    /// epoch period is known, so retuning `EPOCH_MILLIS` re-derives it instead of silently rescaling real
+    /// issuance (the same discipline as the subscription window).
+    ///
+    /// Every node must resolve the identical governed values, because issuance is computed inside the
+    /// reward program and verified by re-execution — a node using a different schedule would produce a
+    /// record that every verifier rejects.
+    pub async fn set_issuance(&self, tokens_per_day: u64, total_cap: u64) {
+        let per_epoch = crate::settlement::issuance_per_epoch(tokens_per_day);
+        self.settlement
+            .write()
+            .await
+            .set_issuance(per_epoch, total_cap);
+    }
+
     /// Apply the GOVERNED subscription window as a DURATION (`economy:subscription_window_secs`, default
     /// 30 days). Time, not an epoch count, so retuning the epoch period cannot rescale the promise made
     /// to payers.
@@ -299,6 +344,7 @@ mod tests {
                 })
                 .collect(),
             entitlements: Vec::new(),
+            ..Default::default()
         }
     }
 

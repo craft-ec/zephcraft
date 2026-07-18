@@ -21,6 +21,69 @@ use alloc::vec::Vec;
 
 use serde::{Deserialize, Serialize};
 
+/// DEFAULT bootstrap issuance rate, in TOKENS PER DAY — a rate in TIME, deliberately not per epoch.
+///
+/// Same lesson as `subscription::DEFAULT_WINDOW`: a per-epoch figure silently changes what it MEANS the
+/// moment the epoch period is retuned (the 30s → 5min change would have cut real daily issuance 10x with
+/// no edit to the constant). The node converts this to a per-epoch target at its own layer, where
+/// `EPOCH_MILLIS` is known. At the default egress price (1 MiB/token) this subsidises ~1 GiB/day.
+pub const DEFAULT_ISSUANCE_TOKENS_PER_DAY: u64 = 1024;
+
+/// Governed config key for the bootstrap issuance rate, in TOKENS PER DAY (a rate in time, see above).
+pub const ISSUANCE_PER_DAY_CONFIG_KEY: &str = "economy:issuance_tokens_per_day";
+
+/// DEFAULT lifetime ceiling on cumulative FRESH issuance, in tokens — the supply cap for minted supply.
+///
+/// Absolute, so it needs no period conversion. At the default rate this is ~2.7 years of uninterrupted
+/// bootstrap, and far less in practice: issuance tapers to zero on its own as paid demand fills the
+/// target, so the cap is a backstop against a network that never develops paid demand, not the plan.
+pub const DEFAULT_ISSUANCE_TOTAL_CAP: u64 = 1_000_000;
+
+/// Governed config key for the lifetime issuance ceiling, in TOKENS.
+pub const ISSUANCE_TOTAL_CAP_CONFIG_KEY: &str = "economy:issuance_total_cap";
+
+/// The governed issuance schedule resolved for ONE epoch, carried in the input so the record stays a pure
+/// function of it — the same rule `entitlements` follows, and it matters more here: issuance is the only
+/// operation that CREATES tokens, so it is the last thing that may be node-local and unreproducible.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct IssuanceParams {
+    /// Bootstrap target for this epoch's DISTRIBUTABLE pool, in tokens. Issuance tops the paid pool up to
+    /// this and no further — which is the whole taper: the gap shrinks as paid demand grows.
+    pub target_per_epoch: u64,
+    /// Lifetime ceiling on cumulative fresh issuance, in tokens.
+    pub total_cap: u64,
+}
+
+/// Fresh issuance for ONE epoch: top the paid pool up toward the governed target, bounded by the lifetime
+/// cap, and only when there is contribution to reward.
+///
+/// **The taper is structural, not a schedule.** `target − paid` shrinks as paid demand grows and reaches
+/// zero once demand meets the target — the design's "bootstrap curve tapers as paid demand grows, steady
+/// state is fee-recycled" with no clock to tune and no cliff to mistime. A network that develops real
+/// demand stops minting because it no longer needs to, not because a timer said so.
+///
+/// **`has_contribution` gates it**, because shares are a RATIO of contribution: with none, every share is
+/// zero and the entire pool falls to dust. Issuing into that would mint supply on an IDLE network with
+/// nobody earning it — inflation for nothing, and the dust would accumulate claimable-by-no-one. No
+/// contribution, no issuance.
+pub fn issuance_for(
+    paid_pool: u64,
+    cumulative_issued: u64,
+    has_contribution: bool,
+    params: &IssuanceParams,
+) -> u64 {
+    if !has_contribution {
+        return 0;
+    }
+    let gap = params.target_per_epoch.saturating_sub(paid_pool);
+    let headroom = params.total_cap.saturating_sub(cumulative_issued);
+    if gap < headroom {
+        gap
+    } else {
+        headroom
+    }
+}
+
 /// One provider's rewardable contribution this epoch — its PAID-serving bytes (identified by
 /// `allocate_quota` on the node from the cheques; free/reciprocal serving is excluded), plus its running
 /// cumulative total. The cumulative is node-supplied state carried through to the record so a provider
@@ -64,10 +127,19 @@ pub struct Entitlement {
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct RewardInput {
     pub epoch: u64,
+    /// The PAID pool: Σ consumers' paid egress this epoch. Fresh issuance is added ON TOP inside
+    /// `compute`; this field stays what consumers actually paid, so the two are never conflated.
     pub pool: u64,
     pub contributions: Vec<Contribution>,
     #[serde(default)]
     pub entitlements: Vec<Entitlement>,
+    /// Cumulative fresh issuance BEFORE this epoch — running state read off the records chain and carried
+    /// in, so `compute` can enforce the lifetime cap deterministically instead of trusting the node.
+    #[serde(default)]
+    pub cumulative_issued: u64,
+    /// The governed issuance schedule for this epoch.
+    #[serde(default)]
+    pub issuance: IssuanceParams,
 }
 
 /// One provider's computed reward share (the amount it may CLAIM for this epoch) plus the REWARDABLE
@@ -99,7 +171,8 @@ pub struct Share {
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct RewardRecord {
     pub epoch: u64,
-    /// The DISTRIBUTABLE pool this epoch divided (the input's `pool`). Carried so the record is
+    /// The DISTRIBUTABLE pool this epoch divided (the input's PAID `pool` plus any fresh `issued`).
+    /// Carried so the record is
     /// self-describing — the shares' denominator is otherwise invisible — and so any node can report the
     /// pool without settling: what is left after this epoch is `pool − Σ shares` (the dust), so both the
     /// distributed and the residual figures come from this one field plus the shares.
@@ -108,6 +181,16 @@ pub struct RewardRecord {
     pub shares: Vec<Share>,
     #[serde(default)]
     pub entitlements: Vec<Entitlement>,
+    /// FRESH tokens issued into this epoch's pool (0 in steady state). Carried so the record is
+    /// self-describing about the thing that most needs to be auditable: `pool − issued` is what consumers
+    /// actually paid, so any node can see how much of a reward was demand and how much was subsidy.
+    #[serde(default)]
+    pub issued: u64,
+    /// Cumulative fresh issuance INCLUDING this epoch — the resulting STATE, which the next epoch's input
+    /// carries back in to enforce the cap. State, so duplicate inputs take MAX and never sum (the same
+    /// rule as `Share::cumulative_bytes`; summing a cumulative would double it).
+    #[serde(default)]
+    pub cumulative_issued: u64,
 }
 
 impl RewardRecord {
@@ -182,13 +265,24 @@ pub fn compute(input: &RewardInput) -> RewardRecord {
         e.1 = e.1.max(c.cumulative_bytes);
     }
     let total: u128 = by_provider.values().map(|(b, _)| *b).sum();
+    // Fresh issuance tops the PAID pool up toward the governed bootstrap target; the shares below divide
+    // the resulting DISTRIBUTABLE pool. Computed inside this pure function (not handed in as an inflated
+    // `pool`) precisely because it creates money: a verifier re-derives the same input from committed
+    // chains and re-runs this, so an over-mint cannot survive verification.
+    let issued = issuance_for(
+        input.pool,
+        input.cumulative_issued,
+        total > 0,
+        &input.issuance,
+    );
+    let distributable = input.pool.saturating_add(issued);
     let shares = by_provider
         .into_iter() // BTreeMap iterates in sorted key order → canonical output
         .map(|(provider, (bytes, cumulative_bytes))| {
             let amount = if total == 0 {
                 0
             } else {
-                ((input.pool as u128) * bytes / total) as u64
+                ((distributable as u128) * bytes / total) as u64
             };
             Share {
                 provider,
@@ -218,9 +312,13 @@ pub fn compute(input: &RewardInput) -> RewardRecord {
         .collect();
     RewardRecord {
         epoch: input.epoch,
-        pool: input.pool,
+        // The DISTRIBUTABLE total (paid + issued) — the shares' actual denominator, which is what this
+        // field has always meant.
+        pool: distributable,
         shares,
         entitlements,
+        issued,
+        cumulative_issued: input.cumulative_issued.saturating_add(issued),
     }
 }
 
@@ -396,6 +494,7 @@ mod tests {
                 },
             ],
             entitlements: alloc::vec![ent(8, 70, 30), ent(9, 30, 0)],
+            ..Default::default()
         });
         // Payout, this epoch's bytes, and the running total all present.
         assert_eq!(rec.share_of(&prov(1)), 60);
@@ -431,6 +530,7 @@ mod tests {
                 },
             ],
             entitlements: alloc::vec![ent(9, 30, 5), ent(8, 40, 2), ent(8, 30, 2)],
+            ..Default::default()
         });
         let b = compute(&RewardInput {
             epoch: 4,
@@ -441,6 +541,7 @@ mod tests {
                 cumulative_bytes: 9
             }],
             entitlements: alloc::vec![ent(8, 70, 2), ent(9, 30, 5)],
+            ..Default::default()
         });
         assert_eq!(a, b, "input order / duplicates must not change the record");
         assert_eq!(
@@ -467,5 +568,191 @@ mod tests {
         let out = run_reward(&input).unwrap();
         let rec: RewardRecord = postcard::from_bytes(&out).unwrap();
         assert_eq!(rec.share_of(&prov(1)), 75);
+    }
+
+    /// Issuance TAPERS as paid demand grows — the design's bootstrap curve, with no clock. It fills the
+    /// gap to the target, shrinks as paid demand rises, and is exactly zero once demand meets the target
+    /// (steady state = pure fee recycling, the pre-issuance model unchanged).
+    #[test]
+    fn issuance_tapers_to_zero_as_paid_demand_reaches_the_target() {
+        let p = IssuanceParams {
+            target_per_epoch: 100,
+            total_cap: 1_000_000,
+        };
+        assert_eq!(
+            issuance_for(0, 0, true, &p),
+            100,
+            "no demand → full subsidy"
+        );
+        assert_eq!(
+            issuance_for(40, 0, true, &p),
+            60,
+            "partial demand → partial subsidy"
+        );
+        assert_eq!(issuance_for(99, 0, true, &p), 1, "nearly there → a sliver");
+        assert_eq!(
+            issuance_for(100, 0, true, &p),
+            0,
+            "demand met the target → NO issuance"
+        );
+        assert_eq!(
+            issuance_for(500, 0, true, &p),
+            0,
+            "demand past the target → still none, never negative"
+        );
+    }
+
+    /// The lifetime cap is a hard ceiling on FRESH supply, and it binds even mid-gap.
+    #[test]
+    fn issuance_is_bounded_by_the_lifetime_cap() {
+        let p = IssuanceParams {
+            target_per_epoch: 100,
+            total_cap: 250,
+        };
+        assert_eq!(
+            issuance_for(0, 200, true, &p),
+            50,
+            "only the headroom left under the cap"
+        );
+        assert_eq!(
+            issuance_for(0, 250, true, &p),
+            0,
+            "cap reached → issuance stops forever"
+        );
+        assert_eq!(
+            issuance_for(0, 9_999, true, &p),
+            0,
+            "over the cap → saturating, never wraps"
+        );
+    }
+
+    /// NO CONTRIBUTION, NO ISSUANCE. Shares are a ratio of contribution, so with none every share is zero
+    /// and the whole pool becomes dust — minting into that would inflate supply on an idle network with
+    /// nobody earning it, and the dust would sit claimable-by-no-one.
+    #[test]
+    fn an_idle_network_issues_nothing() {
+        let p = IssuanceParams {
+            target_per_epoch: 100,
+            total_cap: 1_000_000,
+        };
+        assert_eq!(
+            issuance_for(0, 0, false, &p),
+            0,
+            "no contribution → no mint"
+        );
+
+        let rec = compute(&RewardInput {
+            epoch: 7,
+            pool: 0,
+            contributions: alloc::vec![],
+            entitlements: alloc::vec![],
+            cumulative_issued: 0,
+            issuance: p,
+        });
+        assert_eq!(rec.issued, 0, "idle epoch mints nothing");
+        assert_eq!(rec.pool, 0, "and distributes nothing");
+        assert_eq!(rec.cumulative_issued, 0, "supply is untouched");
+    }
+
+    /// End-to-end: a bootstrap epoch with real contribution issues the subsidy, distributes paid+issued by
+    /// the SAME contribution ratio, stays aggregate-bounded, and advances the cumulative supply state.
+    #[test]
+    fn a_bootstrap_epoch_issues_distributes_and_advances_supply() {
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        let rec = compute(&RewardInput {
+            epoch: 3,
+            pool: 40, // consumers paid 40
+            contributions: alloc::vec![
+                Contribution {
+                    provider: a,
+                    bytes: 300,
+                    cumulative_bytes: 300
+                },
+                Contribution {
+                    provider: b,
+                    bytes: 100,
+                    cumulative_bytes: 100
+                },
+            ],
+            entitlements: alloc::vec![],
+            cumulative_issued: 10,
+            issuance: IssuanceParams {
+                target_per_epoch: 100,
+                total_cap: 1_000_000,
+            },
+        });
+        assert_eq!(rec.issued, 60, "topped 40 paid up to the 100 target");
+        assert_eq!(rec.pool, 100, "distributable = paid + issued");
+        assert_eq!(
+            rec.cumulative_issued, 70,
+            "supply state advanced by exactly what was issued"
+        );
+        // 3:1 contribution ratio over the distributable pool.
+        assert_eq!(rec.share_of(&a), 75);
+        assert_eq!(rec.share_of(&b), 25);
+        let total_shares: u64 = rec.shares.iter().map(|s| s.amount).sum();
+        assert!(
+            total_shares <= rec.pool,
+            "aggregate-bounded by the DISTRIBUTABLE pool"
+        );
+        // And the record stays self-describing about what was demand vs subsidy.
+        assert_eq!(
+            rec.pool - rec.issued,
+            40,
+            "paid-in is recoverable from the record"
+        );
+    }
+
+    /// Issuance must not break the canonical-hash property P8 established: same input, any order, one
+    /// byte-identical record. (Issuance is a pure function of scalar input, so it cannot reorder — this
+    /// pins that it also does not vary.)
+    #[test]
+    fn issuance_keeps_records_canonical_and_reproducible() {
+        let mk = |contribs: Vec<Contribution>| {
+            compute(&RewardInput {
+                epoch: 5,
+                pool: 10,
+                contributions: contribs,
+                entitlements: alloc::vec![],
+                cumulative_issued: 3,
+                issuance: IssuanceParams {
+                    target_per_epoch: 50,
+                    total_cap: 1_000,
+                },
+            })
+        };
+        let a = [9u8; 32];
+        let b = [4u8; 32];
+        let one = mk(alloc::vec![
+            Contribution {
+                provider: a,
+                bytes: 10,
+                cumulative_bytes: 10
+            },
+            Contribution {
+                provider: b,
+                bytes: 20,
+                cumulative_bytes: 20
+            },
+        ]);
+        let two = mk(alloc::vec![
+            Contribution {
+                provider: b,
+                bytes: 20,
+                cumulative_bytes: 20
+            },
+            Contribution {
+                provider: a,
+                bytes: 10,
+                cumulative_bytes: 10
+            },
+        ]);
+        assert_eq!(
+            one, two,
+            "shuffled input → identical record, issuance included"
+        );
+        assert_eq!(one.issued, 40);
+        assert_eq!(one.cumulative_issued, 43);
     }
 }
