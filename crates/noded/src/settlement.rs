@@ -72,13 +72,6 @@ pub struct SettlementStore {
     /// — the reward program pays it against `epochs_per_day` on an exact schedule, so a sub-epoch rate
     /// (1 token/day is 1/288 at a 5min epoch) still pays exactly rather than flooring to nothing.
     issuance_tokens_per_day: u64,
-    /// GOVERNED lifetime ceiling on cumulative fresh issuance, in tokens (`economy:issuance_total_cap`).
-    issuance_total_cap: u64,
-    /// Cumulative fresh issuance so far. RUNNING state, but this store is entirely in-memory (like
-    /// `unallocated` and every watermark here), so it MUST be seeded from the durable records chain at
-    /// startup — otherwise a restart would reset the lifetime supply cap and re-open minting. The record
-    /// carries `cumulative_issued` precisely so the durable chain, not this field, is the source of truth.
-    cumulative_issued: u64,
 }
 
 /// Epochs per day at this node's epoch period — the denominator the reward program's exact issuance
@@ -104,8 +97,6 @@ impl Default for SettlementStore {
             window_epochs: crate::epoch::epochs_in(DEFAULT_WINDOW),
             rewardable: BTreeMap::new(),
             issuance_tokens_per_day: zeph_reward::DEFAULT_ISSUANCE_TOKENS_PER_DAY,
-            issuance_total_cap: zeph_reward::DEFAULT_ISSUANCE_TOTAL_CAP,
-            cumulative_issued: 0,
         }
     }
 }
@@ -147,13 +138,20 @@ impl SettlementStore {
     /// Set the GOVERNED issuance schedule: the seed RATE in tokens per day, and the lifetime cap.
     pub fn set_issuance(&mut self, tokens_per_day: u64, total_cap: u64) {
         self.issuance_tokens_per_day = tokens_per_day;
-        self.issuance_total_cap = total_cap;
+        // The CAP belongs to the token, not to this layer — same reasoning as the counter. Keeping a
+        // second copy here is how the counter bug happened, and a duplicated cap is worse: the compute
+        // check and the mint gate would disagree about how much may exist.
+        self.protocol.supply_mut().set_cap(total_cap);
     }
 
     /// Seed cumulative issuance from the DURABLE records chain (startup). Monotonic — takes the max, so a
     /// late or out-of-order chain read can only ever raise it, never re-open minting headroom.
     pub fn seed_cumulative_issued(&mut self, from_chain: u64) {
-        self.cumulative_issued = self.cumulative_issued.max(from_chain);
+        // Restores the ONE counter — the token's own. An earlier cut of this kept a separate
+        // `cumulative_issued` field on the store and seeded THAT, leaving `ProtocolState`'s counter at
+        // zero after every restart: the cap check read the shadow while `total_supply()` reported 0. Two
+        // counters is the exact defect this whole change exists to remove, so there is now only one.
+        self.protocol.supply_mut().observe_minted(from_chain);
     }
 
     /// Cumulative fresh issuance so far — observable state its own tests assert (same treatment as the
@@ -161,7 +159,7 @@ impl SettlementStore {
     /// "issued supply" figure, which is worth surfacing once issuance actually runs on a fleet.
     #[allow(dead_code)]
     pub fn cumulative_issued(&self) -> u64 {
-        self.cumulative_issued
+        self.protocol.total_supply()
     }
 
     /// Fold a committed `Pay` write into the pool — the CREDIT half of a transfer whose debit already
@@ -220,11 +218,11 @@ impl SettlementStore {
             pool: self.unallocated(),
             contributions,
             entitlements,
-            cumulative_issued: self.cumulative_issued,
+            cumulative_issued: self.protocol.total_supply(),
             issuance: zeph_reward::IssuanceParams {
                 tokens_per_day: self.issuance_tokens_per_day,
                 epochs_per_day: epochs_per_day(),
-                total_cap: self.issuance_total_cap,
+                total_cap: self.protocol.supply().cap(),
             },
         });
         // MINT the seed into the pool for real, through the token's supply gate — the ONE operation in
@@ -235,7 +233,6 @@ impl SettlementStore {
             minted, record.issued,
             "the record's issuance was computed against this same cap, so the gate must grant it in full"
         );
-        self.cumulative_issued = self.protocol.total_supply();
         // Σ shares are NOT deducted from the pool here: they stay in it, EARMARKED as owed via `records`.
         // The tokens only leave the protocol when a provider actually claims (`claim` → debit). That is
         // what makes `Σ balances + pool == total_supply` hold — the old code moved a number between two
@@ -561,6 +558,42 @@ mod tests {
             "forfeiting drops an earmark, it moves nothing"
         );
         check(balances, &s, "after expiry");
+    }
+
+    /// Restart restoration must restore THE counter — the token's own — not a shadow copy beside it.
+    ///
+    /// This is a regression test for a defect introduced while wiring the literal pool: the store kept
+    /// its own `cumulative_issued` field, seeding restored THAT, and `ProtocolState`'s counter stayed at
+    /// zero. The cap check read the shadow (so it looked fine) while `total_supply()` reported 0 after
+    /// every restart and the token's own headroom silently reset. Two counters for one quantity is the
+    /// whole defect class this work exists to remove.
+    #[test]
+    fn restart_restores_the_token_owned_counter_not_a_shadow() {
+        let mut s = SettlementStore::new();
+        s.set_issuance(0, 1_000_000); // no fresh minting; we are testing restoration alone
+
+        // A fresh process has minted nothing...
+        assert_eq!(s.total_supply(), 0);
+        // ...then restores 4_000 of history from the durable chain.
+        s.seed_cumulative_issued(4_000);
+
+        // BOTH views must agree, because they are the same counter.
+        assert_eq!(
+            s.cumulative_issued(),
+            4_000,
+            "the settle input sees the restored history"
+        );
+        assert_eq!(
+            s.total_supply(),
+            4_000,
+            "and so does the TOKEN — a shadow field would leave this at 0"
+        );
+        // Headroom shrank by the restored history, so the cap cannot be reset by restarting.
+        assert_eq!(s.protocol.supply().headroom(), 1_000_000 - 4_000);
+
+        // Monotonic: a stale, lower read cannot hand spent headroom back.
+        s.seed_cumulative_issued(10);
+        assert_eq!(s.total_supply(), 4_000, "a lower read never lowers supply");
     }
 
     /// A claim can never draw more than the pool holds — impossible to violate now, and impossible to

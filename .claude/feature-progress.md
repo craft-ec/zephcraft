@@ -3092,3 +3092,29 @@ than advisory. reward claim mint point sounds weird".
   what the 8 decimals buy us.
 - NOTE: an unrelated `zeph-sql` test (`lazy_reader_fetches_only_touched_pages`) is FLAKY under parallel
   load — passes in isolation, and that crate is untouched by this work.
+
+### P3 part 1 (2026-07-18) — I reintroduced the two-counter defect; collapsed it, twice
+Wiring the literal pool in P2 left the store with its OWN `cumulative_issued` field beside
+`ProtocolState`'s counter. `seed_cumulative_issued` restored the SHADOW, so after any restart the
+token's counter stayed 0: the cap check read the shadow (so it looked fine) while `total_supply()`
+reported 0 and the token's headroom silently reset. Exactly the defect this work exists to remove,
+reintroduced one level down.
+
+Collapsed to ONE counter (the token's). Then the regression test I wrote for it immediately caught a
+SECOND instance: the CAP was duplicated too — `set_issuance` updated the store's `issuance_total_cap`
+but not `ProtocolState`'s, so headroom read 1e14 instead of 996,000. A duplicated cap is worse than a
+duplicated counter: the compute check and the mint gate would disagree about how much may exist.
+Both now live in the token's `SupplyState` alone.
+
+TEST: `restart_restores_the_token_owned_counter_not_a_shadow` — asserts the settle input AND
+`total_supply()` agree after restoration (a shadow leaves the latter at 0), headroom shrinks by the
+restored history so restarting cannot reset the cap, and restoration is monotonic.
+
+LESSON (recurring, now three times): any quantity with two homes will diverge, and the copy that looks
+right is not necessarily the load-bearing one. Route through one owner.
+
+- [ ] P3 part 2 — durable POOL restoration. The counter now survives restart via
+      `seed_cumulative_issued` from the records chain, but `ProtocolState.pool` still starts at 0 on
+      boot. The natural durable home is the reward RECORD (already per-epoch, durable,
+      committee-attested) rather than the governance chain — writing the pool there per epoch would
+      need a quorum-cosigned governance action each time, far too heavy for epoch cadence.
