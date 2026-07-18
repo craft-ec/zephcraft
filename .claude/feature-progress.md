@@ -2514,7 +2514,7 @@ Phases (each: build + test + gate + commit; roll together where consensus-affect
       has a before-measurement, so it is the only claimable number; hetzner `zeph` main sits at ~40% (governor
       + seed/hub work the others don't do — no baseline, NOT claimed as good or bad; separate question).
       zeph2/3/4 ~13%.
-- [ ] **P8 — RewardRecord extension (built 2026-07-17, NOT yet rolled).** `Share` gains `bytes` (the ratio's
+- [x] **P8 — RewardRecord extension (built 2026-07-17, VERIFIED + GATED + ROLLED 2026-07-18).** `Share` gains `bytes` (the ratio's
       numerator, previously computed then discarded) + `RewardRecord`/`RewardInput` gain `spends: Vec<Spend
       {consumer,bytes}>` (per-consumer entitlement spent). `spends` is INPUT-carried so the record stays a pure
       function of its input — a verifier re-derives the input from committed chains and re-runs `compute` to the
@@ -2550,6 +2550,23 @@ Phases (each: build + test + gate + commit; roll together where consensus-affect
       `items_after_test_module` earlier).
       **token.wasm STILL byte-identical ⇒ balances SURVIVE this roll**; only economy-egress moves
       (a1aeca61…, was f8c24c08… live).
+      **ROLL RECORD (2026-07-18).** Already rolled as a SIDE EFFECT of the durability roll: P8 lives entirely
+      in `crates/` (incl. `crates/noded/economy-egress.wasm`, embedded via `include_bytes!` in genesis.rs), and
+      that roll rsync'd `crates/` + rebuilt the binary, so the new wasm was baked in. `genesis::activate()`
+      republishes the embedded wasm and re-pins the anchor on EVERY startup (idempotent), so the 00:46 restart
+      re-pinned it. VERIFIED on the fleet: `anchor-resolve --name economy-egress` →
+      cid=69fc8d3bb2524b73896d2d81e4aae9abeb79917e6d686eb81c0a6468d5954ef4, interface_version=1, owner set —
+      matching the cid logged at the restart. Reward tests 9/9 green; gate12 (all 8 A–G) covered this exact
+      code (1f8c300 is an ancestor of the gated a0847dc) and no code changed after it.
+      **CORRECTION — the expected cid above (d075d828…) is STALE.** Later commits (e.g. 0499412 writer-first
+      head resolution) changed economy-egress.wasm again, so the deployed cid is 69fc8d3b…, not d075d828…
+      Don't treat d075d828 as the current referent.
+      **VERIFICATION LIMIT (honest).** This fleet has NO economic activity — balance 0, pool_unallocated 0,
+      verified 0, mismatched 0 — so the dashboard view P8 exists to feed legitimately reads zeros/absent. P8's
+      LOGIC is verified by its unit tests (absent≠zero, canonical hashing, duplicate-input aggregation), and
+      its DEPLOYMENT is verified by the anchor resolve; the end-to-end "reconstruct settled + subscription from
+      the durable chain" path is NOT live-exercised here. Exercising it needs real paid demand, or
+      `ledger-settle-epoch` (a DEV command that MUTATES ledger state — deliberately not run on the live fleet).
 - [x] **P9 — pool in the record + WRITER-FIRST sync: the last flagged gaps (2026-07-17, user "resolve all").**
       - **`pool` folded into `RewardRecord`** (the 4th zero-reading dashboard field — I had claimed the wire was
         "complete" with 3 of 4 done; audit caught it). `pool_remaining() = pool − Σ shares` gives the residual,
