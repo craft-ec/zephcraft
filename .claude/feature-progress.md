@@ -2871,8 +2871,11 @@ and an inflated mint would be unverifiable.
       distributes paid+issued. Governed defaults + config keys. Tests.
 - [x] P2 — DONE. node wiring: read the governed values (K1 config) and supply them at settle; convert the
       tokens/day RATE to a per-epoch target at the node layer (where EPOCH_MILLIS is known).
-- [ ] P3 — design-check + code-review + integration-check, gate, roll.
-- [ ] P4 — EXERCISE IT: watch a real epoch issue → distribute → claim → balance on the fleet. This is
+- [x] P3 — REVIEWED + GATED. **NOT ROLLED — deliberately blocked, see BLOCKERS below.** Gate13 green
+      (all 8 A–G). Note for the record: a GREEN GATE IS NOT A SAFETY PROOF FOR MONEY LOGIC — it passed
+      while the code contained a self-dealing faucet and a cold-start deadlock, because the harness
+      cannot see economic exploits.
+- [ ] P4 — BLOCKED (cannot fire, see BLOCKERS) — EXERCISE IT: watch a real epoch issue → distribute → claim → balance on the fleet. This is
       the validation debt this feature exists to clear.
 
 **Defaults chosen (governed, not baked):** rate expressed in TOKENS PER DAY, not per epoch — the
@@ -2898,3 +2901,34 @@ falls to dust and issuing would mint supply on an idle network with nobody earni
   unsafe direction). The design's real answer is the issuance counter on the governance-owned chain
   ("the subsidy pool, issuance counter, epoch clock" live there); this is a bounded proxy until that
   exists. Seeding is monotonic (`max`) so a stale read can only raise, never lower.
+
+### BLOCKERS found by adversarial review + verification (2026-07-18) — issuance ships INERT
+Default flipped to `DEFAULT_ISSUANCE_TOKENS_PER_DAY = 0` (OFF) so main stays safe to roll. The
+mechanism is complete, tested, and gated; it is switched off until the policy below is decided.
+
+1. **COLD START IS CIRCULAR (my bug, missed by me, confirmed in code).** Issuance requires contribution
+   → contribution counts only PAID-entitlement serving (`settle_epoch_from_cheques` skips a consumer
+   whose `subs.allocate` returns 0) → entitlement is bought with tokens → tokens require issuance. With
+   all balances 0, `has_contribution` is always false and issuance is always 0. **The feature does NOT
+   supply the fuel it was built to supply.** The commit message d084974 overclaims; this entry is the
+   correction. Design anticipated it ("a small bootstrap allocation to seed the first providers") — not
+   built.
+2. **SELF-DEALING FAUCET (review, critical).** Shares are a RATIO, so the ONLY contributor in an epoch
+   takes 100% of `paid + issued`. Anyone holding one token pays 1, serves itself ≥1 byte, and takes the
+   full per-epoch top-up — repeatedly, up to the whole lifetime cap. The existing
+   `self_dealing_nets_at_most_what_was_paid` test caps the BYTES numerator only; it says nothing about
+   the ISSUED share riding the same ratio.
+   → (1) and (2) are ONE problem: gate on paid contribution and it cannot start; accept unpaid
+   contribution and self-dealers farm it. Escaping needs a genesis allocation or sybil-resistant proof
+   of useful contribution (PDP/K5, deferred + blocked on a cryptographer). USER DECISION REQUIRED.
+3. **RESTART DOUBLE-COUNTS ISSUANCE (review, real, NOT yet fixed).** `seed_issuance_from_chain` seeds
+   from a record whose `cumulative_issued` already INCLUDES that epoch, then
+   `SettlementService::reconstruct_through` replays an 8-epoch window that normally contains it,
+   recomputing issuance on top. Supply-safe direction (inflates the counter) but BREAKS RECORD
+   REPRODUCIBILITY → false verification MISMATCHes, and if ≥2 of a 4-node committee restart together,
+   a stalled epoch or a wrong-but-canonical record. Fix direction: during reconstruction ADOPT an
+   existing `canonical_record(epoch)` (folding its `cumulative_issued`) instead of recomputing, or seed
+   strictly from `start − 1` so seed and replay never overlap. Deferred with issuance off.
+4. **SILENT ZERO (review) — FIXED.** Any governed rate below one token/epoch (288/day at a 5min epoch)
+   floors to 0. Kept the floor (never over-issue = the safe direction for a mint) but made it LOUD: a
+   nonzero rate flooring to zero now warns.

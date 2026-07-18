@@ -107,6 +107,18 @@ impl EconomyEgressService {
     /// record that every verifier rejects.
     pub async fn set_issuance(&self, tokens_per_day: u64, total_cap: u64) {
         let per_epoch = crate::settlement::issuance_per_epoch(tokens_per_day);
+        // The tokens/day → per-epoch conversion floors, which is the SAFE direction for a mint (never
+        // over-issue) but must not be SILENT: any rate below one token per epoch (288/day at a 5min epoch)
+        // floors to zero, so an operator asking for a reduced subsidy would otherwise get none with no
+        // signal. Warn rather than round up — rounding up would over-issue against the governed value.
+        if tokens_per_day > 0 && per_epoch == 0 {
+            tracing::warn!(
+                tokens_per_day,
+                epoch_millis = crate::epoch::EPOCH_MILLIS,
+                "governed issuance rate is below one token per epoch → floors to ZERO issuance; \
+                 raise the rate or lengthen the epoch to make it effective"
+            );
+        }
         self.settlement
             .write()
             .await

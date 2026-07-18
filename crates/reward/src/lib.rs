@@ -21,13 +21,29 @@ use alloc::vec::Vec;
 
 use serde::{Deserialize, Serialize};
 
-/// DEFAULT bootstrap issuance rate, in TOKENS PER DAY — a rate in TIME, deliberately not per epoch.
+/// DEFAULT bootstrap issuance rate, in TOKENS PER DAY — **0, i.e. issuance is OFF at genesis.**
 ///
-/// Same lesson as `subscription::DEFAULT_WINDOW`: a per-epoch figure silently changes what it MEANS the
-/// moment the epoch period is retuned (the 30s → 5min change would have cut real daily issuance 10x with
-/// no edit to the constant). The node converts this to a per-epoch target at its own layer, where
-/// `EPOCH_MILLIS` is known. At the default egress price (1 MiB/token) this subsidises ~1 GiB/day.
-pub const DEFAULT_ISSUANCE_TOKENS_PER_DAY: u64 = 1024;
+/// Deliberately inert until two unresolved problems are settled, because this is the one knob that
+/// CREATES money and a wrong default is a live faucet:
+///
+/// 1. **Cold start is circular.** Issuance requires contribution; contribution counts only PAID-entitlement
+///    serving (`settle_epoch_from_cheques` skips a consumer whose `subs.allocate` returns 0); entitlement is
+///    bought with tokens. With every balance at 0 nothing can start, so a nonzero default would mint
+///    nothing anyway — while looking like it works.
+/// 2. **A lone contributor captures the whole subsidy.** Shares are a RATIO, so the only contributor in an
+///    epoch takes 100% of `paid + issued`. Anyone holding a single token can pay 1, serve itself, and take
+///    the full per-epoch top-up, repeatedly, up to the lifetime cap. Capping the *bytes* numerator (which
+///    the existing self-dealing test does) does not cap the *issued* share riding the same ratio.
+///
+/// Escaping (1) means accepting unpaid contribution, which makes (2) worse — they are one problem, and it
+/// needs either a genesis allocation or sybil-resistant proof of useful contribution (PDP/K5). Until then
+/// the MECHANISM ships complete and tested but switched off; governance turns it on via
+/// [`ISSUANCE_PER_DAY_CONFIG_KEY`] once the policy is decided.
+///
+/// The unit is a rate in TIME, not per epoch — the `subscription::DEFAULT_WINDOW` lesson: a per-epoch
+/// figure silently changes meaning when the epoch period is retuned. For reference, 1024 tokens/day
+/// subsidises ~1 GiB/day at the default 1 MiB/token price.
+pub const DEFAULT_ISSUANCE_TOKENS_PER_DAY: u64 = 0;
 
 /// Governed config key for the bootstrap issuance rate, in TOKENS PER DAY (a rate in time, see above).
 pub const ISSUANCE_PER_DAY_CONFIG_KEY: &str = "economy:issuance_tokens_per_day";
