@@ -77,8 +77,8 @@ impl EconomyEgressService {
     /// paying, i.e. everyone on the paid tier by default. 0 turns it off (payment becomes the only route
     /// to entitlement). Governed so every node grants identically; a divergence would change which
     /// serving is rewardable and so break record re-execution.
-    pub async fn set_default_tier(&self, bytes: u64) {
-        self.settlement.write().await.set_default_tier(bytes);
+    pub async fn set_seeding_paid_tier(&self, bytes: u64) {
+        self.settlement.write().await.set_seeding_paid_tier(bytes);
     }
 
     /// Apply the GOVERNED bootstrap ISSUANCE schedule (§10.3 fair launch): a rate in TOKENS PER DAY plus

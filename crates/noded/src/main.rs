@@ -2246,14 +2246,15 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                         eco.set_bytes_per_token(v as u64).await;
                     }
                 }
-                // The DEFAULT TIER: everyone is on the paid tier by default, so serving is rewardable
-                // from genesis and the economy can start at all. `>= 0` because 0 is the OFF switch.
+                // SEEDING PAID-TIER SUBSIDY: everyone is put on the PAID tier without paying, so serving
+                // is rewardable from genesis and the economy can start at all. Distinct from the
+                // permanent reciprocity FREE tier; ending this subsidy does not remove that. `>= 0` because 0 is the OFF switch.
                 if let Some(v) = gov
-                    .resolve_config(zeph_economy_egress::DEFAULT_TIER_CONFIG_KEY)
+                    .resolve_config(zeph_economy_egress::SEEDING_PAID_TIER_CONFIG_KEY)
                     .await
                 {
                     if v >= 0 {
-                        eco.set_default_tier(v as u64).await;
+                        eco.set_seeding_paid_tier(v as u64).await;
                     }
                 }
                 // §10.3 bootstrap ISSUANCE: the fair-launch subsidy rate + its lifetime ceiling. Both

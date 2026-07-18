@@ -130,9 +130,9 @@ impl SettlementStore {
 
     /// Apply the GOVERNED DEFAULT TIER: bytes of rewardable-serving entitlement every account holds per
     /// window without paying (0 = off). This is what lets the economy start from all-zero balances.
-    pub fn set_default_tier(&mut self, bytes: u64) {
+    pub fn set_seeding_paid_tier(&mut self, bytes: u64) {
         let window = self.window_epochs;
-        self.subs.set_default_tier(bytes, window);
+        self.subs.set_seeding_paid_tier(bytes, window);
     }
 
     /// Set the GOVERNED issuance schedule: the seed RATE in tokens per day, and the lifetime cap.
@@ -546,8 +546,8 @@ mod tests {
     #[test]
     fn per_consumer_fcfs_caps_rewardable_at_what_the_consumer_paid() {
         let mut s = SettlementStore::new();
-        // STEADY STATE (post-seeding): entitlement must be PAID for. The seeding-phase free tier is off.
-        s.set_default_tier(0);
+        // STEADY STATE (post-seeding): entitlement must be PAID for. The seeding-phase paid-tier subsidy is off.
+        s.set_seeding_paid_tier(0);
         // Steady state: no seed, so the asserted shares are exactly the paid pool.
         s.set_issuance(0, 0);
         // UNIT PRICE in base terms: one whole token buys ONE_TOKEN bytes, i.e. 1 BASE UNIT = 1 byte, so
@@ -580,8 +580,8 @@ mod tests {
     #[test]
     fn self_dealing_nets_at_most_what_was_paid() {
         let mut s = SettlementStore::new();
-        // STEADY STATE (post-seeding): entitlement must be PAID for. The seeding-phase free tier is off.
-        s.set_default_tier(0);
+        // STEADY STATE (post-seeding): entitlement must be PAID for. The seeding-phase paid-tier subsidy is off.
+        s.set_seeding_paid_tier(0);
         // Steady state: no seed. UNIT PRICE in base terms (1 base unit = 1 byte); the price cancels in
         // the pool-average anyway — see the price test.
         s.set_issuance(0, 0);
@@ -625,8 +625,8 @@ mod tests {
     #[test]
     fn serving_beyond_a_consumers_quota_is_unrewarded_subsidy() {
         let mut s = SettlementStore::new();
-        // STEADY STATE (post-seeding): entitlement must be PAID for. The seeding-phase free tier is off.
-        s.set_default_tier(0);
+        // STEADY STATE (post-seeding): entitlement must be PAID for. The seeding-phase paid-tier subsidy is off.
+        s.set_seeding_paid_tier(0);
         // Steady state: no seed. UNIT PRICE in base terms — 1 base unit = 1 byte.
         s.set_issuance(0, 0);
         s.set_bytes_per_token(zeph_token::ONE_TOKEN);
@@ -644,8 +644,9 @@ mod tests {
         // compared bytes against tokens directly (an implicit 1 token = 1 byte).
         let mut s = SettlementStore::new();
         // STEADY STATE (post-seeding): the default tier is off, so entitlement must be PAID for. This is
-        // the real end state — the free tier is a seeding-phase bootstrap that governance switches off.
-        s.set_default_tier(0);
+        // the real end state — the seeding-phase PAID-TIER SUBSIDY is what governance switches off (the free
+        // tier — reciprocity — is permanent and unrelated).
+        s.set_seeding_paid_tier(0);
         // Isolate the PRICE property: no bootstrap issuance, so "the whole pool" is exactly what was paid.
         s.set_issuance(0, 0);
         s.set_bytes_per_token(1000);
@@ -687,8 +688,8 @@ mod tests {
         let mut s = SettlementStore::new();
         // Steady state: no seed either, so the asserted pool is exactly what was paid.
         s.set_issuance(0, 0);
-        // STEADY STATE (post-seeding): entitlement must be PAID for. The seeding-phase free tier is off.
-        s.set_default_tier(0);
+        // STEADY STATE (post-seeding): entitlement must be PAID for. The seeding-phase paid-tier subsidy is off.
+        s.set_seeding_paid_tier(0);
         s.set_bytes_per_token(10);
         s.set_window(std::time::Duration::from_millis(
             crate::epoch::EPOCH_MILLIS * 5,
@@ -714,8 +715,9 @@ mod tests {
         // Steady state: no seed, so the asserted pool arithmetic is exactly what was paid.
         s.set_issuance(0, 0);
         // STEADY STATE (post-seeding): the default tier is off, so entitlement must be PAID for. This is
-        // the real end state — the free tier is a seeding-phase bootstrap that governance switches off.
-        s.set_default_tier(0);
+        // the real end state — the seeding-phase PAID-TIER SUBSIDY is what governance switches off (the free
+        // tier — reciprocity — is permanent and unrelated).
+        s.set_seeding_paid_tier(0);
         let c = prov(9);
         s.settle_epoch_from_cheques(1, vec![(c, 0)], vec![]);
         // C never paid (quota 0) but was served 500 → all subsidy, no reward, no pool.
@@ -730,8 +732,9 @@ mod tests {
         // Steady state: no seed either, so the asserted pool is exactly what was paid.
         s.set_issuance(0, 0);
         // STEADY STATE (post-seeding): the default tier is off, so entitlement must be PAID for. This is
-        // the real end state — the free tier is a seeding-phase bootstrap that governance switches off.
-        s.set_default_tier(0);
+        // the real end state — the seeding-phase PAID-TIER SUBSIDY is what governance switches off (the free
+        // tier — reciprocity — is permanent and unrelated).
+        s.set_seeding_paid_tier(0);
         let c = prov(9);
         // Amounts are BASE UNITS. C's FIRST appearance already carries a historical paid total →
         // baseline, quota 0, pool 0.

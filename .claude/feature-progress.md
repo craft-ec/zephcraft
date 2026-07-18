@@ -3003,3 +3003,20 @@ BUYING (at 1 MiB/token nobody would pay for what they get free) — an INCENTIVE
 
 REAL LESSON: entitlement and supply are different currencies. Do not convert between them to reason about
 safety. The supply is bounded by the schedule and the lifetime cap ALONE.
+
+### TERMINOLOGY CORRECTION (2026-07-18) — "free tier" vs "paid-tier subsidy"
+User: "self-dealing exposure ends when governance switches the paid tier subsidy off. we can't switch
+free tier off. free tier is there forever."
+
+I had been calling my seeding mechanism "the free tier", which collides with the EXISTING permanent one
+and wrongly implies it disappears. They are different mechanisms with opposite lifetimes:
+- **FREE TIER** = the reciprocity grant (`reciprocity:grant`, `noded::cheque`) — tit-for-tat admission to
+  FETCH. Not a token, not an entitlement. **PERMANENT.** Untouched by any of this work.
+- **SEEDING PAID-TIER SUBSIDY** = what I built: hands out PAID-tier entitlement without payment so the
+  economy can start. **A PHASE.** Governance ends it by setting it to 0, after which the allowance must be
+  paid for. Ending it does NOT remove the free tier.
+
+Renamed accordingly (free while nothing is rolled): `DEFAULT_TIER_BYTES` → `SEEDING_PAID_TIER_BYTES`,
+`economy:default_tier_bytes` → `economy:seeding_paid_tier_bytes`, `set_default_tier` →
+`set_seeding_paid_tier`. The self-dealing exposure recorded earlier ends with the SUBSIDY, not with the
+free tier.
