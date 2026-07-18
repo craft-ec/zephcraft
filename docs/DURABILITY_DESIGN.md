@@ -149,148 +149,85 @@ Arm repair **only on converged `Dead`**, never on `Suspect`. SWIM's Suspect stat
 
 ---
 
-## 5. Liveness is not durability — the diurnal oscillator
+## 5. Steady-state churn — the reconcile window, and why diurnal is not special
 
-**This is the gap that decides whether the design works for home nodes, and today it does not.**
+**The concern that motivated this section, stated correctly.** Repair arms on converged `Dead` (§4). A
+node going to sleep looks, at the instant it leaves, exactly like a node that died — only waiting tells
+them apart. On a fleet of home machines that raised an obvious worry: does every sleep trigger a repair,
+and every wake a shed, so the fleet thrashes mint-against-shed forever?
 
-Everything in §4 arms repair on converged `Dead`. That is correct when death is permanent. It is wrong when
-the fleet is home machines that go to sleep at midnight and come back at 08:00 — because *at the moment of
-departure, "asleep" and "dead" are indistinguishable*. Only waiting tells them apart, and repair does not
-wait.
+**The answer, on a GLOBAL fleet, is no — and the reason is that there is no synchronized "night".** The
+network runs in every timezone at once. At any instant some regions are going dark and others are waking,
+continuously, so the fleet's online population is roughly CONSTANT and the stream of departures and arrivals
+is steady and balanced, not a burst. That is precisely the `O(churn)` case §4 is built for. There is no
+fleet-wide midnight to survive; there is just churn, arriving at a steady rate, which the machinery below
+consolidates and the floor gate mostly ignores. An earlier draft of this section framed the problem as a
+single node leaving at midnight and returning at 08:00 — a *synchronized* diurnal event. That framing was
+wrong: it imported a single-node, single-timezone picture into a system whose defining property is that all
+timezones run it together.
 
-**The one number doing two jobs.** Repair and shed are both driven by
+**Why the floor gate makes ordinary churn cheap.** Repair and shed both read
+`effective = own_pieces + Σ (piece_count of LIVE providers)`, and `repair_cid` returns early on
+`have >= floor`. So a provider going offline only mints if it genuinely drops the cid BELOW the durability
+floor. When a cid's providers are spread across timezones, a roughly constant fraction is always awake, so
+`effective` stays above the floor as individual providers cycle in and out — the departures and arrivals
+substitute for each other, and repair never fires. The mint path is correct as written; it does the right
+thing precisely by doing nothing when live redundancy is adequate.
 
-    effective = own_pieces + Σ (piece_count of LIVE providers)
+**What we BUILT, and why it is the general mechanism (not a diurnal special case).**
 
-That single quantity is being asked to answer two different questions: *do the bytes still exist*
-(DURABILITY) and *can I reach k of them right now* (AVAILABILITY). On an always-on fleet those are the same
-number, which is why this never surfaced. For a node that is present 12h a day they diverge every single
-night, and both mechanisms treat the divergence as real: a sleeping node's bytes are counted as LOST, and a
-waking node's bytes are counted as SURPLUS.
+**(1) One per-cid reconcile job, not per-direction, not a per-event sweep [2026-07-18].** A cid whose
+provider set changes enqueues a single `reconcile:{cid}` job that reads the probe-verified net `have` across
+ALL its providers ONCE and moves toward the band: mint below the floor, shed one above it, nothing inside.
+Repair and shed are the same operation — "move `effective` toward the band" — in opposite directions, so
+they are one job (`reconcile_cid`) with one dedup key, delegating to the two reviewed executors
+(`repair_cid`, `shed_cid`). This replaced death-repair's old giant per-death sweep (one task grinding ~1200
+cids, measured at 2h36m live) with per-cid jobs on the shared scheduler, and it means a death and a return
+of the same cid COALESCE into one net evaluation instead of a repair and a shed that each separately no-op.
 
-**The closed loop.** Neither half is wrong on its own; together they oscillate forever.
+**(2) The trigger is a MONITORING WINDOW, not a per-event reflex [2026-07-18].** Reconcile must not fire on
+each provider change — under steady churn that would be constant work, even though most fires net to a
+no-op. Instead every change accrues a per-cid signed delta (`+1` a holder appeared, `-1` a holder
+dropped/died) into a `RECONCILE_WINDOW` (30s). At the window's close, only cids whose net is NON-ZERO enqueue
+one reconcile; a departure offset by an arrival in the same window nets to 0, is pruned, and fires NOTHING —
+not even a no-op. This is the "normalize over a period" the design turns on: over any window the fleet's
+balanced churn largely cancels per cid, and only genuine net movement triggers work. `reconcile_cid` still
+computes the true net from probe-verified pieces at execution; the accrued sign is just a cheap gate on
+whether to look at all. The window bounds how long a genuine loss waits (≤30s, covered by erasure margin)
+against how much churn it swallows; a mass death, a node's whole manifest delta, and a quick flap all
+collapse into one net.
 
-| phase | `effective` | mechanism | action |
-|---|---|---|---|
-| night — X sleeps | `floor − X` | death-driven repair (§4) | MINT, in bulk, within seconds |
-| day — X wakes | `floor + X` | cold-surplus shed | SHED, 1 piece per scan |
+Live-validated (all four nodes, 2026-07-18): steady state fires zero reconcile-windows; a kill accrues
+`-1` across ~1200 elected cids and consolidates them into a SINGLE window batch; a restore within ~90s
+leaves most of those jobs to find the node back at the floor and no-op; the fleet settles with no ongoing
+mint/shed thrash.
 
-The day's shed destroys exactly the redundancy the night's repair built, because while X is awake its pieces
-make the cid *look* over-replicated. Then X sleeps and it is a deficit again. Nothing converges to a stable
-set of pieces; it converges to a stable **churn**.
+**Accounting split + `k/p` provisioning — DE-SCOPED.** An earlier version of this section made a
+durability-vs-availability accounting split ("count pieces that EXIST separately from pieces REACHABLE") a
+required third part. It is not load-bearing. That split only matters if a normal amount of sleeping
+routinely drops cids below the floor — but under continuous, balanced, global churn with an adequate erasure
+set `n`, live redundancy stays above the floor on its own, and the existing floor gate handles the rest. The
+split is a tool to reach for only if measurement on a real mixed fleet shows live redundancy dipping below
+the floor in ordinary operation. It is not a milestone this design is waiting on.
 
-It is not marginal at real parameters. The Schmitt band is `delta = max(floor/8, 2)`, so at k=32 (floor ≈ 96)
-delta ≈ 12, while a holder on a ~5-way spread carries ≈ 19 pieces. Any node holding more than delta sustains
-the cycle — i.e. every ordinary holder.
+**The one real residual: per-cid PLACEMENT diversity.** The fleet aggregate normalizing does not by itself
+guarantee that a *given* cid's providers span timezones. Today placement is `peer_source.peers()` — whoever
+is reachable at publish time — which skews toward the publisher's currently-awake cohort, and that cohort
+correlates with timezone. So a cid whose `n` pieces all land inside one timezone's active window has
+providers that then sleep together: THAT cid can dip below the floor on a correlated schedule while the rest
+of the fleet is fine. Global participation makes this rare (different cids cluster in different zones, so the
+aggregate stays balanced), but the publish-time-biased placement does not eliminate it. The fix, if
+measurement ever shows it mattering, is a placement nicety — spread each cid's `n` pieces across the
+availability (timezone/phase) dimension the way one would spread across failure domains, using peers'
+observable uptime phase — not a timer and not an accounting change. This is the honest remaining item, and
+it is narrow.
 
-**The asymmetry is structural, not a tuning bug.** Absence is PUSHED: SWIM tells the whole fleet in ~25s and
-repair fires off the local index with no scan. Presence is PULLED: nobody is notified that a node came back;
-its provider records simply reappear in the DHT, and the surplus is only noticed when some holder next scans
-that cid — a bounded but lazy ~1–2h (`recheck_max`), and then only ONE piece per scan. The system reacts to
-a home node vanishing in seconds and to its return in hours.
-
-**At this fleet's scale it merely oscillates. At the target scale it RATCHETS.** Because shed is rate-limited
-to 1 piece/scan and repair mints in bulk, the surplus never fully sheds before nightfall — the leftover is
-what absorbs X's next absence — so on a small fleet it damps to a steady ~7 pieces/cid/night of mint+shed
-rather than growing. That is luck, not design.
-
-And it is luck that RUNS OUT, because it depends on the one thing this design exists to remove. `shed_one` is
-called from exactly one place: inside `health_scan_chunk`. **Every shed rides the periodic health scan** —
-the O(N_cids)/interval sweep measured in §1 at ~252 DHT streams/sec/node, which does not hold at 1M cids and
-which P5 replaces with PDP SAMPLING. Sampling visits cids statistically, not exhaustively; a given cid's
-surplus is then essentially never noticed. So at the target scale:
-
-| | trigger | cost | fires? |
-|---|---|---|---|
-| MINT | SWIM death (event) | O(churn) | promptly, in bulk, at any scale |
-| SHED | periodic scan (sweep) | O(N_cids) | never, at scale |
-
-Every night every home node's absence mints; nothing ever sheds. Storage grows monotonically, forever.
-
-**Correction — the MINT path is not itself wrong; it is floor-gated.** `repair_cid` recounts live providers
-into `have = own + Σ live piece_counts` and returns early on `have >= floor`. So a departure only mints when
-it genuinely drops the cid below the durability floor. It fires on an ordinary absence for a narrower reason
-than "mint is broken": the standing margin is the Schmitt band `delta ≈ 12` (at k=32), while one holder on a
-~5-way spread carries `≈ 19` pieces — so a single absence really does cross the floor. And what pins the
-margin that thin is the SHED, which trims `effective` down toward the floor *while counting the soon-absent
-node's pieces*. So the fault is two-sided: the margin is provisioned smaller than one node's share, and the
-shed actively removes what margin remains. The mint is the one part behaving correctly.
-
-**The general error, which is worth more than the specific bug:** repair was made event-driven while its
-INVERSE was left sweep-driven. That pair cannot be stable at any scale where the sweep is the thing being
-retired — the fast side always wins, and the slow side's cleanup is exactly the O(N_cids) cost this design
-was built to delete. A mechanism that creates work on an event must have its cleanup driven by an event too,
-or it must not create the work at all.
-
-**Why a grace period is NOT the fix.** The obvious patch — wait before treating `Dead` as lost — only
-addresses the night half. The day half still trims X's pieces as cold surplus, so the fleet keeps paying,
-and the grace window buys the reduced durability of an under-replicated cid for nothing. A timer cannot fix
-a mis-measurement.
-
-**The fix has three parts, ordered by how load-bearing they are.**
-
-**(1) Unify repair and shed into ONE queued job type, per cid — not a per-event sweep [BUILT 2026-07-18].**
-This is the structural correction under everything else. Death repair used to run as one giant per-death
-task looping ~1200 cids, holding a budget permit across the whole sweep; spawning it (so it stopped blocking
-the census watcher) only gave the sweep its own thread — the sweep itself is still the wrong unit. The right
-unit is the health scan's: a single `PieceJob { cid, kind }` submitted to the shared scheduler, one per cid,
-drained at a bounded worker count with per-cid dedup and priority. A death then ENQUEUES `|S_x ∩ ours|` jobs
-and returns immediately; the scheduler does the rest. Multiple deaths add jobs to the same queue instead of
-spawning competing sweeps. Repair and shed are the *same* job with opposite `kind`, because they are the
-same operation — "move `effective` toward the band" — in opposite directions, and must not grow two
-divergent execution paths.
-
-**Realised as ONE job — `reconcile_cid` — keyed per cid, not per direction [BUILT 2026-07-18].** A cid whose
-provider set changes (a death, a drop, a return) enqueues a single `reconcile:{cid}` job. It reads the
-probe-verified net `have` across ALL that cid's providers ONCE and moves toward the band: mint below the
-floor, shed one above it, nothing inside. Because the key is per cid (not `repair:` vs `shed:`), every
-provider change for a cid COALESCES into one net evaluation — the offset is per cid ACROSS its providers,
-not per cid per provider. Some left, some returned: if the net never left the band, reconcile does nothing,
-instead of the old repair-per-departure + shed-per-arrival that each separately no-op'd. The two reviewed
-executors (`repair_cid`, `shed_cid`) stay as the delegated bodies, so unification added a dispatcher, not a
-new destructive path.
-
-**(2) The offset is a MONITORING WINDOW, not a per-event reflex [BUILT 2026-07-18].** Reconcile must NOT
-fire on each provider change — a churny fleet would then reconcile forever, even though each fire nets to a
-no-op. Instead every provider change accrues a per-cid signed delta (`+1` a holder appeared, `-1` a holder
-dropped/died) into a `RECONCILE_WINDOW` (30s). At the window's close, exactly the cids whose net is NON-ZERO
-enqueue one reconcile; a leave offset by a return nets to 0 and is pruned, firing NOTHING — not even a
-no-op. This is the consolidation done per cid across providers and across time: some left, some returned,
-and only the net moves work. `reconcile_cid` still computes the true net from probe-verified pieces at
-execution; the accrued sign is just a cheap gate on whether to look. The window bounds how long a genuine
-loss waits (≤30s here, covered by erasure margin) against how much churn it swallows (a mass death, a node's
-whole manifest delta, a quick flap all collapse). A true moving average was rejected earlier for a timescale
-reason — a window long enough to hide a full night also delays real-loss detection by a night; the 30s
-window consolidates BURSTS, and diurnal-scale offset is left to part (3)'s provisioning, not a longer timer.
-
-**(3) Placement across the availability dimension is the primary lever; accounting split + provisioning are
-the backup.** The deepest fix needs a mixed fleet to tune, so it is sequenced last:
-- **Phase-diverse placement.** "One region sleeps as another wakes" only helps a given cid if THAT cid's
-  pieces span the anti-correlated regions. Today placement is `peer_source.peers()` — timezone-blind, it
-  spreads onto whoever is reachable at publish, i.e. onto the awake cohort that then sleeps together. Spread
-  each cid's `n` pieces across the diurnal-phase dimension (a failure-domain-style spread) and a roughly
-  constant fraction of every cid's holders is always awake, so instantaneous `effective` never crosses the
-  floor and the EXISTING gate handles absence with nothing added. Needs peers' phase, which is observable
-  (uptime pattern), not declared.
-- **Accounting split + `k/p` provisioning.** Count pieces that EXIST for durability (only that mints), pieces
-  REACHABLE for availability, and hold `k/p` for the expected online fraction `p` so a normal night never
-  crosses the line. This is the static version of the same idea; placement is the adaptive one.
-
-Together these make the returning node a non-event — **it never lost anything** — and, crucially, with no
-unnecessary mint there is no surplus, so the scan-driven shed is never needed to clean up after it. The
-scaling problem is not solved by cheaper cleanup; it is dissolved by not making the mess.
-
-**What (3) needs that we do not have.** Distinguishing "offline but holding" from "gone forever" requires
-knowing a holder still HAS the bytes while we cannot reach it — a signed manifest is a claim, worth even less
-from a node that is not answering. Same trust boundary PDP (K5) closes. So the honest sequencing is: build
-(1) and (2) now (they are correct at any `p` and testable via ordinary surplus/deficit), measure the online
-fraction on a real mixed fleet, then tune (3).
-
-**Status.** (1) and (2) BUILT and rolled 2026-07-18. (3) OPEN — not exercised by the current fleet (4
-always-on Hetzner nodes, where durability and availability are identical by construction), so its tuning is
-unmeasured. The A-G harness cannot see the diurnal case either: `scenario_h_mass_death` kills permanently. A
-diurnal scenario (stop/restore on offset phases, assert net mint/shed churn ≈ 0) is the test that would, and
-is the natural home for validating (3) once there is a fleet with real phase diversity.
+**Status.** (1) and (2) BUILT, rolled, and live-validated 2026-07-18 — correct at any online fraction and
+exercised by ordinary kill/restore. The accounting split is de-scoped (not needed under global continuous
+churn + adequate `n`). Per-cid placement diversity is the only open item, and it is a measurement-gated
+placement refinement, not a correctness gap. The current 4-node always-on Hetzner fleet cannot exercise
+timezone diversity at all, so nothing here about placement is measured — it is reasoned from the global
+operating premise; a real multi-timezone fleet is what would confirm it.
 
 ---
 
