@@ -50,7 +50,13 @@ fleet to tune).
       mixed fleet. NOT built.
 - [ ] P6 — Keep the periodic scan as backstop (still submits the same job type) — do NOT retire
       it (needs PDP/K5), just make it one more producer of the same queue
-- [ ] P7 — Gate + roll + live test (kill/restore, assert queue drains, no competing sweeps)
+- [x] P7 — GATE + ROLLED + LIVE-TESTED (2026-07-18, all 4 Hetzner nodes). Kill zeph4: census
+      watcher saw departure → `reconcile accrued (window)` (-1 per ~1212 elected cids, NOT enqueued
+      immediately) → 30s window closed → `reconcile window: net changes → reconcile cids=1212` →
+      repair jobs minted (8/27/14 across survivors). Restore zeph4: watcher logged `joined=1`
+      PROMPTLY (not blocked); most reconcile jobs found zeph4 back at floor → no-op (the re-check
+      offset). Settled with ZERO ongoing reconcile-window fires (no mint-shed thrash). Steady state
+      SILENT (0 windows/3min when nothing changes). All commits pushed; fleet NRestarts=0.
 
 ## Decisions / notes
 - 2026-07-18: mint is floor-gated and CORRECT; fault is margin+shed (see §5 correction).
@@ -69,3 +75,10 @@ NOT coalesce (per-cid-per-provider). Fixed: ONE reconcile:{cid} key for both dir
 - on_death + anti-entropy(lost∪gained) both enqueue reconcile:{cid} → death offset by return coalesces.
 - Delegates to the reviewed repair_cid/shed_cid → dispatcher, not a new destructive path.
 - Test: reconcile_nets_to_noop_when_redundancy_is_in_band. Commit 8522c23. NOT yet gated/rolled.
+
+
+## DONE 2026-07-18 — windowed reconcile live. Remaining (unbuilt, out of scope):
+- Diurnal-scale offset (leave-at-midnight/return-at-morning) = §5 part 3 provisioning (k/p +
+  phase-diverse placement). The 30s window only consolidates BURSTS/flaps, not a full night.
+- Execution cost: reconcile still O(net-cids) DHT resolves per window; a holder-count pre-filter
+  would cut no-op resolves but needs per-holder piece counts in the index.
