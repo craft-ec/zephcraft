@@ -36,10 +36,18 @@ pub const ONE_TOKEN: u64 = 100_000_000;
 /// a consumer's payment from being counted many times over. Nobody ever buys a single byte, so the
 /// sub-byte rounding in `purchase` is immaterial: at this price one base unit funds ~11 KB.
 ///
-/// **The scale has to agree with [`DEFAULT_TIER_BYTES`], and at 1 MiB/token it did not.** A 1 TiB free
-/// tier priced at 1 MiB/token was worth 1,048,576 tokens of entitlement per account per window — MORE
-/// than the entire lifetime supply cap, making the "cap" cap nothing. At 1 TiB/token the free tier is
-/// worth exactly 1 token, which is the coherent relationship. Governed (see
+/// **Entitlement is NOT convertible to tokens, so its size cannot threaten the supply.** Entitlements are
+/// pass-through in the record (never paid out); the only payout is `distributable × bytes / Σ bytes` — a
+/// ratio of a FIXED pool. However large an allowance is, the amount distributed is still just the seed
+/// plus what was paid; the allowance only changes how that fixed amount is SPLIT. (An earlier revision of
+/// this comment claimed a 1 TiB tier at 1 MiB/token was "worth 1,048,576 tokens" and breached the supply
+/// cap. That was wrong — it multiplied a ratio cap by a purchase price to invent a token figure that has
+/// no meaning in distribution.)
+///
+/// What the price DOES govern is how generous the free tier is relative to BUYING: at 1 MiB/token, 1 TiB
+/// of entitlement would cost over a million tokens, so nobody would ever pay for what they get free. At
+/// 1 TiB/token the tier is worth one token's purchase, so paying more buys a meaningfully larger share.
+/// That is an INCENTIVE question, not a solvency one. Governed (see
 /// [`BYTES_PER_TOKEN_CONFIG_KEY`]) — this is only the genesis default.
 pub const DEFAULT_BYTES_PER_TOKEN: u64 = 1 << 40; // 1 TiB per token
 

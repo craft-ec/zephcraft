@@ -2983,11 +2983,23 @@ Two things this settled:
    subsidy (`serving_beyond_a_consumers_quota_is_unrewarded_subsidy` already proves this — paid 40,
    SERVED 100). The quota exists only so one payer's money cannot fund reward many times over. Nobody
    buys a byte, so the rounding is immaterial: at 1 TiB/token one base unit funds ~11 KB.
-2. **But it exposed a REAL parameter bug I introduced.** At the old 1 MiB/token default, the 1 TiB free
-   tier was worth 1,048,576 tokens of entitlement per account per window — 1.05x the ENTIRE 1,000,000
-   lifetime supply cap. One account's free allowance exceeded all money that will ever exist, so the cap
-   capped nothing. Fixed: DEFAULT_BYTES_PER_TOKEN = 1 TiB, making the free tier worth exactly 1 token.
+2. **I then claimed a "supply cap breach" that DOES NOT EXIST — corrected, see below.**
 
-LESSON: the price, the free tier and the supply cap are ONE coherent set — changing any of them in
-isolation can silently invalidate the others. Check the token-value of the free tier against the supply
-cap whenever any is retuned.
+### CORRECTION (same day): the "free tier breaches the supply cap" claim was WRONG
+I wrote that a 1 TiB free tier at 1 MiB/token was "worth 1,048,576 tokens", 1.05x the lifetime cap. That
+is nonsense, and the user caught it: "1TiB per user won't be worth 1mil token. it still is just ratio of
+distribution of 1 token per day. Why do you jumble them up?"
+
+Verified in code: `Entitlement` is PASS-THROUGH in the record (never paid out); the only payout is
+`distributable × bytes / Σ bytes` — a ratio of a FIXED pool. Entitlement is a ratio-numerator CAP. It
+never mints, never converts to tokens. However large an allowance, the amount distributed is still the
+seed plus what was paid; the allowance only changes the SPLIT. I had multiplied a ratio cap by a purchase
+price to manufacture a token figure with no meaning in distribution — jumbling three distinct things:
+bytes (ratio cap), tokens (fixed supply), price (purchase conversion).
+
+The price VALUE (1 TiB/token) stands, because that is the stated intended price — but for the right
+reason, not the invented one. What price actually governs is how generous the free tier is relative to
+BUYING (at 1 MiB/token nobody would pay for what they get free) — an INCENTIVE question, not solvency.
+
+REAL LESSON: entitlement and supply are different currencies. Do not convert between them to reason about
+safety. The supply is bounded by the schedule and the lifetime cap ALONE.
