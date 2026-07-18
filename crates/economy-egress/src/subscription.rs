@@ -26,10 +26,22 @@ use alloc::collections::{BTreeMap, VecDeque};
 /// the drift test in `noded`.
 pub const ONE_TOKEN: u64 = 100_000_000;
 
-/// DEFAULT egress price: bytes of rewardable serving that ONE WHOLE token buys (amounts elsewhere are in
-/// BASE UNITS; `purchase` scales by [`ONE_TOKEN`]). Governed (see
+/// DEFAULT egress price: bytes of REWARDABLE SERVING that one whole token funds — 1 TiB. Amounts
+/// elsewhere are BASE UNITS; `purchase` scales by [`ONE_TOKEN`].
+///
+/// **This is not a metered purchase of bytes.** A paid consumer's actual consumption is UNLIMITED; serving
+/// past its entitlement still happens, it is merely unrewarded subsidy (see
+/// `serving_beyond_a_consumers_quota_is_unrewarded_subsidy`). The entitlement exists solely so reward
+/// distribution is FAIR — it caps how much provider reward one payer's money can fund, which is what stops
+/// a consumer's payment from being counted many times over. Nobody ever buys a single byte, so the
+/// sub-byte rounding in `purchase` is immaterial: at this price one base unit funds ~11 KB.
+///
+/// **The scale has to agree with [`DEFAULT_TIER_BYTES`], and at 1 MiB/token it did not.** A 1 TiB free
+/// tier priced at 1 MiB/token was worth 1,048,576 tokens of entitlement per account per window — MORE
+/// than the entire lifetime supply cap, making the "cap" cap nothing. At 1 TiB/token the free tier is
+/// worth exactly 1 token, which is the coherent relationship. Governed (see
 /// [`BYTES_PER_TOKEN_CONFIG_KEY`]) — this is only the genesis default.
-pub const DEFAULT_BYTES_PER_TOKEN: u64 = 1 << 20; // 1 MiB per token
+pub const DEFAULT_BYTES_PER_TOKEN: u64 = 1 << 40; // 1 TiB per token
 
 /// Governed config key for the egress price (`SetConfig` → every node reads the identical value).
 pub const BYTES_PER_TOKEN_CONFIG_KEY: &str = "economy:bytes_per_token";

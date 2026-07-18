@@ -2972,3 +2972,22 @@ not universal (Ethereum 18, USDC 6, SOL 9) — what matters is one canonical val
 - Test fallout was informative: every test asserting exact PAID-pool arithmetic now disables the seed
   (`set_issuance(0,0)`), and "unit price" tests rebase to `bytes_per_token = ONE_TOKEN` (1 base unit =
   1 byte). Those edits describe the steady state, which is the honest framing.
+
+### PRICE / FREE-TIER COHERENCE (2026-07-18) — a parameter bug caught by the user's pricing note
+User: "price can be set 1token/1TB... user doesn't buy single byte because paid user doesn't have quota.
+their quota is unlimited. the quota we set here is just meant for fairness of reward distribution."
+
+Two things this settled:
+1. **My sub-byte rounding concern was misframed.** Entitlement is NOT a metered purchase of bytes. A paid
+   consumer's consumption is UNLIMITED; serving past entitlement still happens, it is just unrewarded
+   subsidy (`serving_beyond_a_consumers_quota_is_unrewarded_subsidy` already proves this — paid 40,
+   SERVED 100). The quota exists only so one payer's money cannot fund reward many times over. Nobody
+   buys a byte, so the rounding is immaterial: at 1 TiB/token one base unit funds ~11 KB.
+2. **But it exposed a REAL parameter bug I introduced.** At the old 1 MiB/token default, the 1 TiB free
+   tier was worth 1,048,576 tokens of entitlement per account per window — 1.05x the ENTIRE 1,000,000
+   lifetime supply cap. One account's free allowance exceeded all money that will ever exist, so the cap
+   capped nothing. Fixed: DEFAULT_BYTES_PER_TOKEN = 1 TiB, making the free tier worth exactly 1 token.
+
+LESSON: the price, the free tier and the supply cap are ONE coherent set — changing any of them in
+isolation can silently invalidate the others. Check the token-value of the free tier against the supply
+cap whenever any is retuned.
