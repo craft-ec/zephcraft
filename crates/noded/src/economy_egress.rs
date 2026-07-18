@@ -78,9 +78,11 @@ impl EconomyEgressService {
         self.settlement.read().await.total_supply()
     }
 
-    /// Seed cumulative fresh issuance to an exact value (monotonic — only ever raises).
-    pub async fn seed_cumulative_issued(&self, value: u64) {
-        self.settlement.write().await.seed_cumulative_issued(value);
+    /// Adopt a durable economic snapshot (pool, supply, watermarks, seeding eligibility, claims) from a
+    /// committee-attested record. Supply restores monotonically, so a stale read can never hand back
+    /// spent minting headroom.
+    pub async fn restore_economic_state(&self, snap: &zeph_reward::EconomicSnapshot) {
+        self.settlement.write().await.restore(snap);
     }
 
     /// Apply the GOVERNED DEFAULT TIER — the per-window egress allowance every account holds WITHOUT

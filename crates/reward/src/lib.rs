@@ -177,6 +177,13 @@ pub struct RewardInput {
     /// The governed issuance schedule for this epoch.
     #[serde(default)]
     pub issuance: IssuanceParams,
+    /// The economic state as the node computed it for this epoch, BEFORE the mint below is applied.
+    /// Node-supplied and carried through to the record — the same discipline `entitlements` follows, and
+    /// for the same reason: a verifier re-derives the identical input from committed chains and re-runs
+    /// `compute` to the identical record. Only the MINT's effect is applied here, because minting is the
+    /// one thing that must not be taken on a node's word.
+    #[serde(default)]
+    pub state: EconomicSnapshot,
 }
 
 /// One provider's computed reward share (the amount it may CLAIM for this epoch) plus the REWARDABLE
@@ -196,6 +203,55 @@ pub struct Share {
     /// ever written, whereas the state makes a provider's own view one lookup of its latest row.
     #[serde(default)]
     pub cumulative_bytes: u64,
+}
+
+/// One `(provider, consumer)` pair's cumulative served-bytes watermark, as carried in the snapshot.
+pub type ServedWatermark = (([u8; 32], [u8; 32]), u64);
+
+/// THE DURABLE ECONOMIC SNAPSHOT — the complete economic state at an epoch boundary, TOKEN side and
+/// REWARD side together, carried on the committee-attested record chain.
+///
+/// **Why one snapshot rather than per-field restoration.** The economy previously had no durable state
+/// layer at all: the whole settlement store was in-memory, and the parts that survived a restart did so
+/// incidentally — either because some chain happened to carry them, or because the failure mode was
+/// conservative. That left real defects (a restart handed every account a fresh subsidy allowance; the
+/// pool forgot every token it held; a re-debit could break conservation) which are all the same defect,
+/// so they get one fix rather than five patches.
+///
+/// **Why on the record chain.** Durability alone is not enough — nodes must AGREE. A snapshot on local
+/// disk would let two nodes hold different pools and compute different records. Riding the epoch record
+/// makes the state durable, agreed (committee-attested) and verifiable (the transition is reproducible:
+/// `snapshot_n = f(snapshot_n-1, epoch inputs)`), at exactly the epoch cadence the design specifies for
+/// shared economic state.
+///
+/// Every collection is SORTED so records stay canonical and hash identically across nodes.
+///
+/// **Known scaling limit, recorded not hidden:** this embeds O(accounts) state in every epoch record.
+/// That is fine at current scale and wrong at large scale, where this wants to become a state ROOT plus
+/// deltas. Sizing it honestly is a separate piece of work from making it exist.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct EconomicSnapshot {
+    // ── TOKEN side ────────────────────────────────────────────────────────────────────────────────
+    /// Tokens the protocol literally holds (earmarked or not).
+    pub pool: u64,
+    /// Total supply ever minted — the token's own counter, so a restart cannot reset the cap.
+    pub minted: u64,
+
+    // ── REWARD side ───────────────────────────────────────────────────────────────────────────────
+    /// Per payer: cumulative `Pay` already folded into the pool. Without it a restart re-baselines and
+    /// silently drops payments made in the gap — providers lose revenue consumers really paid.
+    pub paid_watermarks: Vec<([u8; 32], u64)>,
+    /// Per `(provider, consumer)`: cumulative served bytes already rewarded, so the same cheques cannot
+    /// be rewarded twice.
+    pub served_watermarks: Vec<ServedWatermark>,
+    /// Per account: the first epoch at which it may receive its NEXT seeding allowance. THE fix for
+    /// "restart refreshes your subsidy" — eligibility must outlive the process, or the one-allowance-per-
+    /// window bound is bypassed by restarting.
+    pub seeding_next: Vec<([u8; 32], u64)>,
+    /// `(epoch, provider)` shares already claimed. The token's account chain owns the credit-side dedup,
+    /// but the POOL debit is decided here — so losing this could debit the pool for an already-claimed
+    /// share while the chain refuses the credit, and conservation would break.
+    pub claimed: Vec<(u64, [u8; 32])>,
 }
 
 /// The epoch reward RECORD — per-provider shares and per-consumer spends, both sorted by id (canonical).
@@ -223,6 +279,10 @@ pub struct RewardRecord {
     /// actually paid, so any node can see how much of a reward was demand and how much was subsidy.
     #[serde(default)]
     pub issued: u64,
+    /// THE DURABLE ECONOMIC STATE resulting from this epoch — token and reward together. Carried so a
+    /// node can restore its complete economic position from the chain rather than starting blank.
+    #[serde(default)]
+    pub state: EconomicSnapshot,
     /// Cumulative fresh issuance INCLUDING this epoch — the resulting STATE, which the next epoch's input
     /// carries back in to enforce the cap. State, so duplicate inputs take MAX and never sum (the same
     /// rule as `Share::cumulative_bytes`; summing a cumulative would double it).
@@ -347,8 +407,23 @@ pub fn compute(input: &RewardInput) -> RewardRecord {
             remaining,
         })
         .collect();
+    // The resulting economic state: the node's pre-mint snapshot with THIS epoch's mint applied, and
+    // every collection sorted so two nodes handed the same state in a different order still produce
+    // byte-identical records (they are signed and compared by hash).
+    let mut state = input.state.clone();
+    state.pool = state.pool.saturating_add(issued);
+    state.minted = input.cumulative_issued.saturating_add(issued);
+    state.paid_watermarks.sort_unstable();
+    state.paid_watermarks.dedup_by_key(|(k, _)| *k);
+    state.served_watermarks.sort_unstable();
+    state.served_watermarks.dedup_by_key(|(k, _)| *k);
+    state.seeding_next.sort_unstable();
+    state.seeding_next.dedup_by_key(|(k, _)| *k);
+    state.claimed.sort_unstable();
+    state.claimed.dedup();
     RewardRecord {
         epoch: input.epoch,
+        state,
         // The DISTRIBUTABLE total (paid + issued) — the shares' actual denominator, which is what this
         // field has always meant.
         pool: distributable,
@@ -713,6 +788,7 @@ mod tests {
                 entitlements: alloc::vec![],
                 cumulative_issued: 10,
                 issuance: iss.clone(),
+                state: EconomicSnapshot::default(),
             })
         };
         let rec = mk(alloc::vec![

@@ -128,6 +128,41 @@ impl SettlementStore {
         self.subs.available(consumer, epoch)
     }
 
+    /// Capture the COMPLETE economic position — token side and reward side — for the epoch record.
+    ///
+    /// This is what makes the economy restart-safe. Everything here was previously in-memory only, so a
+    /// restart silently handed every account a fresh seeding allowance, forgot every token the pool held,
+    /// dropped payments made while the node was down, and could re-debit an already-claimed share.
+    pub fn snapshot(&self) -> zeph_reward::EconomicSnapshot {
+        zeph_reward::EconomicSnapshot {
+            pool: self.protocol.pool(),
+            minted: self.protocol.total_supply(),
+            paid_watermarks: self.paid_watermark.iter().map(|(k, v)| (*k, *v)).collect(),
+            served_watermarks: self.served_pair_wm.iter().map(|(k, v)| (*k, *v)).collect(),
+            seeding_next: self.subs.seeding_eligibility(),
+            claimed: self.claimed.iter().map(|(e, p)| (*e, *p)).collect(),
+        }
+    }
+
+    /// Restore the complete economic position from a durable, committee-attested record.
+    ///
+    /// Supply is restored MONOTONICALLY (it can only rise), so a stale read can never hand back spent
+    /// minting headroom. Everything else is authoritative: the record is the agreed state, and a node
+    /// rejoining adopts it rather than trusting whatever its own memory happened to hold.
+    pub fn restore(&mut self, snap: &zeph_reward::EconomicSnapshot) {
+        self.protocol = zeph_token::ProtocolState::new(
+            zeph_token::SupplyState::new(
+                self.protocol.total_supply().max(snap.minted),
+                self.protocol.supply().cap(),
+            ),
+            snap.pool,
+        );
+        self.paid_watermark = snap.paid_watermarks.iter().copied().collect();
+        self.served_pair_wm = snap.served_watermarks.iter().copied().collect();
+        self.subs.restore_seeding_eligibility(&snap.seeding_next);
+        self.claimed = snap.claimed.iter().copied().collect();
+    }
+
     /// Apply the GOVERNED DEFAULT TIER: bytes of rewardable-serving entitlement every account holds per
     /// window without paying (0 = off). This is what lets the economy start from all-zero balances.
     pub fn set_seeding_paid_tier(&mut self, bytes: u64) {
@@ -142,16 +177,6 @@ impl SettlementStore {
         // second copy here is how the counter bug happened, and a duplicated cap is worse: the compute
         // check and the mint gate would disagree about how much may exist.
         self.protocol.supply_mut().set_cap(total_cap);
-    }
-
-    /// Seed cumulative issuance from the DURABLE records chain (startup). Monotonic — takes the max, so a
-    /// late or out-of-order chain read can only ever raise it, never re-open minting headroom.
-    pub fn seed_cumulative_issued(&mut self, from_chain: u64) {
-        // Restores the ONE counter — the token's own. An earlier cut of this kept a separate
-        // `cumulative_issued` field on the store and seeded THAT, leaving `ProtocolState`'s counter at
-        // zero after every restart: the cap check read the shadow while `total_supply()` reported 0. Two
-        // counters is the exact defect this whole change exists to remove, so there is now only one.
-        self.protocol.supply_mut().observe_minted(from_chain);
     }
 
     /// Cumulative fresh issuance so far — observable state its own tests assert (same treatment as the
@@ -219,6 +244,7 @@ impl SettlementStore {
             contributions,
             entitlements,
             cumulative_issued: self.protocol.total_supply(),
+            state: self.snapshot(),
             issuance: zeph_reward::IssuanceParams {
                 tokens_per_day: self.issuance_tokens_per_day,
                 epochs_per_day: epochs_per_day(),
@@ -560,6 +586,72 @@ mod tests {
         check(balances, &s, "after expiry");
     }
 
+    /// A RESTART must not change the economy. Restore the whole position from one durable snapshot and
+    /// every previously-lost property survives — including the exploit that motivated this:
+    /// **restarting used to refresh every account's seeding allowance**, because eligibility lived only
+    /// in process memory. That bypassed the one-allowance-per-window bound completely.
+    #[test]
+    fn a_restart_restores_the_whole_economic_position_including_subsidy_eligibility() {
+        let mut before = SettlementStore::new();
+        before.set_issuance(1000 * epochs_per_day(), 1_000_000_000);
+        before.pay_in(5_000);
+        before.settle_epoch(1, vec![contrib(1, 3), contrib(2, 1)], vec![]);
+        let claimed = before.claim(1, prov(1));
+        assert!(claimed > 0);
+        // Consume the seeding allowance so eligibility is genuinely spent. A small tier, so exhaustion
+        // is one call rather than a terabyte of them.
+        before.set_seeding_paid_tier(1_000);
+        let c = prov(9);
+        assert_eq!(
+            before.subs.allocate(&c, 1_000, 1),
+            1_000,
+            "first allowance granted in full"
+        );
+        assert_eq!(
+            before.subs.allocate(&c, 1_000, 1),
+            0,
+            "and now exhausted for this window"
+        );
+
+        // The epoch record carries the whole position.
+        let snap = before.snapshot();
+        assert_eq!(snap.pool, before.pool_total());
+        assert_eq!(snap.minted, before.total_supply());
+        assert!(!snap.seeding_next.is_empty(), "eligibility is captured");
+        assert!(!snap.claimed.is_empty(), "claims are captured");
+
+        // ── RESTART: a brand-new, empty store adopts the snapshot ──────────────────────────────────
+        let mut after = SettlementStore::new();
+        after.set_issuance(1000 * epochs_per_day(), 1_000_000_000);
+        after.set_seeding_paid_tier(1_000);
+        after.restore(&snap);
+
+        assert_eq!(
+            after.pool_total(),
+            before.pool_total(),
+            "the pool remembers what it holds"
+        );
+        assert_eq!(
+            after.total_supply(),
+            before.total_supply(),
+            "supply survives → the cap cannot reset"
+        );
+        // THE exploit, closed: the allowance is NOT refreshed by restarting.
+        assert_eq!(
+            after.subs.allocate(&c, 1_000, 1),
+            0,
+            "restarting must NOT hand out a fresh seeding allowance"
+        );
+        // And an already-claimed share cannot be re-claimed to re-debit the pool.
+        let pool_before = after.pool_total();
+        assert_eq!(
+            after.claim(1, prov(1)),
+            0,
+            "already claimed — no second debit"
+        );
+        assert_eq!(after.pool_total(), pool_before, "so the pool is untouched");
+    }
+
     /// Restart restoration must restore THE counter — the token's own — not a shadow copy beside it.
     ///
     /// This is a regression test for a defect introduced while wiring the literal pool: the store kept
@@ -575,7 +667,10 @@ mod tests {
         // A fresh process has minted nothing...
         assert_eq!(s.total_supply(), 0);
         // ...then restores 4_000 of history from the durable chain.
-        s.seed_cumulative_issued(4_000);
+        s.restore(&zeph_reward::EconomicSnapshot {
+            minted: 4_000,
+            ..Default::default()
+        });
 
         // BOTH views must agree, because they are the same counter.
         assert_eq!(
@@ -592,7 +687,10 @@ mod tests {
         assert_eq!(s.protocol.supply().headroom(), 1_000_000 - 4_000);
 
         // Monotonic: a stale, lower read cannot hand spent headroom back.
-        s.seed_cumulative_issued(10);
+        s.restore(&zeph_reward::EconomicSnapshot {
+            minted: 10,
+            ..Default::default()
+        });
         assert_eq!(s.total_supply(), 4_000, "a lower read never lowers supply");
     }
 
@@ -661,13 +759,21 @@ mod tests {
 
         // Seeding from the durable chain is monotonic — it can only ever RAISE the counter, so a stale
         // or out-of-order read can never restore spent minting headroom.
-        s.seed_cumulative_issued(0);
+        s.restore(&zeph_reward::EconomicSnapshot {
+            minted: 0,
+            pool: s.pool_total(),
+            ..Default::default()
+        });
         assert_eq!(
             s.cumulative_issued(),
             1,
             "a lower chain read does not lower the counter"
         );
-        s.seed_cumulative_issued(500);
+        s.restore(&zeph_reward::EconomicSnapshot {
+            minted: 500,
+            pool: s.pool_total(),
+            ..Default::default()
+        });
         assert_eq!(s.cumulative_issued(), 500, "a higher chain read raises it");
     }
 

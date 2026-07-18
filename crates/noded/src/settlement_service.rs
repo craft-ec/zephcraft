@@ -466,9 +466,12 @@ impl SettlementService {
         // the same `start` the loop uses makes the two boundaries correct by construction.
         if start > 0 {
             if let Some(prev) = self.records.canonical_record(start - 1).await {
-                self.economy
-                    .seed_cumulative_issued(prev.cumulative_issued)
-                    .await;
+                // Restore the COMPLETE economic position — token side and reward side — from the durable,
+                // committee-attested record, not merely the issuance counter. Everything in that snapshot
+                // was previously in-memory only, so a restart silently handed every account a fresh
+                // seeding allowance, forgot every token the pool held, dropped payments made while the
+                // node was down, and could re-debit an already-claimed share.
+                self.economy.restore_economic_state(&prev.state).await;
             }
         }
         for e in start..=through {

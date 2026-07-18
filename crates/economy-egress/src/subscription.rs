@@ -144,6 +144,22 @@ impl SubscriptionLedger {
         self.seeding_window = window_epochs;
     }
 
+    /// The seeding ELIGIBILITY map, for the durable snapshot: when each account may next receive its
+    /// allowance. Must outlive the process — otherwise restarting refreshes everyone's subsidy, which
+    /// bypasses the one-allowance-per-window bound entirely.
+    pub fn seeding_eligibility(&self) -> alloc::vec::Vec<([u8; 32], u64)> {
+        self.seeding_next.iter().map(|(k, v)| (*k, *v)).collect()
+    }
+
+    /// Restore seeding eligibility from a durable snapshot. Per account the LATER epoch wins, so a stale
+    /// record can only ever delay the next allowance, never grant one early.
+    pub fn restore_seeding_eligibility(&mut self, rows: &[([u8; 32], u64)]) {
+        for (account, next) in rows {
+            let e = self.seeding_next.entry(*account).or_insert(0);
+            *e = (*e).max(*next);
+        }
+    }
+
     /// The default-tier allowance currently in force (observability + tests).
     pub fn seeding_paid_tier(&self) -> u64 {
         self.seeding_paid_tier

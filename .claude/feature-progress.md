@@ -3113,8 +3113,45 @@ restored history so restarting cannot reset the cap, and restoration is monotoni
 LESSON (recurring, now three times): any quantity with two homes will diverge, and the copy that looks
 right is not necessarily the load-bearing one. Route through one owner.
 
-- [ ] P3 part 2 — durable POOL restoration. The counter now survives restart via
+- [x] P3 — DONE (one snapshot, token + reward). Superseded the per-field plan below. The counter now survives restart via
       `seed_cumulative_issued` from the records chain, but `ProtocolState.pool` still starts at 0 on
       boot. The natural durable home is the reward RECORD (already per-epoch, durable,
       committee-attested) rather than the governance chain — writing the pool there per epoch would
       need a quorum-cosigned governance action each time, far too heavy for epoch cadence.
+
+### P3 DONE (2026-07-18/19) — ONE durable economic snapshot, token AND reward
+User: "build it as one durable economic-state snapshot. not just rewards, token too."
+
+**The audit that motivated it — essentially the WHOLE settlement store was in-memory**, and the parts
+that survived a restart did so incidentally (a chain happened to carry them, or the failure mode was
+conservative). Ranked:
+- EXPLOITABLE: `subs.seeding_next` — eligibility lived only in memory, so RESTARTING REFRESHED EVERY
+  ACCOUNT'S 1 TiB SUBSIDY, bypassing the one-per-window bound. (Same faucet defect I "fixed" earlier,
+  through a different door: I closed exhaustion-regrants, not restart-regrants.)
+- CONSERVATION: `claimed` — the token's account chain owns the CREDIT dedup durably, but the POOL debit
+  is decided in-memory, so a restart could re-debit while the chain refuses the credit → tokens vanish.
+- VALUE LOSS: `protocol.pool` (forgets everything held), `subs.grants` (consumers lose what they PAID
+  for), `paid_watermark`/`served_pair_wm` (safe direction, but payments in the gap are never folded →
+  providers silently lose earned revenue).
+
+**Built:** `zeph_reward::EconomicSnapshot` — pool, minted, paid/served watermarks, seeding eligibility,
+claims — carried in `RewardRecord.state`. On the RECORD CHAIN, not local disk, because durability alone
+is insufficient: nodes must AGREE, or two nodes hold different pools and compute different records.
+Riding the epoch record makes it durable + agreed (committee-attested) + verifiable (the transition
+`snapshot_n = f(snapshot_n-1, inputs)` is reproducible), at exactly the epoch cadence the design
+specifies for shared economic state. All collections sorted → records stay canonical/hash-identical.
+
+`SettlementStore::snapshot()` / `restore()`, and `reconstruct_through` now restores the WHOLE position
+instead of just the counter. Supply restores MONOTONICALLY (a stale read can never return spent
+headroom); seeding eligibility takes the LATER epoch (can only delay an allowance, never grant early).
+Consolidated to ONE restoration path — `seed_cumulative_issued` deleted, since two paths for one
+concern is the defect that keeps recurring here.
+
+TEST: `a_restart_restores_the_whole_economic_position_including_subsidy_eligibility` — spends an
+allowance, restarts into an EMPTY store, adopts the snapshot, and asserts the allowance is NOT
+refreshed, the pool remembers its holdings, supply survives (cap cannot reset), and an already-claimed
+share cannot re-debit the pool.
+
+**KNOWN SCALING LIMIT, recorded at the type:** this embeds O(accounts) state in EVERY epoch record.
+Fine now, wrong at scale — it wants to become a state ROOT plus deltas. Sizing it is separate work
+from making it exist.
