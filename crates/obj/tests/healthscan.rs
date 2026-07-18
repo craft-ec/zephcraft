@@ -1427,3 +1427,39 @@ async fn shed_trims_one_verified_surplus_piece() {
     );
     assert!(total(&nodes) >= floor, "still at/above the floor");
 }
+
+/// reconcile_cid is the unified per-cid, net-across-providers job: it must do NOTHING when a cid's real
+/// (probe-verified) redundancy sits inside the band, whatever provider churn triggered it. This is the
+/// offset — a departure offset by an arrival (or a stale-high dead record) nets to a no-op, not a
+/// wasteful repair+shed pair. s0 holds exactly the floor; a dead phantom's stale-high record would make
+/// it LOOK like surplus if trusted, but probe-verified the net is the floor → in band → no mint, no shed.
+#[tokio::test]
+async fn reconcile_nets_to_noop_when_redundancy_is_in_band() {
+    let tracker = start_tracker();
+    let dirs: Vec<tempfile::TempDir> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
+    let floor = 32usize;
+
+    let s0 = node(&tracker, dirs[0].path()).await;
+    s0.routing.announce_node(0, 0).await.unwrap();
+    let publisher = node(&tracker, dirs[1].path()).await;
+    let payload: Vec<u8> = (0..120_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 9) as u8)
+        .collect();
+    let cid = publisher.engine.publish(&payload, false).await.unwrap().cid;
+    wait_have(std::slice::from_ref(&s0), cid, floor).await;
+    let before = s0.engine.store().piece_count(&cid);
+    assert!(before >= floor && before <= floor + (floor / 8).max(2), "s0 sits in the band");
+
+    // A departed provider leaves a stale-high record (would look like surplus if trusted).
+    let phantom = node(&tracker, dirs[2].path()).await;
+    phantom.routing.announce(cid, 64, false).await.unwrap();
+    phantom.kill().await;
+
+    // Net redundancy never actually moved → reconcile does NOTHING.
+    s0.engine.reconcile_cid(cid).await;
+    assert_eq!(
+        s0.engine.store().piece_count(&cid),
+        before,
+        "in-band reconcile is a no-op — no mint, no shed"
+    );
+}

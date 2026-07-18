@@ -293,16 +293,16 @@ impl TestNode {
                                 },
                             );
                         }
-                        EngineWork::Shed(cid) => {
+                        EngineWork::Reconcile(cid) => {
                             let eng = work_engine.clone();
                             work_jobs.submit(
-                                format!("shed:{}", cid.to_hex()),
-                                Priority::Eviction,
+                                format!("reconcile:{}", cid.to_hex()),
+                                Priority::Repair,
                                 1,
                                 move || {
                                     let eng = eng.clone();
                                     async move {
-                                        let _shed = eng.shed_cid(cid).await;
+                                        eng.reconcile_cid(cid).await;
                                         Ok(())
                                     }
                                 },

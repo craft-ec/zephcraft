@@ -240,6 +240,16 @@ spawning competing sweeps. Repair and shed are the *same* job with opposite `kin
 same operation — "move `effective` toward the band" — in opposite directions, and must not grow two
 divergent execution paths.
 
+**Realised as ONE job — `reconcile_cid` — keyed per cid, not per direction [BUILT 2026-07-18].** A cid whose
+provider set changes (a death, a drop, a return) enqueues a single `reconcile:{cid}` job. It reads the
+probe-verified net `have` across ALL that cid's providers ONCE and moves toward the band: mint below the
+floor, shed one above it, nothing inside. Because the key is per cid (not `repair:` vs `shed:`), every
+provider change for a cid COALESCES into one net evaluation — the offset is per cid ACROSS its providers,
+not per cid per provider. Some left, some returned: if the net never left the band, reconcile does nothing,
+instead of the old repair-per-departure + shed-per-arrival that each separately no-op'd. The two reviewed
+executors (`repair_cid`, `shed_cid`) stay as the delegated bodies, so unification added a dispatcher, not a
+new destructive path.
+
 **(2) The queue latency IS the epoch offset — no moving average needed.** A job re-checks current state at
 EXECUTION time (`repair_cid` already re-resolves and no-ops on `have >= floor`; shed will mirror it). So a
 repair job enqueued when X leaves, drained after a deliberate debounce, simply no-ops if X (or an equivalent

@@ -225,17 +225,14 @@ impl DeathRepair {
         if first_sight {
             return true; // a baseline: neither a loss nor a surplus event, just learning the world
         }
-        // A holder DROPPED cids of ours → repair (durability). A holder GAINED cids of ours → shed
-        // (surplus): the event-driven mirror the old code threw away with "gaining is not a durability
-        // event" — true, but it IS a surplus event, and dropping it is why the shed rode the O(N_cids) scan.
-        if !lost.is_empty() {
-            self.repair_our_share(&lost, peer, "anti-entropy: holder dropped cids")
-                .await;
-        }
-        for c in gained {
-            // shed_cid re-checks surplus, so an over-eager request costs a no-op — and that re-check is the
-            // offset: if the holder that made this cid surplus has already left, nothing sheds.
-            self.engine.request_shed(Cid(c)).await;
+        // Every cid whose provider set CHANGED for this peer — dropped OR gained — gets ONE reconcile. The
+        // direction (repair vs shed) is decided at execution from the probe-verified net across ALL
+        // providers, not here per provider: a drop of ours offset by a gain elsewhere nets to a no-op, and
+        // if several peers changed the same cid this pass they coalesce on the `reconcile:{cid}` key into a
+        // single net evaluation. This is the offset done per cid across providers. (lost ∩ gained = ∅ for
+        // one peer — a diff never claims a cid on both sides — so the chain never double-counts.)
+        for c in lost.into_iter().chain(gained) {
+            self.engine.request_reconcile(Cid(c)).await;
         }
         true
     }
@@ -402,16 +399,17 @@ impl DeathRepair {
         let elected = mine.len();
         let last_holder = mine.iter().filter(|(_, n)| *n <= 1).count();
 
-        // ENQUEUE, do not execute. Each elected cid becomes a per-cid `repair:{cid}` scheduler job
-        // (`request_repair`), deduped so it coalesces with a scan-detected repair of the same cid, and the
-        // scheduler bounds concurrency across every death and scan at once. This replaces the old
-        // budget-semaphore loop that ran `repair_cid` inline: that loop was O(elected) DHT resolves — 2h36m
-        // for 1242 cids on the live fleet — and even spawned it only moved the grind off the watcher's
-        // thread; the SWEEP itself was the wrong unit. Submitting in fewest-holders-first order preserves
-        // the P4 priority (urgent cids get the earlier queue slot, since the scheduler is FIFO within a
-        // priority). Enqueue is O(elected) cheap map-inserts, so this returns in milliseconds.
+        // ENQUEUE, do not execute. Each elected cid becomes a per-cid `reconcile:{cid}` scheduler job,
+        // deduped so a death and a return of the same cid coalesce into ONE net evaluation (the offset), and
+        // so it also coalesces with a scan-detected need. The scheduler bounds concurrency across every
+        // death and scan at once. This replaces the old budget-semaphore loop that ran `repair_cid` inline:
+        // that loop was O(elected) DHT resolves — 2h36m for 1242 cids on the live fleet — and even spawned
+        // it only moved the grind off the watcher's thread; the SWEEP itself was the wrong unit. Submitting
+        // fewest-holders-first preserves the P4 priority (urgent cids get the earlier queue slot, FIFO
+        // within a priority). Enqueue is O(elected) cheap map-inserts, so this returns in milliseconds. A
+        // death only ever DROPS redundancy, so reconcile will mint or no-op here, never shed.
         for (c, _) in mine {
-            self.engine.request_repair(Cid(c)).await;
+            self.engine.request_reconcile(Cid(c)).await;
         }
         tracing::info!(
             node = %hex::encode(&gone[..6]),
@@ -419,7 +417,7 @@ impl DeathRepair {
             elected,
             last_holder,
             why,
-            "repair enqueued"
+            "reconcile enqueued"
         );
     }
 }

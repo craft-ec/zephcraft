@@ -254,12 +254,13 @@ pub enum EngineWork {
     /// Durability repair for one at-risk cid (Repair priority — preempts all
     /// routine work; found by the health scan, executed by the coordinator).
     Repair(Cid),
-    /// Surplus shed for one over-replicated cid (Eviction priority — the lowest;
-    /// shedding a cushion is never urgent, and must never contend with repair or
-    /// serving). The event-driven mirror of `Repair`: a returning/appearing holder
-    /// makes a cid surplus, and this trims it back toward the band instead of
-    /// waiting for the O(N_cids) periodic scan to notice.
-    Shed(Cid),
+    /// Reconcile one cid toward the durability band — the unified, per-cid,
+    /// net-across-providers job behind death and anti-entropy events. Repair
+    /// priority: it may need to mint. `reconcile_cid` picks the direction from
+    /// probe-verified net `have` (mint below floor, shed above band, else nothing),
+    /// so a departure offset by an arrival nets to a no-op instead of a repair+shed
+    /// pair. Replaces the separate per-direction Repair/Shed event triggers.
+    Reconcile(Cid),
 }
 
 /// Outcome of publishing a file (content + its manifest).
@@ -2672,29 +2673,72 @@ impl ObjEngine {
     /// enqueueing is O(1): the caller submits N jobs and returns instead of grinding N DHT resolves inline,
     /// which is what let one death block the census watcher for hours.
     ///
-    /// Unwired (tests/library, no coordinator): repair inline so behaviour is unchanged there.
-    pub async fn request_repair(&self, cid: Cid) {
-        self.emit(zeph_events::Event::RepairNeeded(cid));
+    /// Front door for RECONCILE — the unified, per-cid, net-across-providers job.
+    /// A cid whose provider set
+    /// changed (a holder died, dropped it, or (re)appeared) gets ONE `reconcile:{cid}` job, deduped, so all
+    /// of that cid's provider churn collapses into a SINGLE net evaluation instead of a repair PER departure
+    /// and a shed PER arrival. That is the offset done right: it is per cid ACROSS its providers, not per
+    /// cid per provider — some left, some returned, and we act on the NET. Enqueue when wired, run inline
+    /// when not (tests).
+    pub async fn request_reconcile(&self, cid: Cid) {
         if let Some(tx) = self.work_trigger.get() {
-            let _ = tx.send(EngineWork::Repair(cid));
+            let _ = tx.send(EngineWork::Reconcile(cid));
         } else {
-            self.repair_cid(cid).await;
+            self.reconcile_cid(cid).await;
         }
     }
 
-    /// Front door for SHED — the event-driven mirror of [`request_repair`]. Enqueue `cid` as an
-    /// Eviction-priority scheduler job (deduped per cid) rather than shedding inline. Called when a holder
-    /// APPEARS or RETURNS (the anti-entropy `added` signal, which used to be discarded), so surplus is
-    /// trimmed as an EVENT — O(churn) — instead of only when the O(N_cids) periodic scan next visits the
-    /// cid. `shed_cid` re-checks surplus at execution, so an over-eager request costs a no-op.
-    ///
-    /// Unwired (tests/library): shed inline so behaviour is unchanged there.
-    pub async fn request_shed(&self, cid: Cid) {
-        if let Some(tx) = self.work_trigger.get() {
-            let _ = tx.send(EngineWork::Shed(cid));
-        } else {
+    /// Probe-verified total reachable pieces for `cid`: our own + Σ live holders that CONFIRM they hold it
+    /// right now. Unverifiable holders (evicted / slow / unreachable) count as ZERO — the same conservative
+    /// ground truth [`shed_cid`] needs, computed once so [`reconcile_cid`] can pick a direction without
+    /// trusting stale-high records. Under-counts (never over-counts), so a repair decision off this is safe
+    /// and a shed decision off this can only be too timid, never too aggressive.
+    async fn verified_have(&self, cid: Cid) -> usize {
+        let me = self.transport.node_id();
+        let providers = self.routing.resolve(cid).await.unwrap_or_default();
+        let alive_set = self.alive_peers().await;
+        let candidates: Vec<PeerAddr> = providers
+            .iter()
+            .filter(|p| p.node_id != me)
+            .filter(|p| alive_set.as_ref().is_none_or(|s| s.contains(&p.node_id)))
+            .map(|p| p.addr.clone())
+            .collect();
+        let verified: Vec<usize> = futures::stream::iter(candidates)
+            .map(|addr| async move {
+                match self.probe_availability(cid, &addr).await {
+                    Some(ack) if ack.has => ack.piece_count as usize,
+                    _ => 0,
+                }
+            })
+            .buffer_unordered(PROBE_CONCURRENCY)
+            .collect()
+            .await;
+        self.store.piece_count(&cid) + verified.iter().sum::<usize>()
+    }
+
+    /// Reconcile ONE cid toward the durability band — the unified executor behind [`request_reconcile`].
+    /// Probe-verified net `have` across ALL live providers decides the direction ONCE: below the floor →
+    /// mint (delegate to [`repair_cid`]); cold surplus above the band → shed one (delegate to [`shed_cid`]);
+    /// inside the band → nothing. A leave offset by a return nets to a no-op here, which is the whole point
+    /// — no wasteful repair+shed pair for a cid whose redundancy never actually moved. The direction check
+    /// is a pure read; the destructive/minting work stays in the two reviewed executors, which each re-check
+    /// and re-elect from scratch, so this adds no new way to lose data.
+    pub async fn reconcile_cid(&self, cid: Cid) {
+        let Some(gen) = self.store.generation(&cid) else {
+            return;
+        };
+        if self.store.is_tombstoned(&cid) {
+            return;
+        }
+        let floor = target_pieces(gen.k as usize);
+        let delta = (floor / 8).max(2);
+        let have = self.verified_have(cid).await;
+        if have < floor {
+            self.repair_cid(cid).await;
+        } else if have > floor + delta && self.served_pulls(&cid) < self.config.degrade_threshold {
             self.shed_cid(cid).await;
         }
+        // else: the net change kept this cid inside the band — offset complete, nothing to do.
     }
 
     /// The body of a Shed coordinator job — the mirror of [`repair_cid`]. Re-derives the surplus verdict

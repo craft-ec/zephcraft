@@ -1929,20 +1929,21 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                             },
                         );
                     }
-                    zeph_obj::EngineWork::Shed(cid) => {
+                    zeph_obj::EngineWork::Reconcile(cid) => {
                         let eng = work_engine.clone();
-                        // Eviction priority: shedding a cushion is never urgent and must yield to repair
-                        // and serving. Same per-cid dedup key family, distinct prefix so `JobClass::from_key`
-                        // does not fold it into Repair's cap. max_attempts=1: shedding nothing is a valid
-                        // outcome (not surplus, or another node won the shedder election), not an error.
+                        // ONE per-cid `reconcile:{cid}` key for BOTH directions, so all of a cid's provider
+                        // churn (a death, a drop, a return) coalesces into a single net evaluation — the
+                        // offset is per cid across providers, not per provider. Repair priority + max=1:
+                        // reconcile may mint, and doing nothing (net change stayed in the band) is a valid
+                        // outcome, not an error to retry.
                         work_jobs.submit(
-                            format!("shed:{}", cid.to_hex()),
-                            zeph_sched::Priority::Eviction,
+                            format!("reconcile:{}", cid.to_hex()),
+                            zeph_sched::Priority::Repair,
                             1,
                             move || {
                                 let eng = eng.clone();
                                 async move {
-                                    eng.shed_cid(cid).await;
+                                    eng.reconcile_cid(cid).await;
                                     Ok(())
                                 }
                             },

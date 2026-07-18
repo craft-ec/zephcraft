@@ -89,8 +89,8 @@ impl JobClass {
     /// prefix not listed here falls into `Other` (cap 2) — the classifier test
     /// enumerating every real prefix is the guard against silent throttling.
     pub fn from_key(key: &str) -> JobClass {
-        if key.starts_with("repair:") {
-            JobClass::Repair
+        if key.starts_with("repair:") || key.starts_with("reconcile:") {
+            JobClass::Repair // reconcile may mint → bound with repair
         } else if key.starts_with("scan:") {
             JobClass::Scan
         } else if key.starts_with("publish:") {
@@ -103,8 +103,8 @@ impl JobClass {
             JobClass::Scale // scale:{cid} AND scale_quota
         } else if key == "distribute_pending" {
             JobClass::Distribute
-        } else if key == "eviction" || key.starts_with("shed:") {
-            JobClass::Eviction // periodic eviction AND per-cid surplus shed (shed:{cid})
+        } else if key == "eviction" {
+            JobClass::Eviction
         } else {
             JobClass::Other
         }
@@ -896,7 +896,7 @@ mod tests {
             ("scale_quota", Scale),
             ("distribute_pending", Distribute),
             ("eviction", Eviction),
-            ("shed:abc", Eviction),
+            ("reconcile:abc", Repair),
         ];
         for (key, want) in cases {
             assert_eq!(
