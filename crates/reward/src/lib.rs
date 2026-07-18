@@ -45,7 +45,19 @@ pub const DEFAULT_ISSUANCE_TOKENS_PER_DAY: u64 = ONE_TOKEN; // 1 whole token/day
 /// Governed config key for the bootstrap issuance rate, in TOKENS PER DAY (a rate in time, see above).
 pub const ISSUANCE_PER_DAY_CONFIG_KEY: &str = "economy:issuance_tokens_per_day";
 
-/// DEFAULT lifetime ceiling on cumulative FRESH issuance, in tokens — the supply cap for minted supply.
+/// Lifetime ceiling on cumulative FRESH issuance — the TOTAL SUPPLY CAP, across every issuance path that
+/// will ever exist, not just this one.
+///
+/// **Seeding is one deliberately tiny draw against it.** At 1 token/day the seed alone would take
+/// millennia to approach this, which is by design: the headroom is reserved for future distribution
+/// mechanisms (token purchase, grants, whatever else). The cap is not sized to bound the seeding phase —
+/// governance ending the seeding subsidy is what bounds that.
+///
+/// **CONSTRAINT FOR WHOEVER ADDS THE NEXT MINTING PATH:** this ceiling is only real if EVERY path that
+/// creates tokens draws against the SAME `cumulative_issued` counter that [`issuance_for`] checks and
+/// [`RewardRecord::cumulative_issued`] carries. A purchase or grant mechanism that minted independently
+/// would not be capped at all — it would bypass this silently, and nothing here would detect it. Route new
+/// issuance through this counter, or the total supply cap is decorative.
 ///
 /// Absolute, so it needs no period conversion. At the default rate this is ~2.7 years of uninterrupted
 /// bootstrap, and far less in practice: issuance tapers to zero on its own as paid demand fills the

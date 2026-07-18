@@ -3020,3 +3020,18 @@ Renamed accordingly (free while nothing is rolled): `DEFAULT_TIER_BYTES` → `SE
 `economy:default_tier_bytes` → `economy:seeding_paid_tier_bytes`, `set_default_tier` →
 `set_seeding_paid_tier`. The self-dealing exposure recorded earlier ends with the SUBSIDY, not with the
 free tier.
+
+### CAP SEMANTICS clarified (2026-07-18)
+User: "the seeding rate is intentionally small. the cap is for future where user can purchase token. or
+any other distribution mechanism."
+
+So DEFAULT_ISSUANCE_TOTAL_CAP (1,000,000 tokens) is the TOTAL SUPPLY CEILING across every issuance path
+that will ever exist — NOT a bound on the seeding phase. The seed is one tiny draw; at 1 token/day it
+would take ~2,740 years to approach the cap, which is intended. What ends seeding is governance switching
+the SEEDING PAID-TIER SUBSIDY off, not the cap binding. (My earlier "the cap is decorative at this rate"
+read it as a seeding bound — wrong frame.)
+
+**CONSTRAINT THIS CREATES, recorded at the constant:** the ceiling is only real if EVERY future minting
+path (token purchase, grants, other distributions) draws against the SAME `cumulative_issued` counter
+that `issuance_for` checks and `RewardRecord.cumulative_issued` carries. Today only the seed does. A
+purchase mechanism that minted independently would bypass the cap silently and nothing would detect it.
