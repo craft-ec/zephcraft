@@ -1339,4 +1339,70 @@ mod tests {
         assert!(!crate::store::is_safe_component(".."));
         assert!(!crate::store::is_safe_component(""));
     }
+
+    /// DETERMINISM PROBE: do two INDEPENDENT instances, given identical logical operations, commit to
+    /// the same root CID?
+    ///
+    /// This decides an architecture question for the economic layer. If roots match, the epoch record can
+    /// carry a 32-byte state ROOT instead of inlining O(accounts) of state, and comparing one CID proves
+    /// two nodes hold identical economic state — content addressing IS the state hash. If roots DIVERGE,
+    /// the root is good for durability but useless for agreement, and agreement needs a canonical hash
+    /// computed over sorted ROWS rather than over pages (the reason chains use Merkle tries rather than a
+    /// general DB's file layout: SQLite's physical layout can depend on insertion order, freelist state,
+    /// rowid allocation and vacuum history, none of which are logical properties).
+    #[tokio::test]
+    async fn two_independent_instances_agree_on_the_root_cid() {
+        let owner = NodeId([9u8; 32]);
+        // Identical logical operations, applied to two instances that share NOTHING — separate page
+        // stores, separate head stores.
+        let sql = "CREATE TABLE acct(id INTEGER PRIMARY KEY, bal INTEGER); \
+                   INSERT INTO acct VALUES (1,100),(2,250),(3,7);";
+        let dir_a = tempdir().unwrap();
+        let a_heads = MockHeads::new(owner);
+        let a = CraftSql::register(dir_a.path(), a_heads.clone(), owner).unwrap();
+        let mut db_a = a.open("econ").await.unwrap();
+        db_a.write(sql).await.unwrap();
+        let root_a = db_a.root().expect("A committed");
+
+        let dir_b = tempdir().unwrap();
+        let b_heads = MockHeads::new(owner);
+        let b = CraftSql::register(dir_b.path(), b_heads.clone(), owner).unwrap();
+        let mut db_b = b.open("econ").await.unwrap();
+        db_b.write(sql).await.unwrap();
+        let root_b = db_b.root().expect("B committed");
+
+        assert_eq!(
+            root_a, root_b,
+            "IDENTICAL operations must yield an identical root for the root to be usable as an \
+             agreement primitive; if this fails the economic state root must be a canonical hash over \
+             sorted rows, not the page-layout root"
+        );
+
+        // The harder case: the same logical STATE reached by a different insertion ORDER.
+        let dir_c = tempdir().unwrap();
+        let c_heads = MockHeads::new(owner);
+        let c = CraftSql::register(dir_c.path(), c_heads.clone(), owner).unwrap();
+        let mut db_c = c.open("econ").await.unwrap();
+        db_c.write(
+            "CREATE TABLE acct(id INTEGER PRIMARY KEY, bal INTEGER); \
+             INSERT INTO acct VALUES (3,7); INSERT INTO acct VALUES (1,100); \
+             INSERT INTO acct VALUES (2,250);",
+        )
+        .await
+        .unwrap();
+        let root_c = db_c.root().expect("C committed");
+        assert_ne!(
+            root_c, root_a,
+            "MEASURED PROPERTY (pinned deliberately): the root commits to the WRITE HISTORY, not to the \
+             logical state — identical rows inserted in a different order give a different root. If this \
+             ever starts passing, the pager gained order-independence and the note below can be revisited."
+        );
+        // CONSEQUENCE for the economic layer: the SQL root is a valid agreement primitive ONLY between
+        // nodes with identical write histories. A node that restarts and REPLAYS epochs writes a
+        // different sequence than one that ran continuously, so their roots would diverge despite
+        // identical economic state — a false divergence, exactly what verification must not produce.
+        // Therefore: use CraftSQL to STORE and QUERY the state (its real strengths — indexing, paging,
+        // O(changed) commits), but commit to a canonical hash over SORTED ROWS in the record, not this
+        // root. That is why chains hash a Merkle trie over ordered keys rather than a database file.
+    }
 }

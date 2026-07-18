@@ -3155,3 +3155,30 @@ share cannot re-debit the pool.
 **KNOWN SCALING LIMIT, recorded at the type:** this embeds O(accounts) state in EVERY epoch record.
 Fine now, wrong at scale — it wants to become a state ROOT plus deltas. Sizing it is separate work
 from making it exist.
+
+### MEASURED (2026-07-19): can the CraftSQL root CID serve as the economic state commitment?
+User: "we have the sql for this purpose right? that is the thinking on why i build the sql layer."
+Right instinct — CraftSQL commits to a single immutable ROOT CID with page dedup, which is exactly the
+"state root + deltas" fix for the O(accounts)-per-record limit in `EconomicSnapshot`.
+
+EXPERIMENT (`sql::db::tests::two_independent_instances_agree_on_the_root_cid`, permanent):
+- Two instances sharing NOTHING (separate page stores + head stores), identical SQL →
+  **IDENTICAL root**. The pager is deterministic for a given operation sequence. ✓
+- Same logical rows inserted in a DIFFERENT ORDER → **DIFFERENT root**. ✗ (pinned with assert_ne)
+
+CONCLUSION: the root commits to the WRITE HISTORY, not the logical state. So it is a valid agreement
+primitive only between nodes with identical write histories — and a node that restarts and REPLAYS
+epochs writes a different sequence than one that ran continuously, so their roots would diverge despite
+identical economic state. That is a FALSE divergence, precisely what verification must never produce.
+
+ARCHITECTURE (decided by the measurement, not by preference):
+- USE CraftSQL to STORE and QUERY the economic state — indexing, paging, O(changed) commits. This is
+  the real answer to "how do we manage all this data" and removes the O(accounts)-per-record bloat.
+- COMMIT to a canonical hash over SORTED ROWS in the epoch record, NOT the SQL root. This is why chains
+  hash a Merkle trie over ordered keys rather than a database file.
+- My hand-rolled sorted-Vec canonicalisation in `EconomicSnapshot` turns out to be the right SHAPE
+  (canonical ordering) in the wrong PLACE (inlined in the record instead of hashed over a SQL-backed
+  store).
+
+- [ ] NEXT — move `EconomicSnapshot`'s contents into a CraftSQL-backed economic store; keep a canonical
+      row-ordered state hash in the record for agreement.
