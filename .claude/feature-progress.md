@@ -2932,3 +2932,25 @@ mechanism is complete, tested, and gated; it is switched off until the policy be
 4. **SILENT ZERO (review) — FIXED.** Any governed rate below one token/epoch (288/day at a 5min epoch)
    floors to 0. Kept the floor (never over-issue = the safe direction for a mint) but made it LOUD: a
    nonzero rate flooring to zero now warns.
+
+### SEEDING PHASE resolved (user decision, 2026-07-18) — issuance ENABLED
+User: "this is just seeding phase. in actual 1TB need to be paid." So the free tier is a BOOTSTRAP
+PHASE that governance ends, not the steady state.
+- **Default tier = 1 TiB/window free** (`economy:default_tier_bytes`, 0 = off). Granted LAZILY on first
+  use and gated by per-account ELIGIBILITY (`default_next`), not by "has no live grants" — my first cut
+  re-granted the moment an allowance was spent, an unlimited faucet; the test caught it.
+- **Seed rate = 1 token/day** (`economy:issuance_tokens_per_day`). Paid on an EXACT schedule
+  (⌊(e+1)R/E⌋−⌊eR/E⌋) because 1/day is BELOW one token/epoch and a per-epoch division floors it to zero.
+  Proven: 1 token/day sums to exactly 1 across 288 epochs, landing on one of them.
+- **Why the smallness is security, not timidity:** the seed is a FIXED NETWORK-WIDE rate, so sybils
+  cannot multiply it — N identities split the same 1 token/day. The seeding phase's self-dealing
+  exposure is therefore a FAIRNESS cost (honest providers diluted), never a solvency one.
+- **ACCEPTED EXPOSURE, documented in code:** the free tier breaks
+  `self_dealing_nets_at_most_what_was_paid` — normally rewardable is capped at what a consumer PAID
+  (self-dealing zero-sum), but a free allowance lets an account manufacture rewardable bytes having paid
+  nothing, diluting honest providers' share of a SHARED pool. Bounded + temporary; the main reason the
+  phase must end. Steady-state tests assert the paid-only semantics and disable the tier deliberately.
+- **RESTART DOUBLE-COUNT FIXED** (review finding 3): seeding now happens inside `reconstruct_through`
+  from the epoch immediately BEFORE its replay window, so seed and replay are contiguous by
+  construction. The old startup seed was removed outright — because seeding is monotonic, its wrong
+  (higher) value would have won over the correct one.

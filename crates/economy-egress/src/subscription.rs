@@ -41,6 +41,36 @@ pub const DEFAULT_WINDOW: Duration = Duration::from_secs(30 * 24 * 3600);
 /// Governed config key for the subscription window, in SECONDS (a duration, not an epoch count).
 pub const WINDOW_SECS_CONFIG_KEY: &str = "economy:subscription_window_secs";
 
+/// SEEDING-PHASE allowance: egress BYTES every account is entitled to per window WITHOUT paying — i.e.
+/// everyone is on the paid tier by default while the network bootstraps. 1 TB.
+///
+/// **This is a PHASE, not the steady state.** In normal operation 1 TB must be PAID for; the free tier
+/// exists only so the network can start, and governance switches it off (set to 0) when seeding ends.
+/// Every test asserting paid-only entitlement semantics disables it deliberately — those tests describe
+/// the end state.
+///
+/// **Known, accepted exposure while it is on.** It breaks the `self_dealing_nets_at_most_what_was_paid`
+/// invariant: rewardable serving is normally capped at what a consumer PAID, so self-dealing is zero-sum,
+/// but a free allowance lets an account manufacture up to this many rewardable bytes having paid nothing.
+/// Because shares are a ratio of a SHARED pool, that dilutes honest providers' share of real payments,
+/// and identities are free so it scales with sybils. This is accepted as bounded, temporary
+/// seeding-phase cost — total minting is separately capped — and is the main reason the phase must end.
+///
+/// **This is what makes the economy able to start at all.** Rewardable serving requires the consumer to
+/// hold entitlement, entitlement was previously only bought with tokens, and tokens are only earned by
+/// rewardable serving — a closed loop that could never begin from all-zero balances. Granting the tier by
+/// default breaks it: serving is rewardable from genesis, so contribution exists, so the seed can be
+/// earned and distributed.
+///
+/// It renews per window rather than being a one-time faucet (it is granted lazily and expires like any
+/// purchased grant), and it is BOUNDED per account per window, which is what stops a self-dealer from
+/// manufacturing unlimited rewardable bytes to dominate the contribution ratio.
+pub const DEFAULT_TIER_BYTES: u64 = 1 << 40; // 1 TiB
+
+/// Governed config key for the default-tier allowance in BYTES. Setting it to 0 turns the default tier
+/// OFF (payment then becomes the only route to entitlement, restoring the pre-default behaviour).
+pub const DEFAULT_TIER_CONFIG_KEY: &str = "economy:default_tier_bytes";
+
 /// One purchased entitlement: `remaining` egress bytes, unusable once `expires_at` is reached.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Grant {
@@ -54,13 +84,39 @@ pub struct Grant {
 #[derive(Clone, Debug, Default)]
 pub struct SubscriptionLedger {
     grants: BTreeMap<[u8; 32], VecDeque<Grant>>,
+    /// GOVERNED default-tier allowance in bytes (0 = the default tier is off).
+    default_tier: u64,
+    /// Window in EPOCHS that a lazily-granted default tier lives for, mirroring a purchased grant.
+    default_window: u64,
+    /// Per account: the first epoch at which it may receive its NEXT default-tier grant.
+    ///
+    /// Eligibility must be tracked explicitly rather than inferred from "has no live grants": `allocate`
+    /// drops a consumer's entry once its grants are exhausted, so an emptiness check would re-grant the
+    /// allowance immediately on the very next call — an unlimited faucet, defeating the bound that stops a
+    /// self-dealer manufacturing rewardable bytes. This is what makes it ONE allowance per window.
+    default_next: BTreeMap<[u8; 32], u64>,
 }
 
 impl SubscriptionLedger {
     pub fn new() -> Self {
         Self {
             grants: BTreeMap::new(),
+            default_tier: DEFAULT_TIER_BYTES,
+            default_window: 0, // set by the node from the governed window; 0 → fall back at grant time
+            default_next: BTreeMap::new(),
         }
+    }
+
+    /// Apply the GOVERNED default tier: the per-window allowance every account holds without paying, and
+    /// the window it lives for. `bytes = 0` turns the default tier off.
+    pub fn set_default_tier(&mut self, bytes: u64, window_epochs: u64) {
+        self.default_tier = bytes;
+        self.default_window = window_epochs;
+    }
+
+    /// The default-tier allowance currently in force (observability + tests).
+    pub fn default_tier(&self) -> u64 {
+        self.default_tier
     }
 
     /// Buy an entitlement: `tokens` paid at `epoch` → `tokens × bytes_per_token` egress bytes expiring
@@ -101,8 +157,29 @@ impl SubscriptionLedger {
     /// much was actually allocated (≤ `bytes`). The shortfall is subsidy — served but unrewarded.
     pub fn allocate(&mut self, consumer: &[u8; 32], bytes: u64, epoch: u64) -> u64 {
         self.expire(consumer, epoch);
+        // DEFAULT TIER: an account with no live entitlement is granted its allowance here, lazily, rather
+        // than being refused. This is the single change that lets the economy start — without it,
+        // entitlement needs tokens and tokens need entitlement, so nothing can ever be earned from an
+        // all-zero genesis. Granted on demand (never for accounts that never transact) and expiring like
+        // any purchased grant, so it RENEWS per window instead of being a one-time faucet.
+        let eligible = epoch >= self.default_next.get(consumer).copied().unwrap_or(0);
+        if self.default_tier > 0 && eligible {
+            let window = if self.default_window == 0 {
+                1
+            } else {
+                self.default_window
+            };
+            self.grants.entry(*consumer).or_default().push_back(Grant {
+                remaining: self.default_tier,
+                expires_at: epoch.saturating_add(window),
+            });
+            // One allowance per window: eligibility is what gates the next grant, NOT whether the last one
+            // was spent. Exhausting it early buys nothing.
+            self.default_next
+                .insert(*consumer, epoch.saturating_add(window));
+        }
         let Some(q) = self.grants.get_mut(consumer) else {
-            return 0;
+            return 0; // default tier off and nothing purchased → not rewardable, as before
         };
         let mut want = bytes;
         let mut used = 0u64;
@@ -176,6 +253,9 @@ mod tests {
     #[test]
     fn allocation_caps_at_the_entitlement_and_the_rest_is_subsidy() {
         let mut l = SubscriptionLedger::new();
+        // Default tier OFF: this test is about the PURCHASED entitlement cap, so the free allowance would
+        // mask exactly the boundary under test. The default tier has its own test below.
+        l.set_default_tier(0, 0);
         l.purchase(consumer(1), 1, 1000, 0, 100);
         // Serving 400 within entitlement → all rewardable.
         assert_eq!(l.allocate(&consumer(1), 400, 1), 400);
@@ -192,6 +272,7 @@ mod tests {
     #[test]
     fn unused_bytes_expire_and_are_never_refunded() {
         let mut l = SubscriptionLedger::new();
+        l.set_default_tier(0, 0); // isolate purchased-grant expiry from the renewing default tier
         l.purchase(consumer(1), 1, 1000, 0, 10); // expires at epoch 10
         assert_eq!(l.available(&consumer(1), 9), 1000);
         // At expiry the entitlement is dead — use-it-or-lose-it (no escrow, no refund).
@@ -202,9 +283,57 @@ mod tests {
         assert_eq!(l.allocate(&consumer(1), 2500, 11), 2000);
     }
 
+    /// THE deadlock break. Before the default tier, an account that had never paid got zero rewardable
+    /// serving — and since tokens are only earned BY rewardable serving, an all-zero genesis could never
+    /// produce a first token. Everyone being on the paid tier by default means serving is rewardable from
+    /// genesis, so contribution exists and the seed can actually be earned.
+    #[test]
+    fn every_account_is_on_the_paid_tier_by_default_so_the_economy_can_start() {
+        let mut l = SubscriptionLedger::new();
+        l.set_default_tier(1000, 10);
+        // A consumer that has NEVER paid anything is nonetheless served rewardably.
+        assert_eq!(
+            l.allocate(&consumer(7), 400, 0),
+            400,
+            "never paid, still rewardable — this is what lets the first token be earned"
+        );
+        // BOUNDED: the allowance caps what one account can make rewardable, which is what stops a
+        // self-dealer manufacturing unlimited bytes to dominate the contribution ratio.
+        assert_eq!(
+            l.allocate(&consumer(7), 5_000, 0),
+            600,
+            "capped at the allowance"
+        );
+        assert_eq!(
+            l.allocate(&consumer(7), 5_000, 0),
+            0,
+            "exhausted for this window"
+        );
+        // It RENEWS: after the window expires, the account is on the tier again (not a one-time faucet).
+        assert_eq!(
+            l.allocate(&consumer(7), 400, 10),
+            400,
+            "renewed in the next window"
+        );
+    }
+
+    /// Governance can turn the default tier off, restoring payment as the only route to entitlement.
+    #[test]
+    fn governance_can_switch_the_default_tier_off() {
+        let mut l = SubscriptionLedger::new();
+        l.set_default_tier(0, 0);
+        assert_eq!(
+            l.allocate(&consumer(3), 500, 0),
+            0,
+            "off → never paid, never rewardable"
+        );
+    }
+
     #[test]
     fn grants_are_consumed_oldest_first_so_they_are_used_before_expiring() {
         let mut l = SubscriptionLedger::new();
+        // Default tier OFF: this test asserts PURCHASED-grant behaviour, which the free allowance masks.
+        l.set_default_tier(0, 0);
         l.purchase(consumer(1), 1, 100, 0, 10); // expires at 10
         l.purchase(consumer(1), 1, 100, 5, 10); // expires at 15
                                                 // Spending 150 drains the OLD grant (100) then dips into the new one (50).
@@ -221,6 +350,8 @@ mod tests {
         // makes the reward record bit-identical network-wide.
         let build = || {
             let mut l = SubscriptionLedger::new();
+            // Default tier OFF: this test asserts PURCHASED-grant behaviour, which the free allowance masks.
+            l.set_default_tier(0, 0);
             l.purchase(consumer(1), 5, 1000, 0, 100);
             l.purchase(consumer(2), 2, 1000, 1, 100);
             l.allocate(&consumer(1), 3000, 2);

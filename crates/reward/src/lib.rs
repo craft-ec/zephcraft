@@ -21,29 +21,20 @@ use alloc::vec::Vec;
 
 use serde::{Deserialize, Serialize};
 
-/// DEFAULT bootstrap issuance rate, in TOKENS PER DAY — **0, i.e. issuance is OFF at genesis.**
+/// DEFAULT SEED RATE: 1 token per day, network-wide.
 ///
-/// Deliberately inert until two unresolved problems are settled, because this is the one knob that
-/// CREATES money and a wrong default is a live faucet:
+/// The seeding-phase fuel. Deliberately tiny, and the smallness is a security property, not timidity:
+/// because the seed is a FIXED NETWORK-WIDE rate rather than a per-account grant, sybils cannot multiply
+/// it — N identities merely split the same 1 token/day. That bounds the worst case of the seeding phase's
+/// accepted self-dealing exposure (see `subscription::DEFAULT_TIER_BYTES`) to a fairness cost, never a
+/// solvency one: supply cannot be inflated beyond this schedule and [`DEFAULT_ISSUANCE_TOTAL_CAP`].
 ///
-/// 1. **Cold start is circular.** Issuance requires contribution; contribution counts only PAID-entitlement
-///    serving (`settle_epoch_from_cheques` skips a consumer whose `subs.allocate` returns 0); entitlement is
-///    bought with tokens. With every balance at 0 nothing can start, so a nonzero default would mint
-///    nothing anyway — while looking like it works.
-/// 2. **A lone contributor captures the whole subsidy.** Shares are a RATIO, so the only contributor in an
-///    epoch takes 100% of `paid + issued`. Anyone holding a single token can pay 1, serve itself, and take
-///    the full per-epoch top-up, repeatedly, up to the lifetime cap. Capping the *bytes* numerator (which
-///    the existing self-dealing test does) does not cap the *issued* share riding the same ratio.
+/// The unit is a rate in TIME, not per epoch — the `subscription::DEFAULT_WINDOW` lesson. It is also
+/// BELOW one token per epoch (1/288 at a 5min epoch), which a naive per-epoch division would floor to
+/// zero; [`issuance_for`] pays it on an exact schedule instead, so it arrives in full.
 ///
-/// Escaping (1) means accepting unpaid contribution, which makes (2) worse — they are one problem, and it
-/// needs either a genesis allocation or sybil-resistant proof of useful contribution (PDP/K5). Until then
-/// the MECHANISM ships complete and tested but switched off; governance turns it on via
-/// [`ISSUANCE_PER_DAY_CONFIG_KEY`] once the policy is decided.
-///
-/// The unit is a rate in TIME, not per epoch — the `subscription::DEFAULT_WINDOW` lesson: a per-epoch
-/// figure silently changes meaning when the epoch period is retuned. For reference, 1024 tokens/day
-/// subsidises ~1 GiB/day at the default 1 MiB/token price.
-pub const DEFAULT_ISSUANCE_TOKENS_PER_DAY: u64 = 0;
+/// Governed via [`ISSUANCE_PER_DAY_CONFIG_KEY`]; 0 turns issuance off entirely.
+pub const DEFAULT_ISSUANCE_TOKENS_PER_DAY: u64 = 1;
 
 /// Governed config key for the bootstrap issuance rate, in TOKENS PER DAY (a rate in time, see above).
 pub const ISSUANCE_PER_DAY_CONFIG_KEY: &str = "economy:issuance_tokens_per_day";
@@ -63,9 +54,11 @@ pub const ISSUANCE_TOTAL_CAP_CONFIG_KEY: &str = "economy:issuance_total_cap";
 /// operation that CREATES tokens, so it is the last thing that may be node-local and unreproducible.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct IssuanceParams {
-    /// Bootstrap target for this epoch's DISTRIBUTABLE pool, in tokens. Issuance tops the paid pool up to
-    /// this and no further — which is the whole taper: the gap shrinks as paid demand grows.
-    pub target_per_epoch: u64,
+    /// The governed SEED RATE in tokens per day.
+    pub tokens_per_day: u64,
+    /// Epochs per day at the node's epoch period — supplied so this pure function can pay the rate
+    /// EXACTLY without knowing the clock (see [`issuance_for`]).
+    pub epochs_per_day: u64,
     /// Lifetime ceiling on cumulative fresh issuance, in tokens.
     pub total_cap: u64,
 }
@@ -83,18 +76,28 @@ pub struct IssuanceParams {
 /// nobody earning it — inflation for nothing, and the dust would accumulate claimable-by-no-one. No
 /// contribution, no issuance.
 pub fn issuance_for(
-    paid_pool: u64,
+    epoch: u64,
     cumulative_issued: u64,
     has_contribution: bool,
     params: &IssuanceParams,
 ) -> u64 {
-    if !has_contribution {
+    if !has_contribution || params.tokens_per_day == 0 || params.epochs_per_day == 0 {
         return 0;
     }
-    let gap = params.target_per_epoch.saturating_sub(paid_pool);
+    // EXACT daily schedule. A seed rate below one token per epoch — 1 token/day is 1/288 at a 5min epoch —
+    // would vanish entirely under a per-epoch division. Instead pay the DIFFERENCE between the schedule's
+    // cumulative entitlement at this epoch and at the previous one:
+    //
+    //     issue(e) = ⌊(e+1)·R/E⌋ − ⌊e·R/E⌋
+    //
+    // which is 1 on exactly R epochs out of every E and 0 on the rest, summing to EXACTLY R tokens per day
+    // with no fractional state to carry. It stays a pure function of the epoch, so verifiers reproduce it.
+    let r = params.tokens_per_day as u128;
+    let e = params.epochs_per_day as u128;
+    let scheduled = ((epoch as u128 + 1) * r / e).saturating_sub((epoch as u128) * r / e) as u64;
     let headroom = params.total_cap.saturating_sub(cumulative_issued);
-    if gap < headroom {
-        gap
+    if scheduled < headroom {
+        scheduled
     } else {
         headroom
     }
@@ -586,52 +589,60 @@ mod tests {
         assert_eq!(rec.share_of(&prov(1)), 75);
     }
 
-    /// Issuance TAPERS as paid demand grows — the design's bootstrap curve, with no clock. It fills the
-    /// gap to the target, shrinks as paid demand rises, and is exactly zero once demand meets the target
-    /// (steady state = pure fee recycling, the pre-issuance model unchanged).
+    /// THE seed property: a rate BELOW one token per epoch must still pay exactly. 1 token/day at a 5min
+    /// epoch is 1/288 — a per-epoch division would floor it to zero and the seed would never arrive. The
+    /// schedule pays 1 token on exactly one epoch in 288, summing to exactly the governed daily rate.
     #[test]
-    fn issuance_tapers_to_zero_as_paid_demand_reaches_the_target() {
+    fn a_sub_epoch_seed_rate_pays_exactly_the_daily_amount() {
         let p = IssuanceParams {
-            target_per_epoch: 100,
+            tokens_per_day: 1,
+            epochs_per_day: 288,
             total_cap: 1_000_000,
         };
-        assert_eq!(
-            issuance_for(0, 0, true, &p),
-            100,
-            "no demand → full subsidy"
-        );
-        assert_eq!(
-            issuance_for(40, 0, true, &p),
-            60,
-            "partial demand → partial subsidy"
-        );
-        assert_eq!(issuance_for(99, 0, true, &p), 1, "nearly there → a sliver");
-        assert_eq!(
-            issuance_for(100, 0, true, &p),
-            0,
-            "demand met the target → NO issuance"
-        );
-        assert_eq!(
-            issuance_for(500, 0, true, &p),
-            0,
-            "demand past the target → still none, never negative"
+        let day: u64 = (0..288).map(|e| issuance_for(e, 0, true, &p)).sum();
+        assert_eq!(day, 1, "1 token/day pays exactly 1 across the day, never 0");
+        let two_days: u64 = (0..576).map(|e| issuance_for(e, 0, true, &p)).sum();
+        assert_eq!(two_days, 2, "and keeps paying, exactly, day after day");
+        // Most epochs pay nothing — the token lands on one of them.
+        assert!(
+            (0..288)
+                .filter(|e| issuance_for(*e, 0, true, &p) > 0)
+                .count()
+                == 1
         );
     }
 
-    /// The lifetime cap is a hard ceiling on FRESH supply, and it binds even mid-gap.
+    /// A larger rate spreads evenly and still sums exactly — no drift, no accumulated rounding error.
+    #[test]
+    fn a_larger_seed_rate_spreads_evenly_and_sums_exactly() {
+        let p = IssuanceParams {
+            tokens_per_day: 100,
+            epochs_per_day: 288,
+            total_cap: 1_000_000,
+        };
+        let day: u64 = (0..288).map(|e| issuance_for(e, 0, true, &p)).sum();
+        assert_eq!(day, 100);
+        assert!(
+            (0..288).all(|e| issuance_for(e, 0, true, &p) <= 1),
+            "spread, never lumped"
+        );
+    }
+
+    /// The lifetime cap is a hard ceiling on FRESH supply.
     #[test]
     fn issuance_is_bounded_by_the_lifetime_cap() {
         let p = IssuanceParams {
-            target_per_epoch: 100,
-            total_cap: 250,
+            tokens_per_day: 288,
+            epochs_per_day: 288,
+            total_cap: 5,
         };
         assert_eq!(
-            issuance_for(0, 200, true, &p),
-            50,
+            issuance_for(0, 4, true, &p),
+            1,
             "only the headroom left under the cap"
         );
         assert_eq!(
-            issuance_for(0, 250, true, &p),
+            issuance_for(0, 5, true, &p),
             0,
             "cap reached → issuance stops forever"
         );
@@ -642,13 +653,13 @@ mod tests {
         );
     }
 
-    /// NO CONTRIBUTION, NO ISSUANCE. Shares are a ratio of contribution, so with none every share is zero
-    /// and the whole pool becomes dust — minting into that would inflate supply on an idle network with
-    /// nobody earning it, and the dust would sit claimable-by-no-one.
+    /// NO CONTRIBUTION, NO ISSUANCE — an idle network must not mint supply nobody earned. Also: a zero
+    /// governed rate is the OFF switch (the genesis default until the seed policy is enabled).
     #[test]
-    fn an_idle_network_issues_nothing() {
+    fn an_idle_network_and_a_zero_rate_both_issue_nothing() {
         let p = IssuanceParams {
-            target_per_epoch: 100,
+            tokens_per_day: 288,
+            epochs_per_day: 288,
             total_cap: 1_000_000,
         };
         assert_eq!(
@@ -656,119 +667,83 @@ mod tests {
             0,
             "no contribution → no mint"
         );
-
-        let rec = compute(&RewardInput {
-            epoch: 7,
-            pool: 0,
-            contributions: alloc::vec![],
-            entitlements: alloc::vec![],
-            cumulative_issued: 0,
-            issuance: p,
-        });
-        assert_eq!(rec.issued, 0, "idle epoch mints nothing");
-        assert_eq!(rec.pool, 0, "and distributes nothing");
-        assert_eq!(rec.cumulative_issued, 0, "supply is untouched");
+        let off = IssuanceParams {
+            tokens_per_day: 0,
+            epochs_per_day: 288,
+            total_cap: 1_000_000,
+        };
+        assert_eq!(issuance_for(0, 0, true, &off), 0, "rate 0 → issuance off");
     }
 
-    /// End-to-end: a bootstrap epoch with real contribution issues the subsidy, distributes paid+issued by
-    /// the SAME contribution ratio, stays aggregate-bounded, and advances the cumulative supply state.
+    /// End-to-end: a seeded epoch distributes paid+issued by the SAME contribution ratio, stays
+    /// aggregate-bounded, advances the supply counter, and stays canonical under shuffled input.
     #[test]
-    fn a_bootstrap_epoch_issues_distributes_and_advances_supply() {
+    fn a_seeded_epoch_distributes_and_advances_supply_canonically() {
         let a = [1u8; 32];
         let b = [2u8; 32];
-        let rec = compute(&RewardInput {
-            epoch: 3,
-            pool: 40, // consumers paid 40
-            contributions: alloc::vec![
-                Contribution {
-                    provider: a,
-                    bytes: 300,
-                    cumulative_bytes: 300
-                },
-                Contribution {
-                    provider: b,
-                    bytes: 100,
-                    cumulative_bytes: 100
-                },
-            ],
-            entitlements: alloc::vec![],
-            cumulative_issued: 10,
-            issuance: IssuanceParams {
-                target_per_epoch: 100,
-                total_cap: 1_000_000,
+        // epochs_per_day = 1 → the whole daily rate lands on every epoch, making the arithmetic explicit.
+        let iss = IssuanceParams {
+            tokens_per_day: 60,
+            epochs_per_day: 1,
+            total_cap: 1_000_000,
+        };
+        let mk = |contribs: Vec<Contribution>| {
+            compute(&RewardInput {
+                epoch: 3,
+                pool: 40,
+                contributions: contribs,
+                entitlements: alloc::vec![],
+                cumulative_issued: 10,
+                issuance: iss.clone(),
+            })
+        };
+        let rec = mk(alloc::vec![
+            Contribution {
+                provider: a,
+                bytes: 300,
+                cumulative_bytes: 300
             },
-        });
-        assert_eq!(rec.issued, 60, "topped 40 paid up to the 100 target");
-        assert_eq!(rec.pool, 100, "distributable = paid + issued");
+            Contribution {
+                provider: b,
+                bytes: 100,
+                cumulative_bytes: 100
+            },
+        ]);
+        assert_eq!(rec.issued, 60, "the day's seed");
+        assert_eq!(rec.pool, 100, "distributable = paid(40) + issued(60)");
         assert_eq!(
             rec.cumulative_issued, 70,
-            "supply state advanced by exactly what was issued"
+            "supply advanced by exactly what was issued"
         );
-        // 3:1 contribution ratio over the distributable pool.
-        assert_eq!(rec.share_of(&a), 75);
+        assert_eq!(
+            rec.share_of(&a),
+            75,
+            "3:1 contribution ratio over the distributable pool"
+        );
         assert_eq!(rec.share_of(&b), 25);
-        let total_shares: u64 = rec.shares.iter().map(|s| s.amount).sum();
+        let total: u64 = rec.shares.iter().map(|s| s.amount).sum();
         assert!(
-            total_shares <= rec.pool,
-            "aggregate-bounded by the DISTRIBUTABLE pool"
+            total <= rec.pool,
+            "aggregate-bounded by the distributable pool"
         );
-        // And the record stays self-describing about what was demand vs subsidy.
         assert_eq!(
             rec.pool - rec.issued,
             40,
-            "paid-in is recoverable from the record"
+            "paid-in stays recoverable from the record"
         );
-    }
-
-    /// Issuance must not break the canonical-hash property P8 established: same input, any order, one
-    /// byte-identical record. (Issuance is a pure function of scalar input, so it cannot reorder — this
-    /// pins that it also does not vary.)
-    #[test]
-    fn issuance_keeps_records_canonical_and_reproducible() {
-        let mk = |contribs: Vec<Contribution>| {
-            compute(&RewardInput {
-                epoch: 5,
-                pool: 10,
-                contributions: contribs,
-                entitlements: alloc::vec![],
-                cumulative_issued: 3,
-                issuance: IssuanceParams {
-                    target_per_epoch: 50,
-                    total_cap: 1_000,
-                },
-            })
-        };
-        let a = [9u8; 32];
-        let b = [4u8; 32];
-        let one = mk(alloc::vec![
-            Contribution {
-                provider: a,
-                bytes: 10,
-                cumulative_bytes: 10
-            },
+        // Canonical: shuffled input → byte-identical record, issuance included.
+        let shuffled = mk(alloc::vec![
             Contribution {
                 provider: b,
-                bytes: 20,
-                cumulative_bytes: 20
-            },
-        ]);
-        let two = mk(alloc::vec![
-            Contribution {
-                provider: b,
-                bytes: 20,
-                cumulative_bytes: 20
+                bytes: 100,
+                cumulative_bytes: 100
             },
             Contribution {
                 provider: a,
-                bytes: 10,
-                cumulative_bytes: 10
+                bytes: 300,
+                cumulative_bytes: 300
             },
         ]);
-        assert_eq!(
-            one, two,
-            "shuffled input → identical record, issuance included"
-        );
-        assert_eq!(one.issued, 40);
-        assert_eq!(one.cumulative_issued, 43);
+        assert_eq!(rec, shuffled);
     }
 }

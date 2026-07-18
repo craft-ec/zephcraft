@@ -68,33 +68,17 @@ impl EconomyEgressService {
             .set_bytes_per_token(bytes_per_token);
     }
 
-    /// Seed cumulative fresh issuance from the DURABLE records chain at startup.
-    ///
-    /// This store is entirely in-memory (like `unallocated` and every watermark), so without this a
-    /// RESTART would reset the lifetime supply cap and re-open minting headroom. The record carries
-    /// `cumulative_issued` exactly so the durable chain — not process memory — is the source of truth.
-    ///
-    /// **Known limit, deliberately recorded:** the walk is bounded by `look_back` epochs, so a gap longer
-    /// than that finds no record and under-seeds — and under-seeding is the UNSAFE direction (it restores
-    /// headroom). The design's real answer is the issuance counter living on the governance-owned chain
-    /// (ECONOMIC_LAYER_DESIGN: "the subsidy pool, issuance counter, epoch clock ... lives on a
-    /// governance-owned chain"); this is a bounded proxy until that exists. Monotonic (`max`), so a later
-    /// or out-of-order read can only raise the counter, never lower it.
-    pub async fn seed_issuance_from_chain(&self, now_epoch: u64, look_back: u64) {
-        let Some(records) = self.record_chain.read().await.clone() else {
-            return;
-        };
-        let floor = now_epoch.saturating_sub(look_back);
-        for e in (floor..=now_epoch).rev() {
-            if let Some(r) = records.canonical_record(e).await {
-                // Cumulative is monotonic, so the most recent record is the highest — stop at the first.
-                self.settlement
-                    .write()
-                    .await
-                    .seed_cumulative_issued(r.cumulative_issued);
-                return;
-            }
-        }
+    /// Seed cumulative fresh issuance to an exact value (monotonic — only ever raises).
+    pub async fn seed_cumulative_issued(&self, value: u64) {
+        self.settlement.write().await.seed_cumulative_issued(value);
+    }
+
+    /// Apply the GOVERNED DEFAULT TIER — the per-window egress allowance every account holds WITHOUT
+    /// paying, i.e. everyone on the paid tier by default. 0 turns it off (payment becomes the only route
+    /// to entitlement). Governed so every node grants identically; a divergence would change which
+    /// serving is rewardable and so break record re-execution.
+    pub async fn set_default_tier(&self, bytes: u64) {
+        self.settlement.write().await.set_default_tier(bytes);
     }
 
     /// Apply the GOVERNED bootstrap ISSUANCE schedule (§10.3 fair launch): a rate in TOKENS PER DAY plus
@@ -106,23 +90,13 @@ impl EconomyEgressService {
     /// reward program and verified by re-execution — a node using a different schedule would produce a
     /// record that every verifier rejects.
     pub async fn set_issuance(&self, tokens_per_day: u64, total_cap: u64) {
-        let per_epoch = crate::settlement::issuance_per_epoch(tokens_per_day);
-        // The tokens/day → per-epoch conversion floors, which is the SAFE direction for a mint (never
-        // over-issue) but must not be SILENT: any rate below one token per epoch (288/day at a 5min epoch)
-        // floors to zero, so an operator asking for a reduced subsidy would otherwise get none with no
-        // signal. Warn rather than round up — rounding up would over-issue against the governed value.
-        if tokens_per_day > 0 && per_epoch == 0 {
-            tracing::warn!(
-                tokens_per_day,
-                epoch_millis = crate::epoch::EPOCH_MILLIS,
-                "governed issuance rate is below one token per epoch → floors to ZERO issuance; \
-                 raise the rate or lengthen the epoch to make it effective"
-            );
-        }
+        // The RATE passes through as-is: the reward program pays it against `epochs_per_day` on an exact
+        // schedule, so a sub-epoch rate (1 token/day = 1/288 at a 5min epoch) still pays exactly. The old
+        // lossy tokens/day → per-epoch division, which silently floored such rates to zero, is gone.
         self.settlement
             .write()
             .await
-            .set_issuance(per_epoch, total_cap);
+            .set_issuance(tokens_per_day, total_cap);
     }
 
     /// Apply the GOVERNED subscription window as a DURATION (`economy:subscription_window_secs`, default

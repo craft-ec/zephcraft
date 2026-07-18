@@ -1786,15 +1786,10 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         epoch_committee.clone(),
     );
     economy_service.set_record_chain(record_chain.clone()).await;
-    // Restore the lifetime issuance counter from the DURABLE chain before any settle can mint: the
-    // settlement store is in-memory, so without this a restart would reset the supply cap. Bounded walk
-    // (30 days of epochs) — see `seed_issuance_from_chain` for the known limit and its real fix.
-    economy_service
-        .seed_issuance_from_chain(
-            epoch::epoch_at(transport.clock().now().millis()),
-            epoch::epochs_in(std::time::Duration::from_secs(30 * 24 * 3600)),
-        )
-        .await;
+    // NOTE: cumulative issuance is seeded inside `SettlementService::reconstruct_through`, from the epoch
+    // immediately before its replay window — NOT here. A startup seed taken from the most recent record
+    // would overlap the replay and double-count, and because seeding is monotonic the wrong (higher) value
+    // would win over the correct one. One seeding path, derived from the replay boundary.
     // The cross-node epoch-close loop (§10.1): each node authors a per-epoch {paid, served, proof} report
     // as a COMMITTEE-ORDERED write on its settlement chain (the same durable sequencer the ledger rides);
     // every node settles each epoch by reading the SAME committed reports, so the reward record is
@@ -2249,6 +2244,16 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                 {
                     if v > 0 {
                         eco.set_bytes_per_token(v as u64).await;
+                    }
+                }
+                // The DEFAULT TIER: everyone is on the paid tier by default, so serving is rewardable
+                // from genesis and the economy can start at all. `>= 0` because 0 is the OFF switch.
+                if let Some(v) = gov
+                    .resolve_config(zeph_economy_egress::DEFAULT_TIER_CONFIG_KEY)
+                    .await
+                {
+                    if v >= 0 {
+                        eco.set_default_tier(v as u64).await;
                     }
                 }
                 // §10.3 bootstrap ISSUANCE: the fair-launch subsidy rate + its lifetime ceiling. Both

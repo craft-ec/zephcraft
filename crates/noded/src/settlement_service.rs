@@ -454,6 +454,23 @@ impl SettlementService {
     /// records have forfeited, so genesis replay is never needed.
     async fn reconstruct_through(&self, through: u64) {
         let start = through.saturating_sub(CLAIM_WINDOW_EPOCHS);
+        // Seed cumulative issuance from the epoch immediately BEFORE the replay window, so the seed and
+        // the replay are contiguous and never overlap.
+        //
+        // Seeding from the most RECENT record instead would double-count: `cumulative_issued` includes
+        // that epoch's own issuance, and the window below almost always contains that same epoch, so the
+        // replay would mint it a second time on top of a seed that already had it. That inflates the
+        // counter (supply-safe) but makes this node compute a DIFFERENT record from every node that did
+        // not just restart — breaking the re-execution equality that record verification depends on, and
+        // risking a stalled epoch if several committee members restart together. Deriving the seed from
+        // the same `start` the loop uses makes the two boundaries correct by construction.
+        if start > 0 {
+            if let Some(prev) = self.records.canonical_record(start - 1).await {
+                self.economy
+                    .seed_cumulative_issued(prev.cumulative_issued)
+                    .await;
+            }
+        }
         for e in start..=through {
             self.settle_epoch_state(e).await;
         }

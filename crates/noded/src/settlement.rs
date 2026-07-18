@@ -62,10 +62,10 @@ pub struct SettlementStore {
     /// Per-provider CUMULATIVE rewardable served (Σ allocated to it across consumers) — the observable
     /// "settled" numerator of the dashboard settled/served meter.
     rewardable: BTreeMap<[u8; 32], u64>,
-    /// GOVERNED bootstrap issuance target for ONE epoch, in tokens — derived from the governed
-    /// `economy:issuance_tokens_per_day` RATE via `epoch::epochs_in`, so retuning the epoch period
-    /// re-derives it rather than silently rescaling real issuance (same discipline as `window_epochs`).
-    issuance_target_per_epoch: u64,
+    /// GOVERNED seed rate in TOKENS PER DAY (`economy:issuance_tokens_per_day`). Kept as the rate in TIME
+    /// — the reward program pays it against `epochs_per_day` on an exact schedule, so a sub-epoch rate
+    /// (1 token/day is 1/288 at a 5min epoch) still pays exactly rather than flooring to nothing.
+    issuance_tokens_per_day: u64,
     /// GOVERNED lifetime ceiling on cumulative fresh issuance, in tokens (`economy:issuance_total_cap`).
     issuance_total_cap: u64,
     /// Cumulative fresh issuance so far. RUNNING state, but this store is entirely in-memory (like
@@ -75,15 +75,11 @@ pub struct SettlementStore {
     cumulative_issued: u64,
 }
 
-/// Convert a governed TOKENS-PER-DAY issuance rate into a per-epoch target, using this node's epoch
-/// period — the same discipline as `window_epochs`: the governed value is a rate in TIME, so retuning
-/// `EPOCH_MILLIS` re-derives the per-epoch figure instead of silently rescaling real issuance.
-///
-/// Integer division rounds DOWN, so the realised daily rate is at most the governed one. That is the
-/// conservative direction for a MINT: this can under-issue slightly, never over-issue.
-pub fn issuance_per_epoch(tokens_per_day: u64) -> u64 {
-    let epochs_per_day = crate::epoch::epochs_in(core::time::Duration::from_secs(24 * 3600)).max(1);
-    tokens_per_day / epochs_per_day
+/// Epochs per day at this node's epoch period — the denominator the reward program's exact issuance
+/// schedule pays against. Derived (not a constant) so retuning `EPOCH_MILLIS` cannot silently rescale
+/// the real daily seed, the same discipline as `window_epochs`.
+pub fn epochs_per_day() -> u64 {
+    crate::epoch::epochs_in(core::time::Duration::from_secs(24 * 3600)).max(1)
 }
 
 impl Default for SettlementStore {
@@ -98,9 +94,7 @@ impl Default for SettlementStore {
             bytes_per_token: DEFAULT_BYTES_PER_TOKEN,
             window_epochs: crate::epoch::epochs_in(DEFAULT_WINDOW),
             rewardable: BTreeMap::new(),
-            issuance_target_per_epoch: issuance_per_epoch(
-                zeph_reward::DEFAULT_ISSUANCE_TOKENS_PER_DAY,
-            ),
+            issuance_tokens_per_day: zeph_reward::DEFAULT_ISSUANCE_TOKENS_PER_DAY,
             issuance_total_cap: zeph_reward::DEFAULT_ISSUANCE_TOTAL_CAP,
             cumulative_issued: 0,
         }
@@ -134,10 +128,16 @@ impl SettlementStore {
         self.subs.available(consumer, epoch)
     }
 
-    /// Set the GOVERNED issuance schedule for this node: the per-epoch bootstrap target (already derived
-    /// from the tokens/day rate by the caller, which knows the epoch period) and the lifetime cap.
-    pub fn set_issuance(&mut self, target_per_epoch: u64, total_cap: u64) {
-        self.issuance_target_per_epoch = target_per_epoch;
+    /// Apply the GOVERNED DEFAULT TIER: bytes of rewardable-serving entitlement every account holds per
+    /// window without paying (0 = off). This is what lets the economy start from all-zero balances.
+    pub fn set_default_tier(&mut self, bytes: u64) {
+        let window = self.window_epochs;
+        self.subs.set_default_tier(bytes, window);
+    }
+
+    /// Set the GOVERNED issuance schedule: the seed RATE in tokens per day, and the lifetime cap.
+    pub fn set_issuance(&mut self, tokens_per_day: u64, total_cap: u64) {
+        self.issuance_tokens_per_day = tokens_per_day;
         self.issuance_total_cap = total_cap;
     }
 
@@ -189,7 +189,8 @@ impl SettlementStore {
             entitlements,
             cumulative_issued: self.cumulative_issued,
             issuance: zeph_reward::IssuanceParams {
-                target_per_epoch: self.issuance_target_per_epoch,
+                tokens_per_day: self.issuance_tokens_per_day,
+                epochs_per_day: epochs_per_day(),
                 total_cap: self.issuance_total_cap,
             },
         });
@@ -418,30 +419,34 @@ mod tests {
         );
     }
 
-    /// Store-level integration of §10.3 bootstrap issuance: fresh supply tops the PAID pool up to the
-    /// governed target, the shares divide the topped-up total, and the lifetime counter advances by
-    /// exactly what was issued — the counter being the thing that must survive to enforce the cap.
+    /// Store-level integration of the §10.3 seed: scheduled fresh supply enters the pool, the shares
+    /// divide paid + issued, and the lifetime counter advances by exactly what was minted — the counter
+    /// being the thing that must survive to enforce the cap.
     #[test]
-    fn bootstrap_issuance_tops_up_the_pool_and_advances_the_counter() {
+    fn the_seed_enters_the_pool_and_advances_the_counter() {
         let mut s = SettlementStore::new();
-        s.set_issuance(100, 1_000_000); // target 100/epoch, generous lifetime cap
+        // A rate of one token per epoch (rate = epochs/day) makes the per-epoch arithmetic explicit.
+        s.set_issuance(epochs_per_day(), 1_000_000);
         s.pay_in(40); // consumers paid 40
         let rec = s.settle_epoch(1, vec![contrib(1, 1)], vec![]);
-        assert_eq!(rec.issued, 60, "topped 40 paid up to the 100 target");
-        assert_eq!(rec.pool, 100, "the sole provider divides paid + issued");
-        assert_eq!(rec.share_of(&prov(1)), 100);
+        assert_eq!(rec.issued, 1, "the epoch's scheduled seed");
+        assert_eq!(
+            rec.pool, 41,
+            "the sole provider divides paid(40) + issued(1)"
+        );
+        assert_eq!(rec.share_of(&prov(1)), 41);
         assert_eq!(
             s.cumulative_issued(),
-            60,
+            1,
             "counter advanced by exactly the mint"
         );
 
         // Seeding from the durable chain is monotonic — it can only ever RAISE the counter, so a stale
         // or out-of-order read can never restore spent minting headroom.
-        s.seed_cumulative_issued(10);
+        s.seed_cumulative_issued(0);
         assert_eq!(
             s.cumulative_issued(),
-            60,
+            1,
             "a lower chain read does not lower the counter"
         );
         s.seed_cumulative_issued(500);
@@ -453,10 +458,10 @@ mod tests {
     #[test]
     fn the_lifetime_cap_stops_minting_at_the_store_level() {
         let mut s = SettlementStore::new();
-        s.set_issuance(100, 50); // cap below one epoch's target
+        s.set_issuance(epochs_per_day(), 1); // one token/epoch, lifetime cap of exactly 1
         s.pay_in(10);
         let rec = s.settle_epoch(1, vec![contrib(1, 1)], vec![]);
-        assert_eq!(rec.issued, 50, "only the headroom under the cap");
+        assert_eq!(rec.issued, 1, "the cap's entire headroom");
         s.pay_in(10);
         let rec2 = s.settle_epoch(2, vec![contrib(1, 1)], vec![]);
         assert_eq!(rec2.issued, 0, "cap reached → no further minting, ever");
@@ -511,6 +516,8 @@ mod tests {
     #[test]
     fn per_consumer_fcfs_caps_rewardable_at_what_the_consumer_paid() {
         let mut s = SettlementStore::new();
+        // STEADY STATE (post-seeding): entitlement must be PAID for. The seeding-phase free tier is off.
+        s.set_default_tier(0);
         s.set_bytes_per_token(1); // unit price: 1 token = 1 byte, so the arithmetic below is the mechanics
         let c = prov(9);
         // Epoch 1: consumer first seen at paid 0 → baselines (quota 0, pool 0), no serving yet.
@@ -539,6 +546,8 @@ mod tests {
     #[test]
     fn self_dealing_nets_at_most_what_was_paid() {
         let mut s = SettlementStore::new();
+        // STEADY STATE (post-seeding): entitlement must be PAID for. The seeding-phase free tier is off.
+        s.set_default_tier(0);
         s.set_bytes_per_token(1); // unit price (the price cancels in pool-average — see the price test)
         let attacker = prov(5);
         s.settle_epoch_from_cheques(1, vec![(attacker, 0)], vec![]); // baseline
@@ -577,6 +586,8 @@ mod tests {
     #[test]
     fn serving_beyond_a_consumers_quota_is_unrewarded_subsidy() {
         let mut s = SettlementStore::new();
+        // STEADY STATE (post-seeding): entitlement must be PAID for. The seeding-phase free tier is off.
+        s.set_default_tier(0);
         s.set_bytes_per_token(1); // unit price
         let c = prov(9);
         s.settle_epoch_from_cheques(1, vec![(c, 0)], vec![]);
@@ -591,6 +602,9 @@ mod tests {
         // P6: the governed price converts paid TOKENS into an egress BYTE budget. Before P6 the cap
         // compared bytes against tokens directly (an implicit 1 token = 1 byte).
         let mut s = SettlementStore::new();
+        // STEADY STATE (post-seeding): the default tier is off, so entitlement must be PAID for. This is
+        // the real end state — the free tier is a seeding-phase bootstrap that governance switches off.
+        s.set_default_tier(0);
         // Isolate the PRICE property: no bootstrap issuance, so "the whole pool" is exactly what was paid.
         s.set_issuance(0, 0);
         s.set_bytes_per_token(1000);
@@ -629,6 +643,8 @@ mod tests {
         // P6 use-it-or-lose-it: the tokens were folded into the pool and already priced into everyone's
         // pool-average, so an unspent subscription is LOST at the window edge, not refunded.
         let mut s = SettlementStore::new();
+        // STEADY STATE (post-seeding): entitlement must be PAID for. The seeding-phase free tier is off.
+        s.set_default_tier(0);
         s.set_bytes_per_token(10);
         s.set_window(std::time::Duration::from_millis(
             crate::epoch::EPOCH_MILLIS * 5,
@@ -650,6 +666,9 @@ mod tests {
     #[test]
     fn a_free_consumer_that_never_paid_rewards_nobody() {
         let mut s = SettlementStore::new();
+        // STEADY STATE (post-seeding): the default tier is off, so entitlement must be PAID for. This is
+        // the real end state — the free tier is a seeding-phase bootstrap that governance switches off.
+        s.set_default_tier(0);
         let c = prov(9);
         s.settle_epoch_from_cheques(1, vec![(c, 0)], vec![]);
         // C never paid (quota 0) but was served 500 → all subsidy, no reward, no pool.
@@ -661,6 +680,9 @@ mod tests {
     #[test]
     fn a_joining_nodes_historical_pay_is_baselined_not_dumped() {
         let mut s = SettlementStore::new();
+        // STEADY STATE (post-seeding): the default tier is off, so entitlement must be PAID for. This is
+        // the real end state — the free tier is a seeding-phase bootstrap that governance switches off.
+        s.set_default_tier(0);
         let c = prov(9);
         // C's FIRST appearance already carries a historical paid total of 1000 → baseline, quota 0, pool 0.
         let rec1 = s.settle_epoch_from_cheques(1, vec![(c, 1000)], vec![(prov(1), c, 500, 1)]);
