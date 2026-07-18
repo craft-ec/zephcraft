@@ -210,24 +210,42 @@ set `n`, live redundancy stays above the floor on its own, and the existing floo
 split is a tool to reach for only if measurement on a real mixed fleet shows live redundancy dipping below
 the floor in ordinary operation. It is not a milestone this design is waiting on.
 
-**The one real residual: per-cid PLACEMENT diversity.** The fleet aggregate normalizing does not by itself
-guarantee that a *given* cid's providers span timezones. Today placement is `peer_source.peers()` — whoever
-is reachable at publish time — which skews toward the publisher's currently-awake cohort, and that cohort
-correlates with timezone. So a cid whose `n` pieces all land inside one timezone's active window has
-providers that then sleep together: THAT cid can dip below the floor on a correlated schedule while the rest
-of the fleet is fine. Global participation makes this rare (different cids cluster in different zones, so the
-aggregate stays balanced), but the publish-time-biased placement does not eliminate it. The fix, if
-measurement ever shows it mattering, is a placement nicety — spread each cid's `n` pieces across the
-availability (timezone/phase) dimension the way one would spread across failure domains, using peers'
-observable uptime phase — not a timer and not an accounting change. This is the honest remaining item, and
-it is narrow.
+**Placement diversity is mostly already there, and the rest self-corrects.** Distribution is not clustered:
+`distribute_initial` takes the FULL census (`peer_source.peers()`, every alive node, no cap) and round-robins
+the `n` pieces across it (`candidates[i % len]`), so the pieces land on ~`n` DISTINCT currently-awake nodes.
+On a global fleet "currently awake" is the whole daytime HEMISPHERE — ~12 contiguous timezones, potentially
+thousands of nodes — not one timezone. So a freshly published cid already spans ~half the world's zones. The
+only bias is that the SLEEPING hemisphere at publish time gets none of this cid, so ~12h later the original
+providers skew asleep.
 
-**Status.** (1) and (2) BUILT, rolled, and live-validated 2026-07-18 — correct at any online fraction and
-exercised by ordinary kill/restore. The accounting split is de-scoped (not needed under global continuous
-churn + adequate `n`). Per-cid placement diversity is the only open item, and it is a measurement-gated
-placement refinement, not a correctness gap. The current 4-node always-on Hetzner fleet cannot exercise
-timezone diversity at all, so nothing here about placement is measured — it is reasoned from the global
-operating premise; a real multi-timezone fleet is what would confirm it.
+That bias closes itself, because **repair and shed both target the same REACHABLE quantity.**
+`have = own + Σ LIVE providers`; repair mints when `have < floor`, shed trims when `have > floor + delta`.
+Minted pieces PERSIST on their nodes even after those nodes later sleep. So each time a cid dips (its
+hemisphere asleep), repair mints onto whichever hemisphere is awake — and over the first day, as every zone
+takes its turn awake-during-a-dip, the cid accumulates pieces across ALL zones. The equilibrium is automatic:
+because both mechanisms measure the reachable count, they agree on its target (the band), reachable settles
+at ~`floor`, and total pieces settle at ~`floor/p` for online fraction `p` — enough that `floor` stays
+reachable as nodes cycle. The system SELF-PROVISIONS to `floor/p` and converges rather than oscillates; there
+is no placement policy to add and no accounting split to build.
+
+**So the residual is COST, not correctness.** `floor/p` total pieces per cid is real over-replication (≈2× at
+half-online), which is simply the inherent price of keeping `k` reachable when only a fraction `p` is online
+— any design meeting that availability target pays it. The one thing that could fight the accumulation is
+EVICTION under storage pressure: if capacity forces sleeping pieces out, a cid can't reach `floor/p` and its
+reachable count sits below `floor`, minting perpetually. That interaction — eviction vs. the `floor/p`
+working set — is the real thing to watch on a storage-constrained global fleet, and it is a capacity-policy
+question, not a timezone-placement one. A phase-aware placement (spread each cid's pieces across the
+availability dimension up front, instead of letting repair discover it over a day) would only make the first
+day's convergence cheaper; it is an optimization, not a fix for a gap.
+
+**Status.** (1) and (2) BUILT, rolled, and live-validated 2026-07-18 — correct at any online fraction,
+exercised by ordinary kill/restore. The accounting split is de-scoped. Placement diversity is largely
+provided by round-robin distribution across the awake hemisphere, and the residual hemisphere-bias
+self-corrects via repair auto-provisioning to `floor/p` — a convergence transient, not a standing gap. The
+genuine open question is the `floor/p` working set vs. eviction under storage pressure. None of this is
+measured: the 4-node always-on Hetzner fleet has `p ≈ 1` (so `floor/p ≈ floor`, no accumulation to observe)
+and no timezone spread. A real multi-timezone, storage-constrained fleet is what would confirm both the
+convergence and the eviction interaction.
 
 ---
 
