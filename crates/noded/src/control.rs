@@ -185,8 +185,15 @@ pub struct Economy {
     /// Cumulative REWARDABLE served bytes — the per-consumer-capped "settled" numerator of the settled/served
     /// meter (gross served is `reciprocity.earned`). What fell within consumers' paid quotas.
     pub reward_settled: u64,
-    /// The distributable settlement pool (`unallocated`).
+    /// The distributable settlement pool — pool tokens not already earmarked as owed.
     pub pool: u64,
+    /// TOTAL protocol holdings: every token the pool literally holds, earmarked or not. `pool_total −
+    /// pool` is what is owed to providers but unclaimed.
+    pub pool_total: u64,
+    /// TOTAL SUPPLY in existence (CTS-1 L0). Every token ever minted, wherever it now sits. Minting is
+    /// the seed alone, so this rises only by the schedule and never past the governed cap — and
+    /// `Σ balances + pool_total` must equal it.
+    pub total_supply: u64,
     /// P6 SUBSCRIPTION: this node's remaining unexpired egress entitlement in bytes — what its payments
     /// still entitle it to have served (use-it-or-lose-it: unspent bytes expire at the window edge).
     pub subscription_bytes: u64,
@@ -440,6 +447,10 @@ impl State {
             reward_owed: my.owed,
             reward_settled: my.settled_bytes,
             pool: my.pool,
+            // Read straight off the settlement store: these are protocol-wide facts (what the pool holds,
+            // what exists), not this account's view.
+            pool_total: self.economy.pool_total().await,
+            total_supply: self.economy.total_supply().await,
             subscription_bytes: my.subscription_bytes,
             verified,
             mismatched,

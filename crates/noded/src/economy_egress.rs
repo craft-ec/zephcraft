@@ -68,6 +68,16 @@ impl EconomyEgressService {
             .set_bytes_per_token(bytes_per_token);
     }
 
+    /// Total tokens the pool literally holds (earmarked or not).
+    pub async fn pool_total(&self) -> u64 {
+        self.settlement.read().await.pool_total()
+    }
+
+    /// TOTAL SUPPLY in existence — CTS-1 L0. Rises only via the seed mint, capped by governance.
+    pub async fn total_supply(&self) -> u64 {
+        self.settlement.read().await.total_supply()
+    }
+
     /// Seed cumulative fresh issuance to an exact value (monotonic — only ever raises).
     pub async fn seed_cumulative_issued(&self, value: u64) {
         self.settlement.write().await.seed_cumulative_issued(value);

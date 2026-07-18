@@ -3061,7 +3061,7 @@ than advisory. reward claim mint point sounds weird".
       `Σ balances + pool == total_supply` walked across a full pay→seed→claim cycle, and
       `a_claim_cannot_overdraw_the_pool` — which the old mint-on-claim path could not have refused.
       9/9 token tests green.
-- [ ] P2 — wire it through settlement: `SettlementStore.unallocated` (a bare u64) becomes the real
+- [x] P2 — DONE. wired through settlement: `SettlementStore.unallocated` (a bare u64) becomes the real
       pool; `pay_in` → `fold_pay`; issuance → `mint_into_pool` (replacing the cap check in
       `reward::issuance_for`, which must stop owning the cap); `claim` → `debit_for_claim`.
       NOTE: `owed` (settled-but-unclaimed shares) is ALSO protocol-held, so the real invariant is
@@ -3069,3 +3069,26 @@ than advisory. reward claim mint point sounds weird".
 - [ ] P3 — the authoritative pool + counter persist on the governance-owned chain (design: "the subsidy
       pool, issuance counter, epoch clock" live there, touched at EPOCH CADENCE not per transfer).
 - [ ] P4 — gate + roll. NOTHING MINTS until the conservation invariant holds end-to-end.
+
+### P2 notes (2026-07-18) — the literal pool is now the thing settlement runs on
+- `SettlementStore.unallocated: u64` → `protocol: zeph_token::ProtocolState`. `pay_in` → `fold_pay`
+  (a real credit, where the old code destroyed the payer's tokens). Issuance → `mint_into_pool`, so
+  the mint goes through the TOKEN's cap gate, not a check the valuation layer kept for itself.
+- `claim()` now DEBITS the pool and returns what it released; it refuses if the pool cannot cover the
+  owed share. Previously it only inserted into a set — the provider's balance was credited from
+  nothing on its own chain, so an over-large or duplicated share simply created supply.
+- The model got SIMPLER, not more complex: the pool holds everything, `owed` is an EARMARK recorded in
+  `records`, and `unallocated()` is derived (`pool − owed`). Expiry therefore moves NO value — it drops
+  an earmark that was always backed by pool tokens. The old `unallocated -= allocated` / `+= forfeit`
+  bookkeeping only worked because the counter was fictional.
+- Surfaced `total_supply` + `pool_total` in the Economy status view rather than silencing a dead-code
+  warning — total_supply is CTS-1 L0 and should be observable.
+- TEST: `every_token_is_either_in_a_balance_or_in_the_pool_end_to_end` checks
+  `balances + pool == total_supply` after EVERY step of pay → seed-mint → settle → claim → refused
+  double-claim → pay-back → expiry, with every token originating from the single mint point. Plus
+  `a_claim_cannot_draw_money_the_pool_does_not_hold`.
+- Test caught a real edge worth keeping in mind: a 1-base-unit seed split 3:1 floor-divides to ZERO for
+  both providers (all of it dust). Realistic per-epoch seed is ~347,222 base units — which is precisely
+  what the 8 decimals buy us.
+- NOTE: an unrelated `zeph-sql` test (`lazy_reader_fetches_only_touched_pages`) is FLAKY under parallel
+  load — passes in isolation, and that crate is untouched by this work.

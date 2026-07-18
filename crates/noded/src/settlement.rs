@@ -33,8 +33,14 @@ use zeph_reward::{compute, Contribution, Entitlement, RewardInput, RewardRecord}
 pub const CLAIM_WINDOW_EPOCHS: u64 = 8;
 
 pub struct SettlementStore {
-    /// Distributable pool (running): new pay-ins + rolled dust + expired forfeits.
-    unallocated: u64,
+    /// The protocol's LITERAL holdings: every token the protocol has, plus the supply counter that
+    /// gates minting (`zeph_token::ProtocolState`). Replaces a bare `unallocated: u64` that was a
+    /// DERIVED figure — under which `Pay` destroyed tokens and `RewardClaim` created them.
+    ///
+    /// The pool holds settled-but-unclaimed shares too; those are an EARMARK recorded in `records`, not a
+    /// separate balance. So the distributable figure is `pool − owed` ([`Self::unallocated`]), and expiry
+    /// moves no value at all — it just drops an earmark that was always backed by pool tokens.
+    protocol: zeph_token::ProtocolState,
     /// Published epoch records (the `owed` shares) within the claim window, by epoch.
     records: BTreeMap<u64, RewardRecord>,
     /// `(epoch, provider)` shares already claimed — so they neither re-claim nor forfeit-on-expiry.
@@ -85,7 +91,10 @@ pub fn epochs_per_day() -> u64 {
 impl Default for SettlementStore {
     fn default() -> Self {
         Self {
-            unallocated: 0,
+            protocol: zeph_token::ProtocolState::new(
+                zeph_token::SupplyState::new(0, zeph_reward::DEFAULT_ISSUANCE_TOTAL_CAP),
+                0,
+            ),
             records: BTreeMap::new(),
             claimed: BTreeSet::new(),
             paid_watermark: BTreeMap::new(),
@@ -155,14 +164,38 @@ impl SettlementStore {
         self.cumulative_issued
     }
 
-    /// A consumer paid `amount` into the pool (from a committed `Pay` write) → `unallocated`.
+    /// Fold a committed `Pay` write into the pool — the CREDIT half of a transfer whose debit already
+    /// happened on the payer's own chain. Supply is unchanged: this MOVES tokens (the old code destroyed
+    /// them, since nothing received the debit).
     pub fn pay_in(&mut self, amount: u64) {
-        self.unallocated = self.unallocated.saturating_add(amount);
+        self.protocol.fold_pay(amount);
     }
 
-    /// The current distributable pool balance (for observability).
+    /// Settled-but-unclaimed shares still sitting in the pool — the earmarked portion.
+    fn owed_outstanding(&self) -> u64 {
+        self.records
+            .iter()
+            .flat_map(|(e, rec)| {
+                rec.shares
+                    .iter()
+                    .filter(move |s| !self.claimed.contains(&(*e, s.provider)))
+            })
+            .map(|s| s.amount)
+            .fold(0u64, |a, b| a.saturating_add(b))
+    }
+
+    /// Total protocol holdings (pool) and total supply — for the conservation check and observability.
+    pub fn pool_total(&self) -> u64 {
+        self.protocol.pool()
+    }
+
+    pub fn total_supply(&self) -> u64 {
+        self.protocol.total_supply()
+    }
+
+    /// The DISTRIBUTABLE balance: pool tokens not already earmarked as owed to a provider.
     pub fn unallocated(&self) -> u64 {
-        self.unallocated
+        self.protocol.pool().saturating_sub(self.owed_outstanding())
     }
 
     /// Close `epoch`: first expire out-of-window records (forfeiting their unclaimed shares back), then
@@ -184,7 +217,7 @@ impl SettlementStore {
         self.expire(epoch);
         let record = compute(&RewardInput {
             epoch,
-            pool: self.unallocated,
+            pool: self.unallocated(),
             contributions,
             entitlements,
             cumulative_issued: self.cumulative_issued,
@@ -194,14 +227,19 @@ impl SettlementStore {
                 total_cap: self.issuance_total_cap,
             },
         });
-        // Fresh issuance (0 in steady state, and 0 whenever nobody contributed) enters the pool here, so
-        // the shares below are funded by paid + issued. Taking it from the RECORD, not recomputing it,
-        // keeps this node's books identical to what every verifier re-derives.
-        self.unallocated = self.unallocated.saturating_add(record.issued);
-        self.cumulative_issued = record.cumulative_issued;
-        let allocated: u64 = record.shares.iter().map(|s| s.amount).sum();
-        // Σ shares ≤ unallocated (guaranteed by `compute`), so this never underflows; dust stays.
-        self.unallocated -= allocated;
+        // MINT the seed into the pool for real, through the token's supply gate — the ONE operation in
+        // the system that creates tokens. `mint_into_pool` both advances the token-owned supply counter
+        // and credits the pool, so the cap is structural rather than a convention this layer honours.
+        let minted = self.protocol.mint_into_pool(record.issued);
+        debug_assert_eq!(
+            minted, record.issued,
+            "the record's issuance was computed against this same cap, so the gate must grant it in full"
+        );
+        self.cumulative_issued = self.protocol.total_supply();
+        // Σ shares are NOT deducted from the pool here: they stay in it, EARMARKED as owed via `records`.
+        // The tokens only leave the protocol when a provider actually claims (`claim` → debit). That is
+        // what makes `Σ balances + pool == total_supply` hold — the old code moved a number between two
+        // buckets while the actual value was minted at claim time out of nothing.
         self.records.insert(epoch, record.clone());
         record
     }
@@ -354,8 +392,25 @@ impl SettlementStore {
 
     /// Mark `(epoch, provider)`'s share claimed (called after a `RewardClaim` commits), moving it out
     /// of `owed`. Idempotent.
-    pub fn claim(&mut self, epoch: u64, provider: [u8; 32]) {
+    /// A provider claims its share for `epoch`: the tokens LEAVE the pool for that provider's balance.
+    ///
+    /// Returns the amount actually released (0 if there was nothing owed, it was already claimed, or the
+    /// pool could not cover it). The debit is the point: under the old model a claim moved no value here
+    /// at all — the provider's balance was credited from NOTHING on its own chain — so an over-large or
+    /// duplicated share simply created supply. Now a claim can only ever hand out tokens the pool holds.
+    pub fn claim(&mut self, epoch: u64, provider: [u8; 32]) -> u64 {
+        let Some(rec) = self.records.get(&epoch) else {
+            return 0; // no such epoch (never settled, or already expired out of the window)
+        };
+        let share = rec.share_of(&provider);
+        if share == 0 || self.claimed.contains(&(epoch, provider)) {
+            return 0; // nothing owed, or single-use already spent
+        }
+        if !self.protocol.debit_for_claim(share) {
+            return 0; // the pool cannot cover it — refuse rather than conjure the difference
+        }
         self.claimed.insert((epoch, provider));
+        share
     }
 
     /// Expire records with `epoch < now − window`: their UNCLAIMED shares forfeit back to
@@ -370,11 +425,11 @@ impl SettlementStore {
             .collect();
         for e in stale {
             if let Some(rec) = self.records.remove(&e) {
-                for s in &rec.shares {
-                    if !self.claimed.contains(&(e, s.provider)) {
-                        self.unallocated = self.unallocated.saturating_add(s.amount);
-                    }
-                }
+                // Unclaimed shares FORFEIT by simply ceasing to be earmarked — the tokens were in the
+                // pool the whole time, so nothing moves and `unallocated()` rises on its own once the
+                // record is gone. The old code added the amount back to a derived counter, which only
+                // worked because that counter was fictional.
+                let _ = &rec;
             }
             self.claimed.retain(|(ep, _)| *ep != e);
         }
@@ -418,6 +473,110 @@ mod tests {
             s.settle_epoch(1, vec![contrib(3, 999)], vec![])
                 .share_of(&prov(1)),
             60
+        );
+    }
+
+    /// THE end-to-end conservation invariant, through the real settlement path: every token that exists
+    /// is either in someone's balance or in the pool, at every step. Every token here ORIGINATES from the
+    /// single mint point, which is what makes the invariant meaningful rather than arithmetic.
+    ///
+    /// This could not be written against the old code at all: `Pay` destroyed the payer's tokens, a claim
+    /// created the provider's out of nothing, and the "pool" was a derived number that could never be
+    /// over-drawn because it did not exist.
+    #[test]
+    fn every_token_is_either_in_a_balance_or_in_the_pool_end_to_end() {
+        let mut s = SettlementStore::new();
+        // 1000 base units per epoch. Deliberately not 1: a 1-unit seed split 3:1 floor-divides to ZERO
+        // for both providers and the whole seed becomes dust — which is exactly why the token carries 8
+        // decimals (a real epoch's seed is ~347,222 base units, not 1).
+        s.set_issuance(1000 * epochs_per_day(), 1_000_000_000);
+        // Balances that have LEFT the protocol onto providers' own chains. The invariant is
+        // `balances + pool == total_supply` — checked after every single step below.
+        let mut balances = 0u64;
+        let check = |bal: u64, st: &SettlementStore, step: &str| {
+            assert_eq!(
+                bal + st.pool_total(),
+                st.total_supply(),
+                "conservation broken at: {step}"
+            );
+        };
+        check(balances, &s, "genesis (nothing exists)");
+        assert_eq!(s.total_supply(), 0);
+
+        // SETTLE — the seed is MINTED into the pool. The only creation point in the system.
+        let rec = s.settle_epoch(1, vec![contrib(1, 3), contrib(2, 1)], vec![]);
+        assert_eq!(
+            rec.issued, 1000,
+            "the epoch's scheduled seed, minted for real"
+        );
+        assert_eq!(s.total_supply(), 1000, "supply rose by exactly the mint");
+        assert_eq!(
+            s.pool_total(),
+            1000,
+            "and the minted tokens are HELD by the pool"
+        );
+        check(balances, &s, "after the seed mint");
+
+        // CLAIM — tokens LEAVE the pool for a provider. Supply unchanged: this moves value.
+        let got = s.claim(1, prov(1));
+        assert_eq!(
+            got, 750,
+            "3:1 contribution ratio over the 1000 distributable"
+        );
+        balances += got;
+        assert_eq!(
+            s.total_supply(),
+            1000,
+            "claiming MOVES tokens, never creates them"
+        );
+        assert_eq!(
+            s.pool_total(),
+            250,
+            "the rest stays earmarked for provider 2"
+        );
+        check(balances, &s, "after the claim");
+
+        // Double-claim is refused, and moves nothing.
+        assert_eq!(s.claim(1, prov(1)), 0, "single-use");
+        check(balances, &s, "after a refused double-claim");
+
+        // PAY — the provider spends it back into the pool. Supply unchanged: the old code DESTROYED
+        // these tokens (a debit with no credit anywhere).
+        balances -= 750;
+        s.pay_in(750);
+        assert_eq!(
+            s.total_supply(),
+            1000,
+            "paying MOVES tokens, never destroys them"
+        );
+        assert_eq!(s.pool_total(), 1000, "the pool received them back");
+        check(balances, &s, "after paying back in");
+
+        // EXPIRE — an unclaimed earmark lapses. NO value moves: the tokens were in the pool all along.
+        let pool_before = s.pool_total();
+        s.settle_epoch(2 + CLAIM_WINDOW_EPOCHS, vec![], vec![]);
+        assert_eq!(
+            s.pool_total(),
+            pool_before,
+            "forfeiting drops an earmark, it moves nothing"
+        );
+        check(balances, &s, "after expiry");
+    }
+
+    /// A claim can never draw more than the pool holds — impossible to violate now, and impossible to
+    /// even detect before (the credit happened on the provider's chain, out of nothing).
+    #[test]
+    fn a_claim_cannot_draw_money_the_pool_does_not_hold() {
+        let mut s = SettlementStore::new();
+        s.set_issuance(0, 0);
+        s.pay_in(10);
+        s.settle_epoch(1, vec![contrib(1, 1)], vec![]);
+        // Drain the pool behind the record's back, then try to claim against it.
+        assert!(s.protocol.debit_for_claim(10));
+        assert_eq!(
+            s.claim(1, prov(1)),
+            0,
+            "refused — the pool cannot cover the owed share"
         );
     }
 
