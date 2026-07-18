@@ -28,8 +28,10 @@ fleet to tune).
       elects+sorts (fewest-holders-first, preserved via FIFO submit order) then enqueues; giant
       sweep + budget semaphore DELETED. Repair concurrency now an explicit `set_class_cap(Repair,2)`
       preserving the old budget value. 74 tests, clippy clean. Not yet gated/rolled.
-- [ ] P2/urgency — the debounce/urgency tiers are STAGE C (below); Stage A submits all at
-      Priority::Repair immediately (no offset yet, but correct + coalescing).
+- [x] P2/urgency — SUPERSEDED by the uniform RECONCILE_WINDOW (30s). Urgency-TIERED debounce was
+      the old plan; the built window applies one consolidation period to all provider changes and
+      lets the floor gate decide urgency at execution. Tiering can return if measurement shows a
+      genuine loss waiting too long behind the window, but it is not owed.
 - [x] P4 — STAGE B DONE: event-driven SHED. `EngineWork::Shed(cid)` (Eviction priority) +
       `ObjEngine::request_shed` front door + `ObjEngine::shed_cid` executor (mirror of repair_cid:
       resolve providers, compute `have`, surplus check, rendezvous-elect ONE shedder, shed OWN
@@ -46,10 +48,15 @@ fleet to tune).
       piece/invocation (bounds the epoch-boundary concurrent-shedder race to 1 piece each),
       re-announce lower count. Also fixed `shed:` misclassified as Other not Eviction. The offset
       is the probe-verified re-check: `have <= floor+delta` → no-op.
-- [ ] P5-remaining — full night-length offset (debounce keyed on urgency) = §5 part 3, needs
-      mixed fleet. NOT built.
-- [ ] P6 — Keep the periodic scan as backstop (still submits the same job type) — do NOT retire
-      it (needs PDP/K5), just make it one more producer of the same queue
+- [x] P5-remaining — DE-SCOPED 2026-07-18. "Night-length offset" assumed a SYNCHRONIZED diurnal
+      event; the fleet is GLOBAL (all timezones), so sleep/wake is continuous+balanced and the 30s
+      window + floor gate handle it as ordinary churn. The durability-vs-availability ACCOUNTING
+      SPLIT is likewise de-scoped: repair and shed both target the reachable count, so the system
+      SELF-PROVISIONS to floor/p and converges. See docs/DURABILITY_DESIGN.md §5 (rewritten).
+- [x] P6 — DONE. The scan now emits EngineWork::Reconcile (was ::Repair), so it is one more
+      producer of the SAME reconcile:{cid} queue and coalesces with death/anti-entropy instead of
+      running a duplicate repair:{cid} job (a regression the review caught). Scan NOT retired —
+      still the backstop; retiring it needs PDP/K5.
 - [x] P7 — GATE + ROLLED + LIVE-TESTED (2026-07-18, all 4 Hetzner nodes). Kill zeph4: census
       watcher saw departure → `reconcile accrued (window)` (-1 per ~1212 elected cids, NOT enqueued
       immediately) → 30s window closed → `reconcile window: net changes → reconcile cids=1212` →
@@ -82,3 +89,11 @@ NOT coalesce (per-cid-per-provider). Fixed: ONE reconcile:{cid} key for both dir
   phase-diverse placement). The 30s window only consolidates BURSTS/flaps, not a full night.
 - Execution cost: reconcile still O(net-cids) DHT resolves per window; a holder-count pre-filter
   would cut no-op resolves but needs per-holder piece counts in the index.
+
+## REMAINING OPEN (durability), 2026-07-18
+- The genuine open question is COST, not correctness: the floor/p working set vs. EVICTION under
+  storage pressure. If capacity forces sleeping pieces out, a cid cannot reach floor/p and mints
+  perpetually. Unmeasurable on the current fleet (4 always-on nodes ⇒ p≈1 ⇒ floor/p≈floor).
+  Needs a multi-timezone, storage-constrained fleet.
+- Retiring the O(N_cids) scan entirely still needs PDP (K5), which needs a real cryptographer
+  (see memory: lattice-LHS, no production Rust lib).
