@@ -39,6 +39,13 @@ const WATCH_TICK: Duration = Duration::from_secs(5);
 /// dropped something) than death, which SWIM already reports promptly.
 const ANTI_ENTROPY_TICK: Duration = Duration::from_secs(60);
 
+/// The consolidation window (`docs/DURABILITY_DESIGN.md` §5.2). Provider changes accumulate as a per-cid
+/// NET over this period; only the net at the window's close triggers a reconcile. The offset is a PERIOD,
+/// not a per-event reflex — a leave and a return within one window cancel and fire nothing. Longer offsets
+/// more churn but delays repair by up to this long; short enough that erasure margin covers the wait,
+/// long enough to swallow a burst (a mass death, a node's whole manifest delta, a quick flap).
+const RECONCILE_WINDOW: Duration = Duration::from_secs(30);
+
 /// For each cid WE hold: the peers currently claiming to hold it.
 ///
 /// Bounded by OUR store × replication — NOT by the fleet's inventory. That distinction is the whole point:
@@ -53,6 +60,19 @@ type HolderIndex = HashMap<[u8; 32], HashSet<[u8; 32]>>;
 /// Per peer: the last `(version, head_cid)` we processed. 40 bytes each — the version is what lets
 /// `changes_since` take the O(Δ) fast path instead of re-reading a set.
 type PeerHeads = HashMap<[u8; 32], (u64, [u8; 32])>;
+
+/// Fold one provider change into the window's per-cid net map, pruning a cid whose net returns to zero.
+///
+/// Zero-prune IS the offset: a leave (`-1`) later cancelled by a return (`+1`) leaves NO entry, so the
+/// window's close triggers nothing for it — not even a no-op reconcile. Pure so the accumulation is
+/// testable without standing up an engine.
+fn accrue_into(map: &mut HashMap<[u8; 32], i32>, cid: [u8; 32], delta: i32) {
+    let net = map.entry(cid).or_insert(0);
+    *net += delta;
+    if *net == 0 {
+        map.remove(&cid);
+    }
+}
 
 /// The node that must repair `cid`, elected by rendezvous over the surviving holders.
 ///
@@ -80,6 +100,14 @@ pub struct DeathRepair {
     heads: tokio::sync::Mutex<PeerHeads>,
     /// Who holds what, restricted to cids WE hold (see [`HolderIndex`]).
     holders: tokio::sync::Mutex<HolderIndex>,
+    /// Per-cid NET provider change accumulated over the current [`RECONCILE_WINDOW`]: `+1` when a holder
+    /// starts holding a cid we hold, `-1` when one stops (a drop or a death). This is the consolidation the
+    /// design turns on: we do NOT reconcile per provider event — a churny fleet would then reconcile
+    /// forever. We monitor a window and trigger ONCE per cid at its close, and only if the net is non-zero.
+    /// A departure offset by an arrival in the same window nets to 0 and fires NOTHING — not even a no-op
+    /// reconcile. The sign is a cheap proxy for direction (net loss → likely repair, net gain → likely
+    /// shed); `reconcile_cid` re-derives the true direction from probe-verified pieces at execution.
+    pending: tokio::sync::Mutex<HashMap<[u8; 32], i32>>,
 }
 
 impl DeathRepair {
@@ -96,6 +124,40 @@ impl DeathRepair {
             engine,
             heads: tokio::sync::Mutex::new(HashMap::new()),
             holders: tokio::sync::Mutex::new(HashMap::new()),
+            pending: tokio::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Accumulate a provider change for `cid` into the current window (`+1` gained, `-1` lost).
+    async fn accrue(&self, cid: [u8; 32], delta: i32) {
+        let mut pending = self.pending.lock().await;
+        accrue_into(&mut pending, cid, delta);
+    }
+
+    /// The consolidation loop: every [`RECONCILE_WINDOW`], drain the accumulated per-cid net changes and
+    /// enqueue ONE `reconcile:{cid}` for each cid whose net is non-zero. Runs forever.
+    ///
+    /// This is what makes the offset a PERIOD, not a per-event reflex. Within a window a cid can lose and
+    /// regain holders any number of times; only the net at the window's close triggers work, and a net of
+    /// zero triggers none. `reconcile_cid` still computes the true net across all providers from
+    /// probe-verified pieces — the sign here only decides whether it is worth looking at all.
+    pub async fn run_reconcile(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(RECONCILE_WINDOW).await;
+            let batch: Vec<[u8; 32]> = {
+                let mut pending = self.pending.lock().await;
+                pending.drain().map(|(c, _)| c).collect()
+            };
+            if batch.is_empty() {
+                continue; // a quiet window — nothing changed net, so nothing triggers
+            }
+            tracing::info!(
+                cids = batch.len(),
+                "reconcile window: net changes → reconcile"
+            );
+            for c in batch {
+                self.engine.request_reconcile(Cid(c)).await;
+            }
         }
     }
 
@@ -225,14 +287,16 @@ impl DeathRepair {
         if first_sight {
             return true; // a baseline: neither a loss nor a surplus event, just learning the world
         }
-        // Every cid whose provider set CHANGED for this peer — dropped OR gained — gets ONE reconcile. The
-        // direction (repair vs shed) is decided at execution from the probe-verified net across ALL
-        // providers, not here per provider: a drop of ours offset by a gain elsewhere nets to a no-op, and
-        // if several peers changed the same cid this pass they coalesce on the `reconcile:{cid}` key into a
-        // single net evaluation. This is the offset done per cid across providers. (lost ∩ gained = ∅ for
-        // one peer — a diff never claims a cid on both sides — so the chain never double-counts.)
-        for c in lost.into_iter().chain(gained) {
-            self.engine.request_reconcile(Cid(c)).await;
+        // ACCRUE this peer's changes into the current window: a cid it DROPPED is a net loss (-1), one it
+        // GAINED is a net gain (+1). The consolidation loop nets these — across peers and across the window
+        // — and triggers reconcile only for cids whose net is non-zero at the window's close. Some left,
+        // some returned: they cancel, and nothing fires. (lost ∩ gained = ∅ for one peer — a diff never
+        // claims a cid on both sides — so we never double-count within this call.)
+        for c in lost {
+            self.accrue(c, -1).await;
+        }
+        for c in gained {
+            self.accrue(c, 1).await;
         }
         true
     }
@@ -399,17 +463,13 @@ impl DeathRepair {
         let elected = mine.len();
         let last_holder = mine.iter().filter(|(_, n)| *n <= 1).count();
 
-        // ENQUEUE, do not execute. Each elected cid becomes a per-cid `reconcile:{cid}` scheduler job,
-        // deduped so a death and a return of the same cid coalesce into ONE net evaluation (the offset), and
-        // so it also coalesces with a scan-detected need. The scheduler bounds concurrency across every
-        // death and scan at once. This replaces the old budget-semaphore loop that ran `repair_cid` inline:
-        // that loop was O(elected) DHT resolves — 2h36m for 1242 cids on the live fleet — and even spawned
-        // it only moved the grind off the watcher's thread; the SWEEP itself was the wrong unit. Submitting
-        // fewest-holders-first preserves the P4 priority (urgent cids get the earlier queue slot, FIFO
-        // within a priority). Enqueue is O(elected) cheap map-inserts, so this returns in milliseconds. A
-        // death only ever DROPS redundancy, so reconcile will mint or no-op here, never shed.
+        // ACCRUE, do not enqueue. Each elected cid records a net LOSS (-1) into the current reconcile
+        // window; the consolidation loop triggers ONE reconcile per net-non-zero cid when the window closes.
+        // If a holder returns for the same cid before the window closes, the +1 cancels this -1 and nothing
+        // fires — the offset. This also replaced the old inline budget-semaphore loop (O(elected) DHT
+        // resolves, 2h36m for 1242 cids live); accrual is O(elected) cheap map-inserts, returning in ms.
         for (c, _) in mine {
-            self.engine.request_reconcile(Cid(c)).await;
+            self.accrue(c, -1).await;
         }
         tracing::info!(
             node = %hex::encode(&gone[..6]),
@@ -417,13 +477,47 @@ impl DeathRepair {
             elected,
             last_holder,
             why,
-            "reconcile enqueued"
+            "reconcile accrued (window)"
         );
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::accrue_into;
+
+    #[test]
+    fn a_leave_offset_by_a_return_in_the_window_triggers_nothing() {
+        // The consolidation the design turns on: over one window, net a cid's provider churn and act only
+        // on a non-zero net. A departure (-1) cancelled by an arrival (+1) leaves NO pending entry — the
+        // window closes and reconcile fires for it zero times, not once-then-no-op.
+        let mut w = std::collections::HashMap::new();
+        let c = [7u8; 32];
+        accrue_into(&mut w, c, -1); // a holder dropped it (or died)
+        accrue_into(&mut w, c, 1); //  a holder (re)appeared for it
+        assert!(!w.contains_key(&c), "net zero → no trigger for this cid");
+
+        // A net LOSS survives (→ reconcile will repair). Two left, one returned.
+        accrue_into(&mut w, c, -1);
+        accrue_into(&mut w, c, -1);
+        accrue_into(&mut w, c, 1);
+        assert_eq!(
+            w.get(&c),
+            Some(&-1),
+            "net loss remains, to be repaired at window close"
+        );
+
+        // A net GAIN survives (→ reconcile will consider a shed).
+        let d = [8u8; 32];
+        accrue_into(&mut w, d, 1);
+        accrue_into(&mut w, d, 1);
+        assert_eq!(
+            w.get(&d),
+            Some(&2),
+            "net gain remains, to be evaluated for surplus"
+        );
+    }
+
     use super::*;
 
     fn node(n: u8) -> [u8; 32] {

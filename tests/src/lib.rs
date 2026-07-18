@@ -276,23 +276,6 @@ impl TestNode {
                                 },
                             );
                         }
-                        EngineWork::Repair(cid) => {
-                            let eng = work_engine.clone();
-                            // max_attempts=1: repair_cid returning 0 is a valid
-                            // outcome (another holder won the election).
-                            work_jobs.submit(
-                                format!("repair:{}", cid.to_hex()),
-                                Priority::Repair,
-                                1,
-                                move || {
-                                    let eng = eng.clone();
-                                    async move {
-                                        let _landed = eng.repair_cid(cid).await;
-                                        Ok(())
-                                    }
-                                },
-                            );
-                        }
                         EngineWork::Reconcile(cid) => {
                             let eng = work_engine.clone();
                             work_jobs.submit(

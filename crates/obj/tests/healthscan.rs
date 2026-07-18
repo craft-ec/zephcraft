@@ -1206,8 +1206,8 @@ async fn sole_content_holder_enqueues_repair_when_no_peer_is_capable() {
     assert_eq!(report.scanned, 1, "scanned the cid");
     let work = rx.try_recv();
     assert!(
-        matches!(work, Ok(EngineWork::Repair(c)) if c == cid),
-        "sole content holder must enqueue Repair (pre-fix: dead code enqueued nothing); got {work:?}"
+        matches!(work, Ok(EngineWork::Reconcile(c)) if c == cid),
+        "sole content holder must enqueue Reconcile (scan is one more producer of the unified queue); got {work:?}"
     );
 }
 
@@ -1448,7 +1448,10 @@ async fn reconcile_nets_to_noop_when_redundancy_is_in_band() {
     let cid = publisher.engine.publish(&payload, false).await.unwrap().cid;
     wait_have(std::slice::from_ref(&s0), cid, floor).await;
     let before = s0.engine.store().piece_count(&cid);
-    assert!(before >= floor && before <= floor + (floor / 8).max(2), "s0 sits in the band");
+    assert!(
+        before >= floor && before <= floor + (floor / 8).max(2),
+        "s0 sits in the band"
+    );
 
     // A departed provider leaves a stale-high record (would look like surplus if trusted).
     let phantom = node(&tracker, dirs[2].path()).await;

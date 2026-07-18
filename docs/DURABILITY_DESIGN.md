@@ -250,16 +250,18 @@ instead of the old repair-per-departure + shed-per-arrival that each separately 
 executors (`repair_cid`, `shed_cid`) stay as the delegated bodies, so unification added a dispatcher, not a
 new destructive path.
 
-**(2) The queue latency IS the epoch offset — no moving average needed.** A job re-checks current state at
-EXECUTION time (`repair_cid` already re-resolves and no-ops on `have >= floor`; shed will mirror it). So a
-repair job enqueued when X leaves, drained after a deliberate debounce, simply no-ops if X (or an equivalent
-holder) is back by then. Transient churn self-cancels through queue delay + execution-time re-check — the
-"absolute net over an epoch" idea, realised as a property of the queue rather than a statistic anyone
-computes. Urgency sets the delay: below-k / last-holder jobs run at the front with ~no debounce (real loss
-cannot wait); margin-restoration jobs (above-k, below-band) carry a debounce long enough that a normal
-sleep/wake offsets before they fire. A true moving average was rejected earlier for a timescale reason — the
-window that hides a night also delays real-loss detection by a night — and the per-job debounce sidesteps it
-by keying the delay on URGENCY, not on a fixed time.
+**(2) The offset is a MONITORING WINDOW, not a per-event reflex [BUILT 2026-07-18].** Reconcile must NOT
+fire on each provider change — a churny fleet would then reconcile forever, even though each fire nets to a
+no-op. Instead every provider change accrues a per-cid signed delta (`+1` a holder appeared, `-1` a holder
+dropped/died) into a `RECONCILE_WINDOW` (30s). At the window's close, exactly the cids whose net is NON-ZERO
+enqueue one reconcile; a leave offset by a return nets to 0 and is pruned, firing NOTHING — not even a
+no-op. This is the consolidation done per cid across providers and across time: some left, some returned,
+and only the net moves work. `reconcile_cid` still computes the true net from probe-verified pieces at
+execution; the accrued sign is just a cheap gate on whether to look. The window bounds how long a genuine
+loss waits (≤30s here, covered by erasure margin) against how much churn it swallows (a mass death, a node's
+whole manifest delta, a quick flap all collapse). A true moving average was rejected earlier for a timescale
+reason — a window long enough to hide a full night also delays real-loss detection by a night; the 30s
+window consolidates BURSTS, and diurnal-scale offset is left to part (3)'s provisioning, not a longer timer.
 
 **(3) Placement across the availability dimension is the primary lever; accounting split + provisioning are
 the backup.** The deepest fix needs a mixed fleet to tune, so it is sequenced last:

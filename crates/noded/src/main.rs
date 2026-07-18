@@ -1907,30 +1907,9 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                             },
                         );
                     }
-                    zeph_obj::EngineWork::Repair(cid) => {
-                        let eng = work_engine.clone();
-                        let st = work_state.clone();
-                        // max_attempts=1: repair_cid returning false is a valid
-                        // outcome (another holder won the election), not an error
-                        // to retry; the next scan pass re-detects if still at risk.
-                        work_jobs.submit(
-                            format!("repair:{}", cid.to_hex()),
-                            zeph_sched::Priority::Repair,
-                            1,
-                            move || {
-                                let (eng, st) = (eng.clone(), st.clone());
-                                async move {
-                                    let landed = eng.repair_cid(cid).await;
-                                    if landed > 0 {
-                                        st.add_repaired(landed as u64).await;
-                                    }
-                                    Ok(())
-                                }
-                            },
-                        );
-                    }
                     zeph_obj::EngineWork::Reconcile(cid) => {
                         let eng = work_engine.clone();
+                        let st = work_state.clone();
                         // ONE per-cid `reconcile:{cid}` key for BOTH directions, so all of a cid's provider
                         // churn (a death, a drop, a return) coalesces into a single net evaluation — the
                         // offset is per cid across providers, not per provider. Repair priority + max=1:
@@ -1941,9 +1920,12 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
                             zeph_sched::Priority::Repair,
                             1,
                             move || {
-                                let eng = eng.clone();
+                                let (eng, st) = (eng.clone(), st.clone());
                                 async move {
-                                    eng.reconcile_cid(cid).await;
+                                    let landed = eng.reconcile_cid(cid).await;
+                                    if landed > 0 {
+                                        st.add_repaired(landed as u64).await;
+                                    }
                                     Ok(())
                                 }
                             },
@@ -2207,6 +2189,8 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
             engine.clone(),
         ));
         tokio::spawn(repairer.clone().run());
+        // The consolidation loop: accrue provider changes into a window, reconcile the net at its close.
+        tokio::spawn(repairer.clone().run_reconcile());
         // P3: anti-entropy — watch peers' manifest HEADS (O(1) each) and react when a holder's set SHRINKS.
         // Covers loss a holder KNOWS about (eviction) and deaths this node missed. It does NOT cover unaware
         // loss (bytes gone, index intact ⇒ the manifest is unchanged), which is why the periodic scan's

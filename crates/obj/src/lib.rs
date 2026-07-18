@@ -251,9 +251,6 @@ pub enum EngineWork {
     /// Initial post-publish distribution: encode n pieces, push to peers
     /// (Encoding priority — new data needs redundancy quickly).
     PublishDistribute(Cid),
-    /// Durability repair for one at-risk cid (Repair priority — preempts all
-    /// routine work; found by the health scan, executed by the coordinator).
-    Repair(Cid),
     /// Reconcile one cid toward the durability band — the unified, per-cid,
     /// net-across-providers job behind death and anti-entropy events. Repair
     /// priority: it may need to mint. `reconcile_cid` picks the direction from
@@ -2107,7 +2104,7 @@ impl ObjEngine {
                 // per-cid dedup key — inline repair here executed at the
                 // scan's own HealthScan priority, leaving the Repair tier
                 // unused (audit finding).
-                let _ = tx.send(EngineWork::Repair(cid));
+                let _ = tx.send(EngineWork::Reconcile(cid));
                 self.record_health(
                     &cid,
                     have,
@@ -2666,15 +2663,7 @@ impl ObjEngine {
         .await
     }
 
-    /// Front door for repair: ENQUEUE `cid` as a Repair-priority scheduler job (deduped per cid) rather
-    /// than repairing inline. This is what death-driven and anti-entropy repair call so they share the
-    /// scan's queue — same `repair:{cid}` key, so a death and a scan that both want the same cid COALESCE
-    /// into one job instead of two, and the scheduler bounds concurrency across all of them. It also means
-    /// enqueueing is O(1): the caller submits N jobs and returns instead of grinding N DHT resolves inline,
-    /// which is what let one death block the census watcher for hours.
-    ///
-    /// Front door for RECONCILE — the unified, per-cid, net-across-providers job.
-    /// A cid whose provider set
+    /// Front door for RECONCILE — the unified, per-cid, net-across-providers job. A cid whose provider set
     /// changed (a holder died, dropped it, or (re)appeared) gets ONE `reconcile:{cid}` job, deduped, so all
     /// of that cid's provider churn collapses into a SINGLE net evaluation instead of a repair PER departure
     /// and a shed PER arrival. That is the offset done right: it is per cid ACROSS its providers, not per
@@ -2723,22 +2712,23 @@ impl ObjEngine {
     /// — no wasteful repair+shed pair for a cid whose redundancy never actually moved. The direction check
     /// is a pure read; the destructive/minting work stays in the two reviewed executors, which each re-check
     /// and re-elect from scratch, so this adds no new way to lose data.
-    pub async fn reconcile_cid(&self, cid: Cid) {
+    pub async fn reconcile_cid(&self, cid: Cid) -> usize {
         let Some(gen) = self.store.generation(&cid) else {
-            return;
+            return 0;
         };
         if self.store.is_tombstoned(&cid) {
-            return;
+            return 0;
         }
         let floor = target_pieces(gen.k as usize);
         let delta = (floor / 8).max(2);
         let have = self.verified_have(cid).await;
         if have < floor {
-            self.repair_cid(cid).await;
+            return self.repair_cid(cid).await; // pieces minted (for the dashboard's repaired counter)
         } else if have > floor + delta && self.served_pulls(&cid) < self.config.degrade_threshold {
             self.shed_cid(cid).await;
         }
         // else: the net change kept this cid inside the band — offset complete, nothing to do.
+        0
     }
 
     /// The body of a Shed coordinator job — the mirror of [`repair_cid`]. Re-derives the surplus verdict
