@@ -26,7 +26,7 @@ pub mod subscription;
 // the single import for the economy program's callers (node settlement, the wasm wrapper, tests).
 pub use subscription::{
     Grant, SubscriptionLedger, BYTES_PER_TOKEN_CONFIG_KEY, DEFAULT_BYTES_PER_TOKEN,
-    DEFAULT_TIER_BYTES, DEFAULT_TIER_CONFIG_KEY, DEFAULT_WINDOW, WINDOW_SECS_CONFIG_KEY,
+    DEFAULT_TIER_BYTES, DEFAULT_TIER_CONFIG_KEY, DEFAULT_WINDOW, ONE_TOKEN, WINDOW_SECS_CONFIG_KEY,
 };
 pub use zeph_reward::{compute, Contribution, RewardInput, RewardRecord, Share};
 

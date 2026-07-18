@@ -21,7 +21,13 @@ use alloc::vec::Vec;
 
 use serde::{Deserialize, Serialize};
 
-/// DEFAULT SEED RATE: 1 token per day, network-wide.
+/// Base units in one whole token. MIRRORS `zeph_token::ONE_TOKEN`, which is canonical — mirrored rather
+/// than imported because the token (value) and this valuation program are deliberately separate programs
+/// with no dependency between them. `noded`, which sees both, carries a test asserting they agree, so the
+/// duplication cannot drift silently.
+pub const ONE_TOKEN: u64 = 100_000_000;
+
+/// DEFAULT SEED RATE: 1 whole token per day, network-wide, expressed in BASE UNITS.
 ///
 /// The seeding-phase fuel. Deliberately tiny, and the smallness is a security property, not timidity:
 /// because the seed is a FIXED NETWORK-WIDE rate rather than a per-account grant, sybils cannot multiply
@@ -34,7 +40,7 @@ use serde::{Deserialize, Serialize};
 /// zero; [`issuance_for`] pays it on an exact schedule instead, so it arrives in full.
 ///
 /// Governed via [`ISSUANCE_PER_DAY_CONFIG_KEY`]; 0 turns issuance off entirely.
-pub const DEFAULT_ISSUANCE_TOKENS_PER_DAY: u64 = 1;
+pub const DEFAULT_ISSUANCE_TOKENS_PER_DAY: u64 = ONE_TOKEN; // 1 whole token/day, in BASE UNITS
 
 /// Governed config key for the bootstrap issuance rate, in TOKENS PER DAY (a rate in time, see above).
 pub const ISSUANCE_PER_DAY_CONFIG_KEY: &str = "economy:issuance_tokens_per_day";
@@ -44,7 +50,7 @@ pub const ISSUANCE_PER_DAY_CONFIG_KEY: &str = "economy:issuance_tokens_per_day";
 /// Absolute, so it needs no period conversion. At the default rate this is ~2.7 years of uninterrupted
 /// bootstrap, and far less in practice: issuance tapers to zero on its own as paid demand fills the
 /// target, so the cap is a backstop against a network that never develops paid demand, not the plan.
-pub const DEFAULT_ISSUANCE_TOTAL_CAP: u64 = 1_000_000;
+pub const DEFAULT_ISSUANCE_TOTAL_CAP: u64 = 1_000_000 * ONE_TOKEN; // 1e6 whole tokens, in BASE UNITS
 
 /// Governed config key for the lifetime issuance ceiling, in TOKENS.
 pub const ISSUANCE_TOTAL_CAP_CONFIG_KEY: &str = "economy:issuance_total_cap";

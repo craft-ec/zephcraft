@@ -22,7 +22,12 @@ use core::time::Duration;
 
 use alloc::collections::{BTreeMap, VecDeque};
 
-/// DEFAULT egress price: bytes of rewardable serving that ONE token buys. Governed (see
+/// Base units in one whole token — mirrors `zeph_token::ONE_TOKEN` (canonical); see the note there and
+/// the drift test in `noded`.
+pub const ONE_TOKEN: u64 = 100_000_000;
+
+/// DEFAULT egress price: bytes of rewardable serving that ONE WHOLE token buys (amounts elsewhere are in
+/// BASE UNITS; `purchase` scales by [`ONE_TOKEN`]). Governed (see
 /// [`BYTES_PER_TOKEN_CONFIG_KEY`]) — this is only the genesis default.
 pub const DEFAULT_BYTES_PER_TOKEN: u64 = 1 << 20; // 1 MiB per token
 
@@ -129,7 +134,12 @@ impl SubscriptionLedger {
         epoch: u64,
         window: u64,
     ) {
-        let bytes = tokens.saturating_mul(bytes_per_token);
+        // `tokens` is in BASE UNITS while `bytes_per_token` prices a WHOLE token, so scale down by
+        // ONE_TOKEN. Done in u128 so the intermediate cannot overflow, and floor-divided: a payment that
+        // buys a fractional byte buys none. Rounding DOWN is the safe direction — the ledger never grants
+        // entitlement that was not fully paid for.
+        let bytes =
+            ((tokens as u128).saturating_mul(bytes_per_token as u128) / ONE_TOKEN as u128) as u64;
         if bytes == 0 {
             return;
         }
@@ -243,7 +253,7 @@ mod tests {
     #[test]
     fn a_purchase_buys_tokens_times_price_in_bytes() {
         let mut l = SubscriptionLedger::new();
-        l.purchase(consumer(1), 3, 1000, 0, 100); // 3 tokens × 1000 B/token = 3000 B
+        l.purchase(consumer(1), 3 * ONE_TOKEN, 1000, 0, 100); // 3 tokens × 1000 B/token = 3000 B
         assert_eq!(l.available(&consumer(1), 0), 3000);
         // A zero purchase creates nothing.
         l.purchase(consumer(2), 0, 1000, 0, 100);
@@ -256,7 +266,7 @@ mod tests {
         // Default tier OFF: this test is about the PURCHASED entitlement cap, so the free allowance would
         // mask exactly the boundary under test. The default tier has its own test below.
         l.set_default_tier(0, 0);
-        l.purchase(consumer(1), 1, 1000, 0, 100);
+        l.purchase(consumer(1), ONE_TOKEN, 1000, 0, 100);
         // Serving 400 within entitlement → all rewardable.
         assert_eq!(l.allocate(&consumer(1), 400, 1), 400);
         assert_eq!(l.available(&consumer(1), 1), 600);
@@ -273,13 +283,13 @@ mod tests {
     fn unused_bytes_expire_and_are_never_refunded() {
         let mut l = SubscriptionLedger::new();
         l.set_default_tier(0, 0); // isolate purchased-grant expiry from the renewing default tier
-        l.purchase(consumer(1), 1, 1000, 0, 10); // expires at epoch 10
+        l.purchase(consumer(1), ONE_TOKEN, 1000, 0, 10); // expires at epoch 10
         assert_eq!(l.available(&consumer(1), 9), 1000);
         // At expiry the entitlement is dead — use-it-or-lose-it (no escrow, no refund).
         assert_eq!(l.available(&consumer(1), 10), 0);
         assert_eq!(l.allocate(&consumer(1), 500, 10), 0);
         // A fresh purchase after expiry stands on its own.
-        l.purchase(consumer(1), 2, 1000, 10, 10);
+        l.purchase(consumer(1), 2 * ONE_TOKEN, 1000, 10, 10);
         assert_eq!(l.allocate(&consumer(1), 2500, 11), 2000);
     }
 
@@ -334,9 +344,9 @@ mod tests {
         let mut l = SubscriptionLedger::new();
         // Default tier OFF: this test asserts PURCHASED-grant behaviour, which the free allowance masks.
         l.set_default_tier(0, 0);
-        l.purchase(consumer(1), 1, 100, 0, 10); // expires at 10
-        l.purchase(consumer(1), 1, 100, 5, 10); // expires at 15
-                                                // Spending 150 drains the OLD grant (100) then dips into the new one (50).
+        l.purchase(consumer(1), ONE_TOKEN, 100, 0, 10); // expires at 10
+        l.purchase(consumer(1), ONE_TOKEN, 100, 5, 10); // expires at 15
+                                                        // Spending 150 drains the OLD grant (100) then dips into the new one (50).
         assert_eq!(l.allocate(&consumer(1), 150, 6), 150);
         assert_eq!(l.available(&consumer(1), 6), 50);
         // Only the newer grant survives past epoch 10 — the older one is already spent, not lost.
@@ -352,8 +362,8 @@ mod tests {
             let mut l = SubscriptionLedger::new();
             // Default tier OFF: this test asserts PURCHASED-grant behaviour, which the free allowance masks.
             l.set_default_tier(0, 0);
-            l.purchase(consumer(1), 5, 1000, 0, 100);
-            l.purchase(consumer(2), 2, 1000, 1, 100);
+            l.purchase(consumer(1), 5 * ONE_TOKEN, 1000, 0, 100);
+            l.purchase(consumer(2), 2 * ONE_TOKEN, 1000, 1, 100);
             l.allocate(&consumer(1), 3000, 2);
             l.allocate(&consumer(2), 5000, 2);
             (l.available(&consumer(1), 2), l.available(&consumer(2), 2))

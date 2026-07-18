@@ -400,6 +400,8 @@ mod tests {
     #[test]
     fn pay_in_settle_and_claim_conserves_the_pool() {
         let mut s = SettlementStore::new();
+        // Conservation of PAID value: no seed, so `unallocated + owed` is exactly what was paid in.
+        s.set_issuance(0, 0);
         s.pay_in(100); // consumers paid 100 into the pool
         assert_eq!(s.unallocated(), 100);
         // Settle epoch 1: two providers 60/40 → shares 60/40; unallocated → 0 (no dust here).
@@ -416,6 +418,30 @@ mod tests {
             s.settle_epoch(1, vec![contrib(3, 999)], vec![])
                 .share_of(&prov(1)),
             60
+        );
+    }
+
+    /// The token scale is mirrored in three crates (`zeph_token` canonical, `zeph_reward` and
+    /// `zeph_economy_egress` mirroring it) because the token program and the valuation program are
+    /// deliberately separate with no dependency between them. `noded` is the one place that sees all
+    /// three, so this is where the duplication is pinned — without it, a change to one would silently
+    /// re-denominate half the economy.
+    #[test]
+    fn the_token_scale_is_identical_everywhere_it_is_mirrored() {
+        assert_eq!(
+            zeph_token::ONE_TOKEN,
+            zeph_reward::ONE_TOKEN,
+            "reward's mirrored token scale drifted from the canonical one"
+        );
+        assert_eq!(
+            zeph_token::ONE_TOKEN,
+            zeph_economy_egress::ONE_TOKEN,
+            "economy-egress's mirrored token scale drifted from the canonical one"
+        );
+        assert_eq!(
+            zeph_token::ONE_TOKEN,
+            10u64.pow(zeph_token::DECIMALS as u32),
+            "ONE_TOKEN must be exactly 10^DECIMALS or display and arithmetic disagree"
         );
     }
 
@@ -487,6 +513,8 @@ mod tests {
     #[test]
     fn unclaimed_shares_forfeit_back_after_the_claim_window() {
         let mut s = SettlementStore::new();
+        // Steady state: no seed, so the asserted pool arithmetic is exactly what was paid.
+        s.set_issuance(0, 0);
         s.pay_in(50);
         s.settle_epoch(1, vec![contrib(1, 1)], vec![]); // provider 1 owed 50, never claims
         assert_eq!(s.unallocated(), 0);
@@ -503,6 +531,8 @@ mod tests {
     #[test]
     fn settle_with_pool_folds_aggregated_pays_and_is_idempotent() {
         let mut s = SettlementStore::new();
+        // Steady state: no seed, so the asserted pool arithmetic is exactly what was paid.
+        s.set_issuance(0, 0);
         // Cross-node close: feed Σ all nodes' announced pays (say 100) + the epoch's contributions.
         let rec = s.settle_epoch_with_pool(1, 100, vec![contrib(1, 60), contrib(2, 40)]);
         assert_eq!(rec.share_of(&prov(1)), 60);
@@ -518,7 +548,11 @@ mod tests {
         let mut s = SettlementStore::new();
         // STEADY STATE (post-seeding): entitlement must be PAID for. The seeding-phase free tier is off.
         s.set_default_tier(0);
-        s.set_bytes_per_token(1); // unit price: 1 token = 1 byte, so the arithmetic below is the mechanics
+        // Steady state: no seed, so the asserted shares are exactly the paid pool.
+        s.set_issuance(0, 0);
+        // UNIT PRICE in base terms: one whole token buys ONE_TOKEN bytes, i.e. 1 BASE UNIT = 1 byte, so
+        // the arithmetic below reads as the mechanics rather than the pricing.
+        s.set_bytes_per_token(zeph_token::ONE_TOKEN);
         let c = prov(9);
         // Epoch 1: consumer first seen at paid 0 → baselines (quota 0, pool 0), no serving yet.
         s.settle_epoch_from_cheques(1, vec![(c, 0)], vec![]);
@@ -548,7 +582,10 @@ mod tests {
         let mut s = SettlementStore::new();
         // STEADY STATE (post-seeding): entitlement must be PAID for. The seeding-phase free tier is off.
         s.set_default_tier(0);
-        s.set_bytes_per_token(1); // unit price (the price cancels in pool-average — see the price test)
+        // Steady state: no seed. UNIT PRICE in base terms (1 base unit = 1 byte); the price cancels in
+        // the pool-average anyway — see the price test.
+        s.set_issuance(0, 0);
+        s.set_bytes_per_token(zeph_token::ONE_TOKEN);
         let attacker = prov(5);
         s.settle_epoch_from_cheques(1, vec![(attacker, 0)], vec![]); // baseline
                                                                      // Attacker pays 100 and serves ITSELF 1000 bytes (sock-puppet consumer = itself).
@@ -569,6 +606,8 @@ mod tests {
     #[test]
     fn replayed_cheques_earn_nothing_twice_per_consumer() {
         let mut s = SettlementStore::new();
+        // Steady state: no seed, so the asserted pool arithmetic is exactly what was paid.
+        s.set_issuance(0, 0);
         s.set_bytes_per_token(1); // unit price
         let c = prov(9);
         s.settle_epoch_from_cheques(1, vec![(c, 0)], vec![]);
@@ -588,7 +627,9 @@ mod tests {
         let mut s = SettlementStore::new();
         // STEADY STATE (post-seeding): entitlement must be PAID for. The seeding-phase free tier is off.
         s.set_default_tier(0);
-        s.set_bytes_per_token(1); // unit price
+        // Steady state: no seed. UNIT PRICE in base terms — 1 base unit = 1 byte.
+        s.set_issuance(0, 0);
+        s.set_bytes_per_token(zeph_token::ONE_TOKEN);
         let c = prov(9);
         s.settle_epoch_from_cheques(1, vec![(c, 0)], vec![]);
         // C paid 40 but was served 100 by one provider → only 40 rewardable, 60 subsidy.
@@ -616,11 +657,12 @@ mod tests {
             0,
             "not bought until the delta settles"
         );
-        let rec = s.settle_epoch_from_cheques(2, vec![(c, 2)], vec![(prov(1), c, 1500, 1)]);
+        let paid = 2 * zeph_token::ONE_TOKEN; // amounts are BASE UNITS
+        let rec = s.settle_epoch_from_cheques(2, vec![(c, paid)], vec![(prov(1), c, 1500, 1)]);
         assert_eq!(
             rec.share_of(&prov(1)),
-            2,
-            "the whole pool (2 paid) to the sole provider"
+            paid,
+            "the whole pool (2 tokens paid) to the sole provider"
         );
         assert_eq!(
             s.rewardable_served(&prov(1)),
@@ -643,6 +685,8 @@ mod tests {
         // P6 use-it-or-lose-it: the tokens were folded into the pool and already priced into everyone's
         // pool-average, so an unspent subscription is LOST at the window edge, not refunded.
         let mut s = SettlementStore::new();
+        // Steady state: no seed either, so the asserted pool is exactly what was paid.
+        s.set_issuance(0, 0);
         // STEADY STATE (post-seeding): entitlement must be PAID for. The seeding-phase free tier is off.
         s.set_default_tier(0);
         s.set_bytes_per_token(10);
@@ -651,7 +695,8 @@ mod tests {
         )); // 5 epochs
         let c = prov(9);
         s.settle_epoch_from_cheques(1, vec![(c, 0)], vec![]); // first sight
-        s.settle_epoch_from_cheques(2, vec![(c, 10)], vec![]); // buys 100 B at epoch 2, expires at 7
+                                                              // 10 whole tokens (BASE UNITS) × 10 B/token = 100 B, bought at epoch 2, expiring at 7.
+        s.settle_epoch_from_cheques(2, vec![(c, 10 * zeph_token::ONE_TOKEN)], vec![]);
         assert_eq!(s.entitlement(&c, 6), 100, "alive inside the window");
         assert_eq!(s.entitlement(&c, 7), 0, "dead at the window edge");
         // Serving after expiry earns nothing — the entitlement is gone, not refunded or carried.
@@ -666,6 +711,8 @@ mod tests {
     #[test]
     fn a_free_consumer_that_never_paid_rewards_nobody() {
         let mut s = SettlementStore::new();
+        // Steady state: no seed, so the asserted pool arithmetic is exactly what was paid.
+        s.set_issuance(0, 0);
         // STEADY STATE (post-seeding): the default tier is off, so entitlement must be PAID for. This is
         // the real end state — the free tier is a seeding-phase bootstrap that governance switches off.
         s.set_default_tier(0);
@@ -680,29 +727,37 @@ mod tests {
     #[test]
     fn a_joining_nodes_historical_pay_is_baselined_not_dumped() {
         let mut s = SettlementStore::new();
+        // Steady state: no seed either, so the asserted pool is exactly what was paid.
+        s.set_issuance(0, 0);
         // STEADY STATE (post-seeding): the default tier is off, so entitlement must be PAID for. This is
         // the real end state — the free tier is a seeding-phase bootstrap that governance switches off.
         s.set_default_tier(0);
         let c = prov(9);
-        // C's FIRST appearance already carries a historical paid total of 1000 → baseline, quota 0, pool 0.
-        let rec1 = s.settle_epoch_from_cheques(1, vec![(c, 1000)], vec![(prov(1), c, 500, 1)]);
+        // Amounts are BASE UNITS. C's FIRST appearance already carries a historical paid total →
+        // baseline, quota 0, pool 0.
+        let hist = 1000 * zeph_token::ONE_TOKEN;
+        let rec1 = s.settle_epoch_from_cheques(1, vec![(c, hist)], vec![(prov(1), c, 500, 1)]);
         assert!(
             rec1.shares.is_empty(),
             "historical pay is baselined, not dumped into one epoch"
         );
         assert_eq!(s.unallocated(), 0);
         // Only NEW pay past the baseline becomes quota + pool.
-        let rec2 = s.settle_epoch_from_cheques(2, vec![(c, 1200)], vec![(prov(1), c, 700, 2)]);
+        let delta = 200 * zeph_token::ONE_TOKEN;
+        let rec2 =
+            s.settle_epoch_from_cheques(2, vec![(c, hist + delta)], vec![(prov(1), c, 700, 2)]);
         assert_eq!(
             rec2.share_of(&prov(1)),
-            200,
-            "Δpaid 200 → quota 200 → 200 rewardable"
+            delta,
+            "Δpaid → quota → all of it rewardable"
         );
     }
 
     #[test]
     fn a_claimed_share_does_not_forfeit_on_expiry() {
         let mut s = SettlementStore::new();
+        // Steady state: no seed, so the asserted pool arithmetic is exactly what was paid.
+        s.set_issuance(0, 0);
         s.pay_in(50);
         s.settle_epoch(1, vec![contrib(1, 1)], vec![]);
         s.claim(1, prov(1)); // provider claimed its 50 (owed → paid, out of the pool)

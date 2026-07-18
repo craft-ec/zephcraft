@@ -17,6 +17,40 @@
 
 #![no_std]
 
+/// Decimal places for display: the ledger stores integer BASE UNITS, and this says where the point goes.
+/// 8 — Bitcoin's convention (a satoshi). Not universal (Ethereum uses 18, USDC 6, SOL 9); what matters is
+/// that ONE value is canonical, and this is it.
+pub const DECIMALS: u8 = 8;
+
+/// Base units in one whole token — the scale every amount in the economy is denominated in.
+///
+/// **All balances, pools, shares, seeds and caps are BASE UNITS.** Storing base units and treating
+/// decimals as display metadata is the standard ledger discipline: it keeps the arithmetic exact integer
+/// maths with no float anywhere near money.
+///
+/// Two concrete defects this scale removes, beyond convention:
+/// - **Dust.** Reward shares are `pool × bytes_i / Σ bytes`, floor-divided. In whole tokens the remainder
+///   was a WHOLE token (1 MiB of egress at the default price); in base units it is 1e-8 of one.
+/// - **An indivisible seed.** A 1-token/day seed could only land on ONE epoch of 288, so providers in the
+///   other 287 earned nothing from it. In base units every epoch carries a divisible share.
+///
+/// `u64` holds ~1.8e11 whole tokens at this scale — vast headroom over any planned cap.
+pub const ONE_TOKEN: u64 = 100_000_000;
+
+/// Render base units as a decimal token amount (display only — never feed this back into arithmetic).
+pub fn format_amount(base_units: u64) -> alloc::string::String {
+    let whole = base_units / ONE_TOKEN;
+    let frac = base_units % ONE_TOKEN;
+    let mut s = alloc::format!("{whole}.{frac:0width$}", width = DECIMALS as usize);
+    while s.ends_with('0') {
+        s.pop();
+    }
+    if s.ends_with('.') {
+        s.push('0');
+    }
+    s
+}
+
 extern crate alloc;
 
 use alloc::collections::BTreeSet;

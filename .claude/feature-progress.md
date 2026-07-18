@@ -2954,3 +2954,21 @@ PHASE that governance ends, not the steady state.
   from the epoch immediately BEFORE its replay window, so seed and replay are contiguous by
   construction. The old startup seed was removed outright — because seeding is monotonic, its wrong
   (higher) value would have won over the correct one.
+
+### 8-DECIMAL TOKEN (2026-07-18) — base units everywhere
+User asked for 8 decimals ("standard across blockchains"). Noted honestly that 8 is BITCOIN's convention,
+not universal (Ethereum 18, USDC 6, SOL 9) — what matters is one canonical value. 8 adopted.
+- `zeph_token::DECIMALS = 8`, `ONE_TOKEN = 100_000_000`. The ledger stores integer BASE UNITS; decimals
+  are display metadata (`format_amount`). No floats near money.
+- **Done NOW because every balance is 0** — this is a reinterpretation today and a MIGRATION later.
+- Fixes two real defects, not just convention:
+  * DUST: shares are floor-divided, so the remainder was a WHOLE token (1 MiB of egress). Now 1e-8.
+  * INDIVISIBLE SEED: 1 token/day could only land on ONE epoch of 288 — providers in the other 287
+    earned nothing from it. In base units every epoch carries a divisible share.
+- `purchase` now scales: `base_units × bytes_per_token / ONE_TOKEN` in u128, floor-divided (rounding DOWN
+  is safe — never grant entitlement that was not fully paid for).
+- Scale MIRRORED in reward + economy-egress (token is a separate program by design, no dep edge) and
+  pinned by `the_token_scale_is_identical_everywhere_it_is_mirrored` in noded, which sees all three.
+- Test fallout was informative: every test asserting exact PAID-pool arithmetic now disables the seed
+  (`set_issuance(0,0)`), and "unit price" tests rebase to `bytes_per_token = ONE_TOKEN` (1 base unit =
+  1 byte). Those edits describe the steady state, which is the honest framing.
