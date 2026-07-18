@@ -58,3 +58,14 @@ fleet to tune).
   URGENCY.
 - Repair+shed MUST be one job type / one execution path (opposite directions of "move effective
   toward the band"), not two.
+
+
+## 2026-07-18 — UNIFIED into reconcile (user clarification: offset per cid ACROSS providers)
+The separate repair:{cid}/shed:{cid} keys meant a departure and an arrival for the same cid did
+NOT coalesce (per-cid-per-provider). Fixed: ONE reconcile:{cid} key for both directions.
+- verified_have(cid): probe-verified net across ALL providers (unverifiable=0), one pass.
+- reconcile_cid: have<floor→repair_cid; cold surplus>band→shed_cid; in band→NOTHING (the offset).
+- EngineWork::Shed→Reconcile; request_repair/request_shed→request_reconcile; JobClass reconcile:→Repair.
+- on_death + anti-entropy(lost∪gained) both enqueue reconcile:{cid} → death offset by return coalesces.
+- Delegates to the reviewed repair_cid/shed_cid → dispatcher, not a new destructive path.
+- Test: reconcile_nets_to_noop_when_redundancy_is_in_band. Commit 8522c23. NOT yet gated/rolled.
