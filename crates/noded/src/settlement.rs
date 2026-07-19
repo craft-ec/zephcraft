@@ -179,13 +179,6 @@ impl SettlementStore {
         self.protocol.supply_mut().set_cap(total_cap);
     }
 
-    /// Cumulative fresh issuance so far — observable state its own tests assert (same treatment as the
-    /// other store observables). Not read by the binary yet; the natural consumer is a dashboard
-    /// "issued supply" figure, which is worth surfacing once issuance actually runs on a fleet.
-    #[allow(dead_code)]
-    pub fn cumulative_issued(&self) -> u64 {
-        self.protocol.total_supply()
-    }
 
     /// Fold a committed `Pay` write into the pool — the CREDIT half of a transfer whose debit already
     /// happened on the payer's own chain. Supply is unchanged: this MOVES tokens (the old code destroyed
@@ -255,10 +248,21 @@ impl SettlementStore {
         // the system that creates tokens. `mint_into_pool` both advances the token-owned supply counter
         // and credits the pool, so the cap is structural rather than a convention this layer honours.
         let minted = self.protocol.mint_into_pool(record.issued);
-        debug_assert_eq!(
-            minted, record.issued,
-            "the record's issuance was computed against this same cap, so the gate must grant it in full"
-        );
+        // A REAL check, not a `debug_assert`: this is a money invariant, and a debug assertion is
+        // compiled out of release builds — exactly where it would matter. Today it holds by construction
+        // (the cap fed to `compute` is read from this same `protocol`, with no await or mutation
+        // between), so this costs nothing; it exists so a future refactor that inserts one cannot break
+        // it silently. If the gate ever grants less than the record committed to, the record promises
+        // shares the pool cannot back — claims would start being refused — so it must be loud.
+        if minted != record.issued {
+            tracing::error!(
+                epoch,
+                committed = record.issued,
+                minted,
+                "ISSUANCE MISMATCH: the pool minted less than the record committed to — shares in this \
+                 epoch are not fully backed and claims against them will be refused"
+            );
+        }
         // Σ shares are NOT deducted from the pool here: they stay in it, EARMARKED as owed via `records`.
         // The tokens only leave the protocol when a provider actually claims (`claim` → debit). That is
         // what makes `Σ balances + pool == total_supply` hold — the old code moved a number between two
@@ -674,7 +678,7 @@ mod tests {
 
         // BOTH views must agree, because they are the same counter.
         assert_eq!(
-            s.cumulative_issued(),
+            s.total_supply(),
             4_000,
             "the settle input sees the restored history"
         );
@@ -752,7 +756,7 @@ mod tests {
         );
         assert_eq!(rec.share_of(&prov(1)), 41);
         assert_eq!(
-            s.cumulative_issued(),
+            s.total_supply(),
             1,
             "counter advanced by exactly the mint"
         );
@@ -765,7 +769,7 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(
-            s.cumulative_issued(),
+            s.total_supply(),
             1,
             "a lower chain read does not lower the counter"
         );
@@ -774,7 +778,7 @@ mod tests {
             pool: s.pool_total(),
             ..Default::default()
         });
-        assert_eq!(s.cumulative_issued(), 500, "a higher chain read raises it");
+        assert_eq!(s.total_supply(), 500, "a higher chain read raises it");
     }
 
     /// The lifetime cap holds at the STORE level too: once cumulative issuance reaches it, settles stop

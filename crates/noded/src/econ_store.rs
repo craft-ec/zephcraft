@@ -37,21 +37,6 @@ CREATE TABLE IF NOT EXISTS econ_served_wm(provider BLOB NOT NULL, consumer BLOB 
 CREATE TABLE IF NOT EXISTS econ_seeding(account BLOB PRIMARY KEY, next_epoch INTEGER NOT NULL);\
 CREATE TABLE IF NOT EXISTS econ_claims(epoch INTEGER NOT NULL, provider BLOB NOT NULL, PRIMARY KEY(epoch, provider));";
 
-fn hex(b: &[u8; 32]) -> String {
-    let mut s = String::with_capacity(64);
-    for x in b {
-        s.push_str(&alloc_hex(*x));
-    }
-    s
-}
-
-fn alloc_hex(b: u8) -> String {
-    const H: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(2);
-    s.push(H[(b >> 4) as usize] as char);
-    s.push(H[(b & 0xf) as usize] as char);
-    s
-}
 
 
 /// Write the whole position. A full rewrite rather than a diff: it is obviously correct, and it is not
@@ -67,25 +52,25 @@ pub async fn persist(db: &mut CraftDb, snap: &EconomicSnapshot) -> Result<()> {
     for (k, v) in &snap.paid_watermarks {
         sql.push_str(&format!(
             "INSERT INTO econ_paid_wm VALUES (x'{}',{});",
-            hex(k), *v as i64
+            hex::encode(k), *v as i64
         ));
     }
     for ((p, c), v) in &snap.served_watermarks {
         sql.push_str(&format!(
             "INSERT INTO econ_served_wm VALUES (x'{}',x'{}',{});",
-            hex(p), hex(c), *v as i64
+            hex::encode(p), hex::encode(c), *v as i64
         ));
     }
     for (k, v) in &snap.seeding_next {
         sql.push_str(&format!(
             "INSERT INTO econ_seeding VALUES (x'{}',{});",
-            hex(k), *v as i64
+            hex::encode(k), *v as i64
         ));
     }
     for (e, p) in &snap.claimed {
         sql.push_str(&format!(
             "INSERT INTO econ_claims VALUES ({},x'{}');",
-            *e as i64, hex(p)
+            *e as i64, hex::encode(p)
         ));
     }
     db.write(&sql).await?;
