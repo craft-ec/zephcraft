@@ -150,7 +150,6 @@ impl EconomyEgressService {
         true
     }
 
-
     /// Apply the GOVERNED DEFAULT TIER — the per-window egress allowance every account holds WITHOUT
     /// paying, i.e. everyone on the paid tier by default. 0 turns it off (payment becomes the only route
     /// to entitlement). Governed so every node grants identically; a divergence would change which

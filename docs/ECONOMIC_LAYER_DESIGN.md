@@ -873,3 +873,98 @@ binary roll). Committing to a *shape* rather than a magic constant is itself the
 
 Mechanism (steps 1–2) is complete. With §10 resolved, **step 4 (the token-ledger app) is the
 active next build**; step 3 dissolved into it; step 5 stays deferred.
+
+## 12. AS BUILT (2026-07-19) — reconciling this document with the code
+
+Sections 0–11 describe the design as reasoned; this section records what the code actually does, where
+it DIVERGED, and why. Written because the doc had drifted far enough to mislead: it described a notional
+pool, no supply counter, and whole-token units — none of which is still true.
+
+### 12.1 The token owns supply; the pool literally holds tokens
+
+`Pay` used to DESTROY the payer's tokens (a debit with no credit anywhere) and `RewardClaim` used to
+CREATE the provider's (a credit with no debit). The two netted out in aggregate, so nothing caught it,
+but supply was untracked across the whole cycle and the "pool" was a number derived by summing `Pay`
+writes — it could not be over-drawn because it did not exist.
+
+Now (`zeph_token::ProtocolState`, `SupplyState`):
+
+| operation | movement | supply |
+|---|---|---|
+| `Pay` | payer → pool | conserved |
+| seed | **mint** → pool | +granted, through the ONE cap gate |
+| `RewardClaim` | pool → provider | conserved |
+
+`SupplyState::authorize_mint` is the single gate every token-creating path must call; `total_supply`
+(CTS-1 L0) is now implemented. The cap is the TOTAL supply ceiling across every future issuance path
+— **any new minting mechanism must draw against the same counter or the cap is decorative.**
+
+### 12.2 Denomination — 8 decimals, base units everywhere
+
+`DECIMALS = 8`, `ONE_TOKEN = 100_000_000`. The ledger stores integer BASE UNITS; decimals are display
+metadata. Adopted while every balance was still zero, when it was a reinterpretation rather than a
+migration. It also fixed two real defects: reward-share dust was a WHOLE token (1 MiB of egress at the
+then-price), and a 1 token/day seed was indivisible so it landed entirely on one epoch of 288.
+
+### 12.3 Seeding phase — a PAID-TIER SUBSIDY, distinct from the free tier
+
+Cold start is circular: issuance needs contribution, contribution needs paid entitlement, entitlement
+needs tokens. Resolved by granting **paid-tier status** by default during seeding
+(`SEEDING_PAID_TIER_BYTES`, 1 TiB/window, governed; 0 = off).
+
+**This is NOT the free tier.** The free tier is the reciprocity grant (`reciprocity:grant`) — permanent,
+untouched. The subsidy is a PHASE that governance ends, after which the allowance must be paid for.
+
+Accepted exposure while it runs: it breaks `self_dealing_nets_at_most_what_was_paid`, since an account
+can manufacture rewardable bytes having paid nothing and take a share of a SHARED pool. Bounded — the
+seed is a fixed NETWORK-WIDE rate (1 token/day), so sybils split it rather than multiplying it, making
+this a fairness cost, not a solvency one. It is the reason the phase must end.
+
+### 12.4 Issuance — an exact daily schedule, not a per-epoch division
+
+`issue(e) = ⌊(e+1)·R/E⌋ − ⌊e·R/E⌋` pays a rate R/day exactly across E epochs. A per-epoch division
+would floor 1 token/day (=1/288 at a 5-min epoch) to ZERO. Gated on contribution: an idle network mints
+nothing.
+
+### 12.5 The pool DERIVES from canonical records — it is not accumulated locally
+
+The correction that mattered most. Committee-gated settlement (§11) makes each node's view a SAMPLE by
+design, but the pool, the claim debit, the watermarks and the restart check were all written as if it
+were complete. Concretely: a claim's CREDIT resolved from the canonical record (any node) while its
+DEBIT only ran where the node had settled that epoch (a minority) — so the common claim credited
+without ever debiting.
+
+The pool is now a function of the chain:
+
+    pool(E) = pool(E-1) + paid(E) + issued(E) - claim_payouts(E)
+
+computed inside `reward::compute` — the pure function verifiers re-run — with every term carried in the
+record. `claim()` accrues a payout the next record folds rather than debiting locally. Conservation is
+therefore an **epoch-boundary** property: `balances + (pool − pending payouts) == supply`. That is
+weaker instantaneously and correct everywhere, which the previous version was not.
+
+### 12.6 State lives in CraftSQL; the record commits to a canonical ROW HASH
+
+Economic state is O(accounts), so it lives in a CraftSQL store (indexed, queryable, O(changed) commits)
+and the record carries a 32-byte `state_hash` over rows in KEY ORDER.
+
+**Measured, not assumed** (`zeph_sql::db::tests::two_independent_instances_agree_on_the_root_cid`): two
+instances given identical SQL produce an identical root, but the same rows in a DIFFERENT ORDER produce
+a different root. The SQL root commits to WRITE HISTORY, so a replayed node and a continuously-running
+one would diverge while holding identical state — a false divergence, which verification must never
+produce. Hence a content hash in key order, the same reason chains hash an ordered trie rather than a
+database file.
+
+Nodes stay current without settling: each epoch a node either settles it (if elected) or ADOPTS its
+canonical record. Records carry the watermarks they advanced (O(active)), and every
+`CHECKPOINT_EVERY` (32) epochs a record carries the FULL state so a node with NO history can reach a
+verifiable position — deltas alone are unusable to a joiner.
+
+### 12.7 Still open
+
+- **Claim credit is not pinned at commit.** `balance()` re-resolves `reward_share` live, so the same
+  committed write can fold to different amounts over time, and a `Transfer` authored against the higher
+  pre-canonical balance can void on replay. Needs the resolved share pinned into the committed write.
+- **PDP (K5)** remains the missing trust primitive — no proof a node still holds what it claims. Its
+  absence is why seeding-phase sybil resistance is unsolved.
+- **Nothing has ever minted or run on a fleet.** Every property above is unit- and gate-verified only.

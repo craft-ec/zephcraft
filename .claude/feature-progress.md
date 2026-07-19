@@ -3356,3 +3356,19 @@ BUG rather than assuming: with adoption disabled it fails (`Some(0)` vs `Some(10
 passes. My FIRST version of this test passed with the fix disabled — it compared pool deltas across two
 different nodes, so the bases cancelled and it measured nothing. Checking that a test fails without its
 fix is now the step I do, not the step I skip.
+
+### RECONCILED (2026-07-19) — four gaps, two of which I only found when asked
+1. **GATE18 HAD FAILED and I never read it.** It failed at stage 1/4 (`fmt`) while I reported "workspace
+   green, clippy clean" — true of my own checks, not of the gate. I launched it, saw the LAUNCH
+   notification, and moved on. Same "didn't look" failure as dismissing the flaky test. fmt fixed.
+2. **A node with NO HISTORY could never match the canonical state hash** — the gap my finding-#4 fix
+   left. `adopt_canonical` set `committed` to the ADOPTER's snapshot while verification compares the
+   RECORD's hash, so a node that had followed from genesis converged but a joiner never could: it failed
+   verification forever and fell back to defaults every restart. FIXED with a periodic full-state
+   CHECKPOINT (`CHECKPOINT_EVERY = 32`): checkpoint records carry the whole snapshot and are adopted
+   WHOLESALE; other records carry O(active) deltas. TEST verified to FAIL without checkpoints.
+3. **The design doc described an architecture that no longer existed** — zero mentions of the literal
+   pool, decimals, seeding subsidy, state_hash, ONE_TOKEN or the pool recurrence. Anyone reading it got
+   the notional pool and whole-token units. Written up as `ECONOMIC_LAYER_DESIGN.md` §12 "AS BUILT",
+   including where the code DIVERGED from §§0–11 and why, and what is still open.
+4. **Finding #2 still open** — claim credit resolves live rather than pinned at commit.

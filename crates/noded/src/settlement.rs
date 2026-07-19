@@ -158,7 +158,19 @@ impl SettlementStore {
     /// hand back spent minting headroom.
     pub fn adopt_canonical(&mut self, rec: &RewardRecord) {
         self.protocol.set_pool(rec.state_pool());
-        self.protocol.supply_mut().observe_minted(rec.cumulative_issued);
+        self.protocol
+            .supply_mut()
+            .observe_minted(rec.cumulative_issued);
+        // A CHECKPOINT replaces state wholesale rather than merging deltas into it. That is the point:
+        // a node with no history cannot rebuild a state it never saw, so merging deltas would leave it
+        // permanently unable to match the canonical hash. Adopting the checkpoint gives it a verified
+        // starting point; later records carry it forward by delta.
+        if let Some(full) = &rec.checkpoint {
+            self.restore(full);
+            self.committed = full.clone();
+            self.records.insert(rec.epoch, rec.clone());
+            return;
+        }
         // Merge the watermarks this record advanced — MONOTONICALLY, so adopting an older record can
         // never rewind one and re-open a payment for double-counting. Without this a non-settling node's
         // watermarks freeze at its last elected epoch, and the whole skipped gap gets attributed to
@@ -231,7 +243,6 @@ impl SettlementStore {
         self.protocol.supply_mut().set_cap(total_cap);
     }
 
-
     /// Fold a committed `Pay` write into the pool — the CREDIT half of a transfer whose debit already
     /// happened on the payer's own chain. Supply is unchanged: this MOVES tokens (the old code destroyed
     /// them, since nothing received the debit).
@@ -299,7 +310,11 @@ impl SettlementStore {
             // pure function rather than by a local side effect.
             claim_payouts: self.pending_payouts,
             paid: self.pending_paid,
-            paid_marks: self.pending_paid_marks.iter().map(|(k, v)| (*k, *v)).collect(),
+            paid_marks: self
+                .pending_paid_marks
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect(),
             served_marks: self
                 .pending_served_marks
                 .iter()
@@ -614,6 +629,47 @@ mod tests {
         );
     }
 
+    /// A node with NO HISTORY can reach a verifiable state, via a checkpoint.
+    ///
+    /// Deltas alone are unusable to a joiner: it cannot rebuild a state it never saw, so its
+    /// `state_hash` could never match the canonical one and it would fail verification forever, falling
+    /// back to defaults on every restart. This was the gap left by making non-settling nodes adopt
+    /// deltas — it fixed nodes that had followed from genesis and did nothing for one arriving mid-run.
+    #[test]
+    fn a_node_with_no_history_reaches_a_verifiable_state_from_a_checkpoint() {
+        // A settler builds real state over several epochs, ending on a CHECKPOINT epoch.
+        let mut settler = SettlementStore::new();
+        settler.set_issuance(1000 * epochs_per_day(), 1_000_000_000);
+        settler.set_seeding_paid_tier(0);
+        settler.set_bytes_per_token(zeph_token::ONE_TOKEN);
+        settler.settle_epoch_from_cheques(1, vec![(prov(9), 0)], vec![]);
+        settler.settle_epoch_from_cheques(2, vec![(prov(9), 500)], vec![]);
+        let cp_epoch = zeph_reward::CHECKPOINT_EVERY; // a checkpoint epoch
+        let cp = settler.settle_epoch_from_cheques(cp_epoch, vec![(prov(9), 900)], vec![]);
+        assert!(
+            cp.checkpoint.is_some(),
+            "a checkpoint epoch carries full state"
+        );
+
+        // A JOINER with nothing: no watermarks, no pool, no supply.
+        let mut joiner = SettlementStore::new();
+        joiner.set_issuance(1000 * epochs_per_day(), 1_000_000_000);
+        joiner.set_seeding_paid_tier(0);
+        assert_eq!(joiner.total_supply(), 0, "it starts blank");
+
+        joiner.adopt_canonical(&cp);
+
+        // It now holds the settler's exact position — and, crucially, its committed snapshot hashes to
+        // what the record committed, so restart verification SUCCEEDS instead of dumping it to defaults.
+        assert_eq!(joiner.pool_total(), settler.pool_total(), "same pool");
+        assert_eq!(joiner.total_supply(), settler.total_supply(), "same supply");
+        assert_eq!(
+            joiner.committed_snapshot().state_hash(),
+            cp.state_hash,
+            "a historyless node can now MATCH the canonical hash — the whole point of the checkpoint"
+        );
+    }
+
     /// A settle GAP must not lump the skipped epochs into the next elected one.
     ///
     /// Review finding #3: watermarks advanced only when a node settled, but `last_settled` advanced
@@ -633,7 +689,10 @@ mod tests {
         continuous.settle_epoch_from_cheques(1, vec![(payer, 0)], vec![]); // first sight → baseline
         let r2 = continuous.settle_epoch_from_cheques(2, vec![(payer, 100)], vec![]);
         assert_eq!(
-            r2.paid_marks.iter().find(|(a, _)| *a == payer).map(|(_, v)| *v),
+            r2.paid_marks
+                .iter()
+                .find(|(a, _)| *a == payer)
+                .map(|(_, v)| *v),
             Some(100),
             "the record carries the watermark it advanced"
         );
@@ -692,13 +751,25 @@ mod tests {
         observer.set_seeding_paid_tier(1_000);
         // It has spent its own subsidy allowance, which must survive.
         let c = prov(9);
-        assert_eq!(observer.subs.allocate(&c, 1_000, 1), 1_000, "allowance granted");
+        assert_eq!(
+            observer.subs.allocate(&c, 1_000, 1),
+            1_000,
+            "allowance granted"
+        );
         assert_eq!(observer.subs.allocate(&c, 1_000, 1), 0, "and spent");
 
         observer.adopt_canonical(&rec);
 
-        assert_eq!(observer.pool_total(), settler.pool_total(), "tracks the canonical pool");
-        assert_eq!(observer.total_supply(), settler.total_supply(), "and the canonical supply");
+        assert_eq!(
+            observer.pool_total(),
+            settler.pool_total(),
+            "tracks the canonical pool"
+        );
+        assert_eq!(
+            observer.total_supply(),
+            settler.total_supply(),
+            "and the canonical supply"
+        );
         // Its committed snapshot now matches what it would persist, so a restart verifies instead of
         // falling back to defaults...
         assert_eq!(
@@ -733,7 +804,11 @@ mod tests {
         // A DIFFERENT node that settled nothing — no pay-ins folded, no records of its own.
         let mut observer = SettlementStore::new();
         observer.set_issuance(1000 * epochs_per_day(), 1_000_000_000);
-        assert_eq!(observer.pool_total(), 0, "it has accumulated nothing itself");
+        assert_eq!(
+            observer.pool_total(),
+            0,
+            "it has accumulated nothing itself"
+        );
 
         // Adopting the canonical record's committed state gives it the settler's pool exactly.
         observer.restore(&zeph_reward::EconomicSnapshot {
@@ -746,7 +821,11 @@ mod tests {
             settler.pool_total(),
             "a non-settling node derives the SAME pool — which local accumulation could never give it"
         );
-        assert_eq!(observer.total_supply(), settler.total_supply(), "and the same supply");
+        assert_eq!(
+            observer.total_supply(),
+            settler.total_supply(),
+            "and the same supply"
+        );
     }
 
     /// A claim no longer debits the pool locally; it accrues a payout that the NEXT record folds. That is
@@ -791,7 +870,7 @@ mod tests {
         let mut s = SettlementStore::new();
         s.set_issuance(1000 * epochs_per_day(), 1_000_000_000);
         let mut balances = 0u64; // value that has left the protocol onto providers' own chains
-        // Conservation, accounting for payouts not yet folded into a record.
+                                 // Conservation, accounting for payouts not yet folded into a record.
         let check = |bal: u64, st: &SettlementStore, step: &str| {
             assert_eq!(
                 bal + st.pool_total() - st.pending_payouts,
@@ -805,15 +884,27 @@ mod tests {
         let rec1 = s.settle_epoch(1, vec![contrib(1, 3), contrib(2, 1)], vec![]);
         assert_eq!(rec1.issued, 1000, "the epoch's scheduled seed");
         assert_eq!(s.total_supply(), 1000, "supply rose by exactly the mint");
-        assert_eq!(s.pool_total(), 1000, "and the pool holds it, per the record");
+        assert_eq!(
+            s.pool_total(),
+            1000,
+            "and the pool holds it, per the record"
+        );
         check(balances, &s, "after the seed mint");
 
         // CLAIM — accrues a payout; the pool still reads the last canonical figure.
         let got = s.claim(1, prov(1));
         assert_eq!(got, 750, "3:1 ratio over the 1000 distributable");
         balances += got;
-        assert_eq!(s.total_supply(), 1000, "claiming MOVES value, never creates it");
-        assert_eq!(s.pool_total(), 1000, "not debited locally — that is the whole point");
+        assert_eq!(
+            s.total_supply(),
+            1000,
+            "claiming MOVES value, never creates it"
+        );
+        assert_eq!(
+            s.pool_total(),
+            1000,
+            "not debited locally — that is the whole point"
+        );
         check(balances, &s, "after the claim (payout pending)");
 
         // Double-claim is refused and accrues nothing further.
@@ -829,7 +920,11 @@ mod tests {
         );
         assert_eq!(s.pending_payouts, 0, "folded, so nothing is outstanding");
         check(balances, &s, "after the next record folded the payout");
-        assert_eq!(s.total_supply(), 1000 + rec2.issued, "supply only ever rises by mints");
+        assert_eq!(
+            s.total_supply(),
+            1000 + rec2.issued,
+            "supply only ever rises by mints"
+        );
     }
 
     /// Payouts can never exceed what the pool held. The protection MOVED when the per-claim local debit
@@ -893,11 +988,7 @@ mod tests {
             "the sole provider divides paid(40) + issued(1)"
         );
         assert_eq!(rec.share_of(&prov(1)), 41);
-        assert_eq!(
-            s.total_supply(),
-            1,
-            "counter advanced by exactly the mint"
-        );
+        assert_eq!(s.total_supply(), 1, "counter advanced by exactly the mint");
 
         // Seeding from the durable chain is monotonic — it can only ever RAISE the counter, so a stale
         // or out-of-order read can never restore spent minting headroom.

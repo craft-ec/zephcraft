@@ -282,6 +282,22 @@ impl EconomicSnapshot {
     }
 }
 
+/// How often a record carries a FULL state snapshot instead of only the deltas it advanced.
+///
+/// Deltas alone are unusable to a node without history: it cannot reconstruct a state it never saw, so
+/// its `state_hash` can never match the canonical one and it fails verification forever, falling back to
+/// defaults every restart. A periodic checkpoint gives any node a place to START from — adopt the full
+/// snapshot, then apply subsequent deltas — which is the same reason chains ship state snapshots
+/// alongside block history.
+///
+/// The cost is one O(accounts) record every `CHECKPOINT_EVERY` epochs; the rest stay O(active).
+pub const CHECKPOINT_EVERY: u64 = 32;
+
+/// Whether `epoch` carries a full-state checkpoint.
+pub fn is_checkpoint(epoch: u64) -> bool {
+    epoch.is_multiple_of(CHECKPOINT_EVERY)
+}
+
 /// One `(provider, consumer)` pair's cumulative served-bytes watermark, as carried in the snapshot.
 pub type ServedWatermark = (([u8; 32], [u8; 32]), u64);
 
@@ -356,6 +372,13 @@ pub struct RewardRecord {
     /// actually paid, so any node can see how much of a reward was demand and how much was subsidy.
     #[serde(default)]
     pub issued: u64,
+    /// FULL state snapshot, present only on checkpoint epochs ([`is_checkpoint`]).
+    ///
+    /// A node with no history cannot rebuild state from deltas, so without this it could never match the
+    /// canonical `state_hash` and would fail verification forever. Adopting a checkpoint gives it a
+    /// verified starting point; subsequent records' deltas carry it forward.
+    #[serde(default)]
+    pub checkpoint: Option<EconomicSnapshot>,
     /// Watermarks advanced this epoch — see [`RewardInput::paid_marks`]. Sorted, so records stay
     /// canonical; merged monotonically by adopters, so a stale record can never rewind a watermark.
     #[serde(default)]
@@ -539,6 +562,12 @@ pub fn compute(input: &RewardInput) -> RewardRecord {
         // Commit to the resulting state by hash. `compute` produces it, so a verifier re-running this on
         // the same committed input derives the identical commitment — the state is verified exactly like
         // every other field, rather than being taken on the node's word.
+        // On a checkpoint epoch, carry the WHOLE resulting state so a historyless node can adopt it.
+        checkpoint: if is_checkpoint(input.epoch) {
+            Some(state.clone())
+        } else {
+            None
+        },
         paid_marks: {
             let mut v = input.paid_marks.clone();
             v.sort_unstable();

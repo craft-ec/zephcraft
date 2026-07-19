@@ -37,8 +37,6 @@ CREATE TABLE IF NOT EXISTS econ_served_wm(provider BLOB NOT NULL, consumer BLOB 
 CREATE TABLE IF NOT EXISTS econ_seeding(account BLOB PRIMARY KEY, next_epoch INTEGER NOT NULL);\
 CREATE TABLE IF NOT EXISTS econ_claims(epoch INTEGER NOT NULL, provider BLOB NOT NULL, PRIMARY KEY(epoch, provider));";
 
-
-
 /// Write the whole position. A full rewrite rather than a diff: it is obviously correct, and it is not
 /// the cost it appears to be — CraftSQL pages are content-addressed, so pages whose bytes did not
 /// change deduplicate and the commit stays O(changed) anyway.
@@ -52,25 +50,30 @@ pub async fn persist(db: &mut CraftDb, snap: &EconomicSnapshot) -> Result<()> {
     for (k, v) in &snap.paid_watermarks {
         sql.push_str(&format!(
             "INSERT INTO econ_paid_wm VALUES (x'{}',{});",
-            hex::encode(k), *v as i64
+            hex::encode(k),
+            *v as i64
         ));
     }
     for ((p, c), v) in &snap.served_watermarks {
         sql.push_str(&format!(
             "INSERT INTO econ_served_wm VALUES (x'{}',x'{}',{});",
-            hex::encode(p), hex::encode(c), *v as i64
+            hex::encode(p),
+            hex::encode(c),
+            *v as i64
         ));
     }
     for (k, v) in &snap.seeding_next {
         sql.push_str(&format!(
             "INSERT INTO econ_seeding VALUES (x'{}',{});",
-            hex::encode(k), *v as i64
+            hex::encode(k),
+            *v as i64
         ));
     }
     for (e, p) in &snap.claimed {
         sql.push_str(&format!(
             "INSERT INTO econ_claims VALUES ({},x'{}');",
-            *e as i64, hex::encode(p)
+            *e as i64,
+            hex::encode(p)
         ));
     }
     db.write(&sql).await?;
@@ -126,7 +129,8 @@ pub fn load(db: &CraftDb) -> Result<EconomicSnapshot> {
             snap.seeding_next.push((a, v as u64));
         }
     }
-    let mut claims = conn.prepare("SELECT epoch,provider FROM econ_claims ORDER BY epoch,provider")?;
+    let mut claims =
+        conn.prepare("SELECT epoch,provider FROM econ_claims ORDER BY epoch,provider")?;
     for row in claims.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))? {
         let (e, p) = row?;
         if let Ok(p) = <[u8; 32]>::try_from(p.as_slice()) {
