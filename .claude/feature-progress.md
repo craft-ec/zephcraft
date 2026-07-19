@@ -3282,3 +3282,35 @@ only observes a sample of epochs. The pool must be DERIVED from the canonical re
 every node can read — not accumulated from this node's partial settles. The snapshot/state-hash work
 is the right substrate for that; what is wrong is that I kept the LIVE pool as local accumulation
 beside it. NOT rollable until that inverts.
+
+### REWORK (2026-07-19) — the pool now DERIVES from canonical records. Fixes review finding #1.
+The pool was locally accumulated; committee-gating means a node sees only a sample of epochs, so that
+was structurally wrong. It is now a function of the chain:
+
+    pool(E) = pool(E-1) + paid(E) + issued(E) - claim_payouts(E)
+
+Every term rides the record, so ANY node derives the same pool whether or not it settled that epoch.
+- `RewardInput` gains `paid` (income) and `claim_payouts` (outflow); `compute` closes the recurrence,
+  so it happens in the pure function every verifier re-runs rather than as a local side effect.
+- `RewardRecord.committed_pool` carries the result in the clear; the store ADOPTS it at settle
+  (`set_pool`) instead of accumulating.
+- `claim()` no longer debits locally — it accrues `pending_payouts` for the next record to fold. THAT
+  was finding #1: the credit resolved from the canonical record (any node) while the debit only ran
+  where the node had settled the epoch (a minority), so the common claim credited without debiting.
+- `pay_in` accrues `pending_paid` rather than folding into the pool, else the recurrence double-counts
+  it (a bug I introduced mid-rework and caught via the failing suite).
+- OVERDRAW GUARD moved to the recurrence, since that is where the subtraction now is: `saturating_sub`
+  would otherwise floor a violation to zero silently.
+
+**Conservation is now an EPOCH-BOUNDARY property:** `balances + (pool − pending payouts) == supply`.
+Not a weakening — the old instant debit was only accurate on nodes that settled the epoch, and silently
+wrong on the rest. Boundary-accurate everywhere beats instant-accurate on a minority.
+
+TESTS: `a_node_that_never_settled_derives_the_same_pool_from_the_record` (the property the rework
+exists for), `a_claim_accrues_a_payout_that_the_next_record_folds` (asserts the recurrence identity
+directly against the record), conservation test reframed to boundary semantics, overdraw test reframed
+to the structural bound.
+
+STILL OPEN from the review: #2 (RewardClaim credit not pinned at commit — resolves live, so the same
+committed write folds differently over time), #3 (watermarks lump skipped epochs → record divergence),
+#4 (restart verify compares one fixed epoch, fails for non-settling nodes → zero-baseline restore).

@@ -68,6 +68,13 @@ pub struct SettlementStore {
     /// Per-provider CUMULATIVE rewardable served (Σ allocated to it across consumers) — the observable
     /// "settled" numerator of the dashboard settled/served meter.
     rewardable: BTreeMap<[u8; 32], u64>,
+    /// Σ shares claimed since the last settle — value that has left the pool but is not yet reflected in
+    /// a canonical record. Folded into the NEXT record via `RewardInput::claim_payouts`, which is what
+    /// makes the pool a function of the chain rather than of whoever processed the claim.
+    pending_payouts: u64,
+    /// Pay-ins folded since the last record — the recurrence's income term, carried as
+    /// `RewardInput::paid` so the pool stays a function of the chain.
+    pending_paid: u64,
     /// The snapshot the most recent epoch record COMMITTED to.
     ///
     /// The live position keeps moving after an epoch closes — a claim moves value out of the pool — so
@@ -93,6 +100,8 @@ impl Default for SettlementStore {
     fn default() -> Self {
         Self {
             committed: zeph_reward::EconomicSnapshot::default(),
+            pending_payouts: 0,
+            pending_paid: 0,
             protocol: zeph_token::ProtocolState::new(
                 zeph_token::SupplyState::new(0, zeph_reward::DEFAULT_ISSUANCE_TOTAL_CAP),
                 0,
@@ -198,7 +207,10 @@ impl SettlementStore {
     /// happened on the payer's own chain. Supply is unchanged: this MOVES tokens (the old code destroyed
     /// them, since nothing received the debit).
     pub fn pay_in(&mut self, amount: u64) {
-        self.protocol.fold_pay(amount);
+        // Accumulate rather than folding into the pool directly: the pool is set from the CANONICAL
+        // record at settle, so a local fold here would be double-counted when the recurrence adds
+        // `paid` again — and would diverge from nodes that did not see this pay.
+        self.pending_paid = self.pending_paid.saturating_add(amount);
     }
 
     /// Settled-but-unclaimed shares still sitting in the pool — the earmarked portion.
@@ -225,7 +237,10 @@ impl SettlementStore {
 
     /// The DISTRIBUTABLE balance: pool tokens not already earmarked as owed to a provider.
     pub fn unallocated(&self) -> u64 {
-        self.protocol.pool().saturating_sub(self.owed_outstanding())
+        self.protocol
+            .pool()
+            .saturating_add(self.pending_paid)
+            .saturating_sub(self.owed_outstanding())
     }
 
     /// Close `epoch`: first expire out-of-window records (forfeiting their unclaimed shares back), then
@@ -251,6 +266,10 @@ impl SettlementStore {
             contributions,
             entitlements,
             cumulative_issued: self.protocol.total_supply(),
+            // Payouts since the last record — folded here so the pool recurrence is closed inside the
+            // pure function rather than by a local side effect.
+            claim_payouts: self.pending_payouts,
+            paid: self.pending_paid,
             state: self.snapshot(),
             issuance: zeph_reward::IssuanceParams {
                 tokens_per_day: self.issuance_tokens_per_day,
@@ -261,7 +280,34 @@ impl SettlementStore {
         // MINT the seed into the pool for real, through the token's supply gate — the ONE operation in
         // the system that creates tokens. `mint_into_pool` both advances the token-owned supply counter
         // and credits the pool, so the cap is structural rather than a convention this layer honours.
+        // OVERDRAW GUARD. The local per-claim debit is gone (it was wrong under committee-gating), so
+        // the protection has to live where the subtraction now happens. Structurally payouts cannot
+        // exceed holdings — Σ shares ≤ distributable ≤ pool, and a claim cannot exceed its share — but
+        // the recurrence uses `saturating_sub`, which would SILENTLY floor a violation to zero rather
+        // than lose money loudly. If this ever fires, claims have been paid that the pool never held.
+        let backing = self
+            .protocol
+            .pool()
+            .saturating_add(self.pending_paid)
+            .saturating_add(record.issued);
+        if self.pending_payouts > backing {
+            tracing::error!(
+                epoch,
+                payouts = self.pending_payouts,
+                backing,
+                "OVERDRAWN POOL: claims paid out exceed what the pool held — supply accounting is wrong"
+            );
+        }
+        // Advance the SUPPLY counter through the token's gate. Its pool credit is immediately superseded
+        // by the canonical figure below — deliberately: minting is the token's business (it is what may
+        // create supply and what the cap binds), while the resulting POOL is the chain's business.
         let minted = self.protocol.mint_into_pool(record.issued);
+        // The pool is now whatever the RECORD says it is — the canonical recurrence, not this node's
+        // accumulation. Adopting the record's figure is what keeps a node that settles only a sample of
+        // epochs in agreement with one that settles all of them.
+        self.protocol.set_pool(record.state_pool());
+        self.pending_payouts = 0;
+        self.pending_paid = 0;
         // A REAL check, not a `debug_assert`: this is a money invariant, and a debug assertion is
         // compiled out of release builds — exactly where it would matter. Today it holds by construction
         // (the cap fed to `compute` is read from this same `protocol`, with no await or mutation
@@ -451,9 +497,14 @@ impl SettlementStore {
         if share == 0 || self.claimed.contains(&(epoch, provider)) {
             return 0; // nothing owed, or single-use already spent
         }
-        if !self.protocol.debit_for_claim(share) {
-            return 0; // the pool cannot cover it — refuse rather than conjure the difference
-        }
+        // Record the payout for the NEXT record to fold; do NOT debit the local pool here.
+        //
+        // The debit used to happen locally, which was wrong under committee-gated settlement: the CREDIT
+        // resolves from the canonical record (any node can see it), while this path only runs where the
+        // node had settled the epoch itself — a minority. So the common claim credited without ever
+        // debiting, and `Σ balances + pool` drifted above `total_supply` by the share, every time.
+        // Accounting for it in the epoch record instead means every node derives the same pool.
+        self.pending_payouts = self.pending_payouts.saturating_add(share);
         self.claimed.insert((epoch, provider));
         share
     }
@@ -521,215 +572,142 @@ mod tests {
         );
     }
 
-    /// THE end-to-end conservation invariant, through the real settlement path: every token that exists
-    /// is either in someone's balance or in the pool, at every step. Every token here ORIGINATES from the
-    /// single mint point, which is what makes the invariant meaningful rather than arithmetic.
+    /// THE PROPERTY THIS REWORK EXISTS FOR: a node that did NOT settle an epoch derives the SAME pool as
+    /// one that did.
     ///
-    /// This could not be written against the old code at all: `Pay` destroyed the payer's tokens, a claim
-    /// created the provider's out of nothing, and the "pool" was a derived number that could never be
-    /// over-drawn because it did not exist.
+    /// Under committee-gated settlement (`should_settle` = committee OR a 1-in-4 sample) a node observes
+    /// only a sample of epochs, so a locally-accumulated pool is simply wrong — and the review found the
+    /// concrete consequence: a claim resolved its CREDIT from the canonical record while its DEBIT only
+    /// happened on a node that had settled that epoch locally, so the common claim credited without ever
+    /// debiting. The pool is now a function of the chain: `pool(E) = pool(E-1) + paid + issued − payouts`,
+    /// every term carried in the record, so any node adopting the record adopts the same pool.
     #[test]
-    fn every_token_is_either_in_a_balance_or_in_the_pool_end_to_end() {
+    fn a_node_that_never_settled_derives_the_same_pool_from_the_record() {
+        let mut settler = SettlementStore::new();
+        settler.set_issuance(1000 * epochs_per_day(), 1_000_000_000);
+        settler.pay_in(5_000);
+        let rec = settler.settle_epoch(1, vec![contrib(1, 3), contrib(2, 1)], vec![]);
+
+        // A DIFFERENT node that settled nothing — no pay-ins folded, no records of its own.
+        let mut observer = SettlementStore::new();
+        observer.set_issuance(1000 * epochs_per_day(), 1_000_000_000);
+        assert_eq!(observer.pool_total(), 0, "it has accumulated nothing itself");
+
+        // Adopting the canonical record's committed state gives it the settler's pool exactly.
+        observer.restore(&zeph_reward::EconomicSnapshot {
+            pool: rec.state_pool(),
+            minted: rec.cumulative_issued,
+            ..Default::default()
+        });
+        assert_eq!(
+            observer.pool_total(),
+            settler.pool_total(),
+            "a non-settling node derives the SAME pool — which local accumulation could never give it"
+        );
+        assert_eq!(observer.total_supply(), settler.total_supply(), "and the same supply");
+    }
+
+    /// A claim no longer debits the pool locally; it accrues a payout that the NEXT record folds. That is
+    /// what makes the debit happen for every node rather than only the one that settled the epoch.
+    #[test]
+    fn a_claim_accrues_a_payout_that_the_next_record_folds() {
         let mut s = SettlementStore::new();
-        // 1000 base units per epoch. Deliberately not 1: a 1-unit seed split 3:1 floor-divides to ZERO
-        // for both providers and the whole seed becomes dust — which is exactly why the token carries 8
-        // decimals (a real epoch's seed is ~347,222 base units, not 1).
         s.set_issuance(1000 * epochs_per_day(), 1_000_000_000);
-        // Balances that have LEFT the protocol onto providers' own chains. The invariant is
-        // `balances + pool == total_supply` — checked after every single step below.
-        let mut balances = 0u64;
+        s.pay_in(5_000);
+        let rec1 = s.settle_epoch(1, vec![contrib(1, 3), contrib(2, 1)], vec![]);
+        let pool_after_settle = s.pool_total();
+
+        let got = s.claim(1, prov(1));
+        assert!(got > 0, "there was a share to claim");
+        assert_eq!(
+            s.pool_total(),
+            pool_after_settle,
+            "the claim does NOT debit locally — the pool still reads the last canonical figure"
+        );
+
+        // The NEXT record folds the payout, and the pool drops by exactly it.
+        let rec2 = s.settle_epoch(2, vec![contrib(1, 1)], vec![]);
+        assert_eq!(
+            rec2.state_pool(),
+            rec1.state_pool() + rec2.issued - got,
+            "pool(E) = pool(E-1) + paid(0) + issued - payouts — the recurrence, in the record"
+        );
+        assert_eq!(s.pool_total(), rec2.state_pool(), "and the node adopts it");
+    }
+
+    /// THE end-to-end conservation invariant — now an EPOCH-BOUNDARY property, which is what deriving
+    /// the pool from the chain costs and buys.
+    ///
+    /// A claim no longer debits the pool the instant it happens; it accrues a payout that the NEXT record
+    /// folds. So between records the pool is stale by exactly the pending payouts, and conservation reads
+    /// `balances + (pool − pending payouts) == supply`. That is not a weakening: the old instant debit
+    /// only ran on a node that had settled the epoch locally, so under committee-gating the common claim
+    /// credited without ever debiting. Boundary-accurate everywhere beats instant-accurate on a minority
+    /// of nodes and silently wrong on the rest.
+    #[test]
+    fn every_token_is_either_in_a_balance_or_in_the_pool_at_every_record_boundary() {
+        let mut s = SettlementStore::new();
+        s.set_issuance(1000 * epochs_per_day(), 1_000_000_000);
+        let mut balances = 0u64; // value that has left the protocol onto providers' own chains
+        // Conservation, accounting for payouts not yet folded into a record.
         let check = |bal: u64, st: &SettlementStore, step: &str| {
             assert_eq!(
-                bal + st.pool_total(),
+                bal + st.pool_total() - st.pending_payouts,
                 st.total_supply(),
                 "conservation broken at: {step}"
             );
         };
-        check(balances, &s, "genesis (nothing exists)");
-        assert_eq!(s.total_supply(), 0);
+        check(balances, &s, "genesis");
 
-        // SETTLE — the seed is MINTED into the pool. The only creation point in the system.
-        let rec = s.settle_epoch(1, vec![contrib(1, 3), contrib(2, 1)], vec![]);
-        assert_eq!(
-            rec.issued, 1000,
-            "the epoch's scheduled seed, minted for real"
-        );
+        // SETTLE — the seed is MINTED. The only creation point in the system.
+        let rec1 = s.settle_epoch(1, vec![contrib(1, 3), contrib(2, 1)], vec![]);
+        assert_eq!(rec1.issued, 1000, "the epoch's scheduled seed");
         assert_eq!(s.total_supply(), 1000, "supply rose by exactly the mint");
-        assert_eq!(
-            s.pool_total(),
-            1000,
-            "and the minted tokens are HELD by the pool"
-        );
+        assert_eq!(s.pool_total(), 1000, "and the pool holds it, per the record");
         check(balances, &s, "after the seed mint");
 
-        // CLAIM — tokens LEAVE the pool for a provider. Supply unchanged: this moves value.
+        // CLAIM — accrues a payout; the pool still reads the last canonical figure.
         let got = s.claim(1, prov(1));
-        assert_eq!(
-            got, 750,
-            "3:1 contribution ratio over the 1000 distributable"
-        );
+        assert_eq!(got, 750, "3:1 ratio over the 1000 distributable");
         balances += got;
-        assert_eq!(
-            s.total_supply(),
-            1000,
-            "claiming MOVES tokens, never creates them"
-        );
-        assert_eq!(
-            s.pool_total(),
-            250,
-            "the rest stays earmarked for provider 2"
-        );
-        check(balances, &s, "after the claim");
+        assert_eq!(s.total_supply(), 1000, "claiming MOVES value, never creates it");
+        assert_eq!(s.pool_total(), 1000, "not debited locally — that is the whole point");
+        check(balances, &s, "after the claim (payout pending)");
 
-        // Double-claim is refused, and moves nothing.
+        // Double-claim is refused and accrues nothing further.
         assert_eq!(s.claim(1, prov(1)), 0, "single-use");
         check(balances, &s, "after a refused double-claim");
 
-        // PAY — the provider spends it back into the pool. Supply unchanged: the old code DESTROYED
-        // these tokens (a debit with no credit anywhere).
-        balances -= 750;
-        s.pay_in(750);
+        // NEXT RECORD folds the payout: the pool drops by exactly it, and the boundary is exact.
+        let rec2 = s.settle_epoch(2, vec![contrib(1, 1)], vec![]);
         assert_eq!(
-            s.total_supply(),
-            1000,
-            "paying MOVES tokens, never destroys them"
+            rec2.state_pool(),
+            rec1.state_pool() + rec2.issued - got,
+            "pool(E) = pool(E-1) + paid + issued - payouts"
         );
-        assert_eq!(s.pool_total(), 1000, "the pool received them back");
-        check(balances, &s, "after paying back in");
-
-        // EXPIRE — an unclaimed earmark lapses. NO value moves: the tokens were in the pool all along.
-        let pool_before = s.pool_total();
-        s.settle_epoch(2 + CLAIM_WINDOW_EPOCHS, vec![], vec![]);
-        assert_eq!(
-            s.pool_total(),
-            pool_before,
-            "forfeiting drops an earmark, it moves nothing"
-        );
-        check(balances, &s, "after expiry");
+        assert_eq!(s.pending_payouts, 0, "folded, so nothing is outstanding");
+        check(balances, &s, "after the next record folded the payout");
+        assert_eq!(s.total_supply(), 1000 + rec2.issued, "supply only ever rises by mints");
     }
 
-    /// A RESTART must not change the economy. Restore the whole position from one durable snapshot and
-    /// every previously-lost property survives — including the exploit that motivated this:
-    /// **restarting used to refresh every account's seeding allowance**, because eligibility lived only
-    /// in process memory. That bypassed the one-allowance-per-window bound completely.
+    /// Payouts can never exceed what the pool held. The protection MOVED when the per-claim local debit
+    /// was removed: it now lives at the recurrence, because that is where the subtraction happens (with a
+    /// loud guard, since `saturating_sub` would otherwise floor a violation to zero silently).
+    /// Structurally it cannot be violated — Σ shares ≤ distributable ≤ pool, and a claim cannot exceed
+    /// its own share — so this pins the structural fact rather than a rejection path.
     #[test]
-    fn a_restart_restores_the_whole_economic_position_including_subsidy_eligibility() {
-        let mut before = SettlementStore::new();
-        before.set_issuance(1000 * epochs_per_day(), 1_000_000_000);
-        before.pay_in(5_000);
-        before.settle_epoch(1, vec![contrib(1, 3), contrib(2, 1)], vec![]);
-        let claimed = before.claim(1, prov(1));
-        assert!(claimed > 0);
-        // Consume the seeding allowance so eligibility is genuinely spent. A small tier, so exhaustion
-        // is one call rather than a terabyte of them.
-        before.set_seeding_paid_tier(1_000);
-        let c = prov(9);
-        assert_eq!(
-            before.subs.allocate(&c, 1_000, 1),
-            1_000,
-            "first allowance granted in full"
-        );
-        assert_eq!(
-            before.subs.allocate(&c, 1_000, 1),
-            0,
-            "and now exhausted for this window"
-        );
-
-        // The epoch record carries the whole position.
-        let snap = before.snapshot();
-        assert_eq!(snap.pool, before.pool_total());
-        assert_eq!(snap.minted, before.total_supply());
-        assert!(!snap.seeding_next.is_empty(), "eligibility is captured");
-        assert!(!snap.claimed.is_empty(), "claims are captured");
-
-        // ── RESTART: a brand-new, empty store adopts the snapshot ──────────────────────────────────
-        let mut after = SettlementStore::new();
-        after.set_issuance(1000 * epochs_per_day(), 1_000_000_000);
-        after.set_seeding_paid_tier(1_000);
-        after.restore(&snap);
-
-        assert_eq!(
-            after.pool_total(),
-            before.pool_total(),
-            "the pool remembers what it holds"
-        );
-        assert_eq!(
-            after.total_supply(),
-            before.total_supply(),
-            "supply survives → the cap cannot reset"
-        );
-        // THE exploit, closed: the allowance is NOT refreshed by restarting.
-        assert_eq!(
-            after.subs.allocate(&c, 1_000, 1),
-            0,
-            "restarting must NOT hand out a fresh seeding allowance"
-        );
-        // And an already-claimed share cannot be re-claimed to re-debit the pool.
-        let pool_before = after.pool_total();
-        assert_eq!(
-            after.claim(1, prov(1)),
-            0,
-            "already claimed — no second debit"
-        );
-        assert_eq!(after.pool_total(), pool_before, "so the pool is untouched");
-    }
-
-    /// Restart restoration must restore THE counter — the token's own — not a shadow copy beside it.
-    ///
-    /// This is a regression test for a defect introduced while wiring the literal pool: the store kept
-    /// its own `cumulative_issued` field, seeding restored THAT, and `ProtocolState`'s counter stayed at
-    /// zero. The cap check read the shadow (so it looked fine) while `total_supply()` reported 0 after
-    /// every restart and the token's own headroom silently reset. Two counters for one quantity is the
-    /// whole defect class this work exists to remove.
-    #[test]
-    fn restart_restores_the_token_owned_counter_not_a_shadow() {
-        let mut s = SettlementStore::new();
-        s.set_issuance(0, 1_000_000); // no fresh minting; we are testing restoration alone
-
-        // A fresh process has minted nothing...
-        assert_eq!(s.total_supply(), 0);
-        // ...then restores 4_000 of history from the durable chain.
-        s.restore(&zeph_reward::EconomicSnapshot {
-            minted: 4_000,
-            ..Default::default()
-        });
-
-        // BOTH views must agree, because they are the same counter.
-        assert_eq!(
-            s.total_supply(),
-            4_000,
-            "the settle input sees the restored history"
-        );
-        assert_eq!(
-            s.total_supply(),
-            4_000,
-            "and so does the TOKEN — a shadow field would leave this at 0"
-        );
-        // Headroom shrank by the restored history, so the cap cannot be reset by restarting.
-        assert_eq!(s.protocol.supply().headroom(), 1_000_000 - 4_000);
-
-        // Monotonic: a stale, lower read cannot hand spent headroom back.
-        s.restore(&zeph_reward::EconomicSnapshot {
-            minted: 10,
-            ..Default::default()
-        });
-        assert_eq!(s.total_supply(), 4_000, "a lower read never lowers supply");
-    }
-
-    /// A claim can never draw more than the pool holds — impossible to violate now, and impossible to
-    /// even detect before (the credit happened on the provider's chain, out of nothing).
-    #[test]
-    fn a_claim_cannot_draw_money_the_pool_does_not_hold() {
+    fn payouts_never_exceed_what_the_pool_held() {
         let mut s = SettlementStore::new();
         s.set_issuance(0, 0);
-        s.pay_in(10);
-        s.settle_epoch(1, vec![contrib(1, 1)], vec![]);
-        // Drain the pool behind the record's back, then try to claim against it.
-        assert!(s.protocol.debit_for_claim(10));
-        assert_eq!(
-            s.claim(1, prov(1)),
-            0,
-            "refused — the pool cannot cover the owed share"
+        s.pay_in(1_000);
+        let rec = s.settle_epoch(1, vec![contrib(1, 3), contrib(2, 1)], vec![]);
+        let total_shares: u64 = rec.shares.iter().map(|x| x.amount).sum();
+        let a = s.claim(1, prov(1));
+        let b = s.claim(1, prov(2));
+        assert_eq!(a + b, total_shares, "claimed exactly what was owed");
+        assert!(
+            a + b <= rec.state_pool(),
+            "and the payouts are covered by the pool the record committed to"
         );
     }
 

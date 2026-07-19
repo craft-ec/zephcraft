@@ -181,6 +181,15 @@ impl ProtocolState {
         }
     }
 
+    /// Adopt a pool figure derived from the CANONICAL record chain.
+    ///
+    /// The pool is not this node's to accumulate: under committee-gated settlement a node observes only
+    /// a sample of epochs, so a locally-summed pool is simply wrong. The canonical record carries the
+    /// pool recurrence, and every node adopts it — which is what makes two nodes agree.
+    pub fn set_pool(&mut self, pool: u64) {
+        self.pool = pool;
+    }
+
     /// THE conservation invariant: every token that exists is either in someone's balance or in the pool.
     /// Callers supply the summed account balances (the token cannot see other chains itself).
     pub fn conserves(&self, sum_of_balances: u64) -> bool {

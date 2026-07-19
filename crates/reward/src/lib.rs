@@ -177,6 +177,22 @@ pub struct RewardInput {
     /// The governed issuance schedule for this epoch.
     #[serde(default)]
     pub issuance: IssuanceParams,
+    /// NEW pay-ins folded during this epoch — the pool recurrence's income term.
+    ///
+    /// Distinct from `pool` (which is the DISTRIBUTABLE amount the shares divide, i.e. holdings not
+    /// already earmarked as owed). Conflating them double-counts: the distributable already contains
+    /// prior pay-ins that were never handed out.
+    #[serde(default)]
+    pub paid: u64,
+    /// Σ shares PAID OUT to claimants during this epoch — value that left the pool.
+    ///
+    /// Carried as input (like `entitlements`) so the pool recurrence is computed HERE, in the pure
+    /// function every verifier re-runs, rather than as a local side effect of whoever happened to
+    /// process the claim. That was the defect: the credit resolved from the canonical record while the
+    /// debit only happened on a node that had settled the epoch locally — which, under committee-gated
+    /// settlement, is a minority of nodes. The claim then credited without ever debiting.
+    #[serde(default)]
+    pub claim_payouts: u64,
     /// The economic state as the node computed it for this epoch, BEFORE the mint below is applied.
     /// Node-supplied and carried through to the record — the same discipline `entitlements` follows, and
     /// for the same reason: a verifier re-derives the identical input from committed chains and re-runs
@@ -329,6 +345,10 @@ pub struct RewardRecord {
     /// actually paid, so any node can see how much of a reward was demand and how much was subsidy.
     #[serde(default)]
     pub issued: u64,
+    /// The POOL this record committed to. Carried in the clear (as well as inside `state_hash`) so a
+    /// node can adopt the canonical pool without holding the whole snapshot.
+    #[serde(default)]
+    pub committed_pool: u64,
     /// COMMITMENT to the economic state resulting from this epoch — 32 bytes standing for the whole
     /// position, token side and reward side ([`EconomicSnapshot::state_hash`]).
     ///
@@ -347,6 +367,12 @@ pub struct RewardRecord {
 }
 
 impl RewardRecord {
+    /// The pool this record committed to — carried inside the state commitment, so a node adopting it is
+    /// adopting the canonically-agreed figure rather than its own count.
+    pub fn state_pool(&self) -> u64 {
+        self.committed_pool
+    }
+
     /// The share owed to `provider` this epoch (0 if absent) — the node resolves this for a claim.
     pub fn share_of(&self, provider: &[u8; 32]) -> u64 {
         self.shares
@@ -467,7 +493,21 @@ pub fn compute(input: &RewardInput) -> RewardRecord {
     // every collection sorted so two nodes handed the same state in a different order still produce
     // byte-identical records (they are signed and compared by hash).
     let mut state = input.state.clone();
-    state.pool = state.pool.saturating_add(issued);
+    // THE POOL RECURRENCE — the pool is a function of the CANONICAL CHAIN, not of local accumulation:
+    //
+    //     pool(E) = pool(E-1) + paid(E) + issued(E) - claim_payouts(E)
+    //
+    // `state.pool` arrives as pool(E-1) (the previous canonical record's committed pool), `input.paid` is
+    // what consumers paid this epoch (NOT `input.pool`, which is the distributable amount the shares
+    // divide and already contains undistributed holdings), `issued` is the mint, and `claim_payouts` is what claimants took
+    // out. Every term is in the record, so EVERY node derives the same pool whether or not it settled
+    // this epoch — which is exactly what a locally-accumulated pool could not do once settlement became
+    // committee-gated and each node's view became a sample.
+    state.pool = state
+        .pool
+        .saturating_add(input.paid)
+        .saturating_add(issued)
+        .saturating_sub(input.claim_payouts);
     state.minted = input.cumulative_issued.saturating_add(issued);
     state.paid_watermarks.sort_unstable();
     state.paid_watermarks.dedup_by_key(|(k, _)| *k);
@@ -482,6 +522,7 @@ pub fn compute(input: &RewardInput) -> RewardRecord {
         // Commit to the resulting state by hash. `compute` produces it, so a verifier re-running this on
         // the same committed input derives the identical commitment — the state is verified exactly like
         // every other field, rather than being taken on the node's word.
+        committed_pool: state.pool,
         state_hash: state.state_hash(),
         // The DISTRIBUTABLE total (paid + issued) — the shares' actual denominator, which is what this
         // field has always meant.
@@ -847,6 +888,8 @@ mod tests {
                 entitlements: alloc::vec![],
                 cumulative_issued: 10,
                 issuance: iss.clone(),
+                claim_payouts: 0,
+                paid: 0,
                 state: EconomicSnapshot::default(),
             })
         };
