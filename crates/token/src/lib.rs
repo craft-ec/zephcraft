@@ -617,6 +617,36 @@ mod tests {
         assert_eq!(p.supply().headroom(), 0);
     }
 
+    /// A claim with NO resolved share must waste nothing: it is refused BEFORE the epoch is marked
+    /// claimed, so the provider can claim again once the epoch is finalised.
+    ///
+    /// This is what makes "resolve the share only from the canonical record" safe. Before finality the
+    /// share resolves to 0 and the claim is simply refused; if the refusal instead burned the single-use
+    /// marker, claiming early would forfeit the reward permanently.
+    #[test]
+    fn a_claim_before_finality_is_refused_without_burning_its_single_use() {
+        let p = [1u8; 32];
+        let st = TokenState::default();
+        // No resolved share (epoch not finalised) → refused.
+        let none = Resolved::default();
+        assert!(
+            apply_token(st.clone(), &LedgerOp::RewardClaim(7), &p, &none).is_none(),
+            "refused while unfinalised"
+        );
+        // The epoch was NOT marked, so the same claim succeeds once the share resolves.
+        let resolved = Resolved {
+            reward_share: Some(40),
+            ..Default::default()
+        };
+        let after = apply_token(st, &LedgerOp::RewardClaim(7), &p, &resolved)
+            .expect("claims once the epoch is finalised");
+        assert_eq!(after.balance, 40, "credited the canonical share");
+        assert!(
+            after.claimed_epochs.contains(&7),
+            "and only now is it single-used"
+        );
+    }
+
     /// Restoring the counter from durable history is monotonic — a stale read can never hand back spent
     /// minting headroom.
     #[test]

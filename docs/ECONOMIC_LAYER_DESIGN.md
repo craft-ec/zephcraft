@@ -960,11 +960,22 @@ canonical record. Records carry the watermarks they advanced (O(active)), and ev
 `CHECKPOINT_EVERY` (32) epochs a record carries the FULL state so a node with NO history can reach a
 verifiable position — deltas alone are unusable to a joiner.
 
-### 12.7 Still open
+### 12.7 Claim shares resolve ONLY from the canonical record
 
-- **Claim credit is not pinned at commit.** `balance()` re-resolves `reward_share` live, so the same
-  committed write can fold to different amounts over time, and a `Transfer` authored against the higher
-  pre-canonical balance can void on replay. Needs the resolved share pinned into the committed write.
+`balance()` re-derives the account chain on every call, resolving a `RewardClaim`'s share live rather
+than from a value pinned into the committed write. With a LOCAL FALLBACK that made the same committed
+write fold to different amounts depending on when it was asked — 0 if this node never settled the epoch,
+a pre-convergence figure if it did, the canonical figure after quorum. A `Transfer` authored against the
+higher pre-canonical balance could then silently void on the next replay, and it broke the premise that
+a verifier re-running the fold reproduces the node's result.
+
+The fallback is removed. Canonical records are immutable once finalised, so the fold is stable forever.
+Before finality the share resolves to 0 and `apply_token` refuses the claim BEFORE marking the epoch
+claimed — so a premature claim wastes nothing and simply succeeds once the epoch is final. Claiming an
+unfinalised epoch was never meaningful.
+
+### 12.8 Still open
+
 - **PDP (K5)** remains the missing trust primitive — no proof a node still holds what it claims. Its
-  absence is why seeding-phase sybil resistance is unsolved.
+  absence is why seeding-phase sybil resistance is unsolved and why the O(N) health scan cannot retire.
 - **Nothing has ever minted or run on a fleet.** Every property above is unit- and gate-verified only.

@@ -3372,3 +3372,22 @@ fix is now the step I do, not the step I skip.
    the notional pool and whole-token units. Written up as `ECONOMIC_LAYER_DESIGN.md` §12 "AS BUILT",
    including where the code DIVERGED from §§0–11 and why, and what is still open.
 4. **Finding #2 still open** — claim credit resolves live rather than pinned at commit.
+
+### FIXED review finding #2 (2026-07-19) — claim shares resolve ONLY from canonical
+`reward_share` preferred the canonical record but FELL BACK to this node's local one. Since `balance()`
+re-derives the chain live rather than reading a pinned value, that made the SAME committed `RewardClaim`
+fold to different amounts over time (0 if never settled here → local pre-convergence value → canonical
+after quorum). A `Transfer` authored against the higher pre-canonical balance could silently void on
+replay, and it broke "a verifier re-running the fold reproduces the node's result".
+
+Fallback REMOVED. Canonical records are immutable once finalised → the fold is stable forever. Before
+finality the share is 0 and `apply_token` refuses the claim BEFORE marking the epoch claimed, so a
+premature claim wastes nothing and succeeds later. TEST
+`a_claim_before_finality_is_refused_without_burning_its_single_use`.
+
+Side effect worth noting: `SettlementStore::share_of` became dead — the fallback was its only production
+caller. Kept as a test observable with the reason recorded, since a node's own view of an owed share is
+no longer authoritative for anything.
+
+**ALL FOUR review findings now fixed.** GATE19 PASSED (fmt, clippy, workspace, A-G) — and I read the
+verdict this time, having missed that GATE18 failed on fmt.

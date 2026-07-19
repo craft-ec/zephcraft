@@ -528,6 +528,15 @@ impl SettlementStore {
 
     /// The unclaimed share owed to `provider` for `epoch` (0 if absent, already claimed, or expired) —
     /// what a `RewardClaim` resolves + credits.
+    /// The share still OWED to `provider` for `epoch` (0 once claimed) — observable state its own tests
+    /// assert.
+    ///
+    /// No production caller remains, and that is the point rather than an oversight: the `RewardClaim`
+    /// fold used to fall back to this LOCAL answer when no canonical record existed, which is exactly
+    /// what let the same committed write fold to different amounts over time. Claims now resolve only
+    /// from the canonical record, so a node's own view of an owed share is no longer authoritative for
+    /// anything — it is only a window onto local state.
+    #[allow(dead_code)]
     pub fn share_of(&self, epoch: u64, provider: &[u8; 32]) -> u64 {
         if self.claimed.contains(&(epoch, *provider)) {
             return 0;

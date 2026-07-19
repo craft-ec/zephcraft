@@ -281,12 +281,29 @@ impl EconomyEgressService {
     /// Called by the token ledger's balance fold for a `RewardClaim` — token credits this share (and owns
     /// the single-use dedup itself, so this answer is a valuation, not an authorization).
     pub async fn reward_share(&self, epoch: u64, account: &[u8; 32]) -> u64 {
-        if let Some(records) = self.record_chain.read().await.clone() {
-            if let Some(record) = records.canonical_record(epoch).await {
-                return record.share_of(account);
-            }
+        // CANONICAL ONLY — no local fallback.
+        //
+        // `balance()` re-derives the account chain from scratch on every call, resolving this live rather
+        // than reading a value pinned into the committed write. With a local fallback that made the SAME
+        // committed `RewardClaim` fold to DIFFERENT amounts depending on when it was asked: a query
+        // before quorum used whatever this node happened to hold (0 if it never settled the epoch, or a
+        // pre-convergence value if it did), a query after quorum used the canonical figure. A `Transfer`
+        // authored against the higher pre-canonical balance could then silently void on the next replay
+        // — value disappearing with no new chain activity — and it broke the premise that a verifier
+        // re-running the fold reproduces the node's result, since the input was node-local and
+        // time-varying.
+        //
+        // Canonical records are immutable once finalised, so resolving only from them makes the fold
+        // stable forever. Before finality this returns 0, which `apply_token` rejects BEFORE marking the
+        // epoch claimed — so a premature claim wastes nothing and simply succeeds once the epoch is
+        // final. Claiming an unfinalised epoch was never meaningful anyway.
+        let Some(records) = self.record_chain.read().await.clone() else {
+            return 0;
+        };
+        match records.canonical_record(epoch).await {
+            Some(record) => record.share_of(account),
+            None => 0, // not finalised yet — the claim is refused, not guessed at
         }
-        self.settlement.read().await.share_of(epoch, account)
     }
 
     /// Mark `(epoch, node)`'s reward claimed (called by the token ledger after a `RewardClaim` commits),
