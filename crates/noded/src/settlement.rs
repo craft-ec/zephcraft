@@ -75,6 +75,9 @@ pub struct SettlementStore {
     /// Pay-ins folded since the last record — the recurrence's income term, carried as
     /// `RewardInput::paid` so the pool stays a function of the chain.
     pending_paid: u64,
+    /// Watermarks advanced since the last record — carried in it so non-settling nodes stay current.
+    pending_paid_marks: BTreeMap<[u8; 32], u64>,
+    pending_served_marks: BTreeMap<([u8; 32], [u8; 32]), u64>,
     /// The snapshot the most recent epoch record COMMITTED to.
     ///
     /// The live position keeps moving after an epoch closes — a claim moves value out of the pool — so
@@ -102,6 +105,8 @@ impl Default for SettlementStore {
             committed: zeph_reward::EconomicSnapshot::default(),
             pending_payouts: 0,
             pending_paid: 0,
+            pending_paid_marks: BTreeMap::new(),
+            pending_served_marks: BTreeMap::new(),
             protocol: zeph_token::ProtocolState::new(
                 zeph_token::SupplyState::new(0, zeph_reward::DEFAULT_ISSUANCE_TOTAL_CAP),
                 0,
@@ -154,6 +159,18 @@ impl SettlementStore {
     pub fn adopt_canonical(&mut self, rec: &RewardRecord) {
         self.protocol.set_pool(rec.state_pool());
         self.protocol.supply_mut().observe_minted(rec.cumulative_issued);
+        // Merge the watermarks this record advanced — MONOTONICALLY, so adopting an older record can
+        // never rewind one and re-open a payment for double-counting. Without this a non-settling node's
+        // watermarks freeze at its last elected epoch, and the whole skipped gap gets attributed to
+        // whichever epoch it is next elected for — producing a record nobody else agrees with.
+        for (account, mark) in &rec.paid_marks {
+            let e = self.paid_watermark.entry(*account).or_insert(0);
+            *e = (*e).max(*mark);
+        }
+        for (pair, mark) in &rec.served_marks {
+            let e = self.served_pair_wm.entry(*pair).or_insert(0);
+            *e = (*e).max(*mark);
+        }
         self.committed = self.snapshot();
         self.records.insert(rec.epoch, rec.clone());
     }
@@ -282,6 +299,12 @@ impl SettlementStore {
             // pure function rather than by a local side effect.
             claim_payouts: self.pending_payouts,
             paid: self.pending_paid,
+            paid_marks: self.pending_paid_marks.iter().map(|(k, v)| (*k, *v)).collect(),
+            served_marks: self
+                .pending_served_marks
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect(),
             state: self.snapshot(),
             issuance: zeph_reward::IssuanceParams {
                 tokens_per_day: self.issuance_tokens_per_day,
@@ -320,6 +343,8 @@ impl SettlementStore {
         self.protocol.set_pool(record.state_pool());
         self.pending_payouts = 0;
         self.pending_paid = 0;
+        self.pending_paid_marks.clear();
+        self.pending_served_marks.clear();
         // A REAL check, not a `debug_assert`: this is a money invariant, and a debug assertion is
         // compiled out of release builds — exactly where it would matter. Today it holds by construction
         // (the cap fed to `compute` is read from this same `protocol`, with no await or mutation
@@ -377,6 +402,7 @@ impl SettlementStore {
             match self.paid_watermark.get(node).copied() {
                 None => {
                     self.paid_watermark.insert(*node, *paid_cum); // first sight → delta 0
+                    self.pending_paid_marks.insert(*node, *paid_cum);
                 }
                 Some(w) => {
                     let delta = paid_cum.saturating_sub(w);
@@ -388,7 +414,9 @@ impl SettlementStore {
                         epoch,
                         self.window_epochs,
                     );
-                    self.paid_watermark.insert(*node, (*paid_cum).max(w));
+                    let advanced = (*paid_cum).max(w);
+                    self.paid_watermark.insert(*node, advanced);
+                    self.pending_paid_marks.insert(*node, advanced);
                 }
             }
         }
@@ -402,7 +430,9 @@ impl SettlementStore {
             let key = (provider, consumer);
             let w = self.served_pair_wm.get(&key).copied().unwrap_or(0);
             let delta = cum.saturating_sub(w);
-            self.served_pair_wm.insert(key, cum.max(w));
+            let advanced = cum.max(w);
+            self.served_pair_wm.insert(key, advanced);
+            self.pending_served_marks.insert(key, advanced);
             if delta == 0 {
                 continue;
             }
@@ -581,6 +611,62 @@ mod tests {
             s.settle_epoch(1, vec![contrib(3, 999)], vec![])
                 .share_of(&prov(1)),
             60
+        );
+    }
+
+    /// A settle GAP must not lump the skipped epochs into the next elected one.
+    ///
+    /// Review finding #3: watermarks advanced only when a node settled, but `last_settled` advanced
+    /// unconditionally, so an epoch a node was not elected for was skipped permanently. When it was next
+    /// elected, the delta was computed against a STALE watermark and the entire gap was attributed to
+    /// that one epoch — a record no continuously-settling node would agree with, stalling quorum or (if
+    /// a committee shared the gap) finalising a wrong record forever. Adopting each record's advanced
+    /// watermarks keeps a non-settling node current, so its next delta is the true marginal one.
+    #[test]
+    fn a_settle_gap_does_not_lump_skipped_epochs_into_the_next_record() {
+        let payer = prov(9);
+        // A continuously-settling node, to produce the canonical record for the skipped epoch.
+        let mut continuous = SettlementStore::new();
+        continuous.set_issuance(0, 0);
+        continuous.set_seeding_paid_tier(0);
+        continuous.set_bytes_per_token(zeph_token::ONE_TOKEN);
+        continuous.settle_epoch_from_cheques(1, vec![(payer, 0)], vec![]); // first sight → baseline
+        let r2 = continuous.settle_epoch_from_cheques(2, vec![(payer, 100)], vec![]);
+        assert_eq!(
+            r2.paid_marks.iter().find(|(a, _)| *a == payer).map(|(_, v)| *v),
+            Some(100),
+            "the record carries the watermark it advanced"
+        );
+
+        // A node NOT elected for epoch 2.
+        let mut gapped = SettlementStore::new();
+        gapped.set_issuance(0, 0);
+        gapped.set_seeding_paid_tier(0);
+        gapped.set_bytes_per_token(zeph_token::ONE_TOKEN);
+        gapped.settle_epoch_from_cheques(1, vec![(payer, 0)], vec![]);
+        gapped.adopt_canonical(&r2); // skipped epoch 2 — adopt its canonical watermarks
+
+        // The adopted watermark is what makes epoch 3's delta MARGINAL rather than the whole gap.
+        assert_eq!(
+            gapped
+                .snapshot()
+                .paid_watermarks
+                .iter()
+                .find(|(a, _)| *a == payer)
+                .map(|(_, v)| *v),
+            Some(100),
+            "adoption advanced the watermark past the skipped epoch"
+        );
+
+        // Fold epoch 3 and measure THIS node's own pool movement: cum 300 against a watermark of 100 is
+        // a delta of 200. Without adoption the watermark would still be 0 and this would fold 300 —
+        // the entire gap lumped into one epoch.
+        let pool_before = gapped.pool_total();
+        let r3 = gapped.settle_epoch_from_cheques(3, vec![(payer, 300)], vec![]);
+        assert_eq!(
+            r3.committed_pool - pool_before,
+            200,
+            "folds the MARGINAL 200, not the 300 that a stale watermark would have lumped"
         );
     }
 

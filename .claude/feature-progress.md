@@ -3333,7 +3333,26 @@ adopts the record, lands on the settler's exact pool and supply, has `committed 
 verifies rather than falling back to defaults), and — the point — its SPENT subsidy allowance is still
 spent.
 
-REMAINING from the review: #2 (RewardClaim credit resolves LIVE rather than pinned at commit, so the
-same committed write folds differently over time) and #3 (watermarks lump skipped epochs into the next
-settled one → record divergence). #3 may now be easier: adopting canonical state each epoch is a step
-toward watermarks tracking the chain too.
+#3 FIXED (below). REMAINING: #2 (RewardClaim credit resolves LIVE rather than pinned at commit).
+
+### FIXED review finding #3 (2026-07-19) — records carry the watermarks they advanced
+Watermarks advanced only when a node settled, while `last_settled` advanced unconditionally, so an epoch
+a node was not elected for was skipped PERMANENTLY. Next time it was elected, the delta was computed
+against a stale watermark and the whole gap was attributed to that one epoch — a record no
+continuously-settling node agrees with (quorum stalls; or, if a committee shares the gap, a wrong record
+finalises forever).
+
+Considered and REJECTED: "every node processes every epoch's bookkeeping." `cumulatives_of` does
+DHT-heavy per-account report fetching, so the bookkeeping is NOT separable from the expensive part —
+which is exactly why committee-gating exists. Doing it everywhere would undo that optimisation.
+
+BUILT instead (the state-root-plus-DELTAS shape): the record carries `paid_marks` / `served_marks` —
+the watermarks it ADVANCED, i.e. only participants that acted, so O(active) not O(accounts).
+`adopt_canonical` merges them MONOTONICALLY, so a stale record can never rewind a watermark and re-open
+a payment for double-counting.
+
+TEST `a_settle_gap_does_not_lump_skipped_epochs_into_the_next_record`, and I VERIFIED IT CATCHES THE
+BUG rather than assuming: with adoption disabled it fails (`Some(0)` vs `Some(100)`), with it enabled it
+passes. My FIRST version of this test passed with the fix disabled — it compared pool deltas across two
+different nodes, so the bases cancelled and it measured nothing. Checking that a test fails without its
+fix is now the step I do, not the step I skip.

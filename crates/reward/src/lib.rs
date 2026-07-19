@@ -177,6 +177,17 @@ pub struct RewardInput {
     /// The governed issuance schedule for this epoch.
     #[serde(default)]
     pub issuance: IssuanceParams,
+    /// Watermarks ADVANCED this epoch — `(payer, new cumulative)` and `((provider, consumer), new
+    /// cumulative)` for the participants that actually acted.
+    ///
+    /// Carried so a node that did NOT settle this epoch can still keep its watermarks current. Without
+    /// this its watermarks freeze at its last elected epoch, and when it is next elected the entire
+    /// skipped gap is attributed to that one epoch — producing a record no other node agrees with.
+    /// Only the participants that acted appear, so this is O(active), not O(accounts).
+    #[serde(default)]
+    pub paid_marks: Vec<([u8; 32], u64)>,
+    #[serde(default)]
+    pub served_marks: Vec<ServedWatermark>,
     /// NEW pay-ins folded during this epoch — the pool recurrence's income term.
     ///
     /// Distinct from `pool` (which is the DISTRIBUTABLE amount the shares divide, i.e. holdings not
@@ -345,6 +356,12 @@ pub struct RewardRecord {
     /// actually paid, so any node can see how much of a reward was demand and how much was subsidy.
     #[serde(default)]
     pub issued: u64,
+    /// Watermarks advanced this epoch — see [`RewardInput::paid_marks`]. Sorted, so records stay
+    /// canonical; merged monotonically by adopters, so a stale record can never rewind a watermark.
+    #[serde(default)]
+    pub paid_marks: Vec<([u8; 32], u64)>,
+    #[serde(default)]
+    pub served_marks: Vec<ServedWatermark>,
     /// The POOL this record committed to. Carried in the clear (as well as inside `state_hash`) so a
     /// node can adopt the canonical pool without holding the whole snapshot.
     #[serde(default)]
@@ -522,6 +539,18 @@ pub fn compute(input: &RewardInput) -> RewardRecord {
         // Commit to the resulting state by hash. `compute` produces it, so a verifier re-running this on
         // the same committed input derives the identical commitment — the state is verified exactly like
         // every other field, rather than being taken on the node's word.
+        paid_marks: {
+            let mut v = input.paid_marks.clone();
+            v.sort_unstable();
+            v.dedup_by_key(|(k, _)| *k);
+            v
+        },
+        served_marks: {
+            let mut v = input.served_marks.clone();
+            v.sort_unstable();
+            v.dedup_by_key(|(k, _)| *k);
+            v
+        },
         committed_pool: state.pool,
         state_hash: state.state_hash(),
         // The DISTRIBUTABLE total (paid + issued) — the shares' actual denominator, which is what this
@@ -890,6 +919,8 @@ mod tests {
                 issuance: iss.clone(),
                 claim_payouts: 0,
                 paid: 0,
+                paid_marks: alloc::vec![],
+                served_marks: alloc::vec![],
                 state: EconomicSnapshot::default(),
             })
         };
