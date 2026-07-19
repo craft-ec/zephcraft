@@ -795,6 +795,24 @@ mod tests {
             })
         }
     }
+
+    /// Wait for the FIRE-AND-FORGET head publish to land, instead of sleeping a fixed interval and
+    /// hoping it was long enough.
+    ///
+    /// `write()` publishes the head in the BACKGROUND, so every "sleep 50ms then resolve" here was a
+    /// race that merely usually won — it fails whenever the machine is loaded or the publish is slow.
+    /// One test in this file had no wait at all and failed exactly that way, and confusingly PASSED in a
+    /// fuller suite where other work happened to delay its resolve, which is the inverse of how
+    /// flakiness normally reads. Polling removes the timing dependence rather than widening it.
+    async fn await_head(heads: &Arc<MockHeads>, owner: NodeId, ns: &str) -> (Cid, u64) {
+        for _ in 0..400 {
+            if let Some(h) = heads.resolve(owner, ns).await.unwrap() {
+                return h;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("the background head publish for `{ns}` never landed");
+    }
     #[async_trait::async_trait]
     impl RootStore for MockHeads {
         async fn resolve(&self, owner: NodeId, ns: &str) -> Result<Option<(Cid, u64)>> {
@@ -838,7 +856,7 @@ mod tests {
             db.write("CREATE TABLE s(id INTEGER PRIMARY KEY, secret TEXT); INSERT INTO s VALUES (1,'TOPSECRET');")
                 .await
                 .unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await; // let the async head publish land
+            await_head(&heads, owner, "vault").await;
         }
 
         // Owner reopens (fresh engine, same key) → auto-detects private, reads back.
@@ -883,7 +901,7 @@ mod tests {
         )
         .await
         .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await; // let the async head publish land
+        await_head(&heads, owner, "app").await;
         let root_after = db.root().expect("committed a root");
 
         // The head is now in the store (seq 1).
@@ -927,7 +945,7 @@ mod tests {
         db.write("CREATE TABLE msg(id INTEGER PRIMARY KEY, body TEXT); INSERT INTO msg VALUES (1,'hi'),(2,'yo');")
             .await
             .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await; // let the async head publish land
+        await_head(&heads, owner_id, "mail").await;
 
         // Reader has an EMPTY store + a page source pointing at the owner's per-key store.
         let mail_key = format!("{}_{}", &owner_id.to_hex()[..16], "mail");
@@ -1032,7 +1050,7 @@ mod tests {
         db.write("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t VALUES (1,'durable'),(2,'via erasure');")
             .await
             .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await; // let the async head publish land
+        await_head(&heads, owner, "app").await;
         drop(db);
         assert!(
             !durable.gens.lock().unwrap().is_empty(),
@@ -1110,7 +1128,14 @@ mod tests {
         db.write("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t VALUES (1,'resurrected');")
             .await
             .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await; // let the async head + manifest publishes land
+        await_head(&heads, owner, "app").await;
+        // This one also needs the MANIFEST publish, which is a separate background write.
+        for _ in 0..400 {
+            if manifests.resolve(owner, "app").await.unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
         drop(db);
 
         // Node 2 has an EMPTY store and NO local sidecar — it only knows

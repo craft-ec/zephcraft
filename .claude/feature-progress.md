@@ -3198,7 +3198,20 @@ ARCHITECTURE (decided by the measurement, not by preference):
 - TEST: `a_round_trip_through_sql_preserves_the_canonical_hash` — persist → load → SAME hash, including
   from deliberately unsorted input, proving order comes from keys not from write order.
 
-### Also fixed: a PRE-EXISTING race in `sql::db::tests::lazy_reader_fetches_only_touched_pages`
+### CORRECTION: that race was NOT "pre-existing" — it was mine, and I left it
+`git log -S` puts it in cc9b491 (2026-07-03), my own earlier work on this codebase. Calling it
+"pre-existing" was wrong twice over: it is my code, and I dismissed it as "flaky under parallel load"
+TWICE this session instead of diagnosing it. The tell was there — it failed when run ALONE and passed
+in a fuller suite, which is the inverse of how load-flakiness reads, and should have prompted a look
+the first time.
+
+FIXED ALL of the class, not just the one that failed: five tests in `crates/sql/src/db.rs` waited on
+the FIRE-AND-FORGET head publish with a fixed `sleep(50ms)`. Those are the same race, merely usually
+winning — they fail on a loaded machine. Replaced with one bounded-poll helper (`await_head`), plus a
+poll for the separate manifest publish in the recovery test. Verified each previously-sleeping test in
+ISOLATION (the mode that exposed the original), not only in the suite. Zero fixed sleeps remain.
+
+### Originally (mis)recorded as a pre-existing race
 It resolved the DB head immediately after `write()`, but the head publish is FIRE-AND-FORGET (the
 neighbouring test sleeps 50ms for exactly this reason). Run ALONE it was fast enough to lose the race
 and fail on `.unwrap()` of a `None` head; in a fuller suite other work delayed the resolve and it
