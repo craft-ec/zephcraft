@@ -1165,8 +1165,19 @@ mod tests {
         db.write(&sql).await.unwrap();
         drop(db);
 
+        // The head publish is FIRE-AND-FORGET (see `write`), so wait for it rather than assuming it has
+        // landed. Without this the test raced its own background publish and failed when run alone —
+        // fast enough to lose — while passing in a fuller suite where other work delayed the resolve.
+        let mut published = None;
+        for _ in 0..100 {
+            if let Some(h) = heads.resolve(owner_id, "big").await.unwrap() {
+                published = Some(h);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         // Total objects reachable from the DB root. Pages live in the per-DB store `<dir>/<key>/`.
-        let (root, _) = heads.resolve(owner_id, "big").await.unwrap().unwrap();
+        let (root, _) = published.expect("the background head publish landed");
         let big_key = format!("{}_{}", &owner_id.to_hex()[..16], "big");
         let owner_store = open_db_store(owner_dir.path(), &big_key).unwrap();
         let total = crate::pager::reachable(&owner_store, root, None)

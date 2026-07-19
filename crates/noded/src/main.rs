@@ -40,6 +40,7 @@ mod attest;
 mod board;
 mod cheque;
 mod control;
+mod econ_store;
 mod economy_egress;
 mod epoch;
 mod epoch_committee;
@@ -1786,6 +1787,12 @@ async fn cmd_run(data_dir: &Path, args: RunArgs) -> anyhow::Result<()> {
         epoch_committee.clone(),
     );
     economy_service.set_record_chain(record_chain.clone()).await;
+    // Attach the ECONOMIC STORE: the O(accounts) economic state lives in CraftSQL, and the epoch record
+    // commits to it by hash. Without this the state is in-memory only.
+    match craftsql.open(econ_store::ECON_NAMESPACE).await {
+        Ok(db) => economy_service.set_econ_db(db).await,
+        Err(e) => tracing::warn!(error = %e, "economic store unavailable; state will not persist"),
+    }
     // NOTE: cumulative issuance is seeded inside `SettlementService::reconstruct_through`, from the epoch
     // immediately before its replay window — NOT here. A startup seed taken from the most recent record
     // would overlap the replay and double-count, and because seeding is monotonic the wrong (higher) value

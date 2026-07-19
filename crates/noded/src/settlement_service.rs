@@ -471,7 +471,20 @@ impl SettlementService {
                 // was previously in-memory only, so a restart silently handed every account a fresh
                 // seeding allowance, forgot every token the pool held, dropped payments made while the
                 // node was down, and could re-debit an already-claimed share.
-                self.economy.restore_economic_state(&prev.state).await;
+                // The state lives in the economic STORE now, not in the record — the record carries
+                // only a commitment. So load locally and CHECK it against that commitment: matching
+                // means this node holds the state the network agreed on; mismatching means it diverged,
+                // which must surface rather than be silently adopted.
+                if !self
+                    .economy
+                    .load_and_verify_economic_state(prev.state_hash)
+                    .await
+                {
+                    tracing::warn!(
+                        epoch = start - 1,
+                        "could not adopt a verified economic state; continuing from current"
+                    );
+                }
             }
         }
         for e in start..=through {
@@ -573,9 +586,20 @@ impl SettlementService {
             if now > SETTLE_GRACE_EPOCHS + 1 {
                 let target = now - 1 - SETTLE_GRACE_EPOCHS;
                 let start = last_settled.map_or(target, |e| e + 1);
+                let mut settled_any = false;
                 for s in start..=target {
                     if self.should_settle(s).await {
                         self.settle(s).await;
+                        settled_any = true;
+                    }
+                }
+                // PERSIST the economic position after the epoch closes — the record committed to it by
+                // hash, so what is stored must be exactly what was committed. Without this the state
+                // lives only in memory and a restart loses the pool, the watermarks and (exploitably)
+                // every account's subsidy eligibility.
+                if settled_any {
+                    if let Err(e) = self.economy.persist_economic_state().await {
+                        tracing::warn!(error = %e, "failed to persist economic state");
                     }
                 }
                 last_settled = Some(target);

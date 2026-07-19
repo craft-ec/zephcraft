@@ -205,6 +205,56 @@ pub struct Share {
     pub cumulative_bytes: u64,
 }
 
+impl EconomicSnapshot {
+    /// THE CANONICAL STATE HASH — a digest over the state's CONTENT in key order, not over how it came
+    /// to be stored.
+    ///
+    /// This is what lets the epoch record commit to O(accounts) of economic state in 32 bytes, and what
+    /// lets `k` nodes agree they hold the identical state. It is the same canonicalisation discipline the
+    /// record already obeys (its Vecs are sorted because records are compared BY HASH) — applied to the
+    /// state so the state can live outside the record.
+    ///
+    /// **Why not the CraftSQL root CID instead.** Measured, in `zeph_sql::db::tests::
+    /// two_independent_instances_agree_on_the_root_cid`: two instances given identical SQL produce an
+    /// identical root, but the SAME rows inserted in a DIFFERENT ORDER produce a DIFFERENT root. The root
+    /// commits to the WRITE HISTORY. A node that restarts and replays epochs writes a different sequence
+    /// than one that ran continuously, so their roots would diverge while holding identical state — a
+    /// false divergence, which is exactly what verification must never produce. Hashing content in key
+    /// order has no such dependence, which is why chains hash an ordered trie rather than a database file.
+    ///
+    /// Every field is length-prefixed and fed in a fixed order, so no two distinct states can collide by
+    /// re-arranging bytes across field boundaries.
+    pub fn state_hash(&self) -> [u8; 32] {
+        let mut h = blake3::Hasher::new();
+        h.update(b"zeph.econ.v1");
+        h.update(&self.pool.to_le_bytes());
+        h.update(&self.minted.to_le_bytes());
+        // Sorted on the way in (see `compute`); the length prefix keeps sections unambiguous.
+        h.update(&(self.paid_watermarks.len() as u64).to_le_bytes());
+        for (k, v) in &self.paid_watermarks {
+            h.update(k);
+            h.update(&v.to_le_bytes());
+        }
+        h.update(&(self.served_watermarks.len() as u64).to_le_bytes());
+        for ((p, c), v) in &self.served_watermarks {
+            h.update(p);
+            h.update(c);
+            h.update(&v.to_le_bytes());
+        }
+        h.update(&(self.seeding_next.len() as u64).to_le_bytes());
+        for (k, v) in &self.seeding_next {
+            h.update(k);
+            h.update(&v.to_le_bytes());
+        }
+        h.update(&(self.claimed.len() as u64).to_le_bytes());
+        for (e, p) in &self.claimed {
+            h.update(&e.to_le_bytes());
+            h.update(p);
+        }
+        *h.finalize().as_bytes()
+    }
+}
+
 /// One `(provider, consumer)` pair's cumulative served-bytes watermark, as carried in the snapshot.
 pub type ServedWatermark = (([u8; 32], [u8; 32]), u64);
 
@@ -279,10 +329,16 @@ pub struct RewardRecord {
     /// actually paid, so any node can see how much of a reward was demand and how much was subsidy.
     #[serde(default)]
     pub issued: u64,
-    /// THE DURABLE ECONOMIC STATE resulting from this epoch — token and reward together. Carried so a
-    /// node can restore its complete economic position from the chain rather than starting blank.
+    /// COMMITMENT to the economic state resulting from this epoch — 32 bytes standing for the whole
+    /// position, token side and reward side ([`EconomicSnapshot::state_hash`]).
+    ///
+    /// The state itself lives in the economic STORE (CraftSQL: indexed, queryable, O(changed) commits);
+    /// the record carries only this digest. Two nodes agree they hold identical economic state iff these
+    /// match — which is the same canonical-hash comparison verification already performs on the record as
+    /// a whole, just extended to state that no longer fits inside it. Inlining the state instead put
+    /// O(accounts) into EVERY epoch record.
     #[serde(default)]
-    pub state: EconomicSnapshot,
+    pub state_hash: [u8; 32],
     /// Cumulative fresh issuance INCLUDING this epoch — the resulting STATE, which the next epoch's input
     /// carries back in to enforce the cap. State, so duplicate inputs take MAX and never sum (the same
     /// rule as `Share::cumulative_bytes`; summing a cumulative would double it).
@@ -423,7 +479,10 @@ pub fn compute(input: &RewardInput) -> RewardRecord {
     state.claimed.dedup();
     RewardRecord {
         epoch: input.epoch,
-        state,
+        // Commit to the resulting state by hash. `compute` produces it, so a verifier re-running this on
+        // the same committed input derives the identical commitment — the state is verified exactly like
+        // every other field, rather than being taken on the node's word.
+        state_hash: state.state_hash(),
         // The DISTRIBUTABLE total (paid + issued) — the shares' actual denominator, which is what this
         // field has always meant.
         pool: distributable,

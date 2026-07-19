@@ -3180,5 +3180,27 @@ ARCHITECTURE (decided by the measurement, not by preference):
   (canonical ordering) in the wrong PLACE (inlined in the record instead of hashed over a SQL-backed
   store).
 
-- [ ] NEXT — move `EconomicSnapshot`'s contents into a CraftSQL-backed economic store; keep a canonical
-      row-ordered state hash in the record for agreement.
+- [x] DONE — economic state moved into CraftSQL; the record carries a canonical row hash.
+
+### DONE (2026-07-19) — economic state in CraftSQL, record commits by row hash
+- `EconomicSnapshot::state_hash()` — blake3 over length-prefixed fields in KEY ORDER (blake3 added to
+  `zeph-reward`, no_std, because the hash must be computed INSIDE the pure function verifiers re-run).
+- `RewardRecord.state` (inline, O(accounts)) → `state_hash: [u8; 32]`. An epoch record is now 32 bytes
+  of state commitment instead of the whole position.
+- `crates/noded/src/econ_store.rs` — CraftSQL-backed store (schema, `persist`, `load`). The `ORDER BY`
+  clauses are LOAD-BEARING: the hash is over row sequence, so iteration order IS the commitment.
+  SQLite compares BLOBs bytewise, matching Rust `[u8;32]` ordering, so load order == `compute`'s sort.
+- Restoration now LOADS from SQL and VERIFIES against the record's commitment
+  (`load_and_verify_economic_state`). A mismatch is reported, not silently adopted — silently
+  continuing from a wrong economic position is how a divergence becomes permanent.
+- Wired: `set_econ_db` at startup, `persist_economic_state` after each epoch close.
+- Removed `restore_economic_state` (superseded) — one path per concern, again.
+- TEST: `a_round_trip_through_sql_preserves_the_canonical_hash` — persist → load → SAME hash, including
+  from deliberately unsorted input, proving order comes from keys not from write order.
+
+### Also fixed: a PRE-EXISTING race in `sql::db::tests::lazy_reader_fetches_only_touched_pages`
+It resolved the DB head immediately after `write()`, but the head publish is FIRE-AND-FORGET (the
+neighbouring test sleeps 50ms for exactly this reason). Run ALONE it was fast enough to lose the race
+and fail on `.unwrap()` of a `None` head; in a fuller suite other work delayed the resolve and it
+passed. Replaced with a bounded poll. Not caused by this work — but it was masquerading as flakiness,
+so it is now diagnosed rather than tolerated.

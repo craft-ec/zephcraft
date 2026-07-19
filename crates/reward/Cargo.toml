@@ -10,3 +10,7 @@ license.workspace = true
 [dependencies]
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 postcard = { version = "1", default-features = false, features = ["alloc"] }
+# no_std blake3 — the codebase's canonical hash. Needed here (not just in the node) because the state
+# hash must be computed INSIDE the pure function that verifiers re-run, exactly like every other field
+# of the record.
+blake3 = { version = "1", default-features = false }

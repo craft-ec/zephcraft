@@ -32,6 +32,9 @@ pub struct EconomyEgressService {
     record_chain: tokio::sync::RwLock<Option<Arc<RecordChain>>>,
     /// Cached records-derived view: `(derived_at, account, view)`. See [`VIEW_TTL`].
     view_cache: tokio::sync::RwLock<Option<(Instant, [u8; 32], MyView)>>,
+    /// The ECONOMIC STORE (CraftSQL) — where the O(accounts) state actually lives. Set after
+    /// construction, like `record_chain`. The epoch record commits to it by hash only.
+    econ_db: tokio::sync::Mutex<Option<zeph_sql::CraftDb>>,
     /// SINGLE-FLIGHT gate for [`derive_view`](Self::derive_view). A TTL cache alone does NOT stop a
     /// stampede: the derivation walks the claim window over the DHT, which on a high-RTT node takes
     /// MINUTES, while the dashboard polls every SECOND — so every poll missed the still-empty cache and
@@ -49,6 +52,7 @@ impl EconomyEgressService {
             record_chain: tokio::sync::RwLock::new(None),
             view_cache: tokio::sync::RwLock::new(None),
             derive_lock: tokio::sync::Mutex::new(()),
+            econ_db: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -78,12 +82,55 @@ impl EconomyEgressService {
         self.settlement.read().await.total_supply()
     }
 
-    /// Adopt a durable economic snapshot (pool, supply, watermarks, seeding eligibility, claims) from a
-    /// committee-attested record. Supply restores monotonically, so a stale read can never hand back
-    /// spent minting headroom.
-    pub async fn restore_economic_state(&self, snap: &zeph_reward::EconomicSnapshot) {
-        self.settlement.write().await.restore(snap);
+    /// Attach the economic store (a CraftSQL DB under [`ECON_NAMESPACE`]).
+    pub async fn set_econ_db(&self, db: zeph_sql::CraftDb) {
+        *self.econ_db.lock().await = Some(db);
     }
+
+    /// Persist the current economic position to the store. Called at epoch close, after the record is
+    /// computed, so what is stored is exactly what the record committed to.
+    pub async fn persist_economic_state(&self) -> anyhow::Result<()> {
+        let snap = self.settlement.read().await.snapshot();
+        if let Some(db) = self.econ_db.lock().await.as_mut() {
+            crate::econ_store::persist(db, &snap).await?;
+        }
+        Ok(())
+    }
+
+    /// Load the economic position from the store and adopt it, VERIFYING it against the canonical
+    /// record's commitment.
+    ///
+    /// The hash check is the point of the split: the state lives outside the record, so a node must be
+    /// able to tell whether the state it holds is the state the network agreed on. A mismatch means this
+    /// node has diverged — it is reported rather than silently adopted, because silently continuing from
+    /// a wrong economic position is how a divergence becomes permanent.
+    pub async fn load_and_verify_economic_state(&self, expected: [u8; 32]) -> bool {
+        let loaded = {
+            let mut guard = self.econ_db.lock().await;
+            match guard.as_mut() {
+                Some(db) => match crate::econ_store::load(db) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "economic store unreadable; keeping current state");
+                        return false;
+                    }
+                },
+                None => return false,
+            }
+        };
+        let got = loaded.state_hash();
+        if got != expected {
+            tracing::error!(
+                expected = %hex::encode(&expected[..8]),
+                got = %hex::encode(&got[..8]),
+                "ECONOMIC STATE DIVERGED from the canonical record — not adopting local state"
+            );
+            return false;
+        }
+        self.settlement.write().await.restore(&loaded);
+        true
+    }
+
 
     /// Apply the GOVERNED DEFAULT TIER — the per-window egress allowance every account holds WITHOUT
     /// paying, i.e. everyone on the paid tier by default. 0 turns it off (payment becomes the only route
