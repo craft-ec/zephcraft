@@ -3244,3 +3244,41 @@ matches after a SQL round trip.
 
 Note: I only found this because the first draft of the test asserted equality while its own message
 explained they must differ. The contradiction was the tell.
+
+## ADVERSARIAL REVIEW (2026-07-19) — LAUNCH BLOCKED. The literal-pool design mismatches committee-gated settlement.
+Four criticals, all one root cause: **committee-gating (2026-07-17) makes each node's SettlementStore an
+INCOMPLETE view by design (`should_settle` = committee OR 1-in-4 sample), but my conservation model
+assumes it is complete.** Verified #1 myself in code.
+
+1. **CRITICAL — claim credits without debiting (MINE).** The CREDIT resolves from the CANONICAL record
+   (network-wide). My `claim()` debit looks up `self.records.get(&epoch)` — only epochs THIS node
+   settled — and returns 0 silently otherwise. A provider claiming an epoch its own node didn't settle
+   gets credited while the pool is never debited: `Σ balances + pool` overstates `total_supply` by the
+   share, every time. This is the COMMON case, not a race. Before I made the pool literal, `claim()`
+   only marked a set, so the asymmetry was harmless — making the pool real created the requirement that
+   the debit succeed, and I never checked that it could.
+2. **CRITICAL — RewardClaim credit is not pinned at commit.** `balance()` re-derives the chain and
+   resolves `reward_share` LIVE (canonical if quorum, else local fallback). The same committed write
+   folds to different amounts depending on WHEN it is asked, so a `Transfer` authored against the higher
+   pre-canonical balance can later void on replay. Breaks the "a verifier reproduces the fold" premise.
+   (Pre-dates this work, but my invariant depends on it.)
+3. **CRITICAL — watermarks lump skipped epochs.** `paid_watermark`/`served_pair_wm` advance only when a
+   node settles, but `last_settled` advances unconditionally, so a skipped epoch's deltas are attributed
+   entirely to the next epoch this node happens to settle → different nodes compute different records →
+   quorum stalls, or a wrongly-lumped record reaches quorum and is cached as canonical forever.
+4. **CRITICAL — restart verify fails for most nodes (MINE).** `persist_economic_state` only runs when
+   this node settled, but the check compares against `canonical_record(start-1).state_hash` — one fixed
+   epoch. A node whose last settle predates that legitimately mismatches, so it refuses to restore and
+   starts from a ZERO baseline: supply-cap headroom corrupted, and seeding eligibility wiped —
+   resurrecting the "restart refreshes your subsidy" exploit I twice believed I had fixed.
+
+VERIFIED SAFE by the review: token primitives (authorize_mint/observe_minted/debit_for_claim/dedup
+sets), `mint_into_pool` cannot double-fire per epoch, `restore()`'s merge logic, `econ_store` ORDER BY
+== Rust sort order (incl. the composite key), `settle_epoch_from_cheques` DOES use the literal pool,
+`purchase` u128 scaling, u64→i64 sizing.
+
+**ARCHITECTURAL CONCLUSION (mine to own):** a locally-accumulated pool cannot be correct when a node
+only observes a sample of epochs. The pool must be DERIVED from the canonical record chain — which
+every node can read — not accumulated from this node's partial settles. The snapshot/state-hash work
+is the right substrate for that; what is wrong is that I kept the LIVE pool as local accumulation
+beside it. NOT rollable until that inverts.
