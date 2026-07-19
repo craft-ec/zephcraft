@@ -90,7 +90,9 @@ impl EconomyEgressService {
     /// Persist the current economic position to the store. Called at epoch close, after the record is
     /// computed, so what is stored is exactly what the record committed to.
     pub async fn persist_economic_state(&self) -> anyhow::Result<()> {
-        let snap = self.settlement.read().await.snapshot();
+        // The COMMITTED snapshot, not the live one: the record hashed the state at epoch close, and
+        // claims since then have legitimately moved value.
+        let snap = self.settlement.read().await.committed_snapshot();
         if let Some(db) = self.econ_db.lock().await.as_mut() {
             crate::econ_store::persist(db, &snap).await?;
         }

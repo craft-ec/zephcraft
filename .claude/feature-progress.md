@@ -3217,3 +3217,30 @@ neighbouring test sleeps 50ms for exactly this reason). Run ALONE it was fast en
 and fail on `.unwrap()` of a `None` head; in a fuller suite other work delayed the resolve and it
 passed. Replaced with a bounded poll. Not caused by this work — but it was masquerading as flakiness,
 so it is now diagnosed rather than tolerated.
+
+### HARDENING (2026-07-19) — and a real flaw the hardening test caught
+- `debug_assert_eq!` on the mint invariant → a REAL check. Debug assertions are compiled out of release,
+  i.e. exactly where a money invariant matters. Holds by construction today; the check exists so a
+  future refactor inserting an await between `compute` and the mint cannot break it silently.
+- `econ_store` hand-rolled a hex encoder allocating a String PER BYTE while `hex` was already a
+  dependency. Removed.
+- `SettlementStore::cumulative_issued()` was a pure alias for `total_supply()` kept alive by
+  `#[allow(dead_code)]`. Collapsed — two names for one quantity, for the fourth time in this work.
+- Swept the workspace for the fire-and-forget race class beyond `sql` (sched, membership): ran every
+  test INDIVIDUALLY, not just as a suite. None found.
+
+**FLAW CAUGHT BY WRITING THE INTEGRATION TEST (mine, from this session):** the record commits to the
+state AT EPOCH CLOSE, but the live position keeps moving afterwards — a claim moves value out of the
+pool. I was persisting and verifying the LIVE state against the record's point-in-time commitment, so
+`load_and_verify_economic_state` would have reported a FALSE DIVERGENCE on any node that had claimed
+since its last settle. That is precisely the failure the check was built to detect, so it would have
+fired constantly and taught everyone to ignore it.
+
+FIX: `SettlementStore` now keeps `committed` — the snapshot the most recent record hashed — captured at
+settle before any later claim. That is what is persisted and what verification compares: like with
+like. TEST `the_committed_snapshot_is_what_persists_and_matches_the_record` pins all three facts —
+committed matches the record at close, live DIVERGES after a claim, and the committed snapshot still
+matches after a SQL round trip.
+
+Note: I only found this because the first draft of the test asserted equality while its own message
+explained they must differ. The contradiction was the tell.

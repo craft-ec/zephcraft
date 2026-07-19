@@ -177,6 +177,68 @@ mod tests {
         }
     }
 
+    /// The PRODUCTION path end to end — and a regression test for a real design flaw this caught.
+    ///
+    /// The record commits to the state AT EPOCH CLOSE, but the live position keeps moving afterwards: a
+    /// claim moves value out of the pool. So persisting/verifying the LIVE state would flag a false
+    /// divergence on any node that has claimed since the last settle — the very failure the check
+    /// exists to detect. The store therefore persists the COMMITTED snapshot, and that is what survives
+    /// a reload and matches the record.
+    #[tokio::test]
+    async fn the_committed_snapshot_is_what_persists_and_matches_the_record() {
+        use crate::settlement::{epochs_per_day, SettlementStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let heads: Arc<dyn RootStore> = Arc::new(Heads(Mutex::new(HashMap::new())));
+        let owner = NodeId([4u8; 32]);
+        let sql = CraftSql::register(dir.path(), heads, owner).unwrap();
+        let mut db = sql.open(ECON_NAMESPACE).await.unwrap();
+
+        let mut store = SettlementStore::new();
+        store.set_issuance(1000 * epochs_per_day(), 1_000_000_000);
+        store.pay_in(5_000);
+        let contribs: Vec<zeph_reward::Contribution> = [([1u8; 32], 3u64), ([2u8; 32], 1u64)]
+            .into_iter()
+            .map(|(p, b)| zeph_reward::Contribution {
+                provider: p,
+                bytes: b,
+                cumulative_bytes: b,
+            })
+            .collect();
+        let rec = store.settle_epoch(1, contribs, vec![]);
+
+        // At close, the committed snapshot IS what the record hashed.
+        assert_eq!(
+            store.committed_snapshot().state_hash(),
+            rec.state_hash,
+            "the record commits to the epoch-close state"
+        );
+
+        // A claim then moves value, so the LIVE state legitimately diverges from that commitment.
+        let got = store.claim(1, [1u8; 32]);
+        assert!(got > 0, "provider 1 claimed");
+        assert_ne!(
+            store.snapshot().state_hash(),
+            rec.state_hash,
+            "live state moves on after the epoch — verifying against IT would be a false divergence"
+        );
+        // ...while the committed snapshot still matches, which is what makes the check meaningful.
+        assert_eq!(
+            store.committed_snapshot().state_hash(),
+            rec.state_hash,
+            "the committed snapshot is stable and is what verification compares"
+        );
+
+        // Persist the COMMITTED snapshot and reload it: the commitment survives the round trip.
+        persist(&mut db, &store.committed_snapshot()).await.unwrap();
+        let loaded = load(&db).unwrap();
+        assert_eq!(
+            loaded.state_hash(),
+            rec.state_hash,
+            "a reloaded node can verify its economic state against the canonical record"
+        );
+    }
+
     /// THE round-trip: state written to CraftSQL and read back must produce the SAME canonical hash —
     /// otherwise the record's commitment could never be checked against the stored state, and the whole
     /// split (state in SQL, commitment in the record) does not hold together.

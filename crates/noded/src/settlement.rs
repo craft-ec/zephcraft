@@ -68,6 +68,14 @@ pub struct SettlementStore {
     /// Per-provider CUMULATIVE rewardable served (Σ allocated to it across consumers) — the observable
     /// "settled" numerator of the dashboard settled/served meter.
     rewardable: BTreeMap<[u8; 32], u64>,
+    /// The snapshot the most recent epoch record COMMITTED to.
+    ///
+    /// The live position keeps moving after an epoch closes — a claim moves value out of the pool — so
+    /// the live state deliberately does NOT match the record's `state_hash`. Persisting and verifying
+    /// against the live state would report a FALSE divergence on any node that has claimed since the
+    /// last settle, which is precisely the failure the check exists to detect. So it compares like with
+    /// like: the committed point-in-time state.
+    committed: zeph_reward::EconomicSnapshot,
     /// GOVERNED seed rate in TOKENS PER DAY (`economy:issuance_tokens_per_day`). Kept as the rate in TIME
     /// — the reward program pays it against `epochs_per_day` on an exact schedule, so a sub-epoch rate
     /// (1 token/day is 1/288 at a 5min epoch) still pays exactly rather than flooring to nothing.
@@ -84,6 +92,7 @@ pub fn epochs_per_day() -> u64 {
 impl Default for SettlementStore {
     fn default() -> Self {
         Self {
+            committed: zeph_reward::EconomicSnapshot::default(),
             protocol: zeph_token::ProtocolState::new(
                 zeph_token::SupplyState::new(0, zeph_reward::DEFAULT_ISSUANCE_TOTAL_CAP),
                 0,
@@ -126,6 +135,11 @@ impl SettlementStore {
     #[allow(dead_code)]
     pub fn entitlement(&self, consumer: &[u8; 32], epoch: u64) -> u64 {
         self.subs.available(consumer, epoch)
+    }
+
+    /// The position the most recent record committed to — what to persist and verify against.
+    pub fn committed_snapshot(&self) -> zeph_reward::EconomicSnapshot {
+        self.committed.clone()
     }
 
     /// Capture the COMPLETE economic position — token side and reward side — for the epoch record.
@@ -267,6 +281,10 @@ impl SettlementStore {
         // The tokens only leave the protocol when a provider actually claims (`claim` → debit). That is
         // what makes `Σ balances + pool == total_supply` hold — the old code moved a number between two
         // buckets while the actual value was minted at claim time out of nothing.
+        // Capture exactly what this record committed to, BEFORE any later claim moves value. This is
+        // what gets persisted and what verification compares — comparing the live state instead would
+        // flag every node that has claimed since.
+        self.committed = self.snapshot();
         self.records.insert(epoch, record.clone());
         record
     }
