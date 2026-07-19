@@ -87,6 +87,23 @@ impl EconomyEgressService {
         *self.econ_db.lock().await = Some(db);
     }
 
+    /// Adopt epoch `epoch`'s CANONICAL economic state, for a node that did not settle it.
+    ///
+    /// Returns whether a canonical record was available to adopt. This is what keeps every node's
+    /// economic position tracking the chain rather than only the sample of epochs it was elected for —
+    /// the natural consequence of the pool being a function of the record rather than local
+    /// accumulation.
+    pub async fn adopt_canonical_state(&self, epoch: u64) -> bool {
+        let Some(records) = self.record_chain.read().await.clone() else {
+            return false;
+        };
+        let Some(rec) = records.canonical_record(epoch).await else {
+            return false; // not finalized (yet) — nothing canonical to adopt
+        };
+        self.settlement.write().await.adopt_canonical(&rec);
+        true
+    }
+
     /// Persist the current economic position to the store. Called at epoch close, after the record is
     /// computed, so what is stored is exactly what the record committed to.
     pub async fn persist_economic_state(&self) -> anyhow::Result<()> {

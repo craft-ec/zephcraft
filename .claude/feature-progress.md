@@ -3313,4 +3313,27 @@ to the structural bound.
 
 STILL OPEN from the review: #2 (RewardClaim credit not pinned at commit — resolves live, so the same
 committed write folds differently over time), #3 (watermarks lump skipped epochs → record divergence),
-#4 (restart verify compares one fixed epoch, fails for non-settling nodes → zero-baseline restore).
+#4 — FIXED, see below.
+
+### FIXED review finding #4 (2026-07-19) — every node adopts canonical state, not just settlers
+Persistence was gated on `settled_any`, so a node elected only occasionally held a STALE economic
+position, mismatched the restart hash-check against a newer canonical record, refused to restore, and
+rebuilt from DEFAULTS — wiping subsidy eligibility and resurrecting "restart refreshes your subsidy"
+for the THIRD time in this feature.
+
+The fix falls out of the pool rework: if the pool is a function of the canonical record, a node has no
+business computing its own. So the settle loop now, for each epoch it advances past:
+- settles it if elected (as before), OR
+- ADOPTS its canonical record (`adopt_canonical`: take the committed pool, `observe_minted` the supply
+  monotonically, keep the record so its shares are claimable here).
+Persistence triggers when the position ADVANCED by either route, not only by settling.
+
+TEST `adopting_canonical_state_keeps_a_non_settling_node_current`: an observer that computed nothing
+adopts the record, lands on the settler's exact pool and supply, has `committed == live` (so a restart
+verifies rather than falling back to defaults), and — the point — its SPENT subsidy allowance is still
+spent.
+
+REMAINING from the review: #2 (RewardClaim credit resolves LIVE rather than pinned at commit, so the
+same committed write folds differently over time) and #3 (watermarks lump skipped epochs into the next
+settled one → record divergence). #3 may now be easier: adopting canonical state each epoch is a step
+toward watermarks tracking the chain too.

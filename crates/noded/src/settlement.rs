@@ -146,6 +146,18 @@ impl SettlementStore {
         self.subs.available(consumer, epoch)
     }
 
+    /// Adopt a canonical record's committed economic position without having settled the epoch.
+    ///
+    /// Takes the pool and supply the record committed to, and records the epoch so its shares are
+    /// claimable here. Supply is monotonic (`observe_minted`), so adopting an older record can never
+    /// hand back spent minting headroom.
+    pub fn adopt_canonical(&mut self, rec: &RewardRecord) {
+        self.protocol.set_pool(rec.state_pool());
+        self.protocol.supply_mut().observe_minted(rec.cumulative_issued);
+        self.committed = self.snapshot();
+        self.records.insert(rec.epoch, rec.clone());
+    }
+
     /// The position the most recent record committed to — what to persist and verify against.
     pub fn committed_snapshot(&self) -> zeph_reward::EconomicSnapshot {
         self.committed.clone()
@@ -569,6 +581,50 @@ mod tests {
             s.settle_epoch(1, vec![contrib(3, 999)], vec![])
                 .share_of(&prov(1)),
             60
+        );
+    }
+
+    /// A node that never settles still tracks the chain — which is what stops the restart hash-check
+    /// from failing and dumping it to a ZERO baseline.
+    ///
+    /// Review finding #4: persistence was gated on having settled, so a node elected only occasionally
+    /// held a stale position, mismatched the canonical hash at restart, refused to restore, and rebuilt
+    /// from defaults — wiping subsidy eligibility and resurrecting "restart refreshes your subsidy" for
+    /// the third time. Adopting each epoch's canonical record keeps every node current whether it
+    /// computed the epoch or merely read it.
+    #[test]
+    fn adopting_canonical_state_keeps_a_non_settling_node_current() {
+        // The settler computes an epoch.
+        let mut settler = SettlementStore::new();
+        settler.set_issuance(1000 * epochs_per_day(), 1_000_000_000);
+        settler.pay_in(5_000);
+        let rec = settler.settle_epoch(1, vec![contrib(1, 3), contrib(2, 1)], vec![]);
+
+        // The observer was NOT elected for this epoch and computed nothing.
+        let mut observer = SettlementStore::new();
+        observer.set_issuance(1000 * epochs_per_day(), 1_000_000_000);
+        observer.set_seeding_paid_tier(1_000);
+        // It has spent its own subsidy allowance, which must survive.
+        let c = prov(9);
+        assert_eq!(observer.subs.allocate(&c, 1_000, 1), 1_000, "allowance granted");
+        assert_eq!(observer.subs.allocate(&c, 1_000, 1), 0, "and spent");
+
+        observer.adopt_canonical(&rec);
+
+        assert_eq!(observer.pool_total(), settler.pool_total(), "tracks the canonical pool");
+        assert_eq!(observer.total_supply(), settler.total_supply(), "and the canonical supply");
+        // Its committed snapshot now matches what it would persist, so a restart verifies instead of
+        // falling back to defaults...
+        assert_eq!(
+            observer.committed_snapshot().state_hash(),
+            observer.snapshot().state_hash(),
+            "committed == live for a node that only adopted, so persistence is verifiable"
+        );
+        // ...and the spent allowance is still spent.
+        assert_eq!(
+            observer.subs.allocate(&c, 1_000, 1),
+            0,
+            "adopting canonical state must NOT refresh the subsidy allowance"
         );
     }
 

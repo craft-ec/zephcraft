@@ -586,18 +586,26 @@ impl SettlementService {
             if now > SETTLE_GRACE_EPOCHS + 1 {
                 let target = now - 1 - SETTLE_GRACE_EPOCHS;
                 let start = last_settled.map_or(target, |e| e + 1);
-                let mut settled_any = false;
+                let mut advanced = false;
                 for s in start..=target {
                     if self.should_settle(s).await {
                         self.settle(s).await;
-                        settled_any = true;
+                        advanced = true;
+                    } else if self.economy.adopt_canonical_state(s).await {
+                        // NOT elected for this epoch — so ADOPT its canonical state rather than skipping
+                        // it. Now that the pool derives from the chain, a node has no business computing
+                        // its own: every node tracks the same state whether it settled or merely read.
+                        //
+                        // Skipping used to leave a non-settling node's economic position frozen at its
+                        // last elected epoch, which then failed the restart hash-check against a newer
+                        // canonical record and fell back to a ZERO baseline — wiping subsidy eligibility
+                        // and resurrecting "restart refreshes your subsidy" for the third time.
+                        advanced = true;
                     }
                 }
-                // PERSIST the economic position after the epoch closes — the record committed to it by
-                // hash, so what is stored must be exactly what was committed. Without this the state
-                // lives only in memory and a restart loses the pool, the watermarks and (exploitably)
-                // every account's subsidy eligibility.
-                if settled_any {
+                // PERSIST whenever the position advanced — by settling OR by adopting. Gating this on
+                // settling alone is what made most nodes' on-disk state stale and unverifiable.
+                if advanced {
                     if let Err(e) = self.economy.persist_economic_state().await {
                         tracing::warn!(error = %e, "failed to persist economic state");
                     }
