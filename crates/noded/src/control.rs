@@ -333,11 +333,18 @@ impl State {
             boot_stage: self.boot_stage.read().await.clone(),
             uptime_secs: self.started.elapsed().as_secs(),
             wire_version: zeph_wire::VERSION,
-            erasure: format!(
-                "rlnc-gf256 k=32 n={} · vtags null-space v{}",
-                zeph_erasure::target_pieces(32),
-                zeph_erasure::vtags::SCHEME_NULL_SPACE_V1,
-            ),
+            erasure: {
+                // The REAL configured k, not a hardcoded literal. This line used to read
+                // `"k=32 n={}", target_pieces(32)` — both numbers fixed regardless of the node's actual
+                // config, which made `status` report k=32/n=96 on a fleet running the k=8 default and
+                // sent at least one debugging session down the wrong path.
+                let k = self.engine.config().k;
+                format!(
+                    "rlnc-gf256 k={k} n={} · vtags null-space v{}",
+                    zeph_erasure::target_pieces(k),
+                    zeph_erasure::vtags::SCHEME_NULL_SPACE_V1,
+                )
+            },
             passive_peers: self
                 .passive_peers
                 .load(std::sync::atomic::Ordering::Relaxed),
