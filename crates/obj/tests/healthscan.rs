@@ -1466,3 +1466,76 @@ async fn reconcile_nets_to_noop_when_redundancy_is_in_band() {
         "in-band reconcile is a no-op — no mint, no shed"
     );
 }
+
+/// Repair must place the FULL deficit across however few nodes exist — multiple pieces per node when
+/// distinct peers < deficit — so a small fleet CONVERGES to the floor in a bounded number of passes.
+///
+/// Regression for the idle-fleet repair storm: `repair_one` used to push one piece per DISTINCT peer and
+/// drop the rest, so on a tiny fleet it could add at most (peer count) pieces per cycle no matter the
+/// deficit (32-piece floor / 4 nodes = 8 each, but only ~3 could ever land per pass). It never reached
+/// the floor, re-minting and re-shipping the same deficit forever — the dominant idle traffic. With two
+/// survivors the elected repairer has ONE peer to push to; the old code would add 1 piece/pass (~11
+/// passes to close an 11-piece deficit), the new code places up to REPAIR_BATCH per pass onto that one
+/// peer and converges in a couple. The tight pass bound is what distinguishes them.
+#[tokio::test]
+async fn repair_converges_on_a_fleet_smaller_than_the_deficit() {
+    let tracker = start_tracker();
+    let dirs: Vec<tempfile::TempDir> = (0..6).map(|_| tempfile::tempdir().unwrap()).collect();
+
+    // Only THREE holders — fewer nodes than the 32-piece floor needs pieces.
+    let mut holders = Vec::new();
+    for dir in dirs.iter().take(3) {
+        let h = node(&tracker, dir.path()).await;
+        h.routing.announce_node(0, 0).await.unwrap();
+        holders.push(h);
+    }
+    let publisher = node(&tracker, dirs[4].path()).await;
+    let payload: Vec<u8> = (0..120_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 7) as u8)
+        .collect();
+    let cid = publisher.engine.publish(&payload, false).await.unwrap().cid;
+    holders[0].engine.want(cid).await.unwrap();
+    let floor = 32usize;
+    wait_have(&holders, cid, floor).await;
+
+    // KILL one holder → TWO survivors, verified availability well below the floor. Each survivor's
+    // elected repairer now has a SINGLE peer to push to, so reaching the floor REQUIRES placing many
+    // pieces on that one peer.
+    for dead in holders.split_off(2) {
+        dead.kill().await;
+    }
+    let after = verified_have(&holders, cid).await;
+    assert!(
+        after < floor,
+        "after death verified HAVE {after} < floor {floor}"
+    );
+
+    // BOUNDED passes: the new distribution reaches the floor quickly; the old one-per-peer path could
+    // not (it would take ~ (deficit) passes to close it through a single peer).
+    let max_passes = 4;
+    let mut recovered = 0;
+    let mut used = 0;
+    for pass in 1..=max_passes {
+        for h in &holders {
+            h.engine.health_scan().await;
+        }
+        recovered = verified_have(&holders, cid).await;
+        used = pass;
+        if recovered >= floor {
+            break;
+        }
+    }
+    assert!(
+        recovered >= floor,
+        "two-survivor fleet must reach the floor within {max_passes} passes (took until {used}, \
+         reached {recovered}/{floor}) — the old one-piece-per-peer distribution could not"
+    );
+
+    // And the content is intact, byte-identical, by CID alone.
+    let fetcher = node(&tracker, dirs[5].path()).await;
+    assert_eq!(
+        fetcher.engine.get(cid, ConsumeMode::Drop).await.unwrap(),
+        payload,
+        "content survives repair on a small fleet"
+    );
+}

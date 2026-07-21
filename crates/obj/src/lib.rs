@@ -3067,22 +3067,39 @@ impl ObjEngine {
                 }
             }
         }
-        // Offer/grant admission with redirect (TRANSFER_PLANE_V2 §3): each of
-        // `want` pieces claims the next candidate from a shared cursor, offers
-        // ONE critical push, and — if declined (grant 0, e.g. the target is at
-        // critical memory pressure) or the push fails — walks to the next
-        // candidate rather than dropping the piece for a whole repair cycle.
-        // Coded pieces are fungible, so the floor is restored by whoever has
-        // capacity. The cursor keeps the `want` tasks on DISTINCT candidates.
-        let targets = Arc::new(targets);
+        if targets.is_empty() {
+            return 0; // nowhere to place pieces (no live peers) — nothing to do this cycle
+        }
+        // Offer/grant admission with redirect (TRANSFER_PLANE_V2 §3): each of `want` pieces claims the
+        // next candidate from a shared cursor, offers ONE critical push, and — if declined (grant 0, e.g.
+        // the target is at critical memory pressure) or the push fails — walks to the next candidate
+        // rather than dropping the piece for a whole repair cycle. Coded pieces are fungible, so the floor
+        // is restored by whoever has capacity.
+        //
+        // The candidate sequence ROUND-ROBINS over the targets and REPEATS them, so when there are fewer
+        // distinct nodes than pieces to place — a small fleet — multiple pieces land on the SAME node
+        // instead of the surplus being dropped. This was the bug: the cursor previously walked distinct
+        // targets only, so on a 4-node fleet at most 3 pieces (one per peer) could land per cycle no
+        // matter the deficit, and repair could never lift a cid to the floor (32 pieces / 4 nodes = 8
+        // each). It churned forever — re-minting and re-shipping the same deficit, the dominant idle
+        // traffic on a small fleet. Round-robin over the fewest-pieces-first order fills the neediest
+        // nodes first; the repeat lets the shared cursor still redirect a declined piece to the next slot.
+        let rounds = want
+            .saturating_add(REDIRECT_MARGIN)
+            .div_ceil(targets.len())
+            .max(1);
+        let plan: Vec<PeerAddr> = std::iter::repeat_n(targets.clone(), rounds)
+            .flatten()
+            .collect();
+        let plan = Arc::new(plan);
         let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let pushes = (0..want).map(|_| {
-            let targets = targets.clone();
+            let plan = plan.clone();
             let cursor = cursor.clone();
             async move {
                 loop {
                     let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some(addr) = targets.get(i) else {
+                    let Some(addr) = plan.get(i) else {
                         return false;
                     };
                     if self
